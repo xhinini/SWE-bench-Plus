@@ -1,0 +1,198 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that AutocompleteJsonView uses the serialize_result() hook to construct JSON results in various scenarios: default text modification, custom to_field resolution, MTI and FK PK cases, pagination, ordering, limit_choices_to filtering, permission checks that should prevent serialization, and distinct handling when searching across related fields. They will fail if the view builds the result dict inline instead of delegating to serialize_result(), or if serialize_result() is invoked at the wrong time.
+test_code: |
+  def test_serialize_result_used_for_text_customization(self):
+      """Overriding serialize_result should alter the 'text' value in the response."""
+      class CustomTextView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              return {'id': str(getattr(obj, to_field_name)), 'text': 'CUSTOM:' + str(obj)}
+  
+      q = Question.objects.create(question='Is this a question?')
+      request = self.factory.get(self.url, {'term': 'is', **self.opts})
+      request.user = self.superuser
+      response = CustomTextView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertEqual(data, {
+          'results': [{'id': str(q.pk), 'text': 'CUSTOM:' + q.question}],
+          'pagination': {'more': False},
+      })
+  
+  def test_serialize_result_receives_correct_to_field_for_custom_to_field(self):
+      """serialize_result should receive the resolved to_field_name for custom to_field."""
+      class InspectToFieldView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              # return the to_field name as part of result so we can assert it's the expected attname
+              return {'id': str(getattr(obj, to_field_name)), 'text': str(obj), 'to_field': to_field_name}
+  
+      q = Question.objects.create(question='Is this a question?')
+      # field_name that specifies a custom to_field on the related Question model
+      request = self.factory.get(self.url, {'term': 'is', **self.opts, 'field_name': 'question_with_to_field'})
+      request.user = self.superuser
+      response = InspectToFieldView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      # to_field for question_with_to_field is Question.uuid's attname
+      expected_to_field = Question._meta.get_field('uuid').attname
+      self.assertEqual(data, {
+          'results': [{'id': str(q.uuid), 'text': q.question, 'to_field': expected_to_field}],
+          'pagination': {'more': False},
+      })
+  
+  def test_serialize_result_used_for_mti_targets(self):
+      """serialize_result should be used for MTI-related targets (Employee->WorkHour, Manager->Bonus)."""
+      class MTIInspectView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              return {'id': str(getattr(obj, to_field_name)), 'text': str(obj), 'to_field': to_field_name}
+  
+      tests = [
+          (Employee, WorkHour, 'employee'),
+          (Manager, Bonus, 'recipient'),
+      ]
+      for Target, Remote, related_name in tests:
+          with self.subTest(target_model=Target, remote_model=Remote, related_name=related_name):
+              o = Target.objects.create(name="Frida Kahlo", gender=2, code="painter", alive=False)
+              opts = {
+                  'app_label': Remote._meta.app_label,
+                  'model_name': Remote._meta.model_name,
+                  'field_name': related_name,
+              }
+              request = self.factory.get(self.url, {'term': 'frida', **opts})
+              request.user = self.superuser
+              response = MTIInspectView.as_view(**self.as_view_args)(request)
+              self.assertEqual(response.status_code, 200)
+              data = json.loads(response.content.decode('utf-8'))
+              self.assertEqual(data, {
+                  'results': [{'id': str(o.pk), 'text': o.name, 'to_field': Target._meta.pk.attname}],
+                  'pagination': {'more': False},
+              })
+  
+  def test_serialize_result_used_for_fk_pk_targets(self):
+      """serialize_result should be used for FK target models that use the default PK."""
+      class FKInspectView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              return {'id': str(getattr(obj, to_field_name)), 'text': str(obj), 'to_field': to_field_name}
+  
+      p = Parent.objects.create(name="Bertie")
+      c = PKChild.objects.create(parent=p, name="Anna")
+      opts = {
+          'app_label': Toy._meta.app_label,
+          'model_name': Toy._meta.model_name,
+          'field_name': 'child',
+      }
+      request = self.factory.get(self.url, {'term': 'anna', **opts})
+      request.user = self.superuser
+      response = FKInspectView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      # PKChild uses default PK; to_field should be its pk attname
+      expected_to_field = PKChild._meta.pk.attname
+      self.assertEqual(data, {
+          'results': [{'id': str(c.pk), 'text': c.name, 'to_field': expected_to_field}],
+          'pagination': {'more': False},
+      })
+  
+  def test_serialize_result_applied_on_second_page(self):
+      """serialize_result should be applied to results on subsequent pages as well."""
+      class PageMarkingView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              # mark which page this was serialized for by adding a suffix
+              return {'id': str(getattr(obj, to_field_name)), 'text': str(obj) + '_MARK'}
+  
+      # create more than a page of questions
+      Question.objects.bulk_create(Question(question=str(i)) for i in range(PAGINATOR_SIZE + 5))
+      # request second page
+      request = self.factory.get(self.url, {'term': '', 'page': '2', **self.opts})
+      request.user = self.superuser
+      response = PageMarkingView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      # all returned items should have the custom suffix
+      for item in data['results']:
+          self.assertTrue(item['text'].endswith('_MARK'))
+  
+  def test_serialize_result_preserves_ordering(self):
+      """Custom serialize_result should not alter the ordering of returned results."""
+      class OrderInspectView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              return {'id': str(getattr(obj, to_field_name)), 'text': str(obj)}
+  
+      Question.objects.create(question='A')
+      Question.objects.create(question='B')
+      Question.objects.create(question='C')
+      # use an ordering that is descending by PK
+      class PKDescAdmin(QuestionAdmin):
+          ordering = ['-pk']
+  
+      request = self.factory.get(self.url, {'term': '', **self.opts})
+      request.user = self.superuser
+      with model_admin(Question, PKDescAdmin):
+          response = OrderInspectView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      expected = [{'id': str(q.pk), 'text': q.question} for q in Question.objects.order_by('-pk')[:PAGINATOR_SIZE]]
+      self.assertEqual(data['results'], expected)
+  
+  def test_serialize_result_with_limit_choices_to(self):
+      """When limit_choices_to filters out items, serialize_result should only be called for remaining items."""
+      class LimitInspectView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              return {'id': str(getattr(obj, to_field_name)), 'text': str(obj), 'extra': 'X'}
+  
+      # Question.question_with_to_field uses limit_choices_to to exclude questions starting with 'Not'
+      q1 = Question.objects.create(question='Is this a question?')
+      Question.objects.create(question='Not a question.')
+      request = self.factory.get(self.url, {'term': 'is', **self.opts, 'field_name': 'question_with_to_field'})
+      request.user = self.superuser
+      response = LimitInspectView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertEqual(data, {
+          'results': [{'id': str(q1.uuid), 'text': q1.question, 'extra': 'X'}],
+          'pagination': {'more': False},
+      })
+  
+  def test_serialize_result_not_called_when_permission_denied(self):
+      """serialize_result should not be invoked when process_request raises PermissionDenied."""
+      class FailIfCalledView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              # If this gets called, the test should fail.
+              raise AssertionError("serialize_result should not be called when permission is denied")
+  
+      # related_questions is not allowed for this user's to_field (tests expect PermissionDenied)
+      opts = {
+          'app_label': Question._meta.app_label,
+          'model_name': Question._meta.model_name,
+          'field_name': 'related_questions',
+      }
+      request = self.factory.get(self.url, {'term': 'is', **opts})
+      request.user = self.superuser
+      with self.assertRaises(PermissionDenied):
+          FailIfCalledView.as_view(**self.as_view_args)(request)
+  
+  def test_serialize_result_with_distinct_results(self):
+      """When search uses distinct() to remove duplicates, serialize_result should still be used exactly once per returned object."""
+      class DistinctMarkView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              return {'id': str(getattr(obj, to_field_name)), 'text': str(obj)}
+  
+      q1 = Question.objects.create(question='question 1')
+      q2 = Question.objects.create(question='question 2')
+      q2.related_questions.add(q1)
+      q3 = Question.objects.create(question='question 3')
+      q3.related_questions.add(q1)
+      request = self.factory.get(self.url, {'term': 'question', **self.opts})
+      request.user = self.superuser
+  
+      class DistinctQuestionAdmin(QuestionAdmin):
+          search_fields = ['related_questions__question', 'question']
+  
+      with model_admin(Question, DistinctQuestionAdmin):
+          response = DistinctMarkView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      # Expect 3 unique results
+      self.assertEqual(len(data['results']), 3)
+new_imports_code: |
+  # No new imports required; tests reuse existing imports in tests/admin_views/test_autocomplete_view.py

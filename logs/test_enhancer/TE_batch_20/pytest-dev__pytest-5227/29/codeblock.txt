@@ -1,0 +1,176 @@
+# No additional imports required beyond those in the test module.
+import logging
+import contextlib
+import pytest
+from functools import partial
+
+from _pytest.logging import (
+    ColoredLevelFormatter,
+    get_actual_log_level,
+    catching_logs,
+    LogCaptureHandler,
+    LogCaptureFixture,
+)
+
+class DummyTerminal:
+    def __init__(self):
+        self.written = []
+    def markup(self, text, **kwargs):
+        # Represent colorization by surrounding text for testing
+        opts = ",".join(sorted(kwargs.keys()))
+        return "[%s:%s]" % (opts, text)
+
+class DummyConfig:
+    def __init__(self, option=None, ini=None):
+        self._option = option or {}
+        self._ini = ini or {}
+    def getoption(self, name):
+        return self._option.get(name)
+    def getini(self, name):
+        return self._ini.get(name)
+
+def make_log_record(name="test", level=logging.INFO, msg="hello %s", args=("world",), lineno=1):
+    # create LogRecord similar to how logging does
+    pathname = __file__
+    return logging.LogRecord(name, level, pathname, lineno, msg, args, None)
+
+def test_colored_level_formatter_creates_mapping_and_formats():
+    term = DummyTerminal()
+    fmt = "%(levelname)-8s %(name)s:%(filename)s:%(lineno)d %(message)s"
+    formatter = ColoredLevelFormatter(term, fmt, datefmt="%H:%M:%S")
+    # ensure mapping exists for all configured levels
+    for level in ColoredLevelFormatter.LOGLEVEL_COLOROPTS.keys():
+        assert level in formatter._level_to_fmt_mapping
+        # the mapping should contain the colorized levelname as produced by DummyTerminal.markup
+        mapped = formatter._level_to_fmt_mapping[level]
+        # the mapped string should include a markup bracketed value from DummyTerminal
+        assert "[" in mapped and "]" in mapped
+
+    # formatting a record should use the level-specific fmt (colorized)
+    rec = make_log_record(level=logging.ERROR, msg="oops %s", args=("bad",))
+    out = formatter.format(rec)
+    assert "oops bad" in out
+
+def test_colored_level_formatter_without_levelname_leaves_original_fmt():
+    term = DummyTerminal()
+    fmt = "%(message)s"  # no %(levelname) entry
+    formatter = ColoredLevelFormatter(term, fmt, datefmt="%H:%M:%S")
+    # no per-level mapping must be created
+    assert formatter._level_to_fmt_mapping == {}
+    rec = make_log_record(level=logging.WARNING, msg="warn %s", args=("you",))
+    out = formatter.format(rec)
+    assert "warn you" in out
+
+def test_get_actual_log_level_handles_string_numeric_and_invalid():
+    # string name (case-insensitive)
+    cfg = DummyConfig(option={"a": "info"})
+    assert get_actual_log_level(cfg, "a") == logging.INFO
+
+    # numeric int passed directly
+    cfg2 = DummyConfig(option={"b": 10})
+    assert get_actual_log_level(cfg2, "b") == 10
+
+    # numeric string
+    cfg3 = DummyConfig(option={"c": "10"})
+    assert get_actual_log_level(cfg3, "c") == 10
+
+    # invalid level should raise pytest.UsageError
+    cfg4 = DummyConfig(option={"d": "NOT_A_LEVEL"})
+    with pytest.raises(pytest.UsageError):
+        get_actual_log_level(cfg4, "d")
+
+def test_catching_logs_adds_and_restores_handler_and_level(tmp_path):
+    root = logging.getLogger()
+    # ensure we start with a known level
+    orig_level = root.level
+    handler = logging.StreamHandler()
+    # ensure handler is not yet present
+    if handler in root.handlers:
+        root.removeHandler(handler)
+
+    # Use catching_logs to add handler and set level lower than orig
+    with catching_logs(handler, level=logging.DEBUG) as h:
+        assert h is handler
+        assert handler in root.handlers
+        # root level should be min(orig_level, DEBUG)
+        assert root.level == min(orig_level, logging.DEBUG)
+    # after exit, handler removed and level restored
+    assert handler not in root.handlers
+    assert root.level == orig_level
+
+def test_catching_logs_with_existing_handler_does_not_remove_it():
+    root = logging.getLogger()
+    orig_level = root.level
+    handler = logging.StreamHandler()
+    # add handler beforehand
+    if handler not in root.handlers:
+        root.addHandler(handler)
+    try:
+        with catching_logs(handler, level=logging.DEBUG) as h:
+            # handler should remain in handlers, but catching_logs should not try to re-add it.
+            assert handler in root.handlers
+            assert root.level == min(orig_level, logging.DEBUG)
+        # after exit, handler should still be present (we didn't add it ourselves)
+        assert handler in root.handlers
+    finally:
+        # cleanup: remove the handler if we added it
+        if handler in root.handlers:
+            root.removeHandler(handler)
+        root.setLevel(orig_level)
+
+def test_logcapturefixture_records_messages_and_clear():
+    # create a LogCaptureHandler and emit a record so both stream and records are populated
+    handler = LogCaptureHandler()
+    rec = make_log_record(name="mylogger", level=logging.INFO, msg="hello %s", args=("pytest",))
+    # call emit which appends record and writes to stream
+    handler.emit(rec)
+    # create a fake item that the fixture expects
+    class Item:
+        pass
+    item = Item()
+    item.catch_log_handler = handler
+    item.catch_log_handlers = {"call": handler}
+    fixture = LogCaptureFixture(item)
+    # records/messages/record_tuples should reflect emitted record
+    assert fixture.records == handler.records
+    assert fixture.messages == ["hello pytest"]
+    assert fixture.record_tuples == [("mylogger", logging.INFO, "hello pytest")]
+    # text should contain the message
+    assert "hello pytest" in fixture.text
+    # clearing should reset both
+    fixture.clear()
+    assert fixture.records == []
+    assert fixture.text == ""
+
+def test_logcapturefixture_set_level_and_finalize_restores(tmp_path):
+    # pick a custom logger
+    logger_name = "test.regression.logger"
+    logger = logging.getLogger(logger_name)
+    orig = logger.level
+    class Item:
+        pass
+    item = Item()
+    item.catch_log_handler = LogCaptureHandler()
+    fixture = LogCaptureFixture(item)
+    # set new level and verify it's applied and initial saved
+    fixture.set_level(logging.DEBUG, logger=logger_name)
+    assert logger.level == logging.DEBUG
+    # ensure initial saved
+    assert logger_name in fixture._initial_log_levels
+    # finalize and ensure restored
+    fixture._finalize()
+    assert logger.level == orig
+
+def test_logcapturefixture_at_level_context_manager_restores():
+    logger_name = "test.regression.atlevel"
+    logger = logging.getLogger(logger_name)
+    orig = logger.level
+    class Item:
+        pass
+    item = Item()
+    item.catch_log_handler = LogCaptureHandler()
+    fixture = LogCaptureFixture(item)
+    with fixture.at_level(logging.CRITICAL, logger=logger_name):
+        assert logger.level == logging.CRITICAL
+    # after context manager, level should be restored
+    assert logger.level == orig

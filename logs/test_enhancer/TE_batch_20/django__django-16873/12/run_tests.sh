@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.filter_tests.test_join_llm.JoinMutationTests.test_custom_iterator_returns_original_when_join_fails template_tests.filter_tests.test_join_llm.JoinMutationTests.test_generator_consumed_but_identity_preserved_on_failure template_tests.filter_tests.test_join_llm.JoinMutationTests.test_generator_expression_returns_original_when_join_fails template_tests.filter_tests.test_join_llm.JoinMutationTests.test_generator_of_custom_nonstr_returns_original_when_join_fails template_tests.filter_tests.test_join_llm.JoinMutationTests.test_generator_of_objects_returns_original_when_join_fails template_tests.filter_tests.test_join_llm.JoinMutationTests.test_generator_with_mark_safe_arg_returns_original_when_join_fails template_tests.filter_tests.test_join_llm.JoinMutationTests.test_generator_with_mixed_types_returns_original_when_join_fails template_tests.filter_tests.test_join_llm.JoinMutationTests.test_generator_with_none_elements_returns_original_when_join_fails template_tests.filter_tests.test_join_llm.JoinMutationTests.test_list_iterator_returns_original_when_join_fails template_tests.filter_tests.test_join_llm.JoinMutationTests.test_tuple_iterator_returns_original_when_join_fails
+coverage json -o coverage.json
+: '>>>>> End Test Output'

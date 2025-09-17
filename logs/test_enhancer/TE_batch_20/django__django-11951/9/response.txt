@@ -1,0 +1,128 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests patch the database backend's ops.bulk_batch_size to simulate different maximum allowed batch sizes and assert that QuerySet.bulk_create() respects that maximum (i.e., caps the provided batch_size to the database maximum and falls back to at least 1). They use assertNumQueries to ensure the number of executed INSERT batches matches the expected number of batches. Tests are skipped when the database doesn't support bulk inserts or bulk-insert returning rows where appropriate.
+test_code: |
+  from math import ceil
+  from django.db import connection
+  from django.test import skipUnlessDBFeature, skipIfDBFeature
+  from .models import TwoFields, Country, State, Restaurant
+  
+  class BulkCreateBatchingRegressionTests(BulkCreateTests):
+      # Helper to temporarily patch connection.ops.bulk_batch_size
+      def _patch_bulk_batch_size(self, value):
+          original = connection.ops.bulk_batch_size
+          connection.ops.bulk_batch_size = lambda fields, objs: value
+          return original
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_explicit_batch_size_greater_than_max_is_capped(self):
+          objs = [TwoFields(f1=i, f2=i) for i in range(0, 200)]
+          original = self._patch_bulk_batch_size(50)
+          try:
+              with self.assertNumQueries(ceil(len(objs) / 50)):
+                  TwoFields.objects.bulk_create(objs, batch_size=100)  # larger than max
+          finally:
+              connection.ops.bulk_batch_size = original
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_no_batch_size_uses_max_batch_size(self):
+          objs = [TwoFields(f1=i, f2=i) for i in range(0, 75)]
+          original = self._patch_bulk_batch_size(25)
+          try:
+              # batch_size=None should default to max_batch_size (25)
+              with self.assertNumQueries(ceil(len(objs) / 25)):
+                  TwoFields.objects.bulk_create(objs, batch_size=None)
+          finally:
+              connection.ops.bulk_batch_size = original
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_ops_bulk_batch_size_zero_treated_as_one(self):
+          objs = [TwoFields(f1=i, f2=i) for i in range(0, 3)]
+          original = self._patch_bulk_batch_size(0)
+          try:
+              # max(0, 1) -> 1, so each object is inserted separately (3 queries)
+              with self.assertNumQueries(3):
+                  TwoFields.objects.bulk_create(objs, batch_size=10)  # bigger than max (0 -> 1)
+          finally:
+              connection.ops.bulk_batch_size = original
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_ops_bulk_batch_size_negative_treated_as_one(self):
+          objs = [TwoFields(f1=i, f2=i) for i in range(0, 4)]
+          original = self._patch_bulk_batch_size(-5)
+          try:
+              # negative should be coerced via max(..., 1) to 1
+              with self.assertNumQueries(4):
+                  TwoFields.objects.bulk_create(objs, batch_size=2)
+          finally:
+              connection.ops.bulk_batch_size = original
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batch_size_smaller_than_max_not_changed(self):
+          objs = [TwoFields(f1=i, f2=i) for i in range(0, 60)]
+          original = self._patch_bulk_batch_size(100)
+          try:
+              # Provided batch_size (10) is smaller than max (100) => used as-is.
+              with self.assertNumQueries(ceil(len(objs) / 10)):
+                  TwoFields.objects.bulk_create(objs, batch_size=10)
+          finally:
+              connection.ops.bulk_batch_size = original
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_large_batch_exact_multiple_of_max(self):
+          objs = [TwoFields(f1=i, f2=i) for i in range(0, 100)]
+          original = self._patch_bulk_batch_size(20)
+          try:
+              with self.assertNumQueries(ceil(len(objs) / 20)):
+                  TwoFields.objects.bulk_create(objs, batch_size=50)  # capped to 20
+          finally:
+              connection.ops.bulk_batch_size = original
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_large_batch_not_exact_multiple_of_max(self):
+          objs = [TwoFields(f1=i, f2=i) for i in range(0, 101)]
+          original = self._patch_bulk_batch_size(20)
+          try:
+              with self.assertNumQueries(ceil(len(objs) / 20)):
+                  TwoFields.objects.bulk_create(objs, batch_size=200)  # capped to 20
+          finally:
+              connection.ops.bulk_batch_size = original
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_mixed_with_and_without_pk_respects_max_batch_size(self):
+          # Mix objects with explicit PKs and without; bulk_create handles them in two groups.
+          start = 200000
+          mixed = [
+              TwoFields(id=(start + i) if i % 2 == 0 else None, f1=i, f2=i)
+              for i in range(0, 40)
+          ]
+          original = self._patch_bulk_batch_size(7)
+          try:
+              # Expect batches for objs_with_pk and objs_without_pk separately.
+              with self.assertNumQueries(ceil(20 / 7) + ceil(20 / 7)):
+                  TwoFields.objects.bulk_create(mixed, batch_size=50)  # capped to 7
+          finally:
+              connection.ops.bulk_batch_size = original
+  
+      @skipUnlessDBFeature('can_return_rows_from_bulk_insert')
+      def test_batching_with_returning_rows_feature(self):
+          # When backend can return rows from bulk insert, batching logic still applies.
+          objs = [Country(name="C%s" % i, iso_two_letter="X%s" % i) for i in range(0, 33)]
+          original = self._patch_bulk_batch_size(10)
+          try:
+              with self.assertNumQueries(ceil(len(objs) / 10)):
+                  Country.objects.bulk_create(objs, batch_size=100)  # capped to 10
+          finally:
+              connection.ops.bulk_batch_size = original
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batching_on_different_model_respects_max(self):
+          # Use another model (Restaurant) to ensure behavior is model-independent.
+          objs = [Restaurant(name="R%s" % i) for i in range(0, 37)]
+          original = self._patch_bulk_batch_size(8)
+          try:
+              with self.assertNumQueries(ceil(len(objs) / 8)):
+                  Restaurant.objects.bulk_create(objs, batch_size=1000)
+          finally:
+              connection.ops.bulk_batch_size = original
+new_imports_code: ""

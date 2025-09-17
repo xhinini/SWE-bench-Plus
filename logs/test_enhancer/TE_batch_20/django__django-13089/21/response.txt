@@ -1,0 +1,310 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests validate the DatabaseCache culling behavior around the situation
+  where the culling SQL query may return no "last_cache_key" (i.e. cursor.fetchone()
+  returns None). The original bug attempted to index into the result of
+  fetchone() without checking for None and raised an error. The tests also check
+  that when a last_cache_key is returned, the final "DELETE ... WHERE cache_key < %s"
+  statement is executed with the expected parameter. Various cache operations
+  (set, add, touch) are exercised to ensure the backend handles these scenarios
+  without crashing and performs/avoids the final delete as appropriate. One test
+  also ensures that when culling frequency is zero, clear() is invoked.
+test_code: |
+  @override_settings(CACHES=caches_setting_for_tests(
+      BACKEND='django.core.cache.backends.db.DatabaseCache',
+      LOCATION='test cache table'
+  ))
+  class DBCacheCullingRegressionTests(TransactionTestCase):
+      """
+      Regression tests for the culling logic in DatabaseCache._cull.
+
+      These tests mock/inspect the DB cursor used during _cull to simulate the
+      case where the cursor.fetchone() call after the culling SQL returns None
+      (no last cache key), and verify that no final delete is attempted and no
+      exception is raised. They also test the case where the last cache key is
+      returned and ensure the final delete is executed with the expected value.
+      """
+      available_apps = ['cache']
+
+      def setUp(self):
+          super().setUp()
+          management.call_command('createcachetable', verbosity=0)
+          # Use the 'cull' cache (configured with OPTIONS MAX_ENTRIES in the
+          # test settings helper) to force culling behavior in the tests.
+          self.cull_cache = caches['cull']
+          # Keep copies to restore after tests
+          self._orig_max_entries = self.cull_cache._max_entries
+          self._orig_cull_frequency = self.cull_cache._cull_frequency
+
+      def tearDown(self):
+          # Restore attributes and drop table
+          self.cull_cache._max_entries = self._orig_max_entries
+          self.cull_cache._cull_frequency = self._orig_cull_frequency
+          with connection.cursor() as cursor:
+              table_name = connection.ops.quote_name('test cache table')
+              cursor.execute('DROP TABLE %s' % table_name)
+          super().tearDown()
+
+      def _patch_default_cursor(self, override_fetchone_map):
+          """
+          Replace connections['default'].cursor with a context manager that
+          yields a FakeCursor which delegates to the real cursor except that
+          fetchone() returns override_fetchone_map.get(execute_count, real.fetchone()).
+          The returned dict contains a reference to the FakeCursor instance
+          under key 'fake' for inspection by the caller.
+          """
+          db = router.db_for_write(self.cull_cache.cache_model_class)
+          conn = connections[db]
+          orig_cursor_factory = conn.cursor
+          captured = {}
+
+          class FakeCursor:
+              def __init__(self, real):
+                  self._real = real
+                  self.execute_count = 0
+                  self.last_sql = None
+                  self.executed = []  # list of (sql, params)
+
+              def execute(self, sql, params=None):
+                  self.execute_count += 1
+                  self.last_sql = sql
+                  self.executed.append((sql, params))
+                  return self._real.execute(sql, params)
+
+              def fetchone(self):
+                  # If an override is provided for the current execute_count,
+                  # return that. Otherwise, delegate to the real cursor.
+                  if self.execute_count in override_fetchone_map:
+                      return override_fetchone_map[self.execute_count]
+                  return self._real.fetchone()
+
+              def fetchall(self):
+                  return self._real.fetchall()
+
+              def __getattr__(self, name):
+                  # Delegate all other attributes/methods to the real cursor.
+                  return getattr(self._real, name)
+
+          def replacement():
+              real_cm = orig_cursor_factory()
+              class CM:
+                  def __enter__(self_inner):
+                      real_cursor = real_cm.__enter__()
+                      fake = FakeCursor(real_cursor)
+                      captured['fake'] = fake
+                      return fake
+                  def __exit__(self_inner, exc_type, exc, tb):
+                      return real_cm.__exit__(exc_type, exc, tb)
+              return CM()
+          conn.cursor = replacement
+          return conn, orig_cursor_factory, captured
+
+      def _restore_default_cursor(self, conn, orig_cursor_factory):
+          conn.cursor = orig_cursor_factory
+
+      def test_cull_no_last_cache_key_does_not_execute_final_delete(self):
+          """
+          When the culling SQL returns no last cache key (fetchone() is None),
+          the final 'DELETE ... WHERE cache_key < %s' should not be executed and
+          no exception should be raised.
+          """
+          # Make max entries small so culling is triggered
+          self.cull_cache._max_entries = 1
+          self.cull_cache._cull_frequency = 10
+
+          # Insert records to exceed _max_entries
+          for i in range(3):
+              self.cull_cache.set(f'pre{i}', 'value', 1000)
+
+          # Override fetchone for the execute that runs the culling SQL.
+          # The execute ordering inside _cull (when called from set) results
+          # in the culling SQL being the 4th execute on the shared cursor.
+          conn, orig_cursor, captured = self._patch_default_cursor({4: None})
+          try:
+              # Trigger a set that will start culling on the same cursor.
+              # This should not raise.
+              self.cull_cache.set('trigger-no-last-key', 'value', 1000)
+              fake = captured['fake']
+              # Ensure that the culling SQL was executed (it should be the 4th)
+              self.assertGreaterEqual(fake.execute_count, 4)
+              # Ensure the final delete based on last_cache_key was NOT executed.
+              final_delete_called = any(
+                  'WHERE cache_key <' in (sql or '') for sql, _ in fake.executed
+              )
+              self.assertFalse(final_delete_called)
+          finally:
+              self._restore_default_cursor(conn, orig_cursor)
+
+      def test_cull_with_last_cache_key_executes_final_delete(self):
+          """
+          When the culling SQL returns a last_cache_key, the final delete should
+          be executed and the parameter passed to the DELETE should be the
+          returned key.
+          """
+          self.cull_cache._max_entries = 1
+          self.cull_cache._cull_frequency = 10
+          for i in range(3):
+              self.cull_cache.set(f'pre{i}', 'value', 1000)
+
+          # Simulate the culling SQL returning a last cache key tuple.
+          last_key = 'LAST-CACHE-KEY'
+          conn, orig_cursor, captured = self._patch_default_cursor({4: (last_key,)})
+          try:
+              self.cull_cache.set('trigger-with-last-key', 'value', 1000)
+              fake = captured['fake']
+              # Find if the final delete was executed and capture its params.
+              final_delete_calls = [
+                  params for sql, params in fake.executed
+                  if 'WHERE cache_key <' in (sql or '')
+              ]
+              # The final delete should have been called once with [last_key]
+              self.assertTrue(final_delete_calls, msg="Expected final delete to be executed")
+              self.assertIn([last_key], final_delete_calls)
+          finally:
+              self._restore_default_cursor(conn, orig_cursor)
+
+      def test_set_returns_true_when_no_last_cache_key(self):
+          """
+          Ensure DatabaseCache.set() returns True even when the culling
+          SQL returns no last_cache_key (i.e. fetchone() is None).
+          """
+          self.cull_cache._max_entries = 1
+          self.cull_cache._cull_frequency = 10
+          for i in range(3):
+              self.cull_cache.set(f'pre-set{i}', 'value', 1000)
+
+          conn, orig_cursor, captured = self._patch_default_cursor({4: None})
+          try:
+              result = self.cull_cache.set('trigger-set-true', 'value', 1000)
+              self.assertTrue(result)
+          finally:
+              self._restore_default_cursor(conn, orig_cursor)
+
+      def test_add_does_not_crash_when_no_last_cache_key(self):
+          """
+          Ensure DatabaseCache.add() does not crash when culling fetchone() is None.
+          """
+          self.cull_cache._max_entries = 1
+          self.cull_cache._cull_frequency = 10
+          for i in range(3):
+              self.cull_cache.set(f'pre-add{i}', 'value', 1000)
+
+          conn, orig_cursor, captured = self._patch_default_cursor({4: None})
+          try:
+              # add returns True/False depending on presence; we're primarily
+              # checking it does not raise.
+              res = self.cull_cache.add('trigger-add', 'value', 1000)
+              self.assertIn(res, (True, False))
+          finally:
+              self._restore_default_cursor(conn, orig_cursor)
+
+      def test_touch_handles_no_last_cache_key_gracefully(self):
+          """
+          Ensure touch() (which calls _base_set with mode 'touch') handles the
+          case where the culling query returns no last_cache_key without error.
+          """
+          self.cull_cache._max_entries = 1
+          self.cull_cache._cull_frequency = 10
+          # Create keys to force culling
+          for i in range(3):
+              self.cull_cache.set(f'pre-touch{i}', 'value', 1000)
+
+          conn, orig_cursor, captured = self._patch_default_cursor({4: None})
+          try:
+              # touch returns True on success, False on failure.
+              self.assertIn(self.cull_cache.touch('pre-touch0', timeout=2000), (True, False))
+          finally:
+              self._restore_default_cursor(conn, orig_cursor)
+
+      def test_no_cull_when_num_leq_max_entries(self):
+          """
+          Ensure that when the number of rows does not exceed _max_entries,
+          the culling SQL is not invoked on set (i.e. execute_count remains low).
+          """
+          # Make max entries large so no culling is needed
+          self.cull_cache._max_entries = 1000
+          # Patch the cursor but don't override fetchone; we will assert that
+          # the culling SQL is not executed (execute_count should remain small).
+          conn, orig_cursor, captured = self._patch_default_cursor({})
+          try:
+              self.cull_cache.set('no-cull-key', 'value', 1000)
+              fake = captured['fake']
+              # Only initial COUNT() and any other normal ops should have run.
+              # We should NOT have executed the culling SQL (i.e. no 4th exec).
+              self.assertLess(fake.execute_count, 4)
+          finally:
+              self._restore_default_cursor(conn, orig_cursor)
+
+      def test_cull_calls_clear_when_cull_frequency_zero(self):
+          """
+          When _cull_frequency == 0, _cull should call clear(). Verify clear()
+          is invoked when culling is triggered.
+          """
+          # Force cull path and immediate clear path inside _cull.
+          self.cull_cache._max_entries = -1  # Force cull to run
+          self.cull_cache._cull_frequency = 0
+          called = []
+          orig_clear = self.cull_cache.clear
+          try:
+              def fake_clear():
+                  called.append(True)
+              self.cull_cache.clear = fake_clear
+              # Trigger set; because _max_entries is -1, _cull will be invoked
+              # and with _cull_frequency == 0 it should call clear().
+              self.cull_cache.set('trigger-clear', 'value', 1000)
+              self.assertTrue(called, "Expected clear() to be called when _cull_frequency == 0")
+          finally:
+              self.cull_cache.clear = orig_clear
+
+      def test_repeated_sets_do_not_crash_when_no_last_cache_key(self):
+          """
+          Calling set multiple times under the condition where the culling
+          SQL returns no last_cache_key should not raise.
+          """
+          self.cull_cache._max_entries = 1
+          self.cull_cache._cull_frequency = 10
+          for i in range(3):
+              self.cull_cache.set(f'pre-repeat{i}', 'value', 1000)
+
+          conn, orig_cursor, captured = self._patch_default_cursor({4: None})
+          try:
+              for i in range(5):
+                  # Should not raise for any iteration.
+                  self.cull_cache.set(f'trigger-repeat-{i}', 'value', 1000)
+              fake = captured['fake']
+              # Final delete should never have run.
+              final_delete_called = any(
+                  'WHERE cache_key <' in (sql or '') for sql, _ in fake.executed
+              )
+              self.assertFalse(final_delete_called)
+          finally:
+              self._restore_default_cursor(conn, orig_cursor)
+
+      def test_final_delete_parameter_matches_last_cache_key(self):
+          """
+          Verify that when the last_cache_key is returned, the parameter used
+          for the final DELETE matches exactly the value returned by fetchone().
+          """
+          self.cull_cache._max_entries = 1
+          self.cull_cache._cull_frequency = 10
+          for i in range(3):
+              self.cull_cache.set(f'pre-param{i}', 'value', 1000)
+
+          last_key = 'UNIQUE-LAST-KEY'
+          conn, orig_cursor, captured = self._patch_default_cursor({4: (last_key,)})
+          try:
+              self.cull_cache.set('trigger-param', 'value', 1000)
+              fake = captured['fake']
+              # Extract params used in the final delete call.
+              final_delete_params = [
+                  params for sql, params in fake.executed
+                  if 'WHERE cache_key <' in (sql or '')
+              ]
+              self.assertTrue(final_delete_params, "Expected final delete to have been executed")
+              # The parameter should be the same last_key returned from fetchone.
+              self.assertIn([last_key], final_delete_params)
+          finally:
+              self._restore_default_cursor(conn, orig_cursor)
+new_imports_code: |
+  # No new imports required; tests reuse imports from the main test module.

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 decorators.tests_llm.MethodDecoratorWrappedTests.test_argumented_decorator_factory_receives___wrapped__ decorators.tests_llm.MethodDecoratorWrappedTests.test_class_based_decorator_receives___wrapped__ decorators.tests_llm.MethodDecoratorWrappedTests.test_decorating___call__method_receives___wrapped__ decorators.tests_llm.MethodDecoratorWrappedTests.test_decorator_that_uses_wraps_sees_input_has___wrapped__ decorators.tests_llm.MethodDecoratorWrappedTests.test_descriptor_and_method_decorator_interaction_has___wrapped__ decorators.tests_llm.MethodDecoratorWrappedTests.test_inspect_getfullargspec_on___wrapped__works decorators.tests_llm.MethodDecoratorWrappedTests.test_iterable_of_function_decorators_each_receives___wrapped__ decorators.tests_llm.MethodDecoratorWrappedTests.test_method_decorator_on_class_with_name_param_receives___wrapped__ decorators.tests_llm.MethodDecoratorWrappedTests.test_single_decorator_receives___wrapped__ decorators.tests_llm.MethodDecoratorWrappedTests.test_tuple_of_decorators_each_receives___wrapped__
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,189 @@
+# No new imports required beyond those used in the test file (unittest.mock already imported).
+# Additional regression tests for constraint handling in deserialize_db_from_string
+import types
+from unittest import mock
+
+from django.test import SimpleTestCase
+
+from django.db import connection
+from django.core import serializers
+
+class TestDeserializeConstraintHandling(SimpleTestCase):
+    def _make_cm(self, events=None, enter_label="enter", exit_label="exit"):
+        """
+        Create a simple context manager mock that records enter/exit in events
+        if provided.
+        """
+        cm = mock.MagicMock()
+        if events is not None:
+            def enter():
+                events.append(enter_label)
+            def exit(exc_type, exc, tb):
+                events.append(exit_label)
+                return False
+            cm.__enter__.side_effect = enter
+            cm.__exit__.side_effect = exit
+        else:
+            cm.__enter__.return_value = None
+            cm.__exit__.return_value = False
+        return cm
+
+    def test_constraint_checks_disabled_called(self):
+        # Ensure constraint_checks_disabled is used during deserialization.
+        data = "[]"
+        atomic_cm = self._make_cm()
+        constraint_cm = self._make_cm()
+        # Patch atomic to avoid DB transaction side effects.
+        with mock.patch('django.db.transaction.atomic', return_value=atomic_cm) as atomic_mock, \
+             mock.patch('django.core.serializers.deserialize', return_value=[]) as deser_mock, \
+             mock.patch.object(connection, 'constraint_checks_disabled', return_value=constraint_cm) as ccd_mock, \
+             mock.patch.object(connection, 'check_constraints') as check_constraints_mock:
+            connection.creation.deserialize_db_from_string(data)
+            # constraint_checks_disabled should have been called
+            ccd_mock.assert_called_once()
+            # check_constraints should be called after deserialization
+            check_constraints_mock.assert_called_once()
+            # atomic should be invoked for this connection alias
+            atomic_mock.assert_called_once_with(using=connection.alias)
+
+    def test_check_constraints_called_after_saves(self):
+        # Ensure check_constraints is called after objects' save methods
+        data = "[]"
+        events = []
+        atomic_cm = self._make_cm(events, enter_label="atomic_enter", exit_label="atomic_exit")
+        constraint_cm = self._make_cm(events, enter_label="constraints_enter", exit_label="constraints_exit")
+
+        # Create two mock deserialized objects whose save methods record events.
+        obj1 = mock.MagicMock()
+        obj2 = mock.MagicMock()
+        obj1.save.side_effect = lambda: events.append("save1")
+        obj2.save.side_effect = lambda: events.append("save2")
+
+        # serializers.deserialize should return an iterator (generator) too.
+        def deser_gen(*args, **kwargs):
+            yield obj1
+            yield obj2
+
+        with mock.patch('django.db.transaction.atomic', return_value=atomic_cm), \
+             mock.patch('django.core.serializers.deserialize', side_effect=deser_gen) as deser_mock, \
+             mock.patch.object(connection, 'constraint_checks_disabled', return_value=constraint_cm), \
+             mock.patch.object(connection, 'check_constraints', side_effect=lambda: events.append("check")):
+            connection.creation.deserialize_db_from_string(data)
+
+        # Expected ordering: enter constraints, save objects, exit constraints, then check_constraints
+        self.assertEqual(events, ["atomic_enter", "constraints_enter", "save1", "save2", "constraints_exit", "atomic_exit", "check"])
+
+    def test_serializers_receive_correct_arguments(self):
+        # Ensure serializers.deserialize is invoked with the json format and using the connection alias.
+        sample_data = "[]"
+        atomic_cm = self._make_cm()
+        constraint_cm = self._make_cm()
+        with mock.patch('django.db.transaction.atomic', return_value=atomic_cm), \
+             mock.patch.object(connection, 'constraint_checks_disabled', return_value=constraint_cm), \
+             mock.patch('django.core.serializers.deserialize') as deser_mock, \
+             mock.patch.object(connection, 'check_constraints'):
+            connection.creation.deserialize_db_from_string(sample_data)
+            # Check call signature of serializers.deserialize
+            self.assertTrue(deser_mock.called)
+            call_args, call_kwargs = deser_mock.call_args
+            # First positional arg should be format name 'json'
+            self.assertEqual(call_args[0], 'json')
+            # 'using' should be passed as keyword argument equal to connection.alias
+            self.assertIn('using', call_kwargs)
+            self.assertEqual(call_kwargs['using'], connection.alias)
+
+    def test_no_objects_still_calls_constraint_checks(self):
+        # When no objects are deserialized, check_constraints should still be invoked.
+        data = "[]"
+        atomic_cm = self._make_cm()
+        constraint_cm = self._make_cm()
+        with mock.patch('django.db.transaction.atomic', return_value=atomic_cm), \
+             mock.patch('django.core.serializers.deserialize', return_value=[]) as deser_mock, \
+             mock.patch.object(connection, 'constraint_checks_disabled', return_value=constraint_cm) as ccd_mock, \
+             mock.patch.object(connection, 'check_constraints') as check_constraints_mock:
+            connection.creation.deserialize_db_from_string(data)
+            ccd_mock.assert_called_once()
+            check_constraints_mock.assert_called_once()
+
+    def test_saves_all_deserialized_objects(self):
+        # Ensure every object produced by serializers.deserialize has save() called.
+        data = "[]"
+        atomic_cm = self._make_cm()
+        constraint_cm = self._make_cm()
+        objs = [mock.MagicMock(), mock.MagicMock(), mock.MagicMock()]
+        for o in objs:
+            o.save = mock.MagicMock()
+        with mock.patch('django.db.transaction.atomic', return_value=atomic_cm), \
+             mock.patch('django.core.serializers.deserialize', return_value=iter(objs)), \
+             mock.patch.object(connection, 'constraint_checks_disabled', return_value=constraint_cm), \
+             mock.patch.object(connection, 'check_constraints'):
+            connection.creation.deserialize_db_from_string(data)
+            for o in objs:
+                o.save.assert_called_once()
+
+    def test_constraint_context_manager_used_before_any_save(self):
+        # Ensure constraint context manager __enter__ is invoked before any save occurs.
+        data = "[]"
+        events = []
+        atomic_cm = self._make_cm(events, enter_label="atomic_enter", exit_label="atomic_exit")
+        constraint_cm = self._make_cm(events, enter_label="constraints_enter", exit_label="constraints_exit")
+        obj = mock.MagicMock()
+        def save_side_effect():
+            events.append("save_happened")
+        obj.save.side_effect = save_side_effect
+        with mock.patch('django.db.transaction.atomic', return_value=atomic_cm), \
+             mock.patch('django.core.serializers.deserialize', return_value=[obj]), \
+             mock.patch.object(connection, 'constraint_checks_disabled', return_value=constraint_cm), \
+             mock.patch.object(connection, 'check_constraints', side_effect=lambda: events.append("check")):
+            connection.creation.deserialize_db_from_string(data)
+        # The first relevant event after entering atomic should be entering constraint context
+        self.assertIn("constraints_enter", events)
+        self.assertLess(events.index("constraints_enter"), events.index("save_happened"))
+        self.assertLess(events.index("save_happened"), events.index("check"))
+
+    def test_check_constraints_called_when_serializer_is_generator(self):
+        # Ensure generator-producing serializers.deserialize triggers check_constraints
+        data = "[]"
+        atomic_cm = self._make_cm()
+        constraint_cm = self._make_cm()
+        def gen(*args, **kwargs):
+            for i in range(2):
+                o = mock.MagicMock()
+                o.save = mock.MagicMock()
+                yield o
+        with mock.patch('django.db.transaction.atomic', return_value=atomic_cm), \
+             mock.patch('django.core.serializers.deserialize', side_effect=gen), \
+             mock.patch.object(connection, 'constraint_checks_disabled', return_value=constraint_cm), \
+             mock.patch.object(connection, 'check_constraints') as check_constraints_mock:
+            connection.creation.deserialize_db_from_string(data)
+            check_constraints_mock.assert_called_once()
+
+    def test_atomic_called_with_correct_using_arg(self):
+        # atomic should be called with the connection alias as the using argument.
+        data = "[]"
+        atomic_cm = self._make_cm()
+        constraint_cm = self._make_cm()
+        with mock.patch('django.db.transaction.atomic', return_value=atomic_cm) as atomic_mock, \
+             mock.patch('django.core.serializers.deserialize', return_value=[]), \
+             mock.patch.object(connection, 'constraint_checks_disabled', return_value=constraint_cm), \
+             mock.patch.object(connection, 'check_constraints'):
+            connection.creation.deserialize_db_from_string(data)
+            atomic_mock.assert_called_once_with(using=connection.alias)
+
+    def test_constraint_checks_disabled_called_on_copy_connection(self):
+        # Use a copy of the connection object to ensure instance bound methods are used.
+        from copy import copy, deepcopy
+        conn_copy = copy(connection)
+        conn_copy.settings_dict = deepcopy(connection.settings_dict)
+
+        # Prepare mocks on the copy instance.
+        atomic_cm = self._make_cm()
+        constraint_cm = self._make_cm()
+        with mock.patch('django.db.transaction.atomic', return_value=atomic_cm), \
+             mock.patch('django.core.serializers.deserialize', return_value=[]), \
+             mock.patch.object(conn_copy, 'constraint_checks_disabled', return_value=constraint_cm) as ccd_mock, \
+             mock.patch.object(conn_copy, 'check_constraints') as check_constraints_mock:
+            # Invoke via the creation object bound to the connection copy.
+            conn_copy.creation.deserialize_db_from_string("[]")
+            ccd_mock.assert_called_once()
+            check_constraints_mock.assert_called_once()

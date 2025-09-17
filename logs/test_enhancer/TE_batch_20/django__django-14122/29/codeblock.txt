@@ -1,0 +1,120 @@
+# No additional imports required beyond what's in the test file.
+from django.test import TestCase
+from django.db.models import Count, Max, Value
+from django.db.models.functions import Upper
+from .models import Article, Author, OrderedByFArticle
+
+
+def _get_group_by_clause(qs):
+    """
+    Return the GROUP BY clause from the SQL of the given queryset as a
+    lowercase string (or an empty string if no GROUP BY).
+    """
+    sql = str(qs.query).lower()
+    idx = sql.find('group by')
+    if idx == -1:
+        return ''
+    # end of GROUP BY may be HAVING, ORDER BY, LIMIT/OFFSET or end of string
+    end_tokens = [' having', ' order by', ' limit', ' offset', ')']
+    end_idx = len(sql)
+    for tok in end_tokens:
+        pos = sql.find(tok, idx)
+        if pos != -1:
+            end_idx = min(end_idx, pos)
+    return sql[idx:end_idx]
+
+
+class CompilerGroupByTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        # Reuse the fixtures used by other ordering tests
+        cls.a1 = Article.objects.create(headline="Article 1", pub_date='2005-07-26')
+        cls.a2 = Article.objects.create(headline="Article 2", pub_date='2005-07-27')
+        cls.a3 = Article.objects.create(headline="Article 3", pub_date='2005-07-27')
+        cls.a4 = Article.objects.create(headline="Article 4", pub_date='2005-07-28')
+        cls.author_1 = Author.objects.create(name="Name 1")
+        cls.author_2 = Author.objects.create(name="Name 2")
+
+    def test_meta_ordering_does_not_add_meta_fields_to_group_by_on_values_annotate(self):
+        # Article has Meta.ordering; ensure meta-ordering fields are not injected
+        qs = Article.objects.values('author').annotate(count=Count('author'))
+        g = _get_group_by_clause(qs)
+        # group by should contain the author column (author_id) but not meta-ordering fields
+        self.assertIn('author', g)
+        self.assertNotIn('pub_date', g)
+        self.assertNotIn('headline', g)
+
+    def test_explicit_order_by_added_to_group_by_when_not_using_meta_ordering(self):
+        # When order_by() is explicitly provided, its columns should be considered
+        qs = Article.objects.order_by('headline').values('author').annotate(count=Count('author'))
+        g = _get_group_by_clause(qs)
+        # headline is explicitly ordered, and therefore should be present in GROUP BY
+        self.assertIn('headline', g)
+        # author must remain present
+        self.assertIn('author', g)
+
+    def test_annotation_alias_ordered_by_does_not_become_group_by(self):
+        # Annotate a constant and order by its alias. This is a reference to SELECT
+        # and should not add a separate GROUP BY entry.
+        qs = Article.objects.annotate(constant=Value('1')).values('headline').annotate(cnt=Count('pk')).order_by('constant')
+        g = _get_group_by_clause(qs)
+        # The alias "constant" is a reference to SELECT; it should not be emitted
+        # as a separate GROUP BY column.
+        self.assertNotIn('constant', g)
+
+    def test_order_by_function_on_related_field_added_to_group_by_when_explicit(self):
+        # Ordering by an expression on a related field should add the referenced columns
+        qs = Article.objects.values('author').annotate(cnt=Count('pk')).order_by(Upper('author__name'))
+        g = _get_group_by_clause(qs)
+        # The ordering expression references author__name; the GROUP BY should include author
+        self.assertIn('author', g)
+
+    def test_values_on_field_results_in_group_by_that_field_only(self):
+        # values('headline') should create a GROUP BY on headline only (plus any explicit order_by)
+        qs = Article.objects.values('headline').annotate(cnt=Count('pk'))
+        g = _get_group_by_clause(qs)
+        # headline must be present and pub_date must not be injected by Meta.ordering
+        self.assertIn('headline', g)
+        self.assertNotIn('pub_date', g)
+
+    def test_having_clause_does_not_cause_meta_ordering_columns_to_be_group_by(self):
+        # Annotate and filter on the annotation to force HAVING. GROUP BY should remain minimal.
+        qs = Article.objects.values('author').annotate(total=Count('pk')).filter(total__gt=0)
+        g = _get_group_by_clause(qs)
+        self.assertIn('author', g)
+        self.assertNotIn('pub_date', g)
+        self.assertNotIn('headline', g)
+
+    def test_distinct_with_order_by_does_not_inject_meta_ordering_into_group_by(self):
+        # distinct() combined with order_by() should not cause Meta.ordering to leak into GROUP BY
+        qs = Article.objects.distinct().values('author').annotate(c=Count('pk'))
+        g = _get_group_by_clause(qs)
+        # There is a GROUP BY because of values(); ensure meta ordering fields aren't present.
+        self.assertIn('author', g)
+        self.assertNotIn('pub_date', g)
+
+    def test_order_by_aggregate_expression_with_values_preserves_expected_group_by(self):
+        # Ordering by an aggregate alias should not expand GROUP BY in unexpected ways
+        qs = Article.objects.values('author').annotate(last=Max('pub_date')).order_by('last')
+        g = _get_group_by_clause(qs)
+        # author must be present; meta-ordering should not add its fields
+        self.assertIn('author', g)
+        self.assertNotIn('pub_date', g)
+
+    def test_meta_ordering_on_model_with_f_expression_does_not_affect_group_by(self):
+        # OrderedByFArticle uses F expressions in Meta.ordering. Ensure this default ordering
+        # does not affect GROUP BY for aggregation queries.
+        qs = OrderedByFArticle.objects.values('author').annotate(c=Count('pk'))
+        g = _get_group_by_clause(qs)
+        # Only author should be grouped
+        self.assertIn('author', g)
+        self.assertNotIn('pub_date', g)
+
+    def test_multiple_order_by_expressions_deduplicated_in_generated_group_by(self):
+        # Ensure multiple order_by expressions don't cause duplicate GROUP BY entries
+        qs = Article.objects.order_by('headline', '-headline').values('author').annotate(c=Count('pk'))
+        g = _get_group_by_clause(qs)
+        # headline shouldn't appear duplicated in the SQL GROUP BY clause text
+        # (we check there is at most one occurrence of the token).
+        occurrences = g.count('headline')
+        self.assertLessEqual(occurrences, 1)

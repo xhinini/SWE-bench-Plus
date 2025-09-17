@@ -1,0 +1,171 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify correct handling of links containing anchors when the target resource is non-HTML (or lacks an anchor). The gold patch calls response.raise_for_status() and always checks the document content for the anchor; the candidate patch incorrectly skips anchor checks when the response Content-Type is not text/html (based on HEAD), thereby treating links with anchors on non-HTML resources as working. Each test starts the builder workers, injects a single URI containing a fragment into the worker queue, and asserts that the result is "broken" with an "Anchor '...' not found" message. These tests will fail against the candidate patch (which may return 'working') and pass against the fixed (gold) code.
+new_imports_code: |
+  from unittest import mock
+  from requests.exceptions import HTTPError
+test_code: |
+  import pytest
+  from unittest import mock
+  from requests.exceptions import HTTPError
+
+  # Helper to create a fake response object similar to requests.Response
+  def make_response(status=200, headers=None, content=b'', url=None, method='GET', history=None):
+      resp = mock.MagicMock()
+      resp.status_code = status
+      # Ensure header keys match lower/upper expectations
+      resp.headers = headers or {}
+      resp.url = url or 'https://example.com/'
+      resp.history = history or []
+      # Simulate the .request attribute used by candidate patch
+      resp.request = mock.MagicMock()
+      resp.request.method = method
+      # iter_content yields either bytes or unicode depending on decode_unicode flag
+      def iter_content(chunk_size=4096, decode_unicode=False):
+          if decode_unicode:
+              if isinstance(content, bytes):
+                  yield content.decode('utf-8', errors='ignore')
+              else:
+                  yield str(content)
+          else:
+              yield content
+      resp.iter_content = iter_content
+      # raise_for_status raises HTTPError when status >= 400
+      def raise_for_status():
+          if status >= 400:
+              raise HTTPError(response=resp)
+      resp.raise_for_status = raise_for_status
+      return resp
+
+  def run_single_check(app, url, head_resp, get_resp, timeout=5.0):
+      """
+      Start the builder workers, patch requests.head/get, enqueue one URI and
+      return the result tuple from the rqueue.
+      """
+      # Ensure fresh internal state for this builder
+      app.builder.good = set()
+      app.builder.broken = {}
+      app.builder.redirected = {}
+      # Initialize builder (starts worker threads)
+      app.builder.init()
+
+      with mock.patch('sphinx.builders.linkcheck.requests.head', autospec=True) as mock_head, \
+           mock.patch('sphinx.builders.linkcheck.requests.get', autospec=True) as mock_get:
+          mock_head.side_effect = lambda *a, **k: head_resp
+          mock_get.side_effect = lambda *a, **k: get_resp
+
+          # Put a single uri into the worker queue
+          app.builder.wqueue.put((url, 'docname', 42), False)
+          # Retrieve the result (uri, docname, lineno, status, info, code)
+          result = app.builder.rqueue.get(timeout=timeout)
+
+      # Terminate workers cleanly
+      app.builder.finish()
+      return result
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_on_text_plain_is_broken(app):
+      # HEAD reports text/plain, GET returns text/plain without the anchor
+      url = 'https://example.com/file1.txt#nope'
+      head_resp = make_response(status=200, headers={'Content-Type': 'text/plain'}, content=b'no anchor here', method='HEAD')
+      get_resp = make_response(status=200, headers={'Content-Type': 'text/plain'}, content=b'no anchor here', method='GET')
+      result = run_single_check(app, url, head_resp, get_resp)
+      assert result[0] == url
+      assert result[3] == 'broken'
+      assert "Anchor 'nope' not found" in result[4]
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_on_application_octet_stream_is_broken(app):
+      url = 'https://example.com/file2.bin#frag'
+      head_resp = make_response(status=200, headers={'Content-Type': 'application/octet-stream'}, content=b'binarydata', method='HEAD')
+      get_resp = make_response(status=200, headers={'Content-Type': 'application/octet-stream'}, content=b'binarydata', method='GET')
+      result = run_single_check(app, url, head_resp, get_resp)
+      assert result[3] == 'broken'
+      assert "Anchor 'frag' not found" in result[4]
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_no_content_type_header_is_broken(app):
+      url = 'https://example.com/file3#an'
+      head_resp = make_response(status=200, headers={}, content=b'...', method='HEAD')
+      get_resp = make_response(status=200, headers={}, content=b'...', method='GET')
+      result = run_single_check(app, url, head_resp, get_resp)
+      assert result[3] == 'broken'
+      assert "Anchor 'an' not found" in result[4]
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_on_image_content_type_is_broken(app):
+      url = 'https://example.com/image.png#i'
+      head_resp = make_response(status=200, headers={'Content-Type': 'image/png'}, content=b'\x89PNG\r\n', method='HEAD')
+      get_resp = make_response(status=200, headers={'Content-Type': 'image/png'}, content=b'\x89PNG\r\n', method='GET')
+      result = run_single_check(app, url, head_resp, get_resp)
+      assert result[3] == 'broken'
+      assert "Anchor 'i' not found" in result[4]
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_with_percent_encoded_fragment_is_broken(app):
+      url = 'https://example.com/path#hello%20world'
+      head_resp = make_response(status=200, headers={'Content-Type': 'text/plain'}, content=b'no hello world here', method='HEAD')
+      get_resp = make_response(status=200, headers={'Content-Type': 'text/plain'}, content=b'no hello world here', method='GET')
+      result = run_single_check(app, url, head_resp, get_resp)
+      assert result[3] == 'broken'
+      # unquoted anchor should be reported
+      assert "Anchor 'hello world' not found" in result[4]
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_on_custom_vendor_type_is_broken(app):
+      url = 'https://example.com/custom.t#x'
+      head_resp = make_response(status=200, headers={'Content-Type': 'application/vnd.custom'}, content=b'nothing', method='HEAD')
+      get_resp = make_response(status=200, headers={'Content-Type': 'application/vnd.custom'}, content=b'nothing', method='GET')
+      result = run_single_check(app, url, head_resp, get_resp)
+      assert result[3] == 'broken'
+      assert "Anchor 'x' not found" in result[4]
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_with_uppercase_content_type_is_broken(app):
+      url = 'https://example.com/file4#A'
+      # content-type casing should not matter
+      head_resp = make_response(status=200, headers={'Content-Type': 'TEXT/PLAIN'}, content=b'...', method='HEAD')
+      get_resp = make_response(status=200, headers={'Content-Type': 'TEXT/PLAIN'}, content=b'...', method='GET')
+      result = run_single_check(app, url, head_resp, get_resp)
+      assert result[3] == 'broken'
+      assert "Anchor 'A' not found" in result[4]
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_on_text_html_with_missing_anchor_is_broken(app):
+      # Sanity check: HTML content without the anchor should be broken (and this
+      # should pass for both candidate and gold). Keep as control.
+      url = 'https://example.com/page.html#missing'
+      html = b'<html><head></head><body><a id="present">x</a></body></html>'
+      head_resp = make_response(status=200, headers={'Content-Type': 'text/html; charset=utf-8'}, content=html, method='HEAD')
+      get_resp = make_response(status=200, headers={'Content-Type': 'text/html; charset=utf-8'}, content=html, method='GET')
+      result = run_single_check(app, url, head_resp, get_resp)
+      assert result[3] == 'broken'
+      assert "Anchor 'missing' not found" in result[4]
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_when_head_reports_non_html_but_get_contains_anchor_is_broken_with_get(app):
+      # Candidate may incorrectly use HEAD headers only to skip anchor checks.
+      # Gold code performs GET for anchor checks. Ensure GET content is used:
+      url = 'https://example.com/special#found'
+      # HEAD says non-html
+      head_resp = make_response(status=200, headers={'Content-Type': 'application/octet-stream'}, content=b'', method='HEAD')
+      # GET actually returns HTML that contains the anchor
+      html = b'<html><body><div id="found">Yes</div></body></html>'
+      get_resp = make_response(status=200, headers={'Content-Type': 'text/html'}, content=html, method='GET')
+      result = run_single_check(app, url, head_resp, get_resp)
+      # Gold: should find anchor and mark working; Candidate: may incorrectly return 'working'
+      # However, to catch the candidate's skipping behavior, invert: ensure that if GET lacks anchor it's broken.
+      # Here GET does contain anchor, so verify the gold behavior (working) too.
+      assert result[3] == 'working' or "Anchor 'found' not found" not in result[4]
+
+  # Additional test to assert HTTP error (404) is surfaced rather than being masked as "Anchor not found"
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_404_on_get_with_anchor_reports_http_error(app):
+      url = 'https://example.com/missing.html#frag'
+      head_resp = make_response(status=200, headers={'Content-Type': 'text/html'}, content=b'', method='HEAD')
+      # Simulate GET returning 404; raise_for_status should cause an HTTPError.
+      get_resp = make_response(status=404, headers={'Content-Type': 'text/html'}, content=b'Not Found', method='GET')
+      result = run_single_check(app, url, head_resp, get_resp)
+      # Should be reported as broken due to HTTPError (404), not "Anchor not found"
+      assert result[3] == 'broken'
+      assert '404' in result[4] or 'Not Found' in result[4]

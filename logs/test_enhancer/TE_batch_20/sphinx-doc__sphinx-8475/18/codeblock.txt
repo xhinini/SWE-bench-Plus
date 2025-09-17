@@ -1,0 +1,278 @@
+# No new imports required; tests reuse imports already present in the test module.
+import http.server
+import json
+import textwrap
+
+import pytest
+import requests
+
+from .utils import CERT_FILE, http_server, https_server
+
+# 1) HEAD loops with redirects, GET returns 200 -> treated as working (HTTP)
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_head_too_many_redirects_get_succeeds_http(app):
+    class InfiniteRedirectOnHeadHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            # redirect to same URL, causing TooManyRedirects for HEAD
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200, "OK")
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
+    with http_server(InfiniteRedirectOnHeadHandler):
+        app.builder.build_all()
+
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    assert content == {
+        "code": 0,
+        "status": "working",
+        "filename": "index.rst",
+        "lineno": 1,
+        "uri": "http://localhost:7777/",
+        "info": "",
+    }
+
+# 2) HEAD loops, GET returns a redirect to a new URL -> reported as redirected (HTTP)
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_head_too_many_redirects_get_redirects_and_records_code(app, capsys):
+    class HeadLoopGetRedirectHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            # infinite redirect on HEAD
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            if self.path == "/?redirected=1":
+                # final endpoint
+                self.send_response(204, "No content")
+                self.end_headers()
+            else:
+                # cause a redirect for GET
+                self.send_response(302, "Found")
+                self.send_header("Location", "http://localhost:7777/?redirected=1")
+                self.end_headers()
+
+        def log_date_time_string(self):
+            return ""
+
+    with http_server(HeadLoopGetRedirectHandler):
+        app.builder.build_all()
+
+    stdout, stderr = capsys.readouterr()
+    content = (app.outdir / 'output.txt').read_text()
+    assert content == (
+        "index.rst:1: [redirected with Found] "
+        "http://localhost:7777/ to http://localhost:7777/?redirected=1\n"
+    )
+    # check that HEAD attempted and then GET requests are visible in the server log
+    assert "HEAD / HTTP/1.1" in stderr
+
+# 3) HEAD loops, GET prints request headers -> ensure GET uses configured request headers
+@pytest.mark.sphinx(
+    'linkcheck', testroot='linkcheck-localserver', freshenv=True,
+    confoverrides={'linkcheck_request_headers': {
+        "http://localhost:7777/": {"Accept": "text/html"},
+    }})
+def test_head_too_many_redirects_request_headers_on_get(app, capsys):
+    class HeadersPrintHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            # infinite redirect on HEAD
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200, "OK")
+            self.end_headers()
+            # print headers to process stdout to assert they were sent
+            print(self.headers.as_string())
+
+    with http_server(HeadersPrintHandler):
+        app.builder.build_all()
+
+    stdout, _stderr = capsys.readouterr()
+    assert "Accept: text/html\n" in stdout
+
+# 4) HEAD loops, GET supplies Authorization -> ensure auth is applied on retry
+@pytest.mark.sphinx(
+    'linkcheck', testroot='linkcheck-localserver', freshenv=True,
+    confoverrides={'linkcheck_auth': [
+        (r'.*localhost.*', ('user1', 'password')),
+    ]})
+def test_head_too_many_redirects_auth_on_get(app, capsys):
+    class AuthHeaderHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200, "OK")
+            self.end_headers()
+            # print headers so tests can check for Authorization
+            print(self.headers.as_string())
+
+    with http_server(AuthHeaderHandler):
+        app.builder.build_all()
+
+    stdout, _stderr = capsys.readouterr()
+    auth = requests.auth._basic_auth_str('user1', 'password')
+    assert "Authorization: %s\n" % auth in stdout
+
+# 5) HEAD loops, GET succeeds over HTTPS when tls_verify is False
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver-https', freshenv=True)
+def test_head_too_many_redirects_https_with_tls_verify_false(app):
+    # disable verification so our self-signed test server works for GET
+    app.config.tls_verify = False
+
+    class InfiniteHeadRedirectHTTPSHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            # HEAD infinitely redirects
+            self.send_response(302, "Found")
+            self.send_header("Location", "https://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200, "OK")
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
+    with https_server(InfiniteHeadRedirectHTTPSHandler):
+        app.builder.build_all()
+
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    assert content == {
+        "code": 0,
+        "status": "working",
+        "filename": "index.rst",
+        "lineno": 1,
+        "uri": "https://localhost:7777/",
+        "info": "",
+    }
+
+# 6) HEAD loops, GET returns 307 -> categorized as redirected 'temporarily'
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_head_too_many_redirects_get_redirect_307_records_temporarily(app, capsys):
+    class HeadLoopGet307Handler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            if self.path == "/?redirected=1":
+                self.send_response(204, "No content")
+            else:
+                self.send_response(307, "Temporary Redirect")
+                self.send_header("Location", "http://localhost:7777/?redirected=1")
+            self.end_headers()
+
+        def log_date_time_string(self):
+            return ""
+
+    with http_server(HeadLoopGet307Handler):
+        app.builder.build_all()
+
+    content = (app.outdir / 'output.txt').read_text()
+    assert "redirected temporarily" in content or "redirected with Found" in content
+
+# 7) HEAD loops, GET returns 301 -> categorized as permanently (301 mapping)
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_head_too_many_redirects_get_redirect_301_records_permanently(app, capsys):
+    class HeadLoopGet301Handler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            if self.path == "/?redirected=1":
+                self.send_response(204, "No content")
+            else:
+                self.send_response(301, "Moved Permanently")
+                self.send_header("Location", "http://localhost:7777/?redirected=1")
+            self.end_headers()
+
+        def log_date_time_string(self):
+            return ""
+
+    with http_server(HeadLoopGet301Handler):
+        app.builder.build_all()
+
+    content = (app.outdir / 'output.txt').read_text()
+    assert "permanently" in content or "redirected" in content
+
+# 8) HEAD loops, GET uses wildcard '*' default headers mapping
+@pytest.mark.sphinx(
+    'linkcheck', testroot='linkcheck-localserver', freshenv=True,
+    confoverrides={'linkcheck_request_headers': {
+        "*": {"X-Secret": "open sesame"},
+    }})
+def test_head_too_many_redirects_request_headers_default_star(app, capsys):
+    class PrintHeadersOnGetHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200, "OK")
+            self.end_headers()
+            print(self.headers.as_string())
+
+    with http_server(PrintHeadersOnGetHandler):
+        app.builder.build_all()
+
+    stdout, _ = capsys.readouterr()
+    assert "X-Secret: open sesame\n" in stdout
+
+# 9) HEAD loops, GET returns 204 No Content (final) -> treated as working (HTTP)
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_head_too_many_redirects_get_returns_no_content(app):
+    class HeadLoopGetNoContentHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(204, "No content")
+            self.end_headers()
+
+    with http_server(HeadLoopGetNoContentHandler):
+        app.builder.build_all()
+
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    assert content["status"] == "working"
+
+# 10) HEAD loops, GET returns 200 but with a fragment in the original URI (anchor handling)
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_head_too_many_redirects_get_with_fragment_original_uri(app):
+    class HeadLoopGetWithContentHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            # return a page that would include anchors if needed
+            self.send_response(200, "OK")
+            self.end_headers()
+            self.wfile.write(b"<html><body><a id='top'></a></body></html>")
+
+    with http_server(HeadLoopGetWithContentHandler):
+        # build_all will check the configured link in the testroot; the HEAD
+        # will loop and the GET should be used and succeed
+        app.builder.build_all()
+
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    assert content["status"] in ("working", "redirected")

@@ -1,0 +1,195 @@
+# No new top-level imports required; tests use existing public APIs.
+import builtins
+from django.test import SimpleTestCase
+from django.db import migrations
+from django.db.migrations.writer import MigrationWriter
+from types import SimpleNamespace
+
+class ImportSentinel:
+    """
+    A sentinel object that, when seen by the patched MigrationWriter.serialize,
+    returns a fixed string and a set containing a single import line.
+    """
+    def __init__(self, string, import_string):
+        self.string = string
+        self.import_string = import_string
+
+    def __repr__(self):
+        return "ImportSentinel(%r)" % self.string
+
+class FakeOperation:
+    """
+    A fake operation that deconstructs into positional arguments. Its module
+    is set to a predictable value so OperationWriter will add an import for it.
+    """
+    __module__ = "custom.opmodule"
+
+    def __init__(self, a=None, b=None):
+        self.a = a
+        self.b = b
+
+    def deconstruct(self):
+        # Name is arbitrary and not in django.db.migrations, so OperationWriter
+        # will add "import custom.opmodule" to the imports set.
+        return (self.__class__.__name__, [self.a, self.b], {})
+
+class AdditionalWriterTests(SimpleTestCase):
+    def setUp(self):
+        # Keep reference to original serialize to restore later.
+        self._orig_serialize = MigrationWriter.serialize
+
+    def tearDown(self):
+        MigrationWriter.serialize = self._orig_serialize
+
+    def _run_with_sentinels(self, import_strings):
+        """
+        Create sentinel objects for each import string, patch MigrationWriter.serialize
+        to return those imports for the sentinels, and return the writer output.
+        """
+        sentinels = [ImportSentinel("VAL_%d" % i, imp) for i, imp in enumerate(import_strings)]
+        # Two sentinels used as positional args to the fake operation; pad with None if necessary.
+        a = sentinels[0] if len(sentinels) > 0 else None
+        b = sentinels[1] if len(sentinels) > 1 else None
+
+        def _patched_serialize(value):
+            # If value is one of our sentinels, return the controlled representation.
+            if isinstance(value, ImportSentinel):
+                return (value.string, {value.import_string})
+            return self._orig_serialize(value)
+
+        MigrationWriter.serialize = staticmethod(_patched_serialize)
+
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {"operations": [FakeOperation(a, b)], "dependencies": [], "replaces": None, "initial": False},
+        )
+        writer = MigrationWriter(migration)
+        return writer.as_string()
+
+    def _expected_import_block(self, import_strings):
+        """
+        Compute the expected imports block following the gold sorting algorithm:
+        - Always include the module default: "from django.db import migrations"
+        - Include the operation module import: "import custom.opmodule"
+        - Include all sentinel imports passed in import_strings
+        - Sort with key = (is_from, module_token), where is_from is True if line startswith 'from'
+        """
+        imports = set(import_strings)
+        imports.add("import custom.opmodule")
+        # The writer always ensures at least "from django.db import migrations" is present.
+        # Avoid duplicating if user supplied an import that should merge with it; the tests avoid that case.
+        imports.add("from django.db import migrations")
+        sorted_imports = sorted(imports, key=lambda i: (i.split()[0] == "from", i.split()[1]))
+        return "\n".join(sorted_imports) + "\n"
+
+    def test_mixed_imports_and_froms(self):
+        imports = [
+            "import z",
+            "from alpha import x",
+            "import a.b",
+            "from beta.gamma import y",
+        ]
+        output = self._run_with_sentinels(imports)
+        expected_block = self._expected_import_block(imports)
+        self.assertIn(expected_block, output)
+
+    def test_many_imports_ordering(self):
+        imports = [
+            "import uuid",
+            "import datetime",
+            "from django.conf import settings",
+            "from dateutil import tz",
+        ]
+        output = self._run_with_sentinels(imports)
+        expected_block = self._expected_import_block(imports)
+        self.assertIn(expected_block, output)
+
+    def test_dotted_module_variations(self):
+        imports = [
+            "import aa",
+            "import a.a",
+            "from a import mod1",
+            "from aa import mod2",
+        ]
+        output = self._run_with_sentinels(imports)
+        expected_block = self._expected_import_block(imports)
+        self.assertIn(expected_block, output)
+
+    def test_imports_with_similar_prefixes(self):
+        imports = [
+            "import pkg",
+            "import pkg.sub",
+            "from pkg.sub import thing",
+            "from pkg2 import other",
+        ]
+        output = self._run_with_sentinels(imports)
+        expected_block = self._expected_import_block(imports)
+        self.assertIn(expected_block, output)
+
+    def test_from_and_import_same_base_module(self):
+        # Make sure "import base" appears before "from base import x"
+        imports = [
+            "import base",
+            "from base import x",
+            "import zmod",
+        ]
+        output = self._run_with_sentinels(imports)
+        expected_block = self._expected_import_block(imports)
+        self.assertIn(expected_block, output)
+
+    def test_multiple_froms_sorted_by_module(self):
+        imports = [
+            "from gamma import one",
+            "from alpha import two",
+            "from beta import three",
+        ]
+        output = self._run_with_sentinels(imports)
+        expected_block = self._expected_import_block(imports)
+        self.assertIn(expected_block, output)
+
+    def test_imports_and_froms_with_dots(self):
+        imports = [
+            "import x.y.z",
+            "from x.y import a",
+            "import x.a",
+            "from x import b",
+        ]
+        output = self._run_with_sentinels(imports)
+        expected_block = self._expected_import_block(imports)
+        self.assertIn(expected_block, output)
+
+    def test_unicode_like_module_names(self):
+        imports = [
+            "import aß",
+            "from aß import thing",
+            "import ascii_mod",
+        ]
+        output = self._run_with_sentinels(imports)
+        expected_block = self._expected_import_block(imports)
+        self.assertIn(expected_block, output)
+
+    def test_long_list_of_imports(self):
+        imports = [
+            "import zeta",
+            "import alpha",
+            "from middle import one",
+            "from zeta import two",
+        ]
+        output = self._run_with_sentinels(imports)
+        expected_block = self._expected_import_block(imports)
+        self.assertIn(expected_block, output)
+
+    def test_migration_imports_comment_present_for_numbered_imports(self):
+        # Ensure the manual-porting comment is present when an import looks like a numbered migration.
+        # Use a value that DOES NOT match the numbered-migration regex to avoid removing it;
+        # we simply assert the presence of the comment when the logic would otherwise set migration_imports.
+        # To trigger the migration_imports branch we need an import string that matches r"^import (.*)\.\d+[^\s]*$".
+        # We'll include such a string via sentinel.
+        numbered_import = "import mypkg.0002_initial"
+        # The writer will detect this pattern and move it into the migration_imports comment section.
+        output = self._run_with_sentinels([numbered_import])
+        self.assertIn(
+            "# Functions from the following migrations need manual copying.",
+            output
+        )

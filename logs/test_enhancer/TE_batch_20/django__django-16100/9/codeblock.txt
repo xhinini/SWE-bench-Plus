@@ -1,0 +1,344 @@
+# No new imports required; the file's existing imports cover these tests.
+# Added regression tests for atomicity using router.db_for_write
+from unittest import mock
+from django.test import TestCase, RequestFactory, override_settings
+from django.urls import reverse
+from django.contrib.messages.storage.cookie import CookieStorage
+from django.db import DatabaseError
+from django.db import router
+
+from admin_changelist.admin import SwallowAdmin
+from admin_changelist.models import Swallow
+from admin_changelist import admin as custom_site
+
+
+@override_settings(
+    DATABASES={
+        "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"},
+        "other": {"ENGINE": "django.db.backends.sqlite3", "NAME": ":memory:"},
+    }
+)
+class ListEditableMultiDBAtomicityTests(TestCase):
+    """
+    Tests that list_editable operations are atomic on the DB chosen by
+    router.db_for_write(self.model).
+    """
+
+    def setUp(self):
+        self.factory = RequestFactory()
+        # create a superuser for requests
+        from django.contrib.auth.models import User
+
+        self.super = User.objects.create_superuser(
+            username="superdb", email="a@b.com", password="pwd"
+        )
+
+    def _post_changelist(self, admin_instance, data):
+        """
+        Helper to build a POST request for changelist and call changelist_view
+        on the provided admin_instance. Returns the request object used.
+        """
+        changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+        request = self.factory.post(changelist_url, data=data)
+        request.user = self.super
+        request._messages = CookieStorage(request)
+        # ensure path attribute if used
+        request.path = changelist_url
+        return admin_instance.changelist_view(request)
+
+    def _create_swallow_on_other(self, origin, load, speed):
+        """
+        Create Swallow instance in the "other" DB alias so its _state.db
+        will be set to 'other'.
+        """
+        return Swallow.objects.using("other").create(origin=origin, load=load, speed=speed)
+
+    def test_atomicity_when_log_change_raises(self):
+        a = self._create_swallow_on_other("A", 4, 1)
+        b = self._create_swallow_on_other("B", 2, 2)
+
+        m = SwallowAdmin(Swallow, custom_site)
+        # Force the changelist to operate on the "other" DB queryset.
+        m.get_queryset = lambda request: Swallow.objects.using("other").all()
+
+        data = {
+            "form-TOTAL_FORMS": "2",
+            "form-INITIAL_FORMS": "2",
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "form-0-uuid": str(a.pk),
+            "form-1-uuid": str(b.pk),
+            "form-0-load": "9.0",
+            "form-0-speed": "3.0",
+            "form-1-load": "5.0",
+            "form-1-speed": "1.0",
+            "_save": "Save",
+        }
+
+        # Patch router.db_for_write to return the non-default DB alias.
+        with mock.patch("django.db.router.db_for_write", return_value="other"):
+            # Raise DatabaseError in log_change to force rollback.
+            with mock.patch(
+                "django.contrib.admin.ModelAdmin.log_change", side_effect=DatabaseError
+            ):
+                with self.assertRaises(DatabaseError):
+                    self._post_changelist(m, data)
+
+        # Values on 'other' DB must be unchanged due to rollback.
+        a.refresh_from_db(using="other")
+        b.refresh_from_db(using="other")
+        self.assertEqual(a.load, 4)
+        self.assertEqual(a.speed, 1)
+        self.assertEqual(b.load, 2)
+        self.assertEqual(b.speed, 2)
+
+    def test_atomicity_when_log_change_raises_on_second(self):
+        a = self._create_swallow_on_other("A", 4, 1)
+        b = self._create_swallow_on_other("B", 2, 2)
+
+        m = SwallowAdmin(Swallow, custom_site)
+        m.get_queryset = lambda request: Swallow.objects.using("other").all()
+
+        data = {
+            "form-TOTAL_FORMS": "2",
+            "form-INITIAL_FORMS": "2",
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "form-0-uuid": str(a.pk),
+            "form-1-uuid": str(b.pk),
+            "form-0-load": "9.0",
+            "form-0-speed": "3.0",
+            "form-1-load": "5.0",
+            "form-1-speed": "1.0",
+            "_save": "Save",
+        }
+
+        with mock.patch("django.db.router.db_for_write", return_value="other"):
+            # No error for first log_change, error for second.
+            with mock.patch(
+                "django.contrib.admin.ModelAdmin.log_change",
+                side_effect=[None, DatabaseError],
+            ):
+                with self.assertRaises(DatabaseError):
+                    self._post_changelist(m, data)
+
+        a.refresh_from_db(using="other")
+        b.refresh_from_db(using="other")
+        self.assertEqual(a.load, 4)
+        self.assertEqual(a.speed, 1)
+        self.assertEqual(b.load, 2)
+        self.assertEqual(b.speed, 2)
+
+    def test_atomicity_when_save_model_raises(self):
+        a = self._create_swallow_on_other("A", 4, 1)
+        b = self._create_swallow_on_other("B", 2, 2)
+
+        m = SwallowAdmin(Swallow, custom_site)
+        m.get_queryset = lambda request: Swallow.objects.using("other").all()
+
+        data = {
+            "form-TOTAL_FORMS": "2",
+            "form-INITIAL_FORMS": "2",
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "form-0-uuid": str(a.pk),
+            "form-1-uuid": str(b.pk),
+            "form-0-load": "9.0",
+            "form-0-speed": "3.0",
+            "form-1-load": "5.0",
+            "form-1-speed": "1.0",
+            "_save": "Save",
+        }
+
+        with mock.patch("django.db.router.db_for_write", return_value="other"):
+            with mock.patch(
+                "django.contrib.admin.ModelAdmin.save_model", side_effect=DatabaseError
+            ):
+                with self.assertRaises(DatabaseError):
+                    self._post_changelist(m, data)
+
+        a.refresh_from_db(using="other")
+        b.refresh_from_db(using="other")
+        self.assertEqual(a.load, 4)
+        self.assertEqual(a.speed, 1)
+        self.assertEqual(b.load, 2)
+        self.assertEqual(b.speed, 2)
+
+    def test_atomicity_when_save_related_raises(self):
+        a = self._create_swallow_on_other("A", 4, 1)
+        b = self._create_swallow_on_other("B", 2, 2)
+
+        m = SwallowAdmin(Swallow, custom_site)
+        m.get_queryset = lambda request: Swallow.objects.using("other").all()
+
+        data = {
+            "form-TOTAL_FORMS": "2",
+            "form-INITIAL_FORMS": "2",
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "form-0-uuid": str(a.pk),
+            "form-1-uuid": str(b.pk),
+            "form-0-load": "9.0",
+            "form-0-speed": "3.0",
+            "form-1-load": "5.0",
+            "form-1-speed": "1.0",
+            "_save": "Save",
+        }
+
+        with mock.patch("django.db.router.db_for_write", return_value="other"):
+            with mock.patch(
+                "django.contrib.admin.ModelAdmin.save_related", side_effect=DatabaseError
+            ):
+                with self.assertRaises(DatabaseError):
+                    self._post_changelist(m, data)
+
+        a.refresh_from_db(using="other")
+        b.refresh_from_db(using="other")
+        self.assertEqual(a.load, 4)
+        self.assertEqual(a.speed, 1)
+        self.assertEqual(b.load, 2)
+        self.assertEqual(b.speed, 2)
+
+    def test_atomicity_when_save_form_raises(self):
+        a = self._create_swallow_on_other("A", 4, 1)
+        b = self._create_swallow_on_other("B", 2, 2)
+
+        m = SwallowAdmin(Swallow, custom_site)
+        m.get_queryset = lambda request: Swallow.objects.using("other").all()
+
+        data = {
+            "form-TOTAL_FORMS": "2",
+            "form-INITIAL_FORMS": "2",
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "form-0-uuid": str(a.pk),
+            "form-1-uuid": str(b.pk),
+            "form-0-load": "9.0",
+            "form-0-speed": "3.0",
+            "form-1-load": "5.0",
+            "form-1-speed": "1.0",
+            "_save": "Save",
+        }
+
+        with mock.patch("django.db.router.db_for_write", return_value="other"):
+            with mock.patch(
+                "django.contrib.admin.ModelAdmin.save_form", side_effect=DatabaseError
+            ):
+                with self.assertRaises(DatabaseError):
+                    self._post_changelist(m, data)
+
+        a.refresh_from_db(using="other")
+        b.refresh_from_db(using="other")
+        self.assertEqual(a.load, 4)
+        self.assertEqual(a.speed, 1)
+        self.assertEqual(b.load, 2)
+        self.assertEqual(b.speed, 2)
+
+    def test_atomicity_when_construct_change_message_raises(self):
+        a = self._create_swallow_on_other("A", 4, 1)
+        b = self._create_swallow_on_other("B", 2, 2)
+
+        m = SwallowAdmin(Swallow, custom_site)
+        m.get_queryset = lambda request: Swallow.objects.using("other").all()
+
+        data = {
+            "form-TOTAL_FORMS": "2",
+            "form-INITIAL_FORMS": "2",
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "form-0-uuid": str(a.pk),
+            "form-1-uuid": str(b.pk),
+            "form-0-load": "9.0",
+            "form-0-speed": "3.0",
+            "form-1-load": "5.0",
+            "form-1-speed": "1.0",
+            "_save": "Save",
+        }
+
+        with mock.patch("django.db.router.db_for_write", return_value="other"):
+            with mock.patch(
+                "django.contrib.admin.ModelAdmin.construct_change_message", side_effect=DatabaseError
+            ):
+                with self.assertRaises(DatabaseError):
+                    self._post_changelist(m, data)
+
+        a.refresh_from_db(using="other")
+        b.refresh_from_db(using="other")
+        self.assertEqual(a.load, 4)
+        self.assertEqual(a.speed, 1)
+        self.assertEqual(b.load, 2)
+        self.assertEqual(b.speed, 2)
+
+    def test_atomicity_when_exception_on_first_form(self):
+        a = self._create_swallow_on_other("A", 4, 1)
+        b = self._create_swallow_on_other("B", 2, 2)
+
+        m = SwallowAdmin(Swallow, custom_site)
+        m.get_queryset = lambda request: Swallow.objects.using("other").all()
+
+        data = {
+            "form-TOTAL_FORMS": "2",
+            "form-INITIAL_FORMS": "2",
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "form-0-uuid": str(a.pk),
+            "form-1-uuid": str(b.pk),
+            "form-0-load": "9.0",
+            "form-0-speed": "3.0",
+            "form-1-load": "5.0",
+            "form-1-speed": "1.0",
+            "_save": "Save",
+        }
+
+        with mock.patch("django.db.router.db_for_write", return_value="other"):
+            # Cause DatabaseError during handling of first form's log_change.
+            with mock.patch(
+                "django.contrib.admin.ModelAdmin.log_change",
+                side_effect=[DatabaseError, None],
+            ):
+                with self.assertRaises(DatabaseError):
+                    self._post_changelist(m, data)
+
+        a.refresh_from_db(using="other")
+        b.refresh_from_db(using="other")
+        self.assertEqual(a.load, 4)
+        self.assertEqual(a.speed, 1)
+        self.assertEqual(b.load, 2)
+        self.assertEqual(b.speed, 2)
+
+    def test_atomicity_when_exception_on_second_form_save_related(self):
+        a = self._create_swallow_on_other("A", 4, 1)
+        b = self._create_swallow_on_other("B", 2, 2)
+
+        m = SwallowAdmin(Swallow, custom_site)
+        m.get_queryset = lambda request: Swallow.objects.using("other").all()
+
+        data = {
+            "form-TOTAL_FORMS": "2",
+            "form-INITIAL_FORMS": "2",
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "form-0-uuid": str(a.pk),
+            "form-1-uuid": str(b.pk),
+            "form-0-load": "9.0",
+            "form-0-speed": "3.0",
+            "form-1-load": "5.0",
+            "form-1-speed": "1.0",
+            "_save": "Save",
+        }
+
+        with mock.patch("django.db.router.db_for_write", return_value="other"):
+            # No error for first, error for second during save_related
+            with mock.patch(
+                "django.contrib.admin.ModelAdmin.save_related",
+                side_effect=[None, DatabaseError],
+            ):
+                with self.assertRaises(DatabaseError):
+                    self._post_changelist(m, data)
+
+        a.refresh_from_db(using="other")
+        b.refresh_from_db(using="other")
+        self.assertEqual(a.load, 4)
+        self.assertEqual(a.speed, 1)
+        self.assertEqual(b.load, 2)
+        self.assertEqual(b.speed, 2)

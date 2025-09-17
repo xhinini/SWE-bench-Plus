@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 model_fields.tests_llm.FieldHashRegressionTests.test_auto_created_field_hash_unchanged_on_contribute model_fields.tests_llm.FieldHashRegressionTests.test_copy_preserves_hash model_fields.tests_llm.FieldHashRegressionTests.test_deepcopy_preserves_hash model_fields.tests_llm.FieldHashRegressionTests.test_distinct_fields_have_distinct_hashes model_fields.tests_llm.FieldHashRegressionTests.test_field_stays_as_dict_key_after_manual_contribute_to_class model_fields.tests_llm.FieldHashRegressionTests.test_field_stays_in_set_after_manual_contribute_to_class model_fields.tests_llm.FieldHashRegressionTests.test_hash_unchanged_after_manual_contribute_to_class model_fields.tests_llm.FieldHashRegressionTests.test_hash_unchanged_when_field_assigned_via_class_definition model_fields.tests_llm.FieldHashRegressionTests.test_hash_unchanged_when_setting_model_attribute_manually model_fields.tests_llm.FieldHashRegressionTests.test_set_membership_after_manual_model_assignment
+coverage json -o coverage.json
+: '>>>>> End Test Output'

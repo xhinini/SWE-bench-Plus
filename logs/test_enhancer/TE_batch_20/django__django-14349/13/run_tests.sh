@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 validators.tests_llm.URLValidatorUnsafeCharsTests.test_class_attribute_changes_behavior_for_non_whitespace_char validators.tests_llm.URLValidatorUnsafeCharsTests.test_default_contains_control_chars validators.tests_llm.URLValidatorUnsafeCharsTests.test_has_unsafe_chars_attribute validators.tests_llm.URLValidatorUnsafeCharsTests.test_instance_attribute_is_same_object_as_class_by_default validators.tests_llm.URLValidatorUnsafeCharsTests.test_instance_attribute_override_changes_behavior validators.tests_llm.URLValidatorUnsafeCharsTests.test_modifying_subclass_attribute_does_not_change_base validators.tests_llm.URLValidatorUnsafeCharsTests.test_setting_unsafe_chars_to_arbitrary_character validators.tests_llm.URLValidatorUnsafeCharsTests.test_subclass_inherits_unsafe_chars validators.tests_llm.URLValidatorUnsafeCharsTests.test_subclass_respects_its_own_unsafe_chars validators.tests_llm.URLValidatorUnsafeCharsTests.test_unsafe_chars_is_frozenset
+coverage json -o coverage.json
+: '>>>>> End Test Output'

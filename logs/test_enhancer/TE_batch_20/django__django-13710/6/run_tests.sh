@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_inlines.tests_llm.TestInlineVerboseNamePluralDerived._assert_plural_derived admin_inlines.tests_llm.TestInlineVerboseNamePluralDerived._make_proxy admin_inlines.tests_llm.TestInlineVerboseNamePluralDerived.test_derived_plural_case_1 admin_inlines.tests_llm.TestInlineVerboseNamePluralDerived.test_derived_plural_case_10 admin_inlines.tests_llm.TestInlineVerboseNamePluralDerived.test_derived_plural_case_2 admin_inlines.tests_llm.TestInlineVerboseNamePluralDerived.test_derived_plural_case_3 admin_inlines.tests_llm.TestInlineVerboseNamePluralDerived.test_derived_plural_case_4 admin_inlines.tests_llm.TestInlineVerboseNamePluralDerived.test_derived_plural_case_5 admin_inlines.tests_llm.TestInlineVerboseNamePluralDerived.test_derived_plural_case_6 admin_inlines.tests_llm.TestInlineVerboseNamePluralDerived.test_derived_plural_case_7 admin_inlines.tests_llm.TestInlineVerboseNamePluralDerived.test_derived_plural_case_8 admin_inlines.tests_llm.TestInlineVerboseNamePluralDerived.test_derived_plural_case_9
+coverage json -o coverage.json
+: '>>>>> End Test Output'

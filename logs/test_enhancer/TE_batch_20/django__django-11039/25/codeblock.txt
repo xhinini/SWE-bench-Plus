@@ -1,0 +1,163 @@
+from types import SimpleNamespace
+
+class SqlMigrateTransactionAndErrorsTests(MigrationTestBase):
+    """
+    Tests for sqlmigrate transactional wrapper behavior and error handling,
+    using a mocked MigrationExecutor to control migration atomicity and
+    returned SQL statements.
+    """
+    databases = {'default', 'other'}
+
+    def _make_executor_mock(self, migrated_apps, migration_name='0001', atomic=True, sql_list=None):
+        """
+        Helper to create a mocked MigrationExecutor instance.
+        """
+        if sql_list is None:
+            sql_list = ['-- operation comment', 'CREATE TABLE example;']
+        inst = mock.MagicMock()
+        # Loader behavior
+        migration = SimpleNamespace(name=migration_name, atomic=atomic)
+        inst.loader.migrated_apps = set(migrated_apps)
+        inst.loader.get_migration_by_prefix.return_value = migration
+        inst.loader.graph.nodes = {('migrations', migration_name): 'NODE'}
+        # collect_sql returns the provided SQL list
+        inst.collect_sql.return_value = list(sql_list)
+        return inst
+
+    @mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor')
+    def test_output_transaction_when_atomic_and_db_supports(self, mock_executor):
+        inst = self._make_executor_mock(migrated_apps=['migrations'], atomic=True, sql_list=['-- op', 'CREATE TABLE t;'])
+        mock_executor.return_value = inst
+        with mock.patch.object(connection.features, 'can_rollback_ddl', True):
+            out = io.StringIO()
+            call_command('sqlmigrate', 'migrations', '0001', stdout=out)
+            output = out.getvalue().lower()
+            start_sql = (connection.ops.start_transaction_sql() or '').lower()
+            end_sql = (connection.ops.end_transaction_sql() or '').lower()
+            # When both atomic and DB supports transactional DDL, wrappers should be present (if DB provides start/end SQL)
+            if start_sql:
+                self.assertIn(start_sql, output)
+            if end_sql:
+                self.assertIn(end_sql, output)
+            # The executor SQL should be present and in order
+            self.assertIn('-- op', output)
+            self.assertIn('create table t;', output)
+            # collect_sql should have been called once
+            inst.collect_sql.assert_called_once()
+
+    @mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor')
+    def test_no_wrappers_when_atomic_but_db_does_not_support(self, mock_executor):
+        inst = self._make_executor_mock(migrated_apps=['migrations'], atomic=True, sql_list=['-- op', 'CREATE TABLE t;'])
+        mock_executor.return_value = inst
+        with mock.patch.object(connection.features, 'can_rollback_ddl', False):
+            out = io.StringIO()
+            call_command('sqlmigrate', 'migrations', '0001', stdout=out)
+            output = out.getvalue().lower()
+            start_sql = (connection.ops.start_transaction_sql() or '').lower()
+            end_sql = (connection.ops.end_transaction_sql() or '').lower()
+            # No wrappers should be present when DB doesn't support transactional DDL
+            if start_sql:
+                self.assertNotIn(start_sql, output)
+            if end_sql:
+                self.assertNotIn(end_sql, output)
+            self.assertIn('-- op', output)
+
+    @mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor')
+    def test_no_wrappers_when_non_atomic_even_if_db_supports(self, mock_executor):
+        inst = self._make_executor_mock(migrated_apps=['migrations'], atomic=False, sql_list=['-- op', 'CREATE TABLE t;'])
+        mock_executor.return_value = inst
+        with mock.patch.object(connection.features, 'can_rollback_ddl', True):
+            out = io.StringIO()
+            call_command('sqlmigrate', 'migrations', '0001', stdout=out)
+            output = out.getvalue().lower()
+            start_sql = (connection.ops.start_transaction_sql() or '').lower()
+            end_sql = (connection.ops.end_transaction_sql() or '').lower()
+            # Non-atomic migrations should not be wrapped even if DB supports transactional DDL
+            if start_sql:
+                self.assertNotIn(start_sql, output)
+            if end_sql:
+                self.assertNotIn(end_sql, output)
+            self.assertIn('-- op', output)
+
+    @mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor')
+    def test_database_argument_passed_to_migrationexecutor(self, mock_executor):
+        """
+        Ensure the --database argument is forwarded to MigrationExecutor (i.e.
+        the MigrationExecutor is constructed with the requested connection).
+        """
+        inst = self._make_executor_mock(migrated_apps=['migrations'], atomic=True)
+        mock_executor.return_value = inst
+        with mock.patch.object(connections['other'].features, 'can_rollback_ddl', True):
+            out = io.StringIO()
+            call_command('sqlmigrate', 'migrations', '0001', database='other', stdout=out)
+            # MigrationExecutor should have been constructed with the 'other' connection object
+            mock_executor.assert_called_with(connections['other'])
+
+    @mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor')
+    def test_app_without_migrations_raises_commanderror(self, mock_executor):
+        """
+        If the executor.loader.migrated_apps does not include the app_label,
+        a CommandError indicating the app has no migrations should be raised.
+        """
+        inst = self._make_executor_mock(migrated_apps=[], atomic=True)
+        mock_executor.return_value = inst
+        msg = "App 'migrations' does not have migrations"
+        with self.assertRaisesMessage(CommandError, msg):
+            call_command('sqlmigrate', 'migrations', '0001')
+
+    @mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor')
+    def test_ambiguityerror_raised_from_get_migration_becomes_commanderror(self, mock_executor):
+        inst = mock.MagicMock()
+        inst.loader.migrated_apps = {'migrations'}
+        inst.loader.get_migration_by_prefix.side_effect = AmbiguityError("ambiguous")
+        mock_executor.return_value = inst
+        msg = "More than one migration matches '0001' in app 'migrations'. Please be more specific."
+        with self.assertRaisesMessage(CommandError, msg):
+            call_command('sqlmigrate', 'migrations', '0001')
+
+    @mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor')
+    def test_keyerror_from_get_migration_becomes_commanderror(self, mock_executor):
+        inst = mock.MagicMock()
+        inst.loader.migrated_apps = {'migrations'}
+        inst.loader.get_migration_by_prefix.side_effect = KeyError("not found")
+        mock_executor.return_value = inst
+        msg = "Cannot find a migration matching '0001' from app 'migrations'. Is it in INSTALLED_APPS?"
+        with self.assertRaisesMessage(CommandError, msg):
+            call_command('sqlmigrate', 'migrations', '0001')
+
+    @mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor')
+    def test_sqlmigrate_returns_joined_sql_in_order(self, mock_executor):
+        """
+        The command should join the list returned by collect_sql into the output
+        preserving the order of statements.
+        """
+        sql_list = ['-- first op', '-- second op', 'CREATE TABLE order_test;']
+        inst = self._make_executor_mock(migrated_apps=['migrations'], atomic=False, sql_list=sql_list)
+        mock_executor.return_value = inst
+        out = io.StringIO()
+        call_command('sqlmigrate', 'migrations', '0001', stdout=out)
+        output = out.getvalue()
+        # Ensure the output contains the SQL in the same order
+        self.assertIn('-- first op', output)
+        self.assertIn('-- second op', output)
+        self.assertIn('CREATE TABLE order_test;', output)
+        self.assertTrue(output.index('-- first op') < output.index('-- second op') < output.index('CREATE TABLE order_test;'))
+
+    def test_execute_forces_no_color_option(self):
+        """
+        Command.execute() should force options['no_color'] = True before
+        delegating to BaseCommand.execute().
+        """
+        from django.core.management.base import BaseCommand
+        from django.core.management.commands.sqlmigrate import Command as SqlMigrateCommand
+        called = {}
+        def fake_base_execute(self, *args, **options):
+            # capture whether no_color was set to True
+            called['no_color'] = options.get('no_color', None)
+            return "OK"
+        with mock.patch.object(BaseCommand, 'execute', new=fake_base_execute):
+            cmd = SqlMigrateCommand()
+            # call execute with no_color explicitly False to ensure it's overridden
+            result = cmd.execute(app_label='migrations', migration_name='0001', no_color=False)
+            self.assertEqual(result, "OK")
+            self.assertTrue(called['no_color'] is True)

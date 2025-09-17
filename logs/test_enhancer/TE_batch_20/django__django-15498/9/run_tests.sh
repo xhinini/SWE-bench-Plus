@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attribute_error_propagates_basic view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attribute_error_when_date_contains_comma_variations view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attribute_error_with_leading_and_trailing_whitespace view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attribute_error_with_length_param view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attribute_error_with_length_param_uppercase_keyword view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attribute_error_with_long_timestamp_string view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attribute_error_with_multiple_spaces_and_tabs view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attribute_error_with_space_before_semicolon view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attribute_error_with_trailing_spaces view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attribute_error_with_unicode_in_header
+coverage json -o coverage.json
+: '>>>>> End Test Output'

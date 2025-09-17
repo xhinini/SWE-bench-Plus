@@ -1,0 +1,109 @@
+# No additional imports required; the tests rely on imports already present in tests/cache/tests.py.
+@override_settings(
+    CACHES=caches_setting_for_tests(
+        BACKEND="django.core.cache.backends.filebased.FileBasedCache",
+    )
+)
+class AdditionalFileBasedCacheHasKeyTests(TestCase):
+    def setUp(self):
+        super().setUp()
+        self.dirname = tempfile.mkdtemp()
+        for cache_params in settings.CACHES.values():
+            cache_params["LOCATION"] = self.dirname
+        # Notify the caches framework that settings changed.
+        setting_changed.send(self.__class__, setting="CACHES", enter=False)
+        self.cache = caches["default"]
+
+    def tearDown(self):
+        try:
+            self.cache.clear()
+        finally:
+            shutil.rmtree(self.dirname)
+        super().tearDown()
+
+    def _make_cache_file(self, key, expiry, value=b"value"):
+        """Create a cache file with the exact on-disk layout used by FileBasedCache."""
+        fname = self.cache._key_to_file(key)
+        # Ensure dir exists
+        os.makedirs(os.path.dirname(fname), exist_ok=True)
+        with open(fname, "wb") as fh:
+            fh.write(pickle.dumps(expiry, self.cache.pickle_protocol))
+            fh.write(zlib.compress(pickle.dumps(value, self.cache.pickle_protocol)))
+        return fname
+
+    def test_has_key_returns_false_on_filenotfound(self):
+        # Simulate race where file disappears while opening.
+        self.cache.set("race-key", "value")
+        with mock.patch("builtins.open", side_effect=FileNotFoundError) as mocked_open:
+            self.assertIs(self.cache.has_key("race-key"), False)
+            mocked_open.assert_called_once()
+
+    def test_has_key_propagates_oserror_on_open(self):
+        # If open raises a non-FileNotFoundError, it should propagate.
+        with mock.patch("builtins.open", side_effect=OSError):
+            with self.assertRaises(OSError):
+                self.cache.has_key("some-key")
+
+    def test_has_key_propagates_oserror_from_pickle_load(self):
+        # If pickle.load raises OSError while checking expiry, it should propagate.
+        key = "pickle-error"
+        # Create a normal cache file first.
+        self._make_cache_file(key, time.time() + 10, b"v")
+        with mock.patch("pickle.load", side_effect=OSError):
+            with self.assertRaises(OSError):
+                self.cache.has_key(key)
+
+    def test_has_key_returns_false_for_empty_cache_file(self):
+        # An empty file is considered expired; has_key should return False.
+        key = "empty-file"
+        fname = self.cache._key_to_file(key)
+        os.makedirs(os.path.dirname(fname), exist_ok=True)
+        with open(fname, "wb") as fh:
+            fh.write(b"")
+        self.assertIs(self.cache.has_key(key), False)
+
+    def test_has_key_deletes_expired_file_and_returns_false(self):
+        # Expired entry should be removed by has_key() and return False.
+        key = "expired"
+        fname = self._make_cache_file(key, time.time() - 10, b"old")
+        # Ensure file exists before call
+        self.assertTrue(os.path.exists(fname))
+        self.assertIs(self.cache.has_key(key), False)
+        # The expired file should have been deleted.
+        self.assertFalse(os.path.exists(fname))
+
+    def test_has_key_returns_true_for_none_expiry(self):
+        # Entries with expiry None never expire.
+        key = "never-expire"
+        fname = self._make_cache_file(key, None, b"forever")
+        self.assertIs(self.cache.has_key(key), True)
+        # File should still exist afterwards.
+        self.assertTrue(os.path.exists(fname))
+
+    def test_has_key_returns_true_for_future_expiry(self):
+        # Entries with a future expiry are present.
+        key = "future"
+        fname = self._make_cache_file(key, time.time() + 60, b"soon")
+        self.assertIs(self.cache.has_key(key), True)
+        self.assertTrue(os.path.exists(fname))
+
+    def test_has_key_handles_race_during_open_and_reports_false(self):
+        # Confirm the race where open raises FileNotFoundError is handled.
+        key = "race2"
+        self.cache.set(key, "value")
+        with mock.patch("builtins.open", side_effect=FileNotFoundError) as mocked_open:
+            result = self.cache.has_key(key)
+            self.assertIs(result, False)
+            mocked_open.assert_called_once()
+
+    def test_has_key_versioning_respected(self):
+        # Different versions map to different files; has_key should respect versions.
+        key = "versioned"
+        # version 1
+        self.cache.set(key, "v1", version=1)
+        # version 2
+        self.cache.set(key, "v2", version=2)
+        self.assertIs(self.cache.has_key(key, version=1), True)
+        self.assertIs(self.cache.has_key(key, version=2), True)
+        # a non-existing version should be False
+        self.assertIs(self.cache.has_key(key, version=3), False)

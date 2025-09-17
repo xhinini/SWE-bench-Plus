@@ -1,0 +1,169 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  Regression tests for TruncDate and TruncTime timezone handling and
+  convert_value behavior. These tests verify that an explicit tzinfo
+  passed to TruncDate/TruncTime takes priority over the current active
+  timezone, that omitting tzinfo uses the current timezone, that DST
+  edge cases raise the appropriate pytz errors, and that convert_value
+  correctly converts datetime -> date/time for TruncDate/TruncTime.
+test_code: |
+  from datetime import datetime, timedelta
+  import pytz
+
+  from django.conf import settings
+  from django.db import connection
+  from django.db.models import DateField, TimeField, DateTimeField
+  from django.db.models.functions import TruncDate, TruncTime
+  from django.test import TestCase, override_settings
+  from django.utils import timezone
+
+  from ..models import DTModel
+
+  def _create_dtmodel(start_datetime):
+      """
+      Helper to create a DTModel instance with minimal required fields
+      consistent with the tests in the suite.
+      """
+      end_datetime = None
+      return DTModel.objects.create(
+          name=str(start_datetime) if start_datetime else 'None',
+          start_datetime=start_datetime,
+          end_datetime=end_datetime,
+          start_date=start_datetime.date() if start_datetime else None,
+          end_date=None,
+          start_time=start_datetime.time() if start_datetime else None,
+          end_time=None,
+          duration=None,
+      )
+
+  @override_settings(USE_TZ=True, TIME_ZONE='UTC')
+  class TruncDateTimeTimezoneRegressionTests(TestCase):
+      # 1
+      def test_trunc_date_respects_explicit_tzinfo_over_current_timezone(self):
+          # UTC time that is the next day in Pacific but previous day in Australia
+          naive = datetime(2023, 1, 1, 23, 30)
+          utc_dt = timezone.make_aware(naive, is_dst=False)
+          _create_dtmodel(utc_dt)
+
+          pacific = pytz.timezone('US/Pacific')  # UTC-8 (or -7 in DST, but for Jan it's -8)
+          melbourne = pytz.timezone('Australia/Melbourne')  # UTC+10
+
+          # Force current timezone to Melbourne
+          with timezone.override(melbourne):
+              qs = DTModel.objects.annotate(
+                  truncated_pacific=TruncDate('start_datetime', tzinfo=pacific),
+                  truncated_current=TruncDate('start_datetime'),
+              ).order_by('pk').get()
+
+          # truncated_pacific should be date in Pacific tz
+          pacific_date = utc_dt.astimezone(pacific).date()
+          melb_date = utc_dt.astimezone(melbourne).date()
+          self.assertEqual(qs.truncated_pacific, pacific_date)
+          # truncated_current should reflect the active timezone (Melbourne)
+          self.assertEqual(qs.truncated_current, melb_date)
+
+      # 2
+      def test_trunc_time_respects_explicit_tzinfo_over_current_timezone(self):
+          naive = datetime(2023, 3, 15, 4, 45, 30)
+          utc_dt = timezone.make_aware(naive, is_dst=False)
+          _create_dtmodel(utc_dt)
+
+          pacific = pytz.timezone('US/Pacific')
+          melbourne = pytz.timezone('Australia/Melbourne')
+
+          with timezone.override(melbourne):
+              qs = DTModel.objects.annotate(
+                  truncated_pacific=TruncTime('start_datetime', tzinfo=pacific),
+                  truncated_current=TruncTime('start_datetime'),
+              ).order_by('pk').get()
+
+          self.assertEqual(qs.truncated_pacific, utc_dt.astimezone(pacific).time())
+          self.assertEqual(qs.truncated_current, utc_dt.astimezone(melbourne).time())
+
+      # 3
+      def test_trunc_date_uses_current_timezone_when_tzinfo_none(self):
+          naive = datetime(2022, 11, 5, 23, 0)  # a time that may change day in other zones
+          utc_dt = timezone.make_aware(naive, is_dst=False)
+          _create_dtmodel(utc_dt)
+
+          tokyo = pytz.timezone('Asia/Tokyo')
+          with timezone.override(tokyo):
+              qs = DTModel.objects.annotate(
+                  truncated=TruncDate('start_datetime'),
+              ).get()
+          self.assertEqual(qs.truncated, utc_dt.astimezone(tokyo).date())
+
+      # 4
+      def test_trunc_time_uses_current_timezone_when_tzinfo_none(self):
+          naive = datetime(2022, 7, 1, 12, 15, 5)
+          utc_dt = timezone.make_aware(naive, is_dst=False)
+          _create_dtmodel(utc_dt)
+
+          london = pytz.timezone('Europe/London')
+          with timezone.override(london):
+              qs = DTModel.objects.annotate(
+                  truncated=TruncTime('start_datetime'),
+              ).get()
+          self.assertEqual(qs.truncated, utc_dt.astimezone(london).time())
+
+      # 5
+      def test_trunc_date_with_explicit_utc_tzinfo(self):
+          naive = datetime(2021, 5, 4, 2, 2, 2)
+          utc_dt = timezone.make_aware(naive, is_dst=False)
+          _create_dtmodel(utc_dt)
+
+          qs = DTModel.objects.annotate(
+              truncated_utc=TruncDate('start_datetime', tzinfo=timezone.utc),
+          ).get()
+          self.assertEqual(qs.truncated_utc, utc_dt.astimezone(timezone.utc).date())
+
+      # 6
+      def test_trunc_date_and_time_raise_on_nonexistent_dst_time(self):
+          """
+          If truncation makes an invalid/non-existent local time in the target
+          timezone, the database/logic should surface the pytz.NonExistentTimeError.
+          """
+          sao = pytz.timezone('America/Sao_Paulo')
+          # A UTC datetime that will map to a nonexistent local date in Sao_Paulo when truncating.
+          # Use a date/time known to be in DST transition (the exact example from other tests).
+          utc_dt = pytz.utc.localize(datetime(2016, 10, 16, 13, 0))
+          _create_dtmodel(utc_dt)
+
+          with timezone.override(sao):
+              with self.assertRaises(pytz.NonExistentTimeError):
+                  # TruncDate uses casting; when converting back to tz-aware time it may raise
+                  list(DTModel.objects.annotate(trunc_date=TruncDate('start_datetime')).order_by('pk'))
+              with self.assertRaises(pytz.NonExistentTimeError):
+                  list(DTModel.objects.annotate(trunc_time=TruncTime('start_datetime')).order_by('pk'))
+
+  @override_settings(USE_TZ=False)
+  class TruncDateTimeConvertValueTests(TestCase):
+      # 7
+      def test_trunc_date_convert_value_returns_date_object_when_value_is_datetime(self):
+          # With USE_TZ=False, TruncDate.output_field is DateField() and convert_value should return date
+          naive = datetime(2020, 8, 20, 15, 45, 30)
+          trunc = TruncDate('start_datetime')  # TruncDate.output_field is DateField()
+          # Use the default connection object; convert_value should convert datetime -> date
+          result = trunc.convert_value(naive, None, connection)
+          self.assertEqual(result, naive.date())
+
+      # 8
+      def test_trunc_time_convert_value_returns_time_when_value_is_datetime(self):
+          naive = datetime(2020, 8, 20, 15, 45, 30)
+          trunc = TruncTime('start_datetime')  # TruncTime.output_field is TimeField()
+          result = trunc.convert_value(naive, None, connection)
+          self.assertEqual(result, naive.time())
+
+      # 9
+      def test_trunc_date_convert_value_none_passthrough(self):
+          trunc = TruncDate('start_datetime')
+          self.assertIsNone(trunc.convert_value(None, None, connection))
+
+      # 10
+      def test_trunc_time_convert_value_none_passthrough(self):
+          trunc = TruncTime('start_datetime')
+          self.assertIsNone(trunc.convert_value(None, None, connection))
+new_imports_code: |
+  from django.db import connection
+  import pytz

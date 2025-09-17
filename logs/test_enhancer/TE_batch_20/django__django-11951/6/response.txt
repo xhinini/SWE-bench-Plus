@@ -1,0 +1,114 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests verify that bulk_create() properly caps the batch size to the database backend's
+  maximum batch size (as returned by connection.ops.bulk_batch_size). They monkeypatch
+  connection.ops.bulk_batch_size and django.db.models.query.QuerySet._insert to observe how many
+  batches are passed to _insert() for various combinations of requested batch_size and backend
+  limits. The tests would fail against the pre-patch implementation (which used the provided
+  batch_size even when it exceeded the backend max) and pass with the patched behavior that
+  properly caps the batch_size.
+test_code: |
+  from math import ceil
+  from unittest.mock import patch
+  
+  from django.test import TestCase
+  
+  from django.db import connection
+  from django.db.models.query import QuerySet
+  
+  from .models import TwoFields, Country, State, Restaurant
+  
+  
+  class BulkCreateBatchingRegressionTests(TestCase):
+      def _run_and_count_batches(self, model, objs, requested_batch_size, backend_batch_size):
+          """
+          Helper that patches connection.ops.bulk_batch_size to return backend_batch_size
+          and patches QuerySet._insert to collect the batches that would be inserted.
+  
+          Returns the list of batches that were passed to _insert().
+          """
+          recorded_batches = []
+  
+          def fake_insert(self, items, fields=None, returning_fields=None, raw=False, using=None, ignore_conflicts=False):
+              # Record the exact batch content passed to _insert.
+              recorded_batches.append(list(items))
+              # Return an empty list to emulate no-return behavior.
+              return []
+  
+          # Patch the bulk_batch_size to return our desired backend limit.
+          with patch.object(connection.ops, 'bulk_batch_size', return_value=backend_batch_size):
+              # Patch QuerySet._insert to avoid any DB activity and record calls.
+              with patch.object(QuerySet, '_insert', new=fake_insert):
+                  # Call bulk_create with the requested_batch_size.
+                  model.objects.bulk_create(objs, batch_size=requested_batch_size)
+  
+          return recorded_batches
+  
+      def test_batched_insert_caps_batch_size_simple(self):
+          objs = [TwoFields(f1=i, f2=i) for i in range(10)]
+          recorded = self._run_and_count_batches(TwoFields, objs, requested_batch_size=10, backend_batch_size=2)
+          self.assertEqual(len(recorded), ceil(len(objs) / 2))
+          # Ensure each batch size except possibly the last is equal to backend_batch_size.
+          for batch in recorded[:-1]:
+              self.assertEqual(len(batch), 2)
+  
+      def test_batched_insert_caps_batch_size_mixed_pk(self):
+          # Mix objects with and without a manually set pk (simulate some pre-set pks).
+          objs = [TwoFields(id=(i if i % 2 == 0 else None), f1=i, f2=i) for i in range(7)]
+          recorded = self._run_and_count_batches(TwoFields, objs, requested_batch_size=50, backend_batch_size=3)
+          self.assertEqual(len(recorded), ceil(len(objs) / 3))
+          for batch in recorded[:-1]:
+              self.assertEqual(len(batch), 3)
+  
+      def test_batched_insert_respects_minimum_one(self):
+          # If the backend reports 0, the code should use at least 1 (max(..., 1)).
+          objs = [TwoFields(f1=i, f2=i) for i in range(5)]
+          recorded = self._run_and_count_batches(TwoFields, objs, requested_batch_size=10, backend_batch_size=0)
+          self.assertEqual(len(recorded), 5)  # batch size should be treated as 1
+  
+      def test_batched_insert_with_no_requested_batch_uses_backend(self):
+          # When no batch_size is provided (None), the backend's max should be used.
+          objs = [TwoFields(f1=i, f2=i) for i in range(10)]
+          recorded = self._run_and_count_batches(TwoFields, objs, requested_batch_size=None, backend_batch_size=4)
+          self.assertEqual(len(recorded), ceil(len(objs) / 4))
+  
+      def test_country_model_batch_cap(self):
+          # Use a different model to ensure the logic isn't model-specific.
+          objs = [Country(name=f"Country{i}", iso_two_letter=f"X{i}") for i in range(12)]
+          recorded = self._run_and_count_batches(Country, objs, requested_batch_size=100, backend_batch_size=5)
+          self.assertEqual(len(recorded), ceil(len(objs) / 5))
+          for batch in recorded[:-1]:
+              self.assertEqual(len(batch), 5)
+  
+      def test_state_model_batch_cap_small(self):
+          objs = [State(two_letter_code=f"AA{i}") for i in range(9)]
+          recorded = self._run_and_count_batches(State, objs, requested_batch_size=9, backend_batch_size=2)
+          self.assertEqual(len(recorded), ceil(len(objs) / 2))
+  
+      def test_restaurant_model_batch_cap(self):
+          objs = [Restaurant(name=f"R{i}") for i in range(11)]
+          recorded = self._run_and_count_batches(Restaurant, objs, requested_batch_size=20, backend_batch_size=3)
+          self.assertEqual(len(recorded), ceil(len(objs) / 3))
+  
+      def test_explicit_batch_size_larger_than_backend_for_varied_size(self):
+          # Verify for a variety of backend sizes the requested large batch_size is capped.
+          for backend_size in (1, 2, 3, 4):
+              objs = [TwoFields(f1=i, f2=i) for i in range(13)]
+              recorded = self._run_and_count_batches(TwoFields, objs, requested_batch_size=1000, backend_batch_size=backend_size)
+              self.assertEqual(len(recorded), ceil(len(objs) / max(backend_size, 1)))
+  
+      def test_batch_size_equal_to_backend_unchanged(self):
+          objs = [TwoFields(f1=i, f2=i) for i in range(8)]
+          recorded = self._run_and_count_batches(TwoFields, objs, requested_batch_size=3, backend_batch_size=3)
+          self.assertEqual(len(recorded), ceil(len(objs) / 3))
+  
+      def test_batch_size_smaller_than_backend_used_directly(self):
+          # If requested batch_size is smaller than backend limit, it should be honored.
+          objs = [TwoFields(f1=i, f2=i) for i in range(10)]
+          recorded = self._run_and_count_batches(TwoFields, objs, requested_batch_size=2, backend_batch_size=5)
+          self.assertEqual(len(recorded), ceil(len(objs) / 2))
+new_imports_code: |
+  from unittest.mock import patch
+  from django.db import connection
+  from django.db.models.query import QuerySet

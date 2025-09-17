@@ -1,0 +1,202 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that the changelist bulk-edit code uses transaction.atomic(...) with the correct using=router.db_for_write(self.model) argument. They will patch the atomic context manager used in django.contrib.admin.options and assert it is called with the DB alias returned by router.db_for_write for the model. The tests also check that atomic is not used when the formset is invalid or when other POST branches are taken. These tests will FAIL if transaction.atomic is called without the using argument (as in the candidate patch) and PASS when the gold patch is applied.
+test_code: |
+  from unittest import mock
+
+  from django.contrib import admin
+  from django.contrib.auth.models import User
+  from django.db import DatabaseError, router
+  from django.test import TestCase, override_settings
+  from django.urls import reverse
+  from django.test.client import RequestFactory
+  from django.utils.http import urlencode
+
+  from admin_changelist.models import Swallow, Parent
+  from admin_changelist.admin import SwallowAdmin, ParentAdmin, site as custom_site
+
+  @override_settings(ROOT_URLCONF="admin_changelist.urls")
+  class TransactionAtomicTests(TestCase):
+      @classmethod
+      def setUpTestData(cls):
+          cls.superuser = User.objects.create_superuser(
+              username="atomic_super", email="a@b.com", password="pwd"
+          )
+
+      def setUp(self):
+          self.client.force_login(self.superuser)
+          self.changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+          # Create some instances for formsets
+          self.a = Swallow.objects.create(origin="Swallow A", load=4, speed=1)
+          self.b = Swallow.objects.create(origin="Swallow B", load=2, speed=2)
+          self.c = Swallow.objects.create(origin="Swallow C", load=5, speed=5)
+
+      def _valid_post_data_for_three(self):
+          return {
+              "form-TOTAL_FORMS": "3",
+              "form-INITIAL_FORMS": "3",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(self.a.pk),
+              "form-1-uuid": str(self.b.pk),
+              "form-2-uuid": str(self.c.pk),
+              "form-0-load": "9.0",
+              "form-0-speed": "3.0",
+              "form-1-load": "5.0",
+              "form-1-speed": "1.0",
+              "form-2-load": "5.0",
+              "form-2-speed": "4.0",
+              "_save": "Save",
+          }
+
+      def test_atomic_called_with_using_arg_on_successful_post(self):
+          """Ensure transaction.atomic is called with using=router.db_for_write(self.model) for a successful list_editable POST."""
+          data = self._valid_post_data_for_three()
+          with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+              response = self.client.post(self.changelist_url, data)
+              # view returns redirect (status 200 with follow=False gives 200 if it renders, here we expect a redirect)
+              # assert atomic was called with correct using arg
+              expected_using = router.db_for_write(Swallow)
+              mock_atomic.assert_called_with(using=expected_using)
+
+      def test_atomic_called_with_using_arg_when_log_change_raises(self):
+          """If log_change raises DatabaseError during saving, atomic should still have been entered with correct using."""
+          data = self._valid_post_data_for_three()
+          # Patch log_change to raise DatabaseError to simulate a DB error mid-loop.
+          with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+              with mock.patch("django.contrib.admin.ModelAdmin.log_change", side_effect=DatabaseError):
+                  with self.assertRaises(DatabaseError):
+                      # POST should propagate the DatabaseError
+                      self.client.post(self.changelist_url, data)
+              expected_using = router.db_for_write(Swallow)
+              mock_atomic.assert_called_with(using=expected_using)
+
+      def test_atomic_called_with_using_arg_when_log_change_fails_after_first(self):
+          """When log_change succeeds for first and fails for second, atomic is still used with correct using."""
+          data = self._valid_post_data_for_three()
+          # Cause log_change to succeed once and then raise.
+          with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+              with mock.patch(
+                  "django.contrib.admin.ModelAdmin.log_change",
+                  side_effect=[None, DatabaseError, None],
+              ):
+                  with self.assertRaises(DatabaseError):
+                      self.client.post(self.changelist_url, data)
+              expected_using = router.db_for_write(Swallow)
+              mock_atomic.assert_called_with(using=expected_using)
+
+      def test_atomic_not_called_when_formset_invalid(self):
+          """If the changelist formset is invalid, transaction.atomic should not be entered."""
+          # Make formset invalid by providing a non-numeric load
+          data = {
+              "form-TOTAL_FORMS": "2",
+              "form-INITIAL_FORMS": "2",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(self.a.pk),
+              "form-1-uuid": str(self.b.pk),
+              "form-0-load": "not-a-number",  # invalid
+              "form-0-speed": "3.0",
+              "form-1-load": "5.0",
+              "form-1-speed": "1.0",
+              "_save": "Save",
+          }
+          with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+              response = self.client.post(self.changelist_url, data)
+              # atomic should not have been called because formset.is_valid() will be False
+              mock_atomic.assert_not_called()
+
+      def test_atomic_called_with_using_arg_when_some_forms_unchanged(self):
+          """Atomic is used even if some forms in the formset haven't changed."""
+          data = self._valid_post_data_for_three()
+          # Make the middle form unchanged to simulate unchanged form scenario.
+          data["form-1-load"] = str(self.b.load)  # unchanged
+          data["form-1-speed"] = str(self.b.speed)
+          with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+              response = self.client.post(self.changelist_url, data)
+              expected_using = router.db_for_write(Swallow)
+              mock_atomic.assert_called_with(using=expected_using)
+
+      def test_atomic_not_called_for_non_list_editable_action_post(self):
+          """If POST triggers an action branch (e.g. selecting an action without saving list_editable), atomic isn't used for list_editable."""
+          # This POST simulates selecting an action (index present and no _save)
+          action_data = {
+              "index": "0",
+              "_selected_action": [str(self.a.pk)],
+              "action": ["delete_selected"],
+          }
+          changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+          with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+              response = self.client.post(changelist_url, action_data)
+              # Should not have entered the list_editable atomic block.
+              mock_atomic.assert_not_called()
+
+      def test_atomic_called_with_using_arg_for_different_admin_instance(self):
+          """Verify the using argument is derived from the model of the ModelAdmin instance (sanity test)."""
+          # Use Parent admin as another admin instance which would use its own model alias
+          parent = Parent.objects.create(name="P1")
+          parent2 = Parent.objects.create(name="P2")
+          # Create a simple changelist for Parent with list_editable enabled dynamically
+          admin_instance = ParentAdmin(Parent, custom_site)
+          admin_instance.list_display = ["id", "name"]
+          admin_instance.list_display_links = ["id"]
+          admin_instance.list_editable = ["name"]
+          url = reverse("admin:admin_changelist_parent_changelist")
+          post_data = {
+              "form-TOTAL_FORMS": "2",
+              "form-INITIAL_FORMS": "2",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-id": str(parent.pk),
+              "form-1-id": str(parent2.pk),
+              "form-0-name": "New P1",
+              "form-1-name": "New P2",
+              "_save": "Save",
+          }
+          with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+              # Use the client to hit the global admin URL; the admin instance's changelist_view will be used.
+              self.client.force_login(self.superuser)
+              self.client.post(url, post_data)
+              expected_using = router.db_for_write(Parent)
+              mock_atomic.assert_called_with(using=expected_using)
+
+      def test_atomic_called_even_when_message_user_called(self):
+          """Ensure atomic is used when message_user is invoked as part of the success path."""
+          data = self._valid_post_data_for_three()
+          with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+              with mock.patch("django.contrib.admin.ModelAdmin.message_user") as mock_msg:
+                  response = self.client.post(self.changelist_url, data)
+              expected_using = router.db_for_write(Swallow)
+              mock_atomic.assert_called_with(using=expected_using)
+
+      def test_atomic_called_with_using_arg_for_many_changed_forms(self):
+          """Ensure atomic is used with the correct using parameter when many forms are changed."""
+          # Create more swallows and craft a POST that changes multiple rows.
+          extra_objs = []
+          for i in range(4, 8):
+              extra_objs.append(Swallow.objects.create(origin=f"S{i}", load=i, speed=i))
+          # Build POST for 5 forms (existing three + two extra)
+          forms = [
+              (self.a, "10.0", "2.0"),
+              (self.b, "11.0", "3.0"),
+              (self.c, "12.0", "4.0"),
+              (extra_objs[0], "13.0", "5.0"),
+              (extra_objs[1], "14.0", "6.0"),
+          ]
+          post = {
+              "form-TOTAL_FORMS": str(len(forms)),
+              "form-INITIAL_FORMS": str(len(forms)),
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "_save": "Save",
+          }
+          for idx, (obj, load, speed) in enumerate(forms):
+              post[f"form-{idx}-uuid"] = str(obj.pk)
+              post[f"form-{idx}-load"] = load
+              post[f"form-{idx}-speed"] = speed
+          with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+              self.client.post(self.changelist_url, post)
+              expected_using = router.db_for_write(Swallow)
+              mock_atomic.assert_called_with(using=expected_using)
+new_imports_code: |
+  # No module-level imports required beyond those used in the test file.

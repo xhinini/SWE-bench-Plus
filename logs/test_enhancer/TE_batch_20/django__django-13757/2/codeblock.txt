@@ -1,0 +1,156 @@
+from types import SimpleNamespace
+from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import patch
+from django.test import SimpleTestCase
+
+from django.db.models.fields.json import (
+    KeyTransformIsNull, HasKey,
+)
+
+class KeyTransformIsNullTests(SimpleTestCase):
+    def _make_lhs(self, lhs_sql='COL_SQL', lhs_params=('LHS_PARAM',)):
+        """
+        Return a mock lhs object with the attributes expected by
+        KeyTransformIsNull: .lhs, .key_name and a preprocess_lhs method.
+        preprocess_lhs returns (lhs_sql, lhs_params, key_transforms).
+        """
+        def preprocess_lhs(compiler, connection):
+            return lhs_sql, lhs_params, ['k']
+        return SimpleNamespace(lhs='col', key_name='k', preprocess_lhs=preprocess_lhs)
+
+    def test_oracle_isnull_true_combines_sql_and_params(self):
+        lhs = self._make_lhs(lhs_sql='COL_SQL', lhs_params=('LHS_PARAM',))
+        lookup = KeyTransformIsNull(lhs, True)
+        connection = SimpleNamespace(vendor='oracle')
+        compiler = SimpleNamespace()
+        with patch.object(HasKey, 'as_oracle', return_value=('HASKEY_SQL', ('HASP',))) as mock_haskey:
+            sql, params = lookup.as_oracle(compiler, connection)
+            self.assertEqual(sql, '(NOT HASKEY_SQL OR COL_SQL IS NULL)')
+            self.assertEqual(params, ('HASP', 'LHS_PARAM'))
+            mock_haskey.assert_called_once()
+
+    def test_oracle_isnull_false_returns_haskey_sql_and_params(self):
+        lhs = self._make_lhs()
+        lookup = KeyTransformIsNull(lhs, False)
+        connection = SimpleNamespace(vendor='oracle')
+        compiler = SimpleNamespace()
+        with patch.object(HasKey, 'as_oracle', return_value=('HASKEY_SQL', ('HASP',))) as mock_haskey:
+            sql, params = lookup.as_oracle(compiler, connection)
+            # For isnull=False, KeyTransformIsNull should return the HasKey SQL directly.
+            self.assertEqual(sql, 'HASKEY_SQL')
+            self.assertEqual(params, ('HASP',))
+            mock_haskey.assert_called_once()
+
+    def test_oracle_isnull_true_with_no_haskey_params_returns_lhs_params_only(self):
+        lhs = self._make_lhs(lhs_sql='COL_SQL', lhs_params=('ONLY_LHS',))
+        lookup = KeyTransformIsNull(lhs, True)
+        connection = SimpleNamespace(vendor='oracle')
+        compiler = SimpleNamespace()
+        # Simulate HasKey.as_oracle returning no params (as Oracle often does).
+        with patch.object(HasKey, 'as_oracle', return_value=('HASKEY_SQL', ())) as mock_haskey:
+            sql, params = lookup.as_oracle(compiler, connection)
+            self.assertEqual(sql, '(NOT HASKEY_SQL OR COL_SQL IS NULL)')
+            # Expect only the lhs params to be present when HasKey returned no params.
+            self.assertEqual(params, ('ONLY_LHS',))
+            mock_haskey.assert_called_once()
+
+    def test_oracle_isnull_true_with_no_params_at_all(self):
+        lhs = self._make_lhs(lhs_sql='COL_SQL', lhs_params=())
+        lookup = KeyTransformIsNull(lhs, True)
+        connection = SimpleNamespace(vendor='oracle')
+        compiler = SimpleNamespace()
+        with patch.object(HasKey, 'as_oracle', return_value=('HASKEY_SQL', ())) as mock_haskey:
+            sql, params = lookup.as_oracle(compiler, connection)
+            self.assertEqual(sql, '(NOT HASKEY_SQL OR COL_SQL IS NULL)')
+            # No params at all when both sides provide none.
+            self.assertEqual(params, ())
+
+    def test_sqlite_isnull_true_uses_is_null_template_and_returns_unmodified_sql(self):
+        lhs = self._make_lhs()
+        lookup = KeyTransformIsNull(lhs, True)
+        connection = SimpleNamespace(vendor='sqlite')
+        compiler = SimpleNamespace()
+        captured = {}
+        def fake_as_sql(self, compiler_arg, connection_arg, template=None):
+            # Capture the template used by KeyTransformIsNull.as_sqlite
+            captured['template'] = template
+            return ('HAS_SQL', ('HASP',))
+        with patch.object(HasKey, 'as_sql', new=fake_as_sql):
+            sql, params = lookup.as_sqlite(compiler, connection)
+            # Gold behavior: should not negate the HasKey SQL and should return it directly.
+            self.assertEqual(sql, 'HAS_SQL')
+            self.assertEqual(params, ('HASP',))
+            # Expect the JSON_TYPE IS NULL template to be passed for isnull=True.
+            self.assertEqual(captured['template'], 'JSON_TYPE(%s, %%s) IS NULL')
+
+    def test_sqlite_isnull_false_uses_is_not_null_template(self):
+        lhs = self._make_lhs()
+        lookup = KeyTransformIsNull(lhs, False)
+        connection = SimpleNamespace(vendor='sqlite')
+        compiler = SimpleNamespace()
+        captured = {}
+        def fake_as_sql(self, compiler_arg, connection_arg, template=None):
+            captured['template'] = template
+            return ('HAS_SQL_NOT', ('P1',))
+        with patch.object(HasKey, 'as_sql', new=fake_as_sql):
+            sql, params = lookup.as_sqlite(compiler, connection)
+            self.assertEqual(sql, 'HAS_SQL_NOT')
+            self.assertEqual(params, ('P1',))
+            # For isnull=False, template should be IS NOT NULL.
+            self.assertEqual(captured['template'], 'JSON_TYPE(%s, %%s) IS NOT NULL')
+
+    def test_sqlite_isnull_true_does_not_negate_sql_and_preserves_params(self):
+        lhs = self._make_lhs()
+        lookup = KeyTransformIsNull(lhs, True)
+        connection = SimpleNamespace(vendor='sqlite')
+        compiler = SimpleNamespace()
+        # Simulate HasKey.as_sql returning multiple params.
+        def fake_as_sql(self, compiler_arg, connection_arg, template=None):
+            return ('HAS_SQL_MULTI', ('A', 'B'))
+        with patch.object(HasKey, 'as_sql', new=fake_as_sql):
+            sql, params = lookup.as_sqlite(compiler, connection)
+            # Candidate implementation would prepend NOT(...) in some branches;
+            # correct behavior is to return HasKey.as_sql result directly.
+            self.assertEqual(sql, 'HAS_SQL_MULTI')
+            self.assertEqual(params, ('A', 'B'))
+
+    def test_oracle_isnull_calls_haskey_with_lhs_lhs_and_key(self):
+        """
+        Ensure HasKey is constructed with the inner lhs and the key_name.
+        We inspect the 'self' passed to HasKey.as_oracle (the HasKey instance).
+        """
+        lhs = self._make_lhs()
+        lookup = KeyTransformIsNull(lhs, False)
+        connection = SimpleNamespace(vendor='oracle')
+        compiler = SimpleNamespace()
+        seen = {}
+        def fake_as_oracle(self, compiler_arg, connection_arg):
+            # Capture the HasKey instance attributes to ensure it was created correctly.
+            seen['haskey_lhs'] = getattr(self, 'lhs', None)
+            seen['haskey_key'] = getattr(self, 'rhs', None) or getattr(self, 'key', None)
+            # Return a dummy SQL/params
+            return ('HK_SQL', ('P',))
+        with patch.object(HasKey, 'as_oracle', new=fake_as_oracle):
+            sql, params = lookup.as_oracle(compiler, connection)
+            # The HasKey instance's .lhs should be the lhs.lhs value ('col' in our helper).
+            # And the key passed to HasKey was the key_name; HasKey.__init__ stores it on rhs or similar,
+            # but we at least assert that the HasKey instance was constructed and the call reached our fake.
+            self.assertEqual(sql, 'HK_SQL')
+            self.assertEqual(params, ('P',))
+            self.assertIn('haskey_lhs', seen)
+
+    def test_oracle_isnull_true_param_order(self):
+        """
+        Ensure the returned params are the HasKey params followed by the lhs params,
+        preserving ordering (HasKey params first).
+        """
+        lhs = self._make_lhs(lhs_sql='C', lhs_params=('L1', 'L2'))
+        lookup = KeyTransformIsNull(lhs, True)
+        connection = SimpleNamespace(vendor='oracle')
+        compiler = SimpleNamespace()
+        with patch.object(HasKey, 'as_oracle', return_value=('HK', ('H1', 'H2'))) as mock_haskey:
+            sql, params = lookup.as_oracle(compiler, connection)
+            self.assertEqual(sql, '(NOT HK OR C IS NULL)')
+            # Expect HasKey params first, then lhs params.
+            self.assertEqual(params, ('H1', 'H2', 'L1', 'L2'))

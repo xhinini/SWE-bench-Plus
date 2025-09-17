@@ -1,0 +1,281 @@
+from django.test import SimpleTestCase
+from django.db import migrations, models
+from django.db.migrations.writer import MigrationWriter
+from django.db.migrations.serializer import BaseSerializer
+import datetime
+import decimal
+import uuid
+import time
+import os
+from types import SimpleNamespace
+import importlib
+import builtins
+
+class DummyWithMigrationImport:
+    pass
+
+class DummyMigrationSerializer(BaseSerializer):
+    def serialize(self):
+        # Emit an "import" line that looks like a migration import (has a .<digits> segment)
+        # The MigrationWriter looks for r"^import (.*)\.\d+[^\s]*$" to detect migration imports.
+        return ("Dummy()", {"import mypkg.0001_custom"})
+
+class AdditionalWriterTests(SimpleTestCase):
+    def test_imports_grouping_and_sorting_basic(self):
+        """
+        Ensure 'import' statements come before 'from' statements and both
+        groups are sorted by the module/package name (the part after the
+        'import'/'from').
+        """
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "mymodel",
+                        "dt",
+                        models.DateTimeField(
+                            default=datetime.datetime(2012, 1, 1, 1, 1, tzinfo=datetime.timezone.utc)
+                        ),
+                    ),
+                    migrations.AddField(
+                        "mymodel",
+                        "f",
+                        models.FloatField(default=time.time),
+                    ),
+                    migrations.AddField(
+                        "mymodel",
+                        "uuid",
+                        models.UUIDField(default=uuid.UUID("5c859437-d061-4847-b3f7-e6b78852f8c8")),
+                    ),
+                    # Decimal default to force a "from decimal import Decimal"
+                    migrations.AddField(
+                        "mymodel",
+                        "dec",
+                        models.DecimalField(default=decimal.Decimal("1.3"), max_digits=5, decimal_places=2),
+                    ),
+                ],
+                "dependencies": [],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        # Expected ordering by module name within import group then within from group,
+        # with all 'import ...' lines before any 'from ...' lines.
+        expected_import_block = (
+            "import datetime\n"
+            "import time\n"
+            "import uuid\n"
+            "from decimal import Decimal\n"
+            "from django.db import migrations, models\n"
+        )
+        self.assertIn(expected_import_block, output)
+
+    def test_models_import_merged_when_models_used(self):
+        """
+        If models import is required, it should be merged into the migrations import
+        line as 'from django.db import migrations, models'.
+        """
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "mymodel",
+                        "char",
+                        models.CharField(max_length=10),
+                    ),
+                ],
+                "dependencies": [],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        # There must be an import line merging migrations and models
+        self.assertIn("from django.db import migrations, models\n", output)
+        # And there should not be a separate 'from django.db import models' line
+        self.assertNotIn("from django.db import models\n", output)
+
+    def test_no_models_import_when_unused(self):
+        """
+        If models isn't used, only 'from django.db import migrations' should be present.
+        """
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AlterModelOptions(
+                        name="model",
+                        options={"verbose_name": "model"},
+                    ),
+                ],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        # Only migrations should be imported from django.db
+        self.assertIn("from django.db import migrations\n", output)
+        self.assertNotIn("from django.db import migrations, models\n", output)
+
+    def test_from_group_sorted_by_module_name(self):
+        """
+        When multiple 'from ... import ...' statements are present, the ordering
+        of the 'from' group should be sorted by the module name that follows
+        'from'.
+        """
+        # Use values that serialize to 'from decimal import Decimal' and 'from django.conf import settings'
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "mymodel",
+                        "dec",
+                        models.DecimalField(default=decimal.Decimal("1.3"), max_digits=5, decimal_places=2),
+                    ),
+                    # Using SettingsReference via a default to force 'from django.conf import settings'
+                    migrations.AddField(
+                        "mymodel",
+                        "settingref",
+                        models.CharField(default="x", max_length=1),
+                    ),
+                ],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        # 'decimal' should come before 'django.conf'
+        pos_decimal = output.find("from decimal import Decimal")
+        pos_django = output.find("from django.conf import settings")
+        # If both present, decimal should come first (smaller module name)
+        if pos_decimal != -1 and pos_django != -1:
+            self.assertLess(pos_decimal, pos_django)
+
+    def test_imports_first_even_if_module_name_comes_later(self):
+        """
+        Ensure that even when the module name for a 'from' import alphabetically
+        would come before some 'import' modules, 'import' lines still appear before
+        'from' lines.
+        """
+        # Create an import that would alphabetically come after 'django' modules
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "mymodel",
+                        "uuid",
+                        models.UUIDField(default=uuid.UUID("5c859437-d061-4847-b3f7-e6b78852f8c8")),
+                    ),
+                    migrations.AddField(
+                        "mymodel",
+                        "dec",
+                        models.DecimalField(default=decimal.Decimal("1.3"), max_digits=5, decimal_places=2),
+                    ),
+                ],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        # Ensure at least one 'import' appears before the first 'from'
+        first_import_idx = min(
+            [i for i in (output.find("import "), output.find("\nimport ")) if i != -1],
+            default=-1,
+        )
+        first_from_idx = output.find("from ")
+        if first_from_idx != -1 and first_import_idx != -1:
+            self.assertLess(first_import_idx, first_from_idx)
+
+    def test_migration_imports_comment_added_for_migration_like_imports(self):
+        """
+        If an import that looks like a migration (contains a dotted segment with
+        digits) is present, it should be removed from the imports block and listed
+        in the manual-copying comment.
+        """
+        # Register a temporary serializer for DummyWithMigrationImport to emit a
+        # migration-style import that matches the regex in MigrationWriter.
+        from django.db.migrations.writer import MigrationWriter as MW
+        MW.register_serializer(DummyWithMigrationImport, DummyMigrationSerializer)
+        try:
+            migration = type(
+                "Migration",
+                (migrations.Migration,),
+                {
+                    "operations": [
+                        # Put an instance of the dummy into kwargs of a custom op
+                        # Using AddField so that serialize() will pick up the value.
+                        migrations.AddField(
+                            "mymodel",
+                            "dummy",
+                            models.CharField(default=DummyWithMigrationImport(), max_length=1),
+                        ),
+                    ],
+                    "dependencies": [],
+                },
+            )
+            writer = MW(migration)
+            output = writer.as_string()
+            # The manual copy comment block must be present (and must mention mypkg.0001_custom)
+            self.assertIn("Functions from the following migrations need manual copying.", output)
+            self.assertIn("mypkg.0001_custom", output)
+            # The problematic import should not appear as a normal import line
+            self.assertNotIn("import mypkg.0001_custom\n", output)
+        finally:
+            MW.unregister_serializer(DummyWithMigrationImport)
+
+    def test_many_imports_sorted_correctly(self):
+        """
+        Ensure a larger mixture of imports yields the expected grouped ordering.
+        """
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField("m", "a", models.DateTimeField(default=datetime.datetime.now)),
+                    migrations.AddField("m", "b", models.FloatField(default=time.time)),
+                    migrations.AddField("m", "c", models.UUIDField(default=uuid.UUID("5c859437-d061-4847-b3f7-e6b78852f8c8"))),
+                    migrations.AddField("m", "d", models.DecimalField(default=decimal.Decimal("1.3"), max_digits=5, decimal_places=2)),
+                ],
+                "dependencies": [],
+            },
+        )
+        output = MigrationWriter(migration).as_string()
+        # Basic membership checks and grouping
+        self.assertIn("import datetime", output)
+        self.assertIn("import time", output)
+        self.assertIn("import uuid", output)
+        self.assertIn("from decimal import Decimal", output)
+        # Confirm 'import' block appears before 'from' block start (the first 'from' line)
+        first_import = output.find("import ")
+        first_from = output.find("from ")
+        if first_import != -1 and first_from != -1:
+            self.assertLess(first_import, first_from)
+
+    def test_import_lines_unique_and_no_duplicate_models_merge(self):
+        """
+        Ensure there are no duplicate import lines and that models merging only
+        produces one combined line.
+        """
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.CreateModel("X", (), {}, (models.Model,)),
+                    migrations.AddField("X", "f", models.CharField(default="x", max_length=1)),
+                ],
+            },
+        )
+        output = MigrationWriter(migration).as_string()
+        # Count occurrences: there should be exactly one migrations import line
+        self.assertEqual(output.count("from django.db import migrations"), 1)
+        # If models used, ensure there is the combined form once
+        self.assertTrue(("from django.db import migrations, models" in output) or ("from django.db import migrations\n" in output))
+new_imports_code: |
+  # No new imports needed beyond those already used in tests.

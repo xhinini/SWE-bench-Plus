@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 check_framework.test_translation_llm.test_inconsistent_language_settings_when_translation_api_reports_lookuperror_ca_valencia check_framework.test_translation_llm.test_inconsistent_language_settings_when_translation_api_reports_lookuperror_empty_tag check_framework.test_translation_llm.test_inconsistent_language_settings_when_translation_api_reports_lookuperror_en_uppercase check_framework.test_translation_llm.test_inconsistent_language_settings_when_translation_api_reports_lookuperror_en_us check_framework.test_translation_llm.test_inconsistent_language_settings_when_translation_api_reports_lookuperror_en_us_locale_like check_framework.test_translation_llm.test_inconsistent_language_settings_when_translation_api_reports_lookuperror_fr check_framework.test_translation_llm.test_inconsistent_language_settings_when_translation_api_reports_lookuperror_mas check_framework.test_translation_llm.test_inconsistent_language_settings_when_translation_api_reports_lookuperror_sgn_ase check_framework.test_translation_llm.test_inconsistent_language_settings_when_translation_api_reports_lookuperror_sr_at_latin check_framework.test_translation_llm.test_inconsistent_language_settings_when_translation_api_reports_lookuperror_zh_hans
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,142 @@
+from types import SimpleNamespace
+from types import SimpleNamespace
+from django.test import SimpleTestCase
+from django.db.models import Q
+from django.db.models.functions import Mod
+from django.db.models.lookups import Exact
+from django.db.models.sql.where import WhereNode, XOR, OR, AND
+
+
+class DummyCompiler:
+    """
+    Minimal compiler that can be used by WhereNode.as_sql in tests.
+    It recognizes Q, WhereNode, Exact, Case and Mod to return predictable SQL pieces.
+    """
+
+    def __init__(self, connection):
+        self.connection = connection
+
+    def compile(self, obj):
+        # Import here so tests import only when running under Django test runner.
+        from django.db.models import Q
+        from django.db.models.expressions import Case
+        from django.db.models.functions import Mod
+        from django.db.models.lookups import Exact
+
+        # Recurse for nested WhereNode instances.
+        if isinstance(obj, WhereNode):
+            return obj.as_sql(self, self.connection)
+
+        # Q objects represent simple conditions in these tests.
+        if isinstance(obj, Q):
+            # Generate a deterministic SQL fragment based on the Q object's children.
+            return ("Q_COND", [])
+
+        # Case expressions (from the Case(When(...)) construction).
+        if isinstance(obj, Case):
+            return ("CASE_SQL", [])
+
+        # Mod expressions should be detected and reported so tests can assert they exist.
+        if isinstance(obj, Mod):
+            return ("MOD_SQL", [])
+
+        # Exact is used for rhs = Exact(1, rhs_sum_or_mod). Inspect the rhs to see
+        # whether Mod was used by the transformation (Exact.rhs is a Mod instance).
+        if isinstance(obj, Exact):
+            rhs = getattr(obj, "rhs", None)
+            if isinstance(rhs, Mod):
+                return ("EXACT_WITH_MOD", [])
+            # If rhs is not a Mod, return a distinct token so tests notice difference.
+            return ("EXACT_WITHOUT_MOD", [])
+
+        # Default fallback for unknown objects.
+        return ("UNKNOWN_EXPR", [])
+
+
+class WhereNodeXorConversionTests(SimpleTestCase):
+    def setUp(self):
+        # Simulate a backend that doesn't support XOR.
+        self.connection = SimpleNamespace(features=SimpleNamespace(supports_logical_xor=False))
+        self.compiler = DummyCompiler(self.connection)
+
+    def test_xor_three_children_compiles_without_error(self):
+        children = [Q(pk=1), Q(pk=2), Q(pk=3)]
+        node = WhereNode(children, XOR)
+        sql, params = node.as_sql(self.compiler, self.connection)
+        # Should produce a tuple (sql, params) and include an AND between lhs (OR-ed children) and rhs.
+        self.assertIsInstance(sql, str)
+        self.assertIn("AND", sql)
+
+    def test_xor_three_children_contains_or_for_lhs(self):
+        children = [Q(a=1), Q(b=2), Q(c=3)]
+        node = WhereNode(children, XOR)
+        sql, params = node.as_sql(self.compiler, self.connection)
+        # The left-hand side should be an OR of the child conditions.
+        self.assertIn("OR", sql)
+
+    def test_xor_three_children_uses_mod_on_rhs(self):
+        children = [Q(x=1), Q(y=2), Q(z=3)]
+        node = WhereNode(children, XOR)
+        sql, params = node.as_sql(self.compiler, self.connection)
+        # Our DummyCompiler reports EXACT_WITH_MOD when Exact.rhs is a Mod instance.
+        # Ensure the compiled SQL path for Exact detected a Mod.
+        # Since DummyCompiler.compile returns tuples for pieces, ensure that when
+        # compiling the top-level node we eventually see the token for Exact-with-Mod.
+        # We assert that the sql string contains the indicator that our DummyCompiler
+        # returns when compiling the Exact with a Mod.
+        self.assertIn("EXACT_WITH_MOD", sql)
+
+    def test_xor_five_children_compiles_without_error(self):
+        children = [Q(n=i) for i in range(5)]
+        node = WhereNode(children, XOR)
+        sql, params = node.as_sql(self.compiler, self.connection)
+        self.assertIsInstance(sql, str)
+        self.assertIn("AND", sql)
+        self.assertIn("OR", sql)
+
+    def test_xor_five_children_uses_mod_on_rhs(self):
+        children = [Q(v=i) for i in range(5)]
+        node = WhereNode(children, XOR)
+        sql, params = node.as_sql(self.compiler, self.connection)
+        self.assertIn("EXACT_WITH_MOD", sql)
+
+    def test_xor_three_children_negated_compiles_without_error(self):
+        children = [Q(pk=10), Q(pk=20), Q(pk=30)]
+        node = WhereNode(children, XOR, negated=True)
+        sql, params = node.as_sql(self.compiler, self.connection)
+        # Negation should be handled; ensure we still produce SQL and an AND/OR structure.
+        self.assertIsInstance(sql, str)
+        self.assertIn("AND", sql)
+        self.assertIn("OR", sql)
+
+    def test_xor_multiple_children_mixed_field_names(self):
+        children = [Q(a=1), Q(b__gte=2), Q(c__lte=3), Q(d__in=[4]), Q(e__exact=5)]
+        node = WhereNode(children, XOR)
+        sql, params = node.as_sql(self.compiler, self.connection)
+        self.assertIn("EXACT_WITH_MOD", sql)
+
+    def test_xor_three_children_top_level_joins(self):
+        children = [Q(one=1), Q(two=2), Q(three=3)]
+        node = WhereNode(children, XOR)
+        sql, params = node.as_sql(self.compiler, self.connection)
+        # The top-level WhereNode (converted) should join its two parts with 'AND'
+        # and inner lhs should use 'OR' to combine original children.
+        self.assertTrue("AND" in sql and "OR" in sql)
+
+    def test_xor_three_children_params_is_list(self):
+        children = [Q(foo=1), Q(bar=2), Q(baz=3)]
+        node = WhereNode(children, XOR)
+        sql, params = node.as_sql(self.compiler, self.connection)
+        self.assertIsInstance(params, list)
+
+    def test_xor_three_children_exact_rhs_is_mod_instance_before_compile(self):
+        """
+        Ensure that after the XOR-to-(lhs AND rhs) transformation, the rhs of the
+        Exact is a Mod instance (so Mod was used to build the modulo expression).
+        This is validated indirectly via the DummyCompiler returning a distinct token
+        (EXACT_WITH_MOD) when it encounters Exact with rhs being a Mod.
+        """
+        children = [Q(m=1), Q(n=2), Q(o=3)]
+        node = WhereNode(children, XOR)
+        sql, params = node.as_sql(self.compiler, self.connection)
+        self.assertIn("EXACT_WITH_MOD", sql)

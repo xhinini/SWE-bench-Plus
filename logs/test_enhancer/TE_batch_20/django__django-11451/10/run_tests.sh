@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_auth_backends_llm.ModelBackendMissingCredentialsTests.setUp auth_tests.test_auth_backends_llm.ModelBackendMissingCredentialsTests.setUpTestData auth_tests.test_auth_backends_llm.ModelBackendMissingCredentialsTests.test_authenticate_with_both_credentials_calls_hasher_once_and_returns_user auth_tests.test_auth_backends_llm.ModelBackendMissingCredentialsTests.test_empty_credentials_no_queries_and_no_hash_calls auth_tests.test_auth_backends_llm.ModelBackendMissingCredentialsTests.test_empty_string_username_and_password_triggers_auth_path_and_hasher_called auth_tests.test_auth_backends_llm.ModelBackendMissingCredentialsTests.test_explicit_username_none_and_password_provided_no_queries_and_no_hash_calls auth_tests.test_auth_backends_llm.ModelBackendMissingCredentialsTests.test_password_only_no_queries_and_no_hash_calls auth_tests.test_auth_backends_llm.ModelBackendMissingCredentialsTests.test_username_in_kwargs_but_no_password_no_queries_and_no_hash_calls auth_tests.test_auth_backends_llm.ModelBackendMissingCredentialsTests.test_username_kw_and_password_none_short_circuits_even_when_username_present auth_tests.test_auth_backends_llm.ModelBackendMissingCredentialsTests.test_username_none_but_username_in_kwargs_and_no_password_no_queries_and_no_hash_calls auth_tests.test_auth_backends_llm.ModelBackendMissingCredentialsTests.test_username_only_arg_no_queries_and_no_hash_calls auth_tests.test_auth_backends_llm.ModelBackendMissingCredentialsTests.test_username_only_kw_no_queries_and_no_hash_calls
+coverage json -o coverage.json
+: '>>>>> End Test Output'

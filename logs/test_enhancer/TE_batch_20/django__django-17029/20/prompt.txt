@@ -1,0 +1,1113 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `django/apps/registry.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 import functools
+2 import sys
+3 import threading
+4 import warnings
+5 from collections import Counter, defaultdict
+6 from functools import partial
+7 
+8 from django.core.exceptions import AppRegistryNotReady, ImproperlyConfigured
+9 
+10 from .config import AppConfig
+11 
+12 
+13 class Apps:
+14     """
+15     A registry that stores the configuration of installed applications.
+16 
+17     It also keeps track of models, e.g. to provide reverse relations.
+18     """
+19 
+20     def __init__(self, installed_apps=()):
+21         # installed_apps is set to None when creating the main registry
+22         # because it cannot be populated at that point. Other registries must
+23         # provide a list of installed apps and are populated immediately.
+24         if installed_apps is None and hasattr(sys.modules[__name__], "apps"):
+25             raise RuntimeError("You must supply an installed_apps argument.")
+26 
+27         # Mapping of app labels => model names => model classes. Every time a
+28         # model is imported, ModelBase.__new__ calls apps.register_model which
+29         # creates an entry in all_models. All imported models are registered,
+30         # regardless of whether they're defined in an installed application
+31         # and whether the registry has been populated. Since it isn't possible
+32         # to reimport a module safely (it could reexecute initialization code)
+33         # all_models is never overridden or reset.
+34         self.all_models = defaultdict(dict)
+35 
+36         # Mapping of labels to AppConfig instances for installed apps.
+37         self.app_configs = {}
+38 
+39         # Stack of app_configs. Used to store the current state in
+40         # set_available_apps and set_installed_apps.
+41         self.stored_app_configs = []
+42 
+43         # Whether the registry is populated.
+44         self.apps_ready = self.models_ready = self.ready = False
+45         # For the autoreloader.
+46         self.ready_event = threading.Event()
+47 
+48         # Lock for thread-safe population.
+49         self._lock = threading.RLock()
+50         self.loading = False
+51 
+52         # Maps ("app_label", "modelname") tuples to lists of functions to be
+53         # called when the corresponding model is ready. Used by this class's
+54         # `lazy_model_operation()` and `do_pending_operations()` methods.
+55         self._pending_operations = defaultdict(list)
+56 
+57         # Populate apps and models, unless it's the main registry.
+58         if installed_apps is not None:
+59             self.populate(installed_apps)
+60 
+61     def populate(self, installed_apps=None):
+62         """
+63         Load application configurations and models.
+64 
+65         Import each application module and then each model module.
+66 
+67         It is thread-safe and idempotent, but not reentrant.
+68         """
+69         if self.ready:
+70             return
+71 
+72         # populate() might be called by two threads in parallel on servers
+73         # that create threads before initializing the WSGI callable.
+74         with self._lock:
+75             if self.ready:
+76                 return
+77 
+78             # An RLock prevents other threads from entering this section. The
+79             # compare and set operation below is atomic.
+80             if self.loading:
+81                 # Prevent reentrant calls to avoid running AppConfig.ready()
+82                 # methods twice.
+83                 raise RuntimeError("populate() isn't reentrant")
+84             self.loading = True
+85 
+86             # Phase 1: initialize app configs and import app modules.
+87             for entry in installed_apps:
+88                 if isinstance(entry, AppConfig):
+89                     app_config = entry
+90                 else:
+91                     app_config = AppConfig.create(entry)
+92                 if app_config.label in self.app_configs:
+93                     raise ImproperlyConfigured(
+94                         "Application labels aren't unique, "
+95                         "duplicates: %s" % app_config.label
+96                     )
+97 
+98                 self.app_configs[app_config.label] = app_config
+99                 app_config.apps = self
+100 
+101             # Check for duplicate app names.
+102             counts = Counter(
+103                 app_config.name for app_config in self.app_configs.values()
+104             )
+105             duplicates = [name for name, count in counts.most_common() if count > 1]
+106             if duplicates:
+107                 raise ImproperlyConfigured(
+108                     "Application names aren't unique, "
+109                     "duplicates: %s" % ", ".join(duplicates)
+110                 )
+111 
+112             self.apps_ready = True
+113 
+114             # Phase 2: import models modules.
+115             for app_config in self.app_configs.values():
+116                 app_config.import_models()
+117 
+118             self.clear_cache()
+119 
+120             self.models_ready = True
+121 
+122             # Phase 3: run ready() methods of app configs.
+123             for app_config in self.get_app_configs():
+124                 app_config.ready()
+125 
+126             self.ready = True
+127             self.ready_event.set()
+128 
+129     def check_apps_ready(self):
+130         """Raise an exception if all apps haven't been imported yet."""
+131         if not self.apps_ready:
+132             from django.conf import settings
+133 
+134             # If "not ready" is due to unconfigured settings, accessing
+135             # INSTALLED_APPS raises a more helpful ImproperlyConfigured
+136             # exception.
+137             settings.INSTALLED_APPS
+138             raise AppRegistryNotReady("Apps aren't loaded yet.")
+139 
+140     def check_models_ready(self):
+141         """Raise an exception if all models haven't been imported yet."""
+142         if not self.models_ready:
+143             raise AppRegistryNotReady("Models aren't loaded yet.")
+144 
+145     def get_app_configs(self):
+146         """Import applications and return an iterable of app configs."""
+147         self.check_apps_ready()
+148         return self.app_configs.values()
+149 
+150     def get_app_config(self, app_label):
+151         """
+152         Import applications and returns an app config for the given label.
+153 
+154         Raise LookupError if no application exists with this label.
+155         """
+156         self.check_apps_ready()
+157         try:
+158             return self.app_configs[app_label]
+159         except KeyError:
+160             message = "No installed app with label '%s'." % app_label
+161             for app_config in self.get_app_configs():
+162                 if app_config.name == app_label:
+163                     message += " Did you mean '%s'?" % app_config.label
+164                     break
+165             raise LookupError(message)
+166 
+167     # This method is performance-critical at least for Django's test suite.
+168     @functools.cache
+169     def get_models(self, include_auto_created=False, include_swapped=False):
+170         """
+171         Return a list of all installed models.
+172 
+173         By default, the following models aren't included:
+174 
+175         - auto-created models for many-to-many relations without
+176           an explicit intermediate table,
+177         - models that have been swapped out.
+178 
+179         Set the corresponding keyword argument to True to include such models.
+180         """
+181         self.check_models_ready()
+182 
+183         result = []
+184         for app_config in self.app_configs.values():
+185             result.extend(app_config.get_models(include_auto_created, include_swapped))
+186         return result
+187 
+188     def get_model(self, app_label, model_name=None, require_ready=True):
+189         """
+190         Return the model matching the given app_label and model_name.
+191 
+192         As a shortcut, app_label may be in the form <app_label>.<model_name>.
+193 
+194         model_name is case-insensitive.
+195 
+196         Raise LookupError if no application exists with this label, or no
+197         model exists with this name in the application. Raise ValueError if
+198         called with a single argument that doesn't contain exactly one dot.
+199         """
+200         if require_ready:
+201             self.check_models_ready()
+202         else:
+203             self.check_apps_ready()
+204 
+205         if model_name is None:
+206             app_label, model_name = app_label.split(".")
+207 
+208         app_config = self.get_app_config(app_label)
+209 
+210         if not require_ready and app_config.models is None:
+211             app_config.import_models()
+212 
+213         return app_config.get_model(model_name, require_ready=require_ready)
+214 
+215     def register_model(self, app_label, model):
+216         # Since this method is called when models are imported, it cannot
+217         # perform imports because of the risk of import loops. It mustn't
+218         # call get_app_config().
+219         model_name = model._meta.model_name
+220         app_models = self.all_models[app_label]
+221         if model_name in app_models:
+222             if (
+223                 model.__name__ == app_models[model_name].__name__
+224                 and model.__module__ == app_models[model_name].__module__
+225             ):
+226                 warnings.warn(
+227                     "Model '%s.%s' was already registered. Reloading models is not "
+228                     "advised as it can lead to inconsistencies, most notably with "
+229                     "related models." % (app_label, model_name),
+230                     RuntimeWarning,
+231                     stacklevel=2,
+232                 )
+233             else:
+234                 raise RuntimeError(
+235                     "Conflicting '%s' models in application '%s': %s and %s."
+236                     % (model_name, app_label, app_models[model_name], model)
+237                 )
+238         app_models[model_name] = model
+239         self.do_pending_operations(model)
+240         self.clear_cache()
+241 
+242     def is_installed(self, app_name):
+243         """
+244         Check whether an application with this name exists in the registry.
+245 
+246         app_name is the full name of the app e.g. 'django.contrib.admin'.
+247         """
+248         self.check_apps_ready()
+249         return any(ac.name == app_name for ac in self.app_configs.values())
+250 
+251     def get_containing_app_config(self, object_name):
+252         """
+253         Look for an app config containing a given object.
+254 
+255         object_name is the dotted Python path to the object.
+256 
+257         Return the app config for the inner application in case of nesting.
+258         Return None if the object isn't in any registered app config.
+259         """
+260         self.check_apps_ready()
+261         candidates = []
+262         for app_config in self.app_configs.values():
+263             if object_name.startswith(app_config.name):
+264                 subpath = object_name.removeprefix(app_config.name)
+265                 if subpath == "" or subpath[0] == ".":
+266                     candidates.append(app_config)
+267         if candidates:
+268             return sorted(candidates, key=lambda ac: -len(ac.name))[0]
+269 
+270     def get_registered_model(self, app_label, model_name):
+271         """
+272         Similar to get_model(), but doesn't require that an app exists with
+273         the given app_label.
+274 
+275         It's safe to call this method at import time, even while the registry
+276         is being populated.
+277         """
+278         model = self.all_models[app_label].get(model_name.lower())
+279         if model is None:
+280             raise LookupError("Model '%s.%s' not registered." % (app_label, model_name))
+281         return model
+282 
+283     @functools.cache
+284     def get_swappable_settings_name(self, to_string):
+285         """
+286         For a given model string (e.g. "auth.User"), return the name of the
+287         corresponding settings name if it refers to a swappable model. If the
+288         referred model is not swappable, return None.
+289 
+290         This method is decorated with @functools.cache because it's performance
+291         critical when it comes to migrations. Since the swappable settings don't
+292         change after Django has loaded the settings, there is no reason to get
+293         the respective settings attribute over and over again.
+294         """
+295         to_string = to_string.lower()
+296         for model in self.get_models(include_swapped=True):
+297             swapped = model._meta.swapped
+298             # Is this model swapped out for the model given by to_string?
+299             if swapped and swapped.lower() == to_string:
+300                 return model._meta.swappable
+301             # Is this model swappable and the one given by to_string?
+302             if model._meta.swappable and model._meta.label_lower == to_string:
+303                 return model._meta.swappable
+304         return None
+305 
+306     def set_available_apps(self, available):
+307         """
+308         Restrict the set of installed apps used by get_app_config[s].
+309 
+310         available must be an iterable of application names.
+311 
+312         set_available_apps() must be balanced with unset_available_apps().
+313 
+314         Primarily used for performance optimization in TransactionTestCase.
+315 
+316         This method is safe in the sense that it doesn't trigger any imports.
+317         """
+318         available = set(available)
+319         installed = {app_config.name for app_config in self.get_app_configs()}
+320         if not available.issubset(installed):
+321             raise ValueError(
+322                 "Available apps isn't a subset of installed apps, extra apps: %s"
+323                 % ", ".join(available - installed)
+324             )
+325 
+326         self.stored_app_configs.append(self.app_configs)
+327         self.app_configs = {
+328             label: app_config
+329             for label, app_config in self.app_configs.items()
+330             if app_config.name in available
+331         }
+332         self.clear_cache()
+333 
+334     def unset_available_apps(self):
+335         """Cancel a previous call to set_available_apps()."""
+336         self.app_configs = self.stored_app_configs.pop()
+337         self.clear_cache()
+338 
+339     def set_installed_apps(self, installed):
+340         """
+341         Enable a different set of installed apps for get_app_config[s].
+342 
+343         installed must be an iterable in the same format as INSTALLED_APPS.
+344 
+345         set_installed_apps() must be balanced with unset_installed_apps(),
+346         even if it exits with an exception.
+347 
+348         Primarily used as a receiver of the setting_changed signal in tests.
+349 
+350         This method may trigger new imports, which may add new models to the
+351         registry of all imported models. They will stay in the registry even
+352         after unset_installed_apps(). Since it isn't possible to replay
+353         imports safely (e.g. that could lead to registering listeners twice),
+354         models are registered when they're imported and never removed.
+355         """
+356         if not self.ready:
+357             raise AppRegistryNotReady("App registry isn't ready yet.")
+358         self.stored_app_configs.append(self.app_configs)
+359         self.app_configs = {}
+360         self.apps_ready = self.models_ready = self.loading = self.ready = False
+361         self.clear_cache()
+362         self.populate(installed)
+363 
+364     def unset_installed_apps(self):
+365         """Cancel a previous call to set_installed_apps()."""
+366         self.app_configs = self.stored_app_configs.pop()
+367         self.apps_ready = self.models_ready = self.ready = True
+368         self.clear_cache()
+369 
+370     def clear_cache(self):
+371         """
+372         Clear all internal caches, for methods that alter the app registry.
+373 
+374         This is mostly used in tests.
+375         """
+376         self.get_swappable_settings_name.cache_clear()
+377         # Call expire cache on each model. This will purge
+378         # the relation tree and the fields cache.
+379         self.get_models.cache_clear()
+380         if self.ready:
+381             # Circumvent self.get_models() to prevent that the cache is refilled.
+382             # This particularly prevents that an empty value is cached while cloning.
+383             for app_config in self.app_configs.values():
+384                 for model in app_config.get_models(include_auto_created=True):
+385                     model._meta._expire_cache()
+386 
+387     def lazy_model_operation(self, function, *model_keys):
+388         """
+389         Take a function and a number of ("app_label", "modelname") tuples, and
+390         when all the corresponding models have been imported and registered,
+391         call the function with the model classes as its arguments.
+392 
+393         The function passed to this method must accept exactly n models as
+394         arguments, where n=len(model_keys).
+395         """
+396         # Base case: no arguments, just execute the function.
+397         if not model_keys:
+398             function()
+399         # Recursive case: take the head of model_keys, wait for the
+400         # corresponding model class to be imported and registered, then apply
+401         # that argument to the supplied function. Pass the resulting partial
+402         # to lazy_model_operation() along with the remaining model args and
+403         # repeat until all models are loaded and all arguments are applied.
+404         else:
+405             next_model, *more_models = model_keys
+406 
+407             # This will be executed after the class corresponding to next_model
+408             # has been imported and registered. The `func` attribute provides
+409             # duck-type compatibility with partials.
+410             def apply_next_model(model):
+411                 next_function = partial(apply_next_model.func, model)
+412                 self.lazy_model_operation(next_function, *more_models)
+413 
+414             apply_next_model.func = function
+415 
+416             # If the model has already been imported and registered, partially
+417             # apply it to the function now. If not, add it to the list of
+418             # pending operations for the model, where it will be executed with
+419             # the model class as its sole argument once the model is ready.
+420             try:
+421                 model_class = self.get_registered_model(*next_model)
+422             except LookupError:
+423                 self._pending_operations[next_model].append(apply_next_model)
+424             else:
+425                 apply_next_model(model_class)
+426 
+427     def do_pending_operations(self, model):
+428         """
+429         Take a newly-prepared model and pass it to each function waiting for
+430         it. This is called at the very end of Apps.register_model().
+431         """
+432         key = model._meta.app_label, model._meta.model_name
+433         for function in self._pending_operations.pop(key, []):
+434             function(model)
+435 
+436 
+437 apps = Apps(installed_apps=None)
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `django/apps/registry.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/django/apps/registry.py b/django/apps/registry.py
+--- a/django/apps/registry.py
++++ b/django/apps/registry.py
+@@ -373,6 +373,7 @@ def clear_cache(self):
+ 
+         This is mostly used in tests.
+         """
++        self.get_swappable_settings_name.cache_clear()
+         # Call expire cache on each model. This will purge
+         # the relation tree and the fields cache.
+         self.get_models.cache_clear()
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/django/apps/registry.py b/django/apps/registry.py
+index 0683f3ad3c..481dd1fc86 100644
+--- a/django/apps/registry.py
++++ b/django/apps/registry.py
+@@ -376,6 +376,7 @@ class Apps:
+         # Call expire cache on each model. This will purge
+         # the relation tree and the fields cache.
+         self.get_models.cache_clear()
++        self.get_swappable_settings_name.cache_clear()
+         if self.ready:
+             # Circumvent self.get_models() to prevent that the cache is refilled.
+             # This particularly prevents that an empty value is cached while cloning.
+diff --git a/reproduce.py b/reproduce.py
+new file mode 100644
+index 0000000000..966c5e6290
+--- /dev/null
++++ b/reproduce.py
+@@ -0,0 +1,34 @@
++import django
++from django.conf import settings
++
++settings.configure(
++    INSTALLED_APPS=[
++        'django.contrib.auth',
++        'django.contrib.contenttypes',
++    ],
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    }
++)
++django.setup()
++
++from django.apps import apps
++
++# First call to get_swappable_settings_name
++result1 = apps.get_swappable_settings_name("auth.user")
++print(f"First call result: {result1}")
++
++# Clear the cache
++apps.clear_cache()
++
++# Second call to get_swappable_settings_name - should be recalculated but isn't
++result2 = apps.get_swappable_settings_name("auth.user")
++print(f"Second call result: {result2}")
++
++# Check if the cache was actually cleared
++print(f"\nIs cache still populated? {hasattr(apps.get_swappable_settings_name, 'cache_info')}")
++if hasattr(apps.get_swappable_settings_name, 'cache_info'):
++    print(f"Cache info: {apps.get_swappable_settings_name.cache_info()}")
+\ No newline at end of file
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `tests/apps/tests.py` that contains the existing tests.
+-----------------------------------------------------------
+import os
+
+from django.apps import AppConfig, apps
+from django.apps.registry import Apps
+from django.contrib.admin.models import LogEntry
+from django.core.exceptions import AppRegistryNotReady, ImproperlyConfigured
+from django.db import models
+from django.test import SimpleTestCase, override_settings
+from django.test.utils import extend_sys_path, isolate_apps
+
+from .models import SoAlternative, TotallyNormal, new_apps
+from .one_config_app.apps import OneConfig
+from .two_configs_one_default_app.apps import TwoConfig
+
+# Small list with a variety of cases for tests that iterate on installed apps.
+# Intentionally not in alphabetical order to check if the order is preserved.
+
+SOME_INSTALLED_APPS = [
+    "apps.apps.MyAdmin",
+    "apps.apps.MyAuth",
+    "django.contrib.contenttypes",
+    "django.contrib.sessions",
+    "django.contrib.messages",
+    "django.contrib.staticfiles",
+]
+
+SOME_INSTALLED_APPS_NAMES = [
+    "django.contrib.admin",
+    "django.contrib.auth",
+] + SOME_INSTALLED_APPS[2:]
+
+HERE = os.path.dirname(__file__)
+
+
+class AppsTests(SimpleTestCase):
+    def test_singleton_main(self):
+        """
+        Only one main registry can exist.
+        """
+        with self.assertRaises(RuntimeError):
+            Apps(installed_apps=None)
+
+    def test_ready(self):
+        """
+        Tests the ready property of the main registry.
+        """
+        # The main app registry is always ready when the tests run.
+        self.assertIs(apps.ready, True)
+        # Non-main app registries are populated in __init__.
+        self.assertIs(Apps().ready, True)
+        # The condition is set when apps are ready
+        self.assertIs(apps.ready_event.is_set(), True)
+        self.assertIs(Apps().ready_event.is_set(), True)
+
+    def test_bad_app_config(self):
+        """
+        Tests when INSTALLED_APPS contains an incorrect app config.
+        """
+        msg = "'apps.apps.BadConfig' must supply a name attribute."
+        with self.assertRaisesMessage(ImproperlyConfigured, msg):
+            with self.settings(INSTALLED_APPS=["apps.apps.BadConfig"]):
+                pass
+
+    def test_not_an_app_config(self):
+        """
+        Tests when INSTALLED_APPS contains a class that isn't an app config.
+        """
+        msg = "'apps.apps.NotAConfig' isn't a subclass of AppConfig."
+        with self.assertRaisesMessage(ImproperlyConfigured, msg):
+            with self.settings(INSTALLED_APPS=["apps.apps.NotAConfig"]):
+                pass
+
+    def test_no_such_app(self):
+        """
+        Tests when INSTALLED_APPS contains an app that doesn't exist, either
+        directly or via an app config.
+        """
+        with self.assertRaises(ImportError):
+            with self.settings(INSTALLED_APPS=["there is no such app"]):
+                pass
+        msg = (
+            "Cannot import 'there is no such app'. Check that "
+            "'apps.apps.NoSuchApp.name' is correct."
+        )
+        with self.assertRaisesMessage(ImproperlyConfigured, msg):
+            with self.settings(INSTALLED_APPS=["apps.apps.NoSuchApp"]):
+                pass
+
+    def test_no_such_app_config(self):
+        msg = "Module 'apps' does not contain a 'NoSuchConfig' class."
+        with self.assertRaisesMessage(ImportError, msg):
+            with self.settings(INSTALLED_APPS=["apps.NoSuchConfig"]):
+                pass
+
+    def test_no_such_app_config_with_choices(self):
+        msg = (
+            "Module 'apps.apps' does not contain a 'NoSuchConfig' class. "
+            "Choices are: 'BadConfig', 'ModelPKAppsConfig', 'MyAdmin', "
+            "'MyAuth', 'NoSuchApp', 'PlainAppsConfig', 'RelabeledAppsConfig'."
+        )
+        with self.assertRaisesMessage(ImportError, msg):
+            with self.settings(INSTALLED_APPS=["apps.apps.NoSuchConfig"]):
+                pass
+
+    def test_no_config_app(self):
+        """Load an app that doesn't provide an AppConfig class."""
+        with self.settings(INSTALLED_APPS=["apps.no_config_app"]):
+            config = apps.get_app_config("no_config_app")
+        self.assertIsInstance(config, AppConfig)
+
+    def test_one_config_app(self):
+        """Load an app that provides an AppConfig class."""
+        with self.settings(INSTALLED_APPS=["apps.one_config_app"]):
+            config = apps.get_app_config("one_config_app")
+        self.assertIsInstance(config, OneConfig)
+
+    def test_two_configs_app(self):
+        """Load an app that provides two AppConfig classes."""
+        with self.settings(INSTALLED_APPS=["apps.two_configs_app"]):
+            config = apps.get_app_config("two_configs_app")
+        self.assertIsInstance(config, AppConfig)
+
+    def test_two_default_configs_app(self):
+        """Load an app that provides two default AppConfig classes."""
+        msg = (
+            "'apps.two_default_configs_app.apps' declares more than one "
+            "default AppConfig: 'TwoConfig', 'TwoConfigBis'."
+        )
+        with self.assertRaisesMessage(RuntimeError, msg):
+            with self.settings(INSTALLED_APPS=["apps.two_default_configs_app"]):
+                pass
+
+    def test_two_configs_one_default_app(self):
+        """
+        Load an app that provides two AppConfig classes, one being the default.
+        """
+        with self.settings(INSTALLED_APPS=["apps.two_configs_one_default_app"]):
+            config = apps.get_app_config("two_configs_one_default_app")
+        self.assertIsInstance(config, TwoConfig)
+
+    @override_settings(INSTALLED_APPS=SOME_INSTALLED_APPS)
+    def test_get_app_configs(self):
+        """
+        Tests apps.get_app_configs().
+        """
+        app_configs = apps.get_app_configs()
+        self.assertEqual(
+            [app_config.name for app_config in app_configs], SOME_INSTALLED_APPS_NAMES
+        )
+
+    @override_settings(INSTALLED_APPS=SOME_INSTALLED_APPS)
+    def test_get_app_config(self):
+        """
+        Tests apps.get_app_config().
+        """
+        app_config = apps.get_app_config("admin")
+        self.assertEqual(app_config.name, "django.contrib.admin")
+
+        app_config = apps.get_app_config("staticfiles")
+        self.assertEqual(app_config.name, "django.contrib.staticfiles")
+
+        with self.assertRaises(LookupError):
+            apps.get_app_config("admindocs")
+
+        msg = "No installed app with label 'django.contrib.auth'. Did you mean 'myauth'"
+        with self.assertRaisesMessage(LookupError, msg):
+            apps.get_app_config("django.contrib.auth")
+
+    @override_settings(INSTALLED_APPS=SOME_INSTALLED_APPS)
+    def test_is_installed(self):
+        """
+        Tests apps.is_installed().
+        """
+        self.assertIs(apps.is_installed("django.contrib.admin"), True)
+        self.assertIs(apps.is_installed("django.contrib.auth"), True)
+        self.assertIs(apps.is_installed("django.contrib.staticfiles"), True)
+        self.assertIs(apps.is_installed("django.contrib.admindocs"), False)
+
+    @override_settings(INSTALLED_APPS=SOME_INSTALLED_APPS)
+    def test_get_model(self):
+        """
+        Tests apps.get_model().
+        """
+        self.assertEqual(apps.get_model("admin", "LogEntry"), LogEntry)
+        with self.assertRaises(LookupError):
+            apps.get_model("admin", "LogExit")
+
+        # App label is case-sensitive, Model name is case-insensitive.
+        self.assertEqual(apps.get_model("admin", "loGentrY"), LogEntry)
+        with self.assertRaises(LookupError):
+            apps.get_model("Admin", "LogEntry")
+
+        # A single argument is accepted.
+        self.assertEqual(apps.get_model("admin.LogEntry"), LogEntry)
+        with self.assertRaises(LookupError):
+            apps.get_model("admin.LogExit")
+        with self.assertRaises(ValueError):
+            apps.get_model("admin_LogEntry")
+
+    @override_settings(INSTALLED_APPS=SOME_INSTALLED_APPS)
+    def test_clear_cache(self):
+        # Set cache.
+        self.assertIsNone(apps.get_swappable_settings_name("admin.LogEntry"))
+        apps.get_models()
+
+        apps.clear_cache()
+
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(apps.get_models.cache_info().currsize, 0)
+
+    @override_settings(INSTALLED_APPS=["apps.apps.RelabeledAppsConfig"])
+    def test_relabeling(self):
+        self.assertEqual(apps.get_app_config("relabeled").name, "apps")
+
+    def test_duplicate_labels(self):
+        with self.assertRaisesMessage(
+            ImproperlyConfigured, "Application labels aren't unique"
+        ):
+            with self.settings(INSTALLED_APPS=["apps.apps.PlainAppsConfig", "apps"]):
+                pass
+
+    def test_duplicate_names(self):
+        with self.assertRaisesMessage(
+            ImproperlyConfigured, "Application names aren't unique"
+        ):
+            with self.settings(
+                INSTALLED_APPS=["apps.apps.RelabeledAppsConfig", "apps"]
+            ):
+                pass
+
+    def test_import_exception_is_not_masked(self):
+        """
+        App discovery should preserve stack traces. Regression test for #22920.
+        """
+        with self.assertRaisesMessage(ImportError, "Oops"):
+            with self.settings(INSTALLED_APPS=["import_error_package"]):
+                pass
+
+    def test_models_py(self):
+        """
+        The models in the models.py file were loaded correctly.
+        """
+        self.assertEqual(apps.get_model("apps", "TotallyNormal"), TotallyNormal)
+        with self.assertRaises(LookupError):
+            apps.get_model("apps", "SoAlternative")
+
+        with self.assertRaises(LookupError):
+            new_apps.get_model("apps", "TotallyNormal")
+        self.assertEqual(new_apps.get_model("apps", "SoAlternative"), SoAlternative)
+
+    def test_models_not_loaded(self):
+        """
+        apps.get_models() raises an exception if apps.models_ready isn't True.
+        """
+        apps.models_ready = False
+        try:
+            # The cache must be cleared to trigger the exception.
+            apps.get_models.cache_clear()
+            with self.assertRaisesMessage(
+                AppRegistryNotReady, "Models aren't loaded yet."
+            ):
+                apps.get_models()
+        finally:
+            apps.models_ready = True
+
+    def test_dynamic_load(self):
+        """
+        Makes a new model at runtime and ensures it goes into the right place.
+        """
+        old_models = list(apps.get_app_config("apps").get_models())
+        # Construct a new model in a new app registry
+        body = {}
+        new_apps = Apps(["apps"])
+        meta_contents = {
+            "app_label": "apps",
+            "apps": new_apps,
+        }
+        meta = type("Meta", (), meta_contents)
+        body["Meta"] = meta
+        body["__module__"] = TotallyNormal.__module__
+        temp_model = type("SouthPonies", (models.Model,), body)
+        # Make sure it appeared in the right place!
+        self.assertEqual(list(apps.get_app_config("apps").get_models()), old_models)
+        with self.assertRaises(LookupError):
+            apps.get_model("apps", "SouthPonies")
+        self.assertEqual(new_apps.get_model("apps", "SouthPonies"), temp_model)
+
+    def test_model_clash(self):
+        """
+        Test for behavior when two models clash in the app registry.
+        """
+        new_apps = Apps(["apps"])
+        meta_contents = {
+            "app_label": "apps",
+            "apps": new_apps,
+        }
+
+        body = {}
+        body["Meta"] = type("Meta", (), meta_contents)
+        body["__module__"] = TotallyNormal.__module__
+        type("SouthPonies", (models.Model,), body)
+
+        # When __name__ and __module__ match we assume the module
+        # was reloaded and issue a warning. This use-case is
+        # useful for REPL. Refs #23621.
+        body = {}
+        body["Meta"] = type("Meta", (), meta_contents)
+        body["__module__"] = TotallyNormal.__module__
+        msg = (
+            "Model 'apps.southponies' was already registered. "
+            "Reloading models is not advised as it can lead to inconsistencies, "
+            "most notably with related models."
+        )
+        with self.assertRaisesMessage(RuntimeWarning, msg):
+            type("SouthPonies", (models.Model,), body)
+
+        # If it doesn't appear to be a reloaded module then we expect
+        # a RuntimeError.
+        body = {}
+        body["Meta"] = type("Meta", (), meta_contents)
+        body["__module__"] = TotallyNormal.__module__ + ".whatever"
+        with self.assertRaisesMessage(
+            RuntimeError, "Conflicting 'southponies' models in application 'apps':"
+        ):
+            type("SouthPonies", (models.Model,), body)
+
+    def test_get_containing_app_config_apps_not_ready(self):
+        """
+        apps.get_containing_app_config() should raise an exception if
+        apps.apps_ready isn't True.
+        """
+        apps.apps_ready = False
+        try:
+            with self.assertRaisesMessage(
+                AppRegistryNotReady, "Apps aren't loaded yet"
+            ):
+                apps.get_containing_app_config("foo")
+        finally:
+            apps.apps_ready = True
+
+    @isolate_apps("apps", kwarg_name="apps")
+    def test_lazy_model_operation(self, apps):
+        """
+        Tests apps.lazy_model_operation().
+        """
+        model_classes = []
+        initial_pending = set(apps._pending_operations)
+
+        def test_func(*models):
+            model_classes[:] = models
+
+        class LazyA(models.Model):
+            pass
+
+        # Test models appearing twice, and models appearing consecutively
+        model_keys = [
+            ("apps", model_name)
+            for model_name in ["lazya", "lazyb", "lazyb", "lazyc", "lazya"]
+        ]
+        apps.lazy_model_operation(test_func, *model_keys)
+
+        # LazyModelA shouldn't be waited on since it's already registered,
+        # and LazyModelC shouldn't be waited on until LazyModelB exists.
+        self.assertEqual(
+            set(apps._pending_operations) - initial_pending, {("apps", "lazyb")}
+        )
+
+        # Multiple operations can wait on the same model
+        apps.lazy_model_operation(test_func, ("apps", "lazyb"))
+
+        class LazyB(models.Model):
+            pass
+
+        self.assertEqual(model_classes, [LazyB])
+
+        # Now we are just waiting on LazyModelC.
+        self.assertEqual(
+            set(apps._pending_operations) - initial_pending, {("apps", "lazyc")}
+        )
+
+        class LazyC(models.Model):
+            pass
+
+        # Everything should be loaded - make sure the callback was executed properly.
+        self.assertEqual(model_classes, [LazyA, LazyB, LazyB, LazyC, LazyA])
+
+
+class Stub:
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
+class AppConfigTests(SimpleTestCase):
+    """Unit tests for AppConfig class."""
+
+    def test_path_set_explicitly(self):
+        """If subclass sets path as class attr, no module attributes needed."""
+
+        class MyAppConfig(AppConfig):
+            path = "foo"
+
+        ac = MyAppConfig("label", Stub())
+
+        self.assertEqual(ac.path, "foo")
+
+    def test_explicit_path_overrides(self):
+        """If path set as class attr, overrides __path__ and __file__."""
+
+        class MyAppConfig(AppConfig):
+            path = "foo"
+
+        ac = MyAppConfig("label", Stub(__path__=["a"], __file__="b/__init__.py"))
+
+        self.assertEqual(ac.path, "foo")
+
+    def test_dunder_path(self):
+        """If single element in __path__, use it (in preference to __file__)."""
+        ac = AppConfig("label", Stub(__path__=["a"], __file__="b/__init__.py"))
+
+        self.assertEqual(ac.path, "a")
+
+    def test_no_dunder_path_fallback_to_dunder_file(self):
+        """If there is no __path__ attr, use __file__."""
+        ac = AppConfig("label", Stub(__file__="b/__init__.py"))
+
+        self.assertEqual(ac.path, "b")
+
+    def test_empty_dunder_path_fallback_to_dunder_file(self):
+        """If the __path__ attr is empty, use __file__ if set."""
+        ac = AppConfig("label", Stub(__path__=[], __file__="b/__init__.py"))
+
+        self.assertEqual(ac.path, "b")
+
+    def test_multiple_dunder_path_fallback_to_dunder_file(self):
+        """If the __path__ attr is length>1, use __file__ if set."""
+        ac = AppConfig("label", Stub(__path__=["a", "b"], __file__="c/__init__.py"))
+
+        self.assertEqual(ac.path, "c")
+
+    def test_no_dunder_path_or_dunder_file(self):
+        """If there is no __path__ or __file__, raise ImproperlyConfigured."""
+        with self.assertRaises(ImproperlyConfigured):
+            AppConfig("label", Stub())
+
+    def test_empty_dunder_path_no_dunder_file(self):
+        """If the __path__ attr is empty and there is no __file__, raise."""
+        with self.assertRaises(ImproperlyConfigured):
+            AppConfig("label", Stub(__path__=[]))
+
+    def test_multiple_dunder_path_no_dunder_file(self):
+        """If the __path__ attr is length>1 and there is no __file__, raise."""
+        with self.assertRaises(ImproperlyConfigured):
+            AppConfig("label", Stub(__path__=["a", "b"]))
+
+    def test_duplicate_dunder_path_no_dunder_file(self):
+        """
+        If the __path__ attr contains duplicate paths and there is no
+        __file__, they duplicates should be deduplicated (#25246).
+        """
+        ac = AppConfig("label", Stub(__path__=["a", "a"]))
+        self.assertEqual(ac.path, "a")
+
+    def test_repr(self):
+        ac = AppConfig("label", Stub(__path__=["a"]))
+        self.assertEqual(repr(ac), "<AppConfig: label>")
+
+    def test_invalid_label(self):
+        class MyAppConfig(AppConfig):
+            label = "invalid.label"
+
+        msg = "The app label 'invalid.label' is not a valid Python identifier."
+        with self.assertRaisesMessage(ImproperlyConfigured, msg):
+            MyAppConfig("test_app", Stub())
+
+    @override_settings(
+        INSTALLED_APPS=["apps.apps.ModelPKAppsConfig"],
+        DEFAULT_AUTO_FIELD="django.db.models.SmallAutoField",
+    )
+    def test_app_default_auto_field(self):
+        apps_config = apps.get_app_config("apps")
+        self.assertEqual(
+            apps_config.default_auto_field,
+            "django.db.models.BigAutoField",
+        )
+        self.assertIs(apps_config._is_default_auto_field_overridden, True)
+
+    @override_settings(
+        INSTALLED_APPS=["apps.apps.PlainAppsConfig"],
+        DEFAULT_AUTO_FIELD="django.db.models.SmallAutoField",
+    )
+    def test_default_auto_field_setting(self):
+        apps_config = apps.get_app_config("apps")
+        self.assertEqual(
+            apps_config.default_auto_field,
+            "django.db.models.SmallAutoField",
+        )
+        self.assertIs(apps_config._is_default_auto_field_overridden, False)
+
+
+class NamespacePackageAppTests(SimpleTestCase):
+    # We need nsapp to be top-level so our multiple-paths tests can add another
+    # location for it (if its inside a normal package with an __init__.py that
+    # isn't possible). In order to avoid cluttering the already-full tests/ dir
+    # (which is on sys.path), we add these new entries to sys.path temporarily.
+    base_location = os.path.join(HERE, "namespace_package_base")
+    other_location = os.path.join(HERE, "namespace_package_other_base")
+    app_path = os.path.join(base_location, "nsapp")
+
+    def test_single_path(self):
+        """
+        A Py3.3+ namespace package can be an app if it has only one path.
+        """
+        with extend_sys_path(self.base_location):
+            with self.settings(INSTALLED_APPS=["nsapp"]):
+                app_config = apps.get_app_config("nsapp")
+                self.assertEqual(app_config.path, self.app_path)
+
+    def test_multiple_paths(self):
+        """
+        A Py3.3+ namespace package with multiple locations cannot be an app.
+
+        (Because then we wouldn't know where to load its templates, static
+        assets, etc. from.)
+        """
+        # Temporarily add two directories to sys.path that both contain
+        # components of the "nsapp" package.
+        with extend_sys_path(self.base_location, self.other_location):
+            with self.assertRaises(ImproperlyConfigured):
+                with self.settings(INSTALLED_APPS=["nsapp"]):
+                    pass
+
+    def test_multiple_paths_explicit_path(self):
+        """
+        Multiple locations are ok only if app-config has explicit path.
+        """
+        # Temporarily add two directories to sys.path that both contain
+        # components of the "nsapp" package.
+        with extend_sys_path(self.base_location, self.other_location):
+            with self.settings(INSTALLED_APPS=["nsapp.apps.NSAppConfig"]):
+                app_config = apps.get_app_config("nsapp")
+                self.assertEqual(app_config.path, self.app_path)
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""

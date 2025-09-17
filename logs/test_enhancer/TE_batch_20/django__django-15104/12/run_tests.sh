@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_autodetector_llm.RegressionAutodetectorTests._detect_changes_for migrations.test_autodetector_llm.RegressionAutodetectorTests._make_hardcoded_fk migrations.test_autodetector_llm.RegressionAutodetectorTests.make_project_state migrations.test_autodetector_llm.RegressionAutodetectorTests.test_create_model_with_hardcoded_fk migrations.test_autodetector_llm.RegressionAutodetectorTests.test_detect_changes_with_hardcoded_fk_in_different_app migrations.test_autodetector_llm.RegressionAutodetectorTests.test_multiple_hardcoded_fks_in_model migrations.test_autodetector_llm.RegressionAutodetectorTests.test_only_relation_agnostic_fields_handles_missing_to migrations.test_autodetector_llm.RegressionAutodetectorTests.test_only_relation_agnostic_fields_removes_to_when_present migrations.test_autodetector_llm.RegressionAutodetectorTests.test_only_relation_agnostic_fields_with_mixed_fields migrations.test_autodetector_llm.RegressionAutodetectorTests.test_rename_detection_does_not_error_when_deconstruct_omits_to migrations.test_autodetector_llm.RegressionAutodetectorTests.test_rename_model_with_hardcoded_fk
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_autodetector_llm.HardcodedFK.__init__ migrations.test_autodetector_llm.HardcodedFK.deconstruct migrations.test_autodetector_llm.HardcodedM2M.__init__ migrations.test_autodetector_llm.HardcodedM2M.deconstruct migrations.test_autodetector_llm.HardcodedOneToOne.__init__ migrations.test_autodetector_llm.HardcodedOneToOne.deconstruct migrations.test_autodetector_llm._make_states_for_rename migrations.test_autodetector_llm.test_rename_model_with_both_sides_custom_fk_missing_to migrations.test_autodetector_llm.test_rename_model_with_custom_fk_and_mixed_field_types migrations.test_autodetector_llm.test_rename_model_with_custom_fk_deconstruct_missing_to_new migrations.test_autodetector_llm.test_rename_model_with_custom_fk_deconstruct_missing_to_old migrations.test_autodetector_llm.test_rename_model_with_custom_m2m_deconstruct_missing_to_new migrations.test_autodetector_llm.test_rename_model_with_custom_m2m_deconstruct_missing_to_old migrations.test_autodetector_llm.test_rename_model_with_custom_onetoone_deconstruct_missing_to_new migrations.test_autodetector_llm.test_rename_model_with_custom_onetoone_deconstruct_missing_to_old
+coverage json -o coverage.json
+: '>>>>> End Test Output'

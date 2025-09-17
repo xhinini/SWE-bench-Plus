@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 cache.tests_llm.FileBasedCacheHasKeyRegressionTests.setUp cache.tests_llm.FileBasedCacheHasKeyRegressionTests.tearDown cache.tests_llm.FileBasedCacheHasKeyRegressionTests.test_has_key_calls_open_once_in_race_scenario cache.tests_llm.FileBasedCacheHasKeyRegressionTests.test_has_key_considers_empty_file_expired cache.tests_llm.FileBasedCacheHasKeyRegressionTests.test_has_key_handles_filenotfound_when_exists_reports_true cache.tests_llm.FileBasedCacheHasKeyRegressionTests.test_has_key_handles_filenotfound_with_unicode_key cache.tests_llm.FileBasedCacheHasKeyRegressionTests.test_has_key_handles_filenotfound_with_version_argument cache.tests_llm.FileBasedCacheHasKeyRegressionTests.test_has_key_missing_file_without_exists_call cache.tests_llm.FileBasedCacheHasKeyRegressionTests.test_has_key_propagates_permission_error_from_open cache.tests_llm.FileBasedCacheHasKeyRegressionTests.test_has_key_returns_false_for_expired_entry cache.tests_llm.FileBasedCacheHasKeyRegressionTests.test_has_key_returns_true_for_non_expired_entry cache.tests_llm.FileBasedCacheHasKeyRegressionTests.test_has_key_with_pathlib_location_handles_race
+coverage json -o coverage.json
+: '>>>>> End Test Output'

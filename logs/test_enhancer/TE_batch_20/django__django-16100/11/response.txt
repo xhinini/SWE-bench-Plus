@@ -1,0 +1,191 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests verify that ModelAdmin.changelist_view uses a transaction.atomic()
+  context manager with the correct "using" argument (router.db_for_write(self.model))
+  when saving list_editable changes. The candidate model patch called
+  transaction.atomic() without the using=... argument; the gold patch calls
+  transaction.atomic(using=router.db_for_write(self.model)). Each test patches
+  django.db.transaction.atomic and django.db.router.db_for_write to assert that
+  atomic() is invoked with the expected using value in different scenarios:
+  single change, multiple changes, no changes, partially changed forms, and when
+  log_change raises DatabaseError. One test also asserts atomic() is called with
+  using=None when the router returns None.
+test_code: |
+  # New tests appended to tests/admin_changelist/tests.py
+  from unittest import mock
+  from django.db import DatabaseError
+  from django.urls import reverse
+  
+  @override_settings(ROOT_URLCONF="admin_changelist.urls")
+  class ChangeListTransactionUsingTests(ChangeListTests):
+      def _post_swallow_data(self, data):
+          """Helper to post data to the Swallow changelist and return response."""
+          self.client.force_login(self.superuser)
+          changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+          return self.client.post(changelist_url, data)
+  
+      def _swallow_base_objects(self):
+          """Create two swallow objects and return (a, b)."""
+          a = Swallow.objects.create(origin="Swallow A", load=4, speed=1)
+          b = Swallow.objects.create(origin="Swallow B", load=2, speed=2)
+          return a, b
+  
+      def _build_form_data(self, objs, changes):
+          """
+          Build POST data for list_editable changelist. `objs` is list of swallows,
+          `changes` is dict mapping index -> dict of changed field values.
+          """
+          total = len(objs)
+          data = {
+              "form-TOTAL_FORMS": str(total),
+              "form-INITIAL_FORMS": str(total),
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "_save": "Save",
+          }
+          for i, obj in enumerate(objs):
+              # uuid is the pk attr name used in the swallows tests
+              data[f"form-{i}-uuid"] = str(obj.pk)
+              # populate with current values as defaults
+              data[f"form-{i}-load"] = str(obj.load)
+              data[f"form-{i}-speed"] = str(obj.speed)
+              # apply any overrides (changed fields)
+              if i in changes:
+                  for k, v in changes[i].items():
+                      data[f"form-{i}-{k}"] = str(v)
+          return data
+  
+      @mock.patch("django.db.transaction.atomic")
+      @mock.patch("django.db.router.db_for_write", return_value="other")
+      def test_atomic_called_with_correct_using_on_single_change(self, mock_db_for_write, mock_atomic):
+          a, b = self._swallow_base_objects()
+          data = self._build_form_data([a, b], {0: {"load": "9.0", "speed": "3.0"}})
+          response = self._post_swallow_data(data)
+          # atomic must be called with using='other'
+          mock_atomic.assert_called_once_with(using="other")
+  
+      @mock.patch("django.db.transaction.atomic")
+      @mock.patch("django.db.router.db_for_write", return_value="other-db")
+      def test_atomic_called_with_correct_using_on_multiple_changes(self, mock_db_for_write, mock_atomic):
+          a, b = self._swallow_base_objects()
+          # change both objects
+          data = self._build_form_data(
+              [a, b],
+              {0: {"load": "9.0", "speed": "3.0"}, 1: {"load": "5.0", "speed": "1.0"}},
+          )
+          response = self._post_swallow_data(data)
+          mock_atomic.assert_called_once_with(using="other-db")
+  
+      @mock.patch("django.db.transaction.atomic")
+      @mock.patch("django.db.router.db_for_write", return_value="other")
+      def test_atomic_called_with_correct_using_when_no_changes(self, mock_db_for_write, mock_atomic):
+          a, b = self._swallow_base_objects()
+          # No changes applied at all
+          data = self._build_form_data([a, b], {})
+          response = self._post_swallow_data(data)
+          # atomic should still be used even if changecount ends up zero
+          mock_atomic.assert_called_once_with(using="other")
+  
+      @mock.patch("django.db.transaction.atomic")
+      @mock.patch("django.db.router.db_for_write", return_value="custom-db")
+      def test_atomic_called_with_correct_using_when_some_forms_unchanged(self, mock_db_for_write, mock_atomic):
+          a, b = self._swallow_base_objects()
+          # change only second object
+          data = self._build_form_data([a, b], {1: {"load": "7.0"}})
+          response = self._post_swallow_data(data)
+          mock_atomic.assert_called_once_with(using="custom-db")
+  
+      @mock.patch("django.db.transaction.atomic")
+      @mock.patch("django.db.router.db_for_write", return_value=None)
+      def test_atomic_called_with_using_none_when_router_returns_none(self, mock_db_for_write, mock_atomic):
+          a, b = self._swallow_base_objects()
+          data = self._build_form_data([a, b], {0: {"load": "9.0"}})
+          response = self._post_swallow_data(data)
+          # When router returns None, atomic should be called with using=None
+          mock_atomic.assert_called_once_with(using=None)
+  
+      @mock.patch("django.db.transaction.atomic")
+      @mock.patch("django.db.router.db_for_write", return_value="other")
+      def test_atomic_called_exactly_once_for_each_post(self, mock_db_for_write, mock_atomic):
+          a, b = self._swallow_base_objects()
+          data1 = self._build_form_data([a, b], {0: {"load": "9.0"}})
+          data2 = self._build_form_data([a, b], {1: {"load": "8.0"}})
+          self._post_swallow_data(data1)
+          self._post_swallow_data(data2)
+          # atomic should have been called once per POST
+          self.assertEqual(mock_atomic.call_count, 2)
+          mock_atomic.assert_any_call(using="other")
+  
+      @mock.patch("django.db.transaction.atomic")
+      @mock.patch("django.db.router.db_for_write", return_value="other")
+      def test_atomic_called_when_prefix_contains_regex_chars(self, mock_db_for_write, mock_atomic):
+          # This test mimics a different form prefix that can contain regex chars.
+          # Reuse swallows but construct a prefix-like POST. The ModelAdmin uses
+          # FormSet.get_default_prefix(); this test still verifies atomic usage.
+          a, b = self._swallow_base_objects()
+          data = {
+              "form$-TOTAL_FORMS": "2",
+              "form$-INITIAL_FORMS": "2",
+              "form$-MIN_NUM_FORMS": "0",
+              "form$-MAX_NUM_FORMS": "1000",
+              "form$-0-uuid": str(a.pk),
+              "form$-0-load": "9.0",
+              "form$-0-speed": "3.0",
+              "form$-1-uuid": str(b.pk),
+              "form$-1-load": "5.0",
+              "form$-1-speed": "1.0",
+              "_save": "Save",
+          }
+          self.client.force_login(self.superuser)
+          changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+          # Post raw data; behaviour under test is transaction.atomic usage
+          self.client.post(changelist_url, data)
+          mock_atomic.assert_called_once_with(using="other")
+  
+      @mock.patch("django.db.transaction.atomic")
+      @mock.patch("django.db.router.db_for_write", return_value="other")
+      @mock.patch("django.contrib.admin.ModelAdmin.log_change", side_effect=DatabaseError)
+      def test_atomic_called_with_correct_using_when_log_change_raises(self, mock_log_change, mock_db_for_write, mock_atomic):
+          a, b = self._swallow_base_objects()
+          data = self._build_form_data([a, b], {0: {"load": "9.0"}})
+          self.client.force_login(self.superuser)
+          changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+          with self.assertRaises(DatabaseError):
+              self.client.post(changelist_url, data)
+          # Even if log_change raises, the code should have entered transaction.atomic(...)
+          mock_atomic.assert_called_once_with(using="other")
+  
+      @mock.patch("django.db.transaction.atomic")
+      @mock.patch("django.db.router.db_for_write", return_value="other")
+      def test_atomic_called_with_correct_using_for_unsorted_changelist(self, mock_db_for_write, mock_atomic):
+          # Ensure that even when the changelist has a non-default ordering (o parameter),
+          # atomic is still called with the proper using argument.
+          a, b = self._swallow_base_objects()
+          data = self._build_form_data([a, b], {0: {"load": "9.0"}})
+          # Provide ordering via extra param (follow pattern used elsewhere)
+          response = self.client.post(
+              reverse("admin:admin_changelist_swallow_changelist") + "?o=-2",
+              data,
+          )
+          mock_atomic.assert_called_once_with(using="other")
+  
+      @mock.patch("django.db.transaction.atomic")
+      @mock.patch("django.db.router.db_for_write", return_value="other")
+      def test_atomic_called_with_correct_using_when_formset_invalid(self, mock_db_for_write, mock_atomic):
+          """
+          If the formset is invalid, the view should not reach the saving code
+          and so atomic should not be called. This ensures atomic is only used
+          when appropriate (is_valid() True). This test asserts that atomic is
+          not called when we submit invalid data.
+          """
+          a, b = self._swallow_base_objects()
+          # Make data invalid by providing a non-numeric value for a numeric field
+          data = self._build_form_data([a, b], {0: {"load": "not-a-number"}})
+          self.client.force_login(self.superuser)
+          changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+          response = self.client.post(changelist_url, data)
+          # atomic should not have been entered because formset.is_valid() is False
+          mock_atomic.assert_not_called()
+new_imports_code: |
+  # No new imports required beyond those already present in tests/admin_changelist/tests.py.

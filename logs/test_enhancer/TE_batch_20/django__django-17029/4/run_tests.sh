@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 apps.tests_llm.ClearCacheRegressionTests.tearDown apps.tests_llm.ClearCacheRegressionTests.test_clear_cache_after_get_models_populates_then_clears apps.tests_llm.ClearCacheRegressionTests.test_clear_cache_after_get_swappable_called_for_multiple_strings apps.tests_llm.ClearCacheRegressionTests.test_clear_cache_basic_swappable_and_models apps.tests_llm.ClearCacheRegressionTests.test_clear_cache_does_not_invoke_expire_when_not_ready apps.tests_llm.ClearCacheRegressionTests.test_clear_cache_is_case_insensitive_input_preserved_and_cleared apps.tests_llm.ClearCacheRegressionTests.test_clear_cache_repeated_calls_with_repopulations apps.tests_llm.ClearCacheRegressionTests.test_clear_cache_while_models_ready_toggle apps.tests_llm.ClearCacheRegressionTests.test_clear_cache_with_model_expire_repopulates_and_finally_cleared_multiple_models apps.tests_llm.ClearCacheRegressionTests.test_clear_cache_with_model_expire_repopulates_and_finally_cleared_single_model apps.tests_llm.ClearCacheRegressionTests.test_clear_cache_with_set_available_apps_preserves_behavior
+coverage json -o coverage.json
+: '>>>>> End Test Output'

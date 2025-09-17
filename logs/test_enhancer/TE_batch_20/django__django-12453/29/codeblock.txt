@@ -1,0 +1,245 @@
+import django.db.backends.base.creation as creation
+import types
+from unittest import mock
+
+from django.test import SimpleTestCase
+from django.db import connection
+import django.db.backends.base.creation as creation
+
+
+class DummyCM:
+    """
+    A simple context manager that records enter/exit events to a list.
+    """
+    def __init__(self, record, name):
+        self.record = record
+        self.name = name
+    def __enter__(self):
+        self.record.append(self.name + '.enter')
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        self.record.append(self.name + '.exit')
+        # Do not suppress exceptions
+        return False
+
+class TestDeserializeDbFromStringAdditional(SimpleTestCase):
+    def setUp(self):
+        # Keep a fresh recorder for each test
+        self.record = []
+
+    def _make_atomic(self):
+        # This factory mirrors the signature used in creation.atomic(using=...)
+        def _atomic(using=None):
+            return DummyCM(self.record, 'atomic')
+        return _atomic
+
+    def _make_constraint_cm(self):
+        return lambda: DummyCM(self.record, 'constraint')
+
+    def test_atomic_and_constraint_sequence(self):
+        """
+        Ensure atomic (the symbol imported in the creation module) is entered before
+        constraint_checks_disabled and that check_constraints is called before atomic exit.
+        """
+        data = "[]"
+        # Patch the atomic symbol in the creation module
+        with mock.patch('django.db.backends.base.creation.atomic', new=self._make_atomic()):
+            # Patch the connection's constraint_checks_disabled to our context manager
+            with mock.patch.object(connection, 'constraint_checks_disabled', new=self._make_constraint_cm()):
+                # Patch check_constraints to record its call
+                with mock.patch.object(connection, 'check_constraints', new=lambda: self.record.append('check_constraints')):
+                    # Patch serializers.deserialize inside the creation module to yield nothing
+                    with mock.patch('django.db.backends.base.creation.serializers.deserialize', return_value=iter(())) as mocked_deserialize:
+                        connection.creation.deserialize_db_from_string(data)
+                        # Verify the order of operations
+                        self.assertEqual(
+                            self.record,
+                            ['atomic.enter', 'constraint.enter', 'constraint.exit', 'check_constraints', 'atomic.exit']
+                        )
+                        mocked_deserialize.assert_called_once()
+
+    def test_atomic_used_in_module(self):
+        """
+        Ensure the creation module's atomic is used (this will fail for a patch that calls
+        transaction.atomic instead of the module atomic symbol).
+        """
+        data = "[]"
+        atomic_called = {'entered': False, 'exited': False}
+
+        def atomic_factory(using=None):
+            class C:
+                def __enter__(self_inner):
+                    atomic_called['entered'] = True
+                    return self_inner
+                def __exit__(self_inner, exc_type, exc, tb):
+                    atomic_called['exited'] = True
+                    return False
+            return C()
+
+        with mock.patch('django.db.backends.base.creation.atomic', new=atomic_factory):
+            with mock.patch.object(connection, 'constraint_checks_disabled', new=self._make_constraint_cm()):
+                with mock.patch.object(connection, 'check_constraints', new=lambda: None):
+                    with mock.patch('django.db.backends.base.creation.serializers.deserialize', return_value=iter(())):
+                        connection.creation.deserialize_db_from_string(data)
+                        self.assertTrue(atomic_called['entered'])
+                        self.assertTrue(atomic_called['exited'])
+
+    def test_constraint_checks_disabled_called(self):
+        """
+        Ensure that connection.constraint_checks_disabled() is invoked.
+        """
+        data = "[]"
+        called = {'entered': False, 'exited': False}
+
+        def constraint_factory():
+            class C:
+                def __enter__(self_inner):
+                    called['entered'] = True
+                    return self_inner
+                def __exit__(self_inner, exc_type, exc, tb):
+                    called['exited'] = True
+                    return False
+            return C()
+
+        with mock.patch('django.db.backends.base.creation.atomic', new=self._make_atomic()):
+            with mock.patch.object(connection, 'constraint_checks_disabled', new=constraint_factory):
+                with mock.patch.object(connection, 'check_constraints', new=lambda: None):
+                    with mock.patch('django.db.backends.base.creation.serializers.deserialize', return_value=iter(())):
+                        connection.creation.deserialize_db_from_string(data)
+                        self.assertTrue(called['entered'])
+                        self.assertTrue(called['exited'])
+
+    def test_check_constraints_called_even_when_no_objects(self):
+        """
+        Ensure check_constraints is always called after deserialization when no exception occurs.
+        """
+        data = "[]"
+        called = {'count': 0}
+        with mock.patch('django.db.backends.base.creation.atomic', new=self._make_atomic()):
+            with mock.patch.object(connection, 'constraint_checks_disabled', new=self._make_constraint_cm()):
+                with mock.patch.object(connection, 'check_constraints', new=lambda: called.update(count=called['count'] + 1)):
+                    with mock.patch('django.db.backends.base.creation.serializers.deserialize', return_value=iter(())):
+                        connection.creation.deserialize_db_from_string(data)
+                        self.assertEqual(called['count'], 1)
+
+    def test_serializers_called_with_using_parameter(self):
+        """
+        Ensure serializers.deserialize is called with using=<connection alias>.
+        """
+        data = "[]"
+        def fake_deserialize(format, stream, using=None):
+            # The creation code calls serializers.deserialize('json', data, using=...)
+            self.assertEqual(format, 'json')
+            self.assertEqual(using, connection.alias)
+            # Return empty iterator
+            return iter(())
+
+        with mock.patch('django.db.backends.base.creation.atomic', new=self._make_atomic()):
+            with mock.patch.object(connection, 'constraint_checks_disabled', new=self._make_constraint_cm()):
+                with mock.patch.object(connection, 'check_constraints', new=lambda: None):
+                    with mock.patch('django.db.backends.base.creation.serializers.deserialize', new=fake_deserialize):
+                        connection.creation.deserialize_db_from_string(data)
+
+    def test_each_deserialized_object_save_called(self):
+        """
+        Ensure that for each object yielded by the serializer, save() is invoked.
+        """
+        data = "[]"
+        class Obj:
+            def __init__(self):
+                self.saved = False
+            def save(self):
+                self.saved = True
+        objs = [Obj(), Obj(), Obj()]
+        def fake_deserialize(format, stream, using=None):
+            return iter(objs)
+
+        with mock.patch('django.db.backends.base.creation.atomic', new=self._make_atomic()):
+            with mock.patch.object(connection, 'constraint_checks_disabled', new=self._make_constraint_cm()):
+                with mock.patch.object(connection, 'check_constraints', new=lambda: None):
+                    with mock.patch('django.db.backends.base.creation.serializers.deserialize', new=fake_deserialize):
+                        connection.creation.deserialize_db_from_string(data)
+                        self.assertTrue(all(o.saved for o in objs))
+
+    def test_atomic_and_no_check_constraints_on_exception(self):
+        """
+        If an exception is raised during save(), check_constraints should not be called,
+        but atomic should still have been entered and then exited (propagating the exception).
+        """
+        data = "[]"
+        atomic_flags = {'entered': False, 'exited': False}
+        def atomic_factory(using=None):
+            class C:
+                def __enter__(self_inner):
+                    atomic_flags['entered'] = True
+                    return self_inner
+                def __exit__(self_inner, exc_type, exc, tb):
+                    atomic_flags['exited'] = True
+                    # Do not suppress exception
+                    return False
+            return C()
+
+        class BadObj:
+            def save(self):
+                raise RuntimeError("save failed")
+
+        def fake_deserialize(format, stream, using=None):
+            return iter([BadObj()])
+
+        with mock.patch('django.db.backends.base.creation.atomic', new=atomic_factory):
+            with mock.patch.object(connection, 'constraint_checks_disabled', new=self._make_constraint_cm()):
+                check_called = {'value': False}
+                with mock.patch.object(connection, 'check_constraints', new=lambda: check_called.update(value=True)):
+                    with mock.patch('django.db.backends.base.creation.serializers.deserialize', new=fake_deserialize):
+                        with self.assertRaises(RuntimeError):
+                            connection.creation.deserialize_db_from_string(data)
+                        # atomic was entered and then exited (exit called even on exception)
+                        self.assertTrue(atomic_flags['entered'])
+                        self.assertTrue(atomic_flags['exited'])
+                        # check_constraints should not have been called because save() raised
+                        self.assertFalse(check_called['value'])
+
+    def test_empty_string_is_handled_and_contexts_called(self):
+        """
+        Passing an empty or whitespace-only payload should not skip the context managers
+        and check_constraints should still be called (serializer will parse to empty sequence).
+        """
+        data = "   "
+        with mock.patch('django.db.backends.base.creation.atomic', new=self._make_atomic()):
+            with mock.patch.object(connection, 'constraint_checks_disabled', new=self._make_constraint_cm()):
+                called = {'count': 0}
+                with mock.patch.object(connection, 'check_constraints', new=lambda: called.update(count=called['count'] + 1)):
+                    # serializers.deserialize may raise for invalid JSON; ensure we patch it to empty
+                    with mock.patch('django.db.backends.base.creation.serializers.deserialize', return_value=iter(())):
+                        connection.creation.deserialize_db_from_string(data)
+                        self.assertEqual(called['count'], 1)
+
+    def test_constraint_cm_called_only_once_for_multiple_objects(self):
+        """
+        Ensure the constraint_checks_disabled context manager is only entered once
+        even when multiple objects are deserialized.
+        """
+        data = "[]"
+        enter_count = {'count': 0}
+        def constraint_factory():
+            class C:
+                def __enter__(self_inner):
+                    enter_count['count'] += 1
+                    return self_inner
+                def __exit__(self_inner, exc_type, exc, tb):
+                    return False
+            return C()
+
+        class Obj:
+            def save(self):
+                return
+
+        def fake_deserialize(format, stream, using=None):
+            return iter([Obj(), Obj(), Obj(), Obj()])
+
+        with mock.patch('django.db.backends.base.creation.atomic', new=self._make_atomic()):
+            with mock.patch.object(connection, 'constraint_checks_disabled', new=constraint_factory):
+                with mock.patch.object(connection, 'check_constraints', new=lambda: None):
+                    with mock.patch('django.db.backends.base.creation.serializers.deserialize', new=fake_deserialize):
+                        connection.creation.deserialize_db_from_string(data)
+                        self.assertEqual(enter_count['count'], 1)

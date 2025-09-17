@@ -1,0 +1,153 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  A suite of regression tests ensuring that skip-location correction is applied
+  to reports for various skip scenarios (skip marker, skipif, class-level skip,
+  skip in setup, combinations with xfail and --runxfail). Each test constructs
+  an Item via testdir.getitem(), runs runtestprotocol to get the reports, and
+  asserts that the setup/call report longrepr (when a skip occurred) has been
+  rewritten to point to the item's reportinfo() file and line+1 with the
+  appropriate reason string. These tests would fail against the candidate
+  (model) patch which moves/removes the skip-location correction in a way that
+  causes the correction to be missed for certain code paths, but pass with the
+  gold patch that ensures the correction always runs at the end of
+  pytest_runtest_makereport.
+test_code: |
+  import pytest
+  from _pytest.runner import runtestprotocol
+  from _pytest.skipping import evaluate_skip_marks
+  
+  def _run_and_get_setup_longrepr(testdir, source: str, *, set_runxfail: bool = False):
+      item = testdir.getitem(source)
+      if set_runxfail:
+          # emulate --runxfail
+          item.config.option.runxfail = True
+      reports = runtestprotocol(item, log=False)
+      # reports order: setup, call, teardown in normal cases
+      setup_report = reports[0]
+      assert setup_report.skipped
+      return setup_report.longrepr, item
+  
+  def test_skip_marker_on_function_has_correct_location(testdir):
+      src = "import pytest\n@pytest.mark.skip(reason='skip reason')\ndef test_func():\n    pass\n"
+      longrepr, item = _run_and_get_setup_longrepr(testdir, src)
+      assert isinstance(longrepr, tuple)
+      filename, line, reason = longrepr
+      expected_file, expected_line = item.reportinfo()[:2]
+      assert str(expected_file) == filename
+      assert expected_line + 1 == line
+      assert reason == "skip reason"
+  
+  def test_skip_marker_with_xfail_on_same_function_reports_skip_location(testdir):
+      src = "import pytest\n@pytest.mark.xfail(reason='xfailed')\n@pytest.mark.skip('skipped test')\ndef test_func():\n    pass\n"
+      longrepr, item = _run_and_get_setup_longrepr(testdir, src)
+      filename, line, reason = longrepr
+      expected_file, expected_line = item.reportinfo()[:2]
+      assert str(expected_file) == filename
+      assert expected_line + 1 == line
+      assert reason == "skipped test"
+  
+  def test_skip_marker_with_runxfail_option_still_reports_correct_location(testdir):
+      src = "import pytest\n@pytest.mark.xfail(reason='xfailed')\n@pytest.mark.skip(reason='skipped-runxfail')\ndef test_func():\n    pass\n"
+      longrepr, item = _run_and_get_setup_longrepr(testdir, src, set_runxfail=True)
+      filename, line, reason = longrepr
+      expected_file, expected_line = item.reportinfo()[:2]
+      assert str(expected_file) == filename
+      assert expected_line + 1 == line
+      assert reason == "skipped-runxfail"
+  
+  def test_unconditional_skip_marker_without_reason_reports_unconditional(testdir):
+      src = "import pytest\n@pytest.mark.skip\ndef test_func():\n    pass\n"
+      longrepr, item = _run_and_get_setup_longrepr(testdir, src)
+      filename, line, reason = longrepr
+      expected_file, expected_line = item.reportinfo()[:2]
+      assert str(expected_file) == filename
+      assert expected_line + 1 == line
+      assert reason == "unconditional skip"
+  
+  def test_skip_marker_with_arg_reason_reports_that_reason(testdir):
+      src = "import pytest\n@pytest.mark.skip('via arg')\ndef test_func():\n    pass\n"
+      longrepr, item = _run_and_get_setup_longrepr(testdir, src)
+      filename, line, reason = longrepr
+      expected_file, expected_line = item.reportinfo()[:2]
+      assert str(expected_file) == filename
+      assert expected_line + 1 == line
+      assert reason == "via arg"
+  
+  def test_skipif_string_condition_reports_condition_reason_and_location(testdir):
+      src = "import pytest\nx = 3\n@pytest.mark.skipif('x == 3')\ndef test_func():\n    pass\n"
+      longrepr, item = _run_and_get_setup_longrepr(testdir, src)
+      filename, line, reason = longrepr
+      expected_file, expected_line = item.reportinfo()[:2]
+      assert str(expected_file) == filename
+      assert expected_line + 1 == line
+      assert reason == "condition: x == 3"
+  
+  def test_class_level_skip_reports_method_location(testdir):
+      src = "import pytest\n@pytest.mark.skip('class-skip')\nclass TestC:\n    def test_m(self):\n        pass\n"
+      # collect the single test method item
+      item = testdir.getitem(src)
+      # run it
+      reports = runtestprotocol(item, log=False)
+      setup_report = reports[0]
+      assert setup_report.skipped
+      longrepr = setup_report.longrepr
+      assert isinstance(longrepr, tuple)
+      filename, line, reason = longrepr
+      expected_file, expected_line = item.reportinfo()[:2]
+      assert str(expected_file) == filename
+      # when class-level skip applies, we expect the location to point at the
+      # item (the method), i.e. reportinfo() line + 1
+      assert expected_line + 1 == line
+      assert reason == "class-skip"
+  
+  def test_skip_raised_in_setup_points_to_test_definition_not_source_line_of_skip_call(testdir):
+      src = (
+          "import pytest\n"
+          "def setup_function(func):\n"
+          "    pytest.skip('skip-from-setup')\n"
+          "def test_target():\n"
+          "    pass\n"
+      )
+      longrepr, item = _run_and_get_setup_longrepr(testdir, src)
+      filename, line, reason = longrepr
+      expected_file, expected_line = item.reportinfo()[:2]
+      assert str(expected_file) == filename
+      # setup call site is at a different line, but the reporting should point to
+      # the test definition (reportinfo line + 1)
+      assert expected_line + 1 == line
+      assert reason == "skip-from-setup"
+  
+  def test_skipif_multiple_conditions_first_falsy_second_true_reports_second_reason_and_location(testdir):
+      src = (
+          "import pytest\n"
+          "@pytest.mark.skipif(False, reason='first')\n"
+          "@pytest.mark.skipif(True, reason='second')\n"
+          "def test_foo():\n"
+          "    pass\n"
+      )
+      longrepr, item = _run_and_get_setup_longrepr(testdir, src)
+      filename, line, reason = longrepr
+      expected_file, expected_line = item.reportinfo()[:2]
+      assert str(expected_file) == filename
+      assert expected_line + 1 == line
+      assert reason == "second"
+  
+  def test_skip_marker_and_xfail_combination_with_raises_on_call_reports_correct_location(testdir):
+      # A test that is marked both skip and xfail where skip triggers;
+      # ensures the final report longrepr points at the test item location.
+      src = (
+          "import pytest\n"
+          "@pytest.mark.xfail(reason='maybe')\n"
+          "@pytest.mark.skip(reason='skippy')\n"
+          "def test_foo():\n"
+          "    assert 0\n"
+      )
+      longrepr, item = _run_and_get_setup_longrepr(testdir, src)
+      filename, line, reason = longrepr
+      expected_file, expected_line = item.reportinfo()[:2]
+      assert str(expected_file) == filename
+      assert expected_line + 1 == line
+      assert reason == "skippy"
+new_imports_code: |
+  # no new imports beyond pytest and runtestprotocol already used in suite

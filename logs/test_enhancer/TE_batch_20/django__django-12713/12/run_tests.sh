@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_widgets.tests_llm.FormfieldForManyToManyWidgetPreserveTests.test_preserve_widget_from_formfield_overrides_class_and_request_none admin_widgets.tests_llm.FormfieldForManyToManyWidgetPreserveTests.test_preserve_widget_from_formfield_overrides_instance_and_request_none admin_widgets.tests_llm.FormfieldForManyToManyWidgetPreserveTests.test_preserve_widget_instance_passed_via_kwargs_overrides_formfield_overrides_request_none admin_widgets.tests_llm.FormfieldForManyToManyWidgetPreserveTests.test_preserve_widget_when_autocomplete_defined_and_request_none admin_widgets.tests_llm.FormfieldForManyToManyWidgetPreserveTests.test_preserve_widget_when_filter_horizontal_and_request_none admin_widgets.tests_llm.FormfieldForManyToManyWidgetPreserveTests.test_preserve_widget_when_filter_vertical_and_request_none admin_widgets.tests_llm.FormfieldForManyToManyWidgetPreserveTests.test_preserve_widget_when_formfield_overrides_and_raw_id_and_request_none admin_widgets.tests_llm.FormfieldForManyToManyWidgetPreserveTests.test_preserve_widget_when_passed_directly_and_request_none admin_widgets.tests_llm.FormfieldForManyToManyWidgetPreserveTests.test_preserve_widget_when_raw_id_and_request_none admin_widgets.tests_llm.FormfieldForManyToManyWidgetPreserveTests.test_preserve_widget_when_widget_class_passed_via_kwargs_request_none admin_widgets.tests_llm._unwrap_widget
+coverage json -o coverage.json
+: '>>>>> End Test Output'

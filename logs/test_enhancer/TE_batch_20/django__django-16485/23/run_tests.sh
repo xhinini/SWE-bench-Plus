@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroRegressionTests.test_decimal_scientific_notation_negative template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroRegressionTests.test_decimal_scientific_notation_positive template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroRegressionTests.test_decimal_with_zero_arg_string template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroRegressionTests.test_decimal_zero_scientific template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroRegressionTests.test_float_many_trailing_zeros template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroRegressionTests.test_float_with_zero_places_returns_integer template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroRegressionTests.test_int_with_zero_places_string_arg template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroRegressionTests.test_large_decimal_integer template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroRegressionTests.test_negative_float_with_zero_places template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroRegressionTests.test_string_number_with_zero_places
+coverage json -o coverage.json
+: '>>>>> End Test Output'

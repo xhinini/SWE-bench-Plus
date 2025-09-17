@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 schema.tests_llm.AddPrimaryKeyFieldTests._add_field_and_capture schema.tests_llm.AddPrimaryKeyFieldTests._create_model_table schema.tests_llm.AddPrimaryKeyFieldTests.tearDownClass schema.tests_llm.AddPrimaryKeyFieldTests.test_add_bigautofield_primary_key_remakes_table schema.tests_llm.AddPrimaryKeyFieldTests.test_add_charfield_primary_key_remakes_table schema.tests_llm.AddPrimaryKeyFieldTests.test_add_integerfield_primary_key_remakes_table schema.tests_llm.AddPrimaryKeyFieldTests.test_add_one_to_one_primary_key_remakes_table schema.tests_llm.AddPrimaryKeyFieldTests.test_add_primary_key_after_adding_other_fields_remakes_table schema.tests_llm.AddPrimaryKeyFieldTests.test_add_primary_key_field_generates_create_table_sql schema.tests_llm.AddPrimaryKeyFieldTests.test_add_primary_key_null_false_remakes_table schema.tests_llm.AddPrimaryKeyFieldTests.test_add_primary_key_with_default_remakes_table schema.tests_llm.AddPrimaryKeyFieldTests.test_add_uuidfield_primary_key_remakes_table schema.tests_llm.get_primary_key
+coverage json -o coverage.json
+: '>>>>> End Test Output'

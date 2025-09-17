@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 file_storage.test_models_llm.CallableStorageClass.__call__ file_storage.test_models_llm.FileFieldDeconstructTests.test_deconstruct_callable_returns_pathlib file_storage.test_models_llm.FileFieldDeconstructTests.test_deconstruct_excludes_default_storage file_storage.test_models_llm.FileFieldDeconstructTests.test_deconstruct_includes_callable_returning_default_storage file_storage.test_models_llm.FileFieldDeconstructTests.test_deconstruct_includes_callable_storage_object file_storage.test_models_llm.FileFieldDeconstructTests.test_deconstruct_includes_non_default_instance_storage file_storage.test_models_llm.FileFieldDeconstructTests.test_deconstruct_preserves_nondefault_max_length file_storage.test_models_llm.FileFieldDeconstructTests.test_deconstruct_preserves_pathlib_upload_to file_storage.test_models_llm.FileFieldDeconstructTests.test_deconstruct_removes_default_max_length file_storage.test_models_llm.FileFieldDeconstructTests.test_deconstruct_with_callable_storage_class file_storage.test_models_llm.FileFieldDeconstructTests.test_deconstruct_with_manually_set__storage_callable_equal_default_storage
+coverage json -o coverage.json
+: '>>>>> End Test Output'

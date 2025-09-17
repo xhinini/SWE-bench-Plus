@@ -1,0 +1,172 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These tests ensure that ForeignKey validation uses the related model's
+  base manager (._base_manager) rather than the default manager (._default_manager).
+  This prevents erroneously rejecting valid references when the default manager
+  filters out certain rows (for example, models with a default manager that
+  excludes "archived" instances). Each test exercises validation via different
+  entry points: direct Field.validate, instance.full_clean, and ModelForm
+  submission (ModelForm._post_clean -> instance.full_clean). The tests create an
+  instance of the related model that is filtered out by the default manager and
+  verify that validation succeeds (i.e., no ValidationError is raised) because
+  the base manager still exposes the object.
+test_code: |
+  from django import forms
+  from django.core.exceptions import ValidationError
+  from django.test import TestCase
+  import datetime
+
+  from tests.model_forms import models as mf_models
+
+  class RelatedFieldBaseManagerTests(TestCase):
+      def setUp(self):
+          # Create a "filtered out" Writer instance (default manager hides archived=True)
+          # Use the regular create API (this still creates the DB row). The custom
+          # manager only alters get_queryset(), not creation.
+          self.archived_writer = mf_models.Writer.objects.create(
+              name='Archived Writer',
+              archived=True
+          )
+          # Sanity check that the default manager indeed filters this instance out.
+          # This verifies the test setup (i.e., the bug would show up without the fix).
+          self.assertFalse(mf_models.Writer.objects.filter(pk=self.archived_writer.pk).exists())
+          self.assertTrue(mf_models.Writer._base_manager.filter(pk=self.archived_writer.pk).exists())
+
+      def test_foreignkey_field_validate_article_unsaved_instance(self):
+          field = mf_models.Article._meta.get_field('writer')
+          article_instance = mf_models.Article(
+              headline='H',
+              slug='s',
+              pub_date=datetime.date.today(),
+              created=datetime.date.today(),
+              article='body'
+          )
+          try:
+              field.validate(self.archived_writer.pk, model_instance=article_instance)
+          except ValidationError as e:
+              self.fail("ForeignKey.validate raised ValidationError unexpectedly: %s" % e)
+
+      def test_foreignkey_field_validate_article_saved_instance(self):
+          # Create an Article instance that will be saved pointing to the archived writer.
+          # Saving should work because the referenced writer exists in the DB.
+          article = mf_models.Article.objects.create(
+              headline='Saved',
+              slug='s2',
+              pub_date=datetime.date.today(),
+              created=datetime.date.today(),
+              article='b',
+              writer=self.archived_writer
+          )
+          field = mf_models.Article._meta.get_field('writer')
+          # Validate using the saved instance; should not raise.
+          try:
+              field.validate(self.archived_writer.pk, model_instance=article)
+          except ValidationError as e:
+              self.fail("ForeignKey.validate raised ValidationError for saved instance: %s" % e)
+
+      def test_foreignkey_field_validate_book_instance(self):
+          # Book.author is a ForeignKey to Writer; ensure validation uses base manager.
+          field = mf_models.Book._meta.get_field('author')
+          book_instance = mf_models.Book(title='T')
+          try:
+              field.validate(self.archived_writer.pk, model_instance=book_instance)
+          except ValidationError as e:
+              self.fail("Book.author.validate raised ValidationError unexpectedly: %s" % e)
+
+      def test_one_to_one_field_validate_writerprofile(self):
+          # WriterProfile.writer is a OneToOneField to Writer (primary key). Ensure it validates.
+          field = mf_models.WriterProfile._meta.get_field('writer')
+          profile_instance = mf_models.WriterProfile()
+          try:
+              field.validate(self.archived_writer.pk, model_instance=profile_instance)
+          except ValidationError as e:
+              self.fail("OneToOneField.validate raised ValidationError unexpectedly: %s" % e)
+
+      def test_instance_full_clean_with_foreignkey_id(self):
+          # Set author_id directly and call full_clean() to trigger model validation.
+          book = mf_models.Book(title='FullCleanBook')
+          book.author_id = self.archived_writer.pk
+          try:
+              # Should not raise because base manager exposes the archived writer.
+              book.full_clean()
+          except ValidationError as e:
+              self.fail("full_clean() raised ValidationError when author exists via base manager: %s" % e)
+
+      def test_modelform_validation_allows_archived_writer_book(self):
+          # A ModelForm that exposes the FK field may still use a custom queryset.
+          class BookForm(forms.ModelForm):
+              class Meta:
+                  model = mf_models.Book
+                  fields = '__all__'
+
+              def __init__(self, *args, **kwargs):
+                  super().__init__(*args, **kwargs)
+                  # Allow archived writers to be chosen in the form widget.
+                  self.fields['author'].queryset = mf_models.Writer._base_manager.all()
+
+          form = BookForm(data={'title': 'FromForm', 'author': str(self.archived_writer.pk)})
+          # ModelChoiceField will convert the value to an object via the supplied queryset,
+          # then ModelForm._post_clean calls instance.full_clean(), which in turn calls
+          # ForeignKey.validate; that must use the base manager (fixed behavior).
+          self.assertTrue(form.is_valid(), msg=form.errors.as_json())
+
+      def test_modelform_save_with_archived_writer_book(self):
+          class BookForm(forms.ModelForm):
+              class Meta:
+                  model = mf_models.Book
+                  fields = '__all__'
+
+              def __init__(self, *args, **kwargs):
+                  super().__init__(*args, **kwargs)
+                  self.fields['author'].queryset = mf_models.Writer._base_manager.all()
+
+          form = BookForm(data={'title': 'SaveForm', 'author': self.archived_writer.pk})
+          self.assertTrue(form.is_valid(), msg=form.errors.as_json())
+          try:
+              saved = form.save()
+          except ValidationError as e:
+              self.fail("ModelForm.save raised ValidationError unexpectedly: %s" % e)
+          # Ensure saved object references the archived writer.
+          self.assertEqual(saved.author_id, self.archived_writer.pk)
+
+      def test_instance_full_clean_article_with_author_id(self):
+          # Similar to book case but using Article.writer; set writer_id and call full_clean.
+          art = mf_models.Article(
+              headline='FC',
+              slug='x',
+              pub_date=datetime.date.today(),
+              created=datetime.date.today(),
+              article='body'
+          )
+          art.writer_id = self.archived_writer.pk
+          try:
+              art.full_clean()
+          except ValidationError as e:
+              self.fail("Article.full_clean raised ValidationError when writer exists via base manager: %s" % e)
+
+      def test_modelform_validation_writerprofile_allows_archived_writer(self):
+          class WriterProfileForm(forms.ModelForm):
+              class Meta:
+                  model = mf_models.WriterProfile
+                  fields = '__all__'
+
+              def __init__(self, *args, **kwargs):
+                  super().__init__(*args, **kwargs)
+                  self.fields['writer'].queryset = mf_models.Writer._base_manager.all()
+
+          form = WriterProfileForm(data={'writer': self.archived_writer.pk, 'age': 30})
+          # Should be valid because writer exists via base manager.
+          self.assertTrue(form.is_valid(), msg=form.errors.as_json())
+
+      def test_direct_validate_using_base_manager_created_via_base_manager(self):
+          # Create a writer via the base manager explicitly and validate again.
+          writer2 = mf_models.Writer._base_manager.create(name='BaseCreated', archived=True)
+          field = mf_models.Book._meta.get_field('author')
+          try:
+              field.validate(writer2.pk, model_instance=mf_models.Book(title='t2'))
+          except ValidationError as e:
+              self.fail("Validation failed for writer created via _base_manager: %s" % e)
+new_imports_code: |
+  # No additional global imports required beyond those in test_code; tests import
+  # models from tests.model_forms.models as mf_models.

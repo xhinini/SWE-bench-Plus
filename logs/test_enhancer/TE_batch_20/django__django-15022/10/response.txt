@@ -1,0 +1,160 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise ModelAdmin.get_search_results (construct_search) for various search field types and search terms: single-term, multi-term (AND semantics), quoted phrases, prefix/exact/search lookups, related-field lookups, M2M lookups (duplicate detection), and ignored/nonexistent fields. They assert both the returned queryset contents and the may_have_duplicates flag where applicable. The tests are written to match the style of the existing test suite and use the models and admin classes already defined in tests/admin_changelist.
+test_code: |
+  from django.test import TestCase, RequestFactory
+  from django.contrib import admin as djadmin
+  from django.contrib.auth.models import User, AnonymousUser
+  from django.utils.http import urlencode
+
+  from .admin import (
+      ChildAdmin, ParentAdmin, ParentAdminTwoSearchFields,
+      BandCallableFilterAdmin, DynamicSearchFieldsChildAdmin
+  )
+  from .models import Child, Parent, Band, Genre
+
+  factory = RequestFactory()
+
+  def make_request():
+      request = factory.get('/')
+      # Attach a simple user object; get_search_results doesn't require special permissions.
+      request.user = User.objects.create_user(username='tester')
+      return request
+
+  class GetSearchResultsTests(TestCase):
+      @classmethod
+      def setUpTestData(cls):
+          # Parents/Children
+          p1 = Parent.objects.create(name='Parent One')
+          p2 = Parent.objects.create(name='Parent Two')
+          Child.objects.create(name='Alice', age=10, parent=p1)
+          Child.objects.create(name='Alicia Bob', age=11, parent=p1)
+          Child.objects.create(name='Bob', age=12, parent=p2)
+          # Bands / Genres (for duplicate-spawning lookups)
+          rock = Genre.objects.create(name='rock')
+          jazz = Genre.objects.create(name='jazz')
+          b1 = Band.objects.create(name='The Rockers', nr_of_members=4)
+          b2 = Band.objects.create(name='Jazz Hands', nr_of_members=6)
+          b1.genres.add(rock, jazz)  # b1 has two genres
+          b2.genres.add(jazz)
+
+      def test_single_term_local_field(self):
+          """
+          Single-term search on a local field should return matching objects.
+          """
+          req = make_request()
+          ma = ChildAdmin(Child, djadmin.AdminSite())
+          qs = Child.objects.all()
+          results, may_have_duplicates = ma.get_search_results(req, qs, 'Alice')
+          self.assertEqual(set(results.values_list('name', flat=True)), {'Alice', 'Alicia Bob'})
+          self.assertFalse(may_have_duplicates)
+
+      def test_multi_term_and_behavior(self):
+          """
+          Multi-term searches should behave like an AND of terms across the
+          configured lookups (i.e., both terms must match somewhere).
+          Searching 'Alicia Bob' should return the object with both terms.
+          """
+          req = make_request()
+          ma = ChildAdmin(Child, djadmin.AdminSite())
+          qs = Child.objects.all()
+          results, may_have_duplicates = ma.get_search_results(req, qs, 'Alicia Bob')
+          # Only the 'Alicia Bob' record contains both 'Alicia' and 'Bob'
+          self.assertEqual(list(results.values_list('name', flat=True)), ['Alicia Bob'])
+          self.assertFalse(may_have_duplicates)
+
+      def test_quoted_phrase_search(self):
+          """
+          Quoted phrase should be used as a single search term.
+          """
+          req = make_request()
+          ma = ChildAdmin(Child, djadmin.AdminSite())
+          qs = Child.objects.all()
+          results, _ = ma.get_search_results(req, qs, '"Alicia Bob"')
+          self.assertEqual(list(results.values_list('name', flat=True)), ['Alicia Bob'])
+
+      def test_prefix_and_exact_search_prefix_and_equal(self):
+          """
+          Test '^' (istartswith) and '=' (iexact) search prefixes via admin search_fields.
+          We'll create a dynamic admin to test these lookups.
+          """
+          req = make_request()
+          # Create a temporary admin to inject special search_fields
+          temp_admin = djadmin.ModelAdmin(Child, djadmin.AdminSite())
+          # Monkey-patch get_search_fields to return prefixed lookups
+          temp_admin.search_fields = ('^name', '=age')
+          qs = Child.objects.all()
+          # Prefix search for name starting with 'Ali' should match 'Alice' and 'Alicia Bob'
+          results, _ = temp_admin.get_search_results(req, qs, 'Ali')
+          self.assertTrue(all('Ali' .lower() in name.lower() for name in results.values_list('name', flat=True)))
+          # Exact numeric search by age
+          results_exact, _ = temp_admin.get_search_results(req, qs, '11')
+          self.assertEqual(list(results_exact.values_list('age', flat=True)), [11])
+
+      def test_search_on_related_field(self):
+          """
+          Searching on a related field (child__name) via ParentAdmin should find parents.
+          """
+          req = make_request()
+          ma = ParentAdmin(Parent, djadmin.AdminSite())
+          qs = Parent.objects.all()
+          results, _ = ma.get_search_results(req, qs, 'Alice')
+          # Parent One has children Alice and Alicia Bob -> should be included
+          self.assertEqual(set(results.values_list('name', flat=True)), {'Parent One'})
+
+      def test_search_on_related_multiple_terms(self):
+          """
+          Searching for multiple terms against related lookups should still
+          perform AND semantics across terms.
+          """
+          req = make_request()
+          ma = ParentAdminTwoSearchFields(Parent, djadmin.AdminSite())
+          qs = Parent.objects.all()
+          # Search for child name 'Alice' and age '10' should match Parent One (child Alice age 10)
+          results, _ = ma.get_search_results(req, qs, 'Alice 10')
+          self.assertEqual(set(results.values_list('name', flat=True)), {'Parent One'})
+
+      def test_m2m_search_may_have_duplicates_flag(self):
+          """
+          Lookups spanning many-to-many relations should set may_have_duplicates True
+          when appropriate search_fields are used. Use BandAdmin with genres M2M.
+          """
+          req = make_request()
+          ma = BandCallableFilterAdmin(Band, djadmin.AdminSite())
+          # Configure search_fields to include a m2m lookup
+          ma.search_fields = ('genres__name',)
+          qs = Band.objects.all()
+          results, may_have_duplicates = ma.get_search_results(req, qs, 'jazz')
+          # Both b1 and b2 have jazz, so they should appear.
+          self.assertEqual(set(results.values_list('name', flat=True)), {'The Rockers', 'Jazz Hands'})
+          # Searching over m2m should indicate duplicates may exist
+          self.assertTrue(may_have_duplicates)
+
+      def test_ignored_nonexistent_field_in_get_change(self):
+          """
+          If get_search_fields returns a field that doesn't exist, construct_search
+          should ignore invalid path parts and not raise.
+          """
+          req = make_request()
+          ma = djadmin.ModelAdmin(Child, djadmin.AdminSite())
+          # Inject a bogus search field
+          ma.search_fields = ('nonexistent__foo', 'name')
+          qs = Child.objects.all()
+          results, _ = ma.get_search_results(req, qs, 'Alice')
+          # Should still find 'Alice'
+          self.assertIn('Alice', list(results.values_list('name', flat=True)))
+
+      def test_dynamic_get_search_fields_combines_with_request(self):
+          """
+          Admins that dynamically extend search_fields via get_search_fields(request)
+          should be supported.
+          """
+          req = make_request()
+          ma = DynamicSearchFieldsChildAdmin(Child, djadmin.AdminSite())
+          qs = Child.objects.all()
+          results, _ = ma.get_search_results(req, qs, '12')
+          # Since DynamicSearchFieldsChildAdmin get_search_fields adds 'age', searching '12' should find 'Bob'
+          self.assertIn('Bob', list(results.values_list('name', flat=True)))
+new_imports_code: |
+  from django.test import RequestFactory
+  from django.contrib import admin as djadmin

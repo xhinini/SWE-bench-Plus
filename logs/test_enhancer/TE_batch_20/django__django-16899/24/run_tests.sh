@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_missing_readonly_field_first_index_modeladmin admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_missing_readonly_field_list_type_modeladmin admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_missing_readonly_field_on_book_model admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_missing_readonly_field_on_custom_admin_class_name admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_missing_readonly_field_on_inline_for_twoalbumfk admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_missing_readonly_field_on_state_admin admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_missing_readonly_field_on_tabular_inline admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_missing_readonly_field_with_first_attr_on_admin admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_multiple_missing_on_inline admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_multiple_missing_readonly_fields_modeladmin
+coverage json -o coverage.json
+: '>>>>> End Test Output'

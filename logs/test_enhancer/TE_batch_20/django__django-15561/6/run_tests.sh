@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 schema.tests_llm.AlterFieldNonDbAttrsTests.test_decimalfield_custom_non_db_attr_noop_new_field schema.tests_llm.AlterFieldNonDbAttrsTests.test_decimalfield_custom_non_db_attr_noop_old_field schema.tests_llm.AlterFieldNonDbAttrsTests.test_new_field_with_custom_non_db_attr_binaryfield_noop schema.tests_llm.AlterFieldNonDbAttrsTests.test_new_field_with_custom_non_db_attr_charfield_noop schema.tests_llm.AlterFieldNonDbAttrsTests.test_new_field_with_custom_non_db_attr_integerfield_noop schema.tests_llm.AlterFieldNonDbAttrsTests.test_new_field_with_custom_non_db_attr_textfield_noop schema.tests_llm.AlterFieldNonDbAttrsTests.test_old_field_with_custom_non_db_attr_binaryfield_noop schema.tests_llm.AlterFieldNonDbAttrsTests.test_old_field_with_custom_non_db_attr_charfield_noop schema.tests_llm.AlterFieldNonDbAttrsTests.test_old_field_with_custom_non_db_attr_integerfield_noop schema.tests_llm.AlterFieldNonDbAttrsTests.test_old_field_with_custom_non_db_attr_textfield_noop
+coverage json -o coverage.json
+: '>>>>> End Test Output'

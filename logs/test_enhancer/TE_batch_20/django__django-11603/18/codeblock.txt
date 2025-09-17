@@ -1,0 +1,104 @@
+from decimal import Decimal
+import datetime
+
+from django.test import TestCase
+from django.test.utils import CaptureQueriesContext
+from django.db import connection
+from django.db.models import Avg, Sum, F
+from django.db.models import Value
+from django.db.models.functions import Cast
+
+from .models import Book, Publisher
+
+class DistinctAggregateRegressionTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        # Reuse the existing fixture population from the main test module.
+        # Importing and calling the module-level setup is not straightforward in tests,
+        # so we mirror minimal setup here by creating the same records used in the suite.
+        # However, to avoid duplicating the entire dataset, rely on the test suite's
+        # AggregateTestCase in the main file by importing it if available. If not,
+        # fall back to creating a small dataset sufficient for these tests.
+        try:
+            from tests.aggregation.tests import AggregateTestCase  # noqa: WPS433
+            # Use the already-populated data from AggregateTestCase.
+            # We simply point to the models populated by that test case.
+            # The test runner will have run that test's setUpTestData first.
+            # To be robust in different test ordering, if models are empty, provide fallback.
+            if Book.objects.exists():
+                return
+        except Exception:
+            pass
+
+        # Fallback population if necessary (minimal dataset)
+        p1 = Publisher.objects.create(name='Apress', num_awards=3, duration=datetime.timedelta(days=1))
+        p2 = Publisher.objects.create(name='Sams', num_awards=1, duration=datetime.timedelta(days=2))
+        # Create books used in these tests
+        Book.objects.create(isbn='1', name='B1', pages=100, rating=4.5, price=Decimal('30.00'), publisher=p1, contact_id=1, pubdate=datetime.date(2007, 1, 1))
+        Book.objects.create(isbn='2', name='B2', pages=200, rating=3.0, price=Decimal('23.09'), publisher=p2, contact_id=1, pubdate=datetime.date(2008, 1, 1))
+        Book.objects.create(isbn='3', name='B3', pages=300, rating=4.0, price=Decimal('29.69'), publisher=p1, contact_id=1, pubdate=datetime.date(2008, 1, 2))
+        Book.objects.create(isbn='4', name='B4', pages=350, rating=4.0, price=Decimal('29.69'), publisher=p1, contact_id=1, pubdate=datetime.date(2008, 1, 3))
+        Book.objects.create(isbn='5', name='B5', pages=1132, rating=4.0, price=Decimal('82.80'), publisher=p1, contact_id=1, pubdate=datetime.date(1995, 1, 15))
+        Book.objects.create(isbn='6', name='B6', pages=946, rating=5.0, price=Decimal('75.00'), publisher=p1, contact_id=1, pubdate=datetime.date(1991, 10, 15))
+
+    def test_avg_distinct_aggregate_sql_and_value(self):
+        with CaptureQueriesContext(connection) as ctx:
+            result = Book.objects.aggregate(avg=Avg('rating', distinct=True))
+        # Value check (unique ratings are 3.0, 4.0, 4.5, 5.0 -> avg = 16.5 / 4 = 4.125)
+        self.assertEqual(result['avg'], 4.125)
+        # SQL should contain DISTINCT (case-insensitive)
+        sql = ctx.captured_queries[0]['sql']
+        self.assertIn('DISTINCT', sql.upper())
+
+    def test_sum_distinct_aggregate_sql_and_value(self):
+        with CaptureQueriesContext(connection) as ctx:
+            result = Book.objects.aggregate(sum_ratings=Sum('rating', distinct=True))
+        # Sum of distinct ratings: 3.0 + 4.0 + 4.5 + 5.0 = 16.5
+        self.assertEqual(result['sum_ratings'], 16.5)
+        sql = ctx.captured_queries[0]['sql']
+        self.assertIn('DISTINCT', sql.upper())
+
+    def test_avg_distinct_in_annotation_on_publisher(self):
+        # For publisher 'Apress' the book ratings are 4.5 and 4.0 -> distinct avg = 4.25
+        with CaptureQueriesContext(connection) as ctx:
+            p = Publisher.objects.annotate(distinct_avg=Avg('book__rating', distinct=True)).get(name='Apress')
+        self.assertAlmostEqual(p.distinct_avg, 4.25, places=2)
+        # Assert DISTINCT present in the SQL used for the annotation
+        sql = ctx.captured_queries[0]['sql']
+        self.assertIn('DISTINCT', sql.upper())
+
+    def test_sum_distinct_in_annotation_on_publisher(self):
+        # For 'Apress' book prices distinct sum should be Decimal('59.69')
+        with CaptureQueriesContext(connection) as ctx:
+            p = Publisher.objects.annotate(distinct_sum=Sum('book__price', distinct=True)).get(name='Apress')
+        # The sum is Decimal - ensure numeric equality (string conversion for precision)
+        self.assertEqual(Decimal(p.distinct_sum), Decimal('59.69'))
+        sql = ctx.captured_queries[0]['sql']
+        self.assertIn('DISTINCT', sql.upper())
+
+    def test_sum_duration_distinct_aggregate(self):
+        # Distinct durations among publishers in the full test dataset are 1 day and 2 days -> sum = 3 days
+        res = Publisher.objects.aggregate(total=Sum('duration', distinct=True))
+        # None values are ignored by SUM; expecting a timedelta of 3 days when both 1 and 2 day durations present
+        self.assertEqual(res['total'], datetime.timedelta(days=3))
+
+    def test_default_alias_for_avg_and_sum_with_distinct(self):
+        # Using aggregate() without specifying an alias should create the default alias 'rating__avg' / 'rating__sum'
+        avg_res = Book.objects.aggregate(Avg('rating', distinct=True))
+        sum_res = Book.objects.aggregate(Sum('rating', distinct=True))
+        self.assertIn('rating__avg', avg_res)
+        self.assertIn('rating__sum', sum_res)
+        self.assertEqual(avg_res['rating__avg'], 4.125)
+        self.assertEqual(sum_res['rating__sum'], 16.5)
+
+    def test_repr_contains_distinct_flag_for_avg(self):
+        # repr should surface the distinct option so it's visible for debugging/inspection
+        r = repr(Avg('rating', distinct=True))
+        self.assertIn('distinct', r)
+
+    def test_values_annotate_sum_distinct_grouped(self):
+        # Group by rating and sum distinct prices for each rating. For rating=4.0 distinct prices {29.69, 82.80} => 112.49
+        rows = list(Book.objects.values('rating').annotate(sum_distinct=Sum('price', distinct=True)).order_by('rating'))
+        # Find the row for rating == 4.0
+        row_for_4 = [r for r in rows if r['rating'] == 4.0][0]
+        self.assertEqual(row_for_4['sum_distinct'], Decimal('112.49'))

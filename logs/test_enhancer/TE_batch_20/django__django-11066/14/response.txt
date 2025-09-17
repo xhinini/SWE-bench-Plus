@@ -1,0 +1,191 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that RenameContentType and related management utilities operate on the intended database connection (respecting the schema editor's connection) rather than being routed to a different database by the database router. They also verify cache clearing behavior, conflict handling (IntegrityError), and the injection behavior of inject_rename_contenttypes_operations. The tests would fail if content_type.save(...) omitted the using=db argument (causing writes to go to the router-selected DB instead of the schema editor's DB).
+new_imports_code: |
+  from unittest import mock
+  from django.db import connections
+test_code: |
+  def test_rename_uses_schema_editor_db_despite_router(self):
+      # Router routes writes to 'default', but allow_migrate only allows 'other'.
+      class BadRouter:
+          def db_for_write(self, model, **hints):
+              return 'default'
+          def allow_migrate(self, db, app_label, model_name=None, **hints):
+              return db == 'other'
+
+      # Create a content type in 'other' DB.
+      ContentType.objects.using('other').create(app_label='contenttypes_tests', model='foo')
+
+      with mock.patch('django.conf.settings.DATABASE_ROUTERS', [BadRouter()]), override_settings(DATABASE_ROUTERS=[BadRouter()]):
+          rename_op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+          conn = connections['other']
+          with conn.schema_editor() as schema_editor:
+              rename_op._rename(apps, schema_editor, 'foo', 'renamedfoo')
+
+      # The rename must have happened in 'other' DB (schema_editor's DB).
+      self.assertFalse(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='foo').exists())
+      self.assertTrue(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='renamedfoo').exists())
+      # Default DB should be unchanged.
+      self.assertFalse(ContentType.objects.using('default').filter(app_label='contenttypes_tests', model='renamedfoo').exists())
+
+  def test_rename_backward_uses_schema_editor_db(self):
+      # Ensure backward rename also respects schema_editor DB.
+      class BadRouter:
+          def db_for_write(self, model, **hints):
+              return 'default'
+          def allow_migrate(self, db, app_label, model_name=None, **hints):
+              return db == 'other'
+
+      ContentType.objects.using('other').create(app_label='contenttypes_tests', model='renamedbar')
+
+      with override_settings(DATABASE_ROUTERS=[BadRouter()]):
+          rename_op = contenttypes_management.RenameContentType('contenttypes_tests', 'bar', 'renamedbar')
+          conn = connections['other']
+          with conn.schema_editor() as schema_editor:
+              # backward should rename renamedbar -> bar
+              rename_op.rename_backward(apps, schema_editor)
+
+      self.assertTrue(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='bar').exists())
+      self.assertFalse(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='renamedbar').exists())
+      self.assertFalse(ContentType.objects.using('default').filter(app_label='contenttypes_tests', model='bar').exists())
+
+  def test_missing_content_type_rename_does_nothing(self):
+      # No content type exists; operation should silently do nothing.
+      class NeutralRouter:
+          def db_for_write(self, model, **hints):
+              return 'default'
+          def allow_migrate(self, db, app_label, model_name=None, **hints):
+              return True
+
+      with override_settings(DATABASE_ROUTERS=[NeutralRouter()]):
+          rename_op = contenttypes_management.RenameContentType('contenttypes_tests', 'nonexistent', 'stillnonexistent')
+          conn = connections['other']
+          with conn.schema_editor() as schema_editor:
+              # Should not raise
+              rename_op._rename(apps, schema_editor, 'nonexistent', 'stillnonexistent')
+
+      # Ensure nothing was created inadvertently.
+      self.assertFalse(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='stillnonexistent').exists())
+      self.assertFalse(ContentType.objects.using('default').filter(app_label='contenttypes_tests', model='stillnonexistent').exists())
+
+  def test_rename_conflict_restores_old_value(self):
+      # Create both old and new to force an IntegrityError when renaming.
+      ContentType.objects.using('other').create(app_label='contenttypes_tests', model='conflict_old')
+      ContentType.objects.using('other').create(app_label='contenttypes_tests', model='conflict_new')
+
+      class BadRouter:
+          def db_for_write(self, model, **hints):
+              return 'default'
+          def allow_migrate(self, db, app_label, model_name=None, **hints):
+              return db == 'other'
+
+      with override_settings(DATABASE_ROUTERS=[BadRouter()]):
+          rename_op = contenttypes_management.RenameContentType('contenttypes_tests', 'conflict_old', 'conflict_new')
+          conn = connections['other']
+          with conn.schema_editor() as schema_editor:
+              rename_op._rename(apps, schema_editor, 'conflict_old', 'conflict_new')
+
+      # Both entries must remain unchanged in 'other' DB.
+      self.assertTrue(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='conflict_old').exists())
+      self.assertTrue(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='conflict_new').exists())
+      # Default DB must not have received the rename.
+      self.assertFalse(ContentType.objects.using('default').filter(app_label='contenttypes_tests', model='conflict_new').exists())
+
+  def test_clear_cache_called_on_successful_rename(self):
+      ContentType.objects.using('other').create(app_label='contenttypes_tests', model='cachefoo')
+
+      class BadRouter:
+          def db_for_write(self, model, **hints):
+              return 'default'
+          def allow_migrate(self, db, app_label, model_name=None, **hints):
+              return db == 'other'
+
+      with override_settings(DATABASE_ROUTERS=[BadRouter()]):
+          rename_op = contenttypes_management.RenameContentType('contenttypes_tests', 'cachefoo', 'cachenew')
+          conn = connections['other']
+          with conn.schema_editor() as schema_editor, mock.patch.object(ContentType.objects, 'clear_cache') as clear_cache_mock:
+              rename_op._rename(apps, schema_editor, 'cachefoo', 'cachenew')
+              clear_cache_mock.assert_called_once()
+
+      self.assertTrue(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='cachenew').exists())
+
+  def test_clear_cache_not_called_on_conflict(self):
+      ContentType.objects.using('other').create(app_label='contenttypes_tests', model='cacheconf_old')
+      ContentType.objects.using('other').create(app_label='contenttypes_tests', model='cacheconf_new')
+
+      class BadRouter:
+          def db_for_write(self, model, **hints):
+              return 'default'
+          def allow_migrate(self, db, app_label, model_name=None, **hints):
+              return db == 'other'
+
+      with override_settings(DATABASE_ROUTERS=[BadRouter()]):
+          rename_op = contenttypes_management.RenameContentType('contenttypes_tests', 'cacheconf_old', 'cacheconf_new')
+          conn = connections['other']
+          with conn.schema_editor() as schema_editor, mock.patch.object(ContentType.objects, 'clear_cache') as clear_cache_mock:
+              rename_op._rename(apps, schema_editor, 'cacheconf_old', 'cacheconf_new')
+              clear_cache_mock.assert_not_called()
+
+  def test_inject_rename_contenttypes_operations_inserts_after_rename_model(self):
+      class FakeMigration:
+          def __init__(self):
+              self.app_label = 'someapp'
+              self.name = '0002_auto'
+              # Use a real RenameModel operation to ensure attributes exist.
+              self.operations = [migrations.RenameModel('Foo', 'Bar'), migrations.CreateModel('Baz', fields=[])]
+
+      migration = FakeMigration()
+      plan = [(migration, False)]
+      # Ensure ContentType model is available via apps and router allows migration (default test env).
+      contenttypes_management.inject_rename_contenttypes_operations(plan=plan, apps=apps, using='default')
+      # There should be a RenameContentType instance inserted immediately after the RenameModel.
+      ops = migration.operations
+      found = False
+      for i, op in enumerate(ops[:-1]):
+          if isinstance(op, migrations.RenameModel):
+              self.assertIsInstance(ops[i + 1], contenttypes_management.RenameContentType)
+              found = True
+              break
+      self.assertTrue(found)
+
+  def test_inject_rename_contenttypes_operations_skips_when_contenttype_unavailable(self):
+      class FakeAppsUnavailable:
+          def get_model(self, app_label, model_name):
+              raise LookupError
+
+      class FakeMigration:
+          def __init__(self):
+              self.app_label = 'someapp'
+              self.name = '0002_auto'
+              self.operations = [migrations.RenameModel('Foo', 'Bar')]
+
+      migration = FakeMigration()
+      plan = [(migration, False)]
+      # Use the fake apps that raises LookupError.
+      contenttypes_management.inject_rename_contenttypes_operations(plan=plan, apps=FakeAppsUnavailable(), using='default')
+      # Operations must remain unchanged.
+      self.assertEqual(len(migration.operations), 1)
+      self.assertIsInstance(migration.operations[0], migrations.RenameModel)
+
+  def test_get_contenttypes_and_models_respects_allow_migrate_model(self):
+      ContentTypeModel = apps.get_model('contenttypes', 'ContentType')
+      app_config = apps.get_app_config('contenttypes_tests')
+      # Patch the allow_migrate_model helper used in the management module.
+      with mock.patch('django.contrib.contenttypes.management.router.allow_migrate_model', return_value=False):
+          cts, models_map = contenttypes_management.get_contenttypes_and_models(app_config, 'default', ContentTypeModel)
+          self.assertIsNone(cts)
+          self.assertIsNone(models_map)
+
+  def test_rename_ignored_if_allow_migrate_model_false(self):
+      # If the ContentType model isn't allowed to migrate on given DB, nothing should happen.
+      ContentType.objects.using('other').create(app_label='contenttypes_tests', model='ignored_old')
+
+      with mock.patch('django.contrib.contenttypes.management.router.allow_migrate_model', return_value=False):
+          rename_op = contenttypes_management.RenameContentType('contenttypes_tests', 'ignored_old', 'ignored_new')
+          conn = connections['other']
+          with conn.schema_editor() as schema_editor:
+              # Should return early and not change the DB.
+              rename_op._rename(apps, schema_editor, 'ignored_old', 'ignored_new')
+
+      self.assertTrue(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='ignored_old').exists())
+      self.assertFalse(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='ignored_new').exists())

@@ -1,0 +1,144 @@
+from django.db.models import Count, Value, CharField
+from django.test import TestCase
+from .models import Article, Author
+from django.db.models import Count, Value, CharField
+from django.test import TestCase
+from operator import attrgetter
+
+from .models import Article, Author
+
+
+class GroupByRegressionTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        # Reuse the same fixture setup as the ordering tests so expectations
+        # about meta ordering (pub_date desc, headline asc) are valid.
+        cls.a1 = Article.objects.create(headline="Article 1", pub_date=None)
+        cls.a2 = Article.objects.create(headline="Article 2", pub_date=None)
+        cls.a3 = Article.objects.create(headline="Article 3", pub_date=None)
+        cls.a4 = Article.objects.create(headline="Article 4", pub_date=None)
+        cls.author_1 = Author.objects.create(name="Name 1")
+        cls.author_2 = Author.objects.create(name="Name 2")
+        # Assign authors to some articles to produce groupable data.
+        Article.objects.filter(headline__in=["Article 1", "Article 2", "Article 3"]).update(author=cls.author_1)
+        Article.objects.filter(headline="Article 4").update(author=cls.author_2)
+
+    def _extract_group_by_fragment(self, qs):
+        """
+        Return the GROUP BY fragment (uppercased) from the SQL for qs.query.
+        If no GROUP BY present, return an empty string.
+        """
+        sql = str(qs.query).upper()
+        if "GROUP BY" not in sql:
+            return ""
+        # Grab from 'GROUP BY' up to either 'HAVING', 'ORDER BY' or end.
+        start = sql.find("GROUP BY")
+        end_candidates = [sql.find(k, start) for k in ("HAVING", "ORDER BY") if sql.find(k, start) != -1]
+        end = min(end_candidates) if end_candidates else len(sql)
+        return sql[start:end]
+
+    def test_meta_ordering_not_added_to_group_by_when_values_and_annotate(self):
+        """
+        When values() creates an explicit group_by, Meta.ordering (pub_date)
+        should not be implicitly added to GROUP BY just because it is the
+        model's default ordering.
+        """
+        qs = Article.objects.values('author').annotate(count=Count('author'))
+        group_by = self._extract_group_by_fragment(qs)
+        # We expect grouping on the values() field (AUTHOR), but NOT on the
+        # model's default ordering field PUB_DATE.
+        self.assertIn("AUTHOR", group_by)
+        self.assertNotIn("PUB_DATE", group_by)
+
+    def test_values_field_appears_in_group_by(self):
+        """
+        Explicitly requested fields via values() should appear in GROUP BY.
+        """
+        qs = Article.objects.values('headline').annotate(count=Count('headline'))
+        group_by = self._extract_group_by_fragment(qs)
+        self.assertIn("HEADLINE", group_by)
+
+    def test_explicit_group_by_pub_date_present_when_requested(self):
+        """
+        If the grouping explicitly includes the meta-ordering field (pub_date),
+        it must be present in GROUP BY.
+        """
+        qs = Article.objects.values('pub_date').annotate(count=Count('author'))
+        group_by = self._extract_group_by_fragment(qs)
+        self.assertIn("PUB_DATE", group_by)
+
+    def test_order_by_cleared_with_empty_order_by_does_not_pull_meta_into_group_by(self):
+        """
+        Calling order_by() with no arguments clears ordering entirely,
+        therefore meta ordering shouldn't be applied, and GROUP BY should
+        only contain the values() keys.
+        """
+        qs = Article.objects.values('author').annotate(count=Count('author')).order_by()
+        group_by = self._extract_group_by_fragment(qs)
+        self.assertIn("AUTHOR", group_by)
+        self.assertNotIn("PUB_DATE", group_by)
+
+    def test_explicit_order_by_field_not_in_values_is_added_to_group_by_when_no_meta_ordering(self):
+        """
+        If ordering is explicitly set on the Query (not coming from Meta),
+        and it references a field not present in values(), that ordering
+        column should be considered for grouping (for GROUP BY correctness).
+        """
+        qs = Article.objects.values('author').annotate(count=Count('author')).order_by('headline')
+        group_by = self._extract_group_by_fragment(qs)
+        # headline is not part of the values() key, and because order_by()
+        # explicitly sets ordering, headline should be included in GROUP BY.
+        self.assertIn("HEADLINE", group_by)
+
+    def test_annotate_with_constant_and_meta_ordering_does_not_add_meta_field(self):
+        """
+        Annotating a constant should not change grouping rules; meta ordering
+        must not leak into GROUP BY.
+        """
+        qs = Article.objects.annotate(constant=Value('1', output_field=CharField())).values('author').annotate(count=Count('author'))
+        group_by = self._extract_group_by_fragment(qs)
+        self.assertIn("AUTHOR", group_by)
+        self.assertNotIn("PUB_DATE", group_by)
+
+    def test_multiple_values_keys_all_present_in_group_by(self):
+        """
+        Multiple explicit values() keys should all appear in the GROUP BY.
+        """
+        qs = Article.objects.values('author', 'headline').annotate(count=Count('author'))
+        group_by = self._extract_group_by_fragment(qs)
+        self.assertIn("AUTHOR", group_by)
+        self.assertIn("HEADLINE", group_by)
+        self.assertNotIn("PUB_DATE", group_by)
+
+    def test_values_then_order_by_meta_ordering_cleared_does_not_add_meta(self):
+        """
+        When values() is used and then order_by('') is used to clear
+        ordering, default Meta ordering must not influence GROUP BY.
+        """
+        qs = Article.objects.values('headline').annotate(count=Count('author')).order_by()
+        group_by = self._extract_group_by_fragment(qs)
+        self.assertIn("HEADLINE", group_by)
+        self.assertNotIn("PUB_DATE", group_by)
+
+    def test_annotate_on_distinct_fields_does_not_raise_due_to_meta_ordering(self):
+        """
+        Ensure that annotate() + distinct(fields) path doesn't raise
+        unintentionally because of meta ordering being added into GROUP BY.
+        """
+        # This should not raise NotImplementedError because meta ordering
+        # must not be injected into GROUP BY (we group only by the distinct field).
+        qs = Article.objects.distinct('author').annotate(count=Count('author'))
+        # Evaluate SQL generation.
+        sql = str(qs.query)  # Should not raise
+        self.assertIsInstance(sql, str)
+
+    def test_group_by_fragment_for_simple_annotate_contains_expected_number_of_expressions(self):
+        """
+        Basic sanity check: values('author') + annotate should have a GROUP BY
+        with a single grouping expression (author) and not include extra
+        meta-ordering columns.
+        """
+        qs = Article.objects.values('author').annotate(count=Count('author'))
+        group_by = self._extract_group_by_fragment(qs)
+        # Count commas to estimate number of group items (1 expected -> no comma).
+        self.assertFalse("," in group_by.replace("GROUP BY", "").strip())

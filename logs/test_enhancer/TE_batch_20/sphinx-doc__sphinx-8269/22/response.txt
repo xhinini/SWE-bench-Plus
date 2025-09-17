@@ -1,0 +1,299 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests exercise the CheckExternalLinksBuilder worker behavior around checking anchors and
+  handling HTTP status codes. They specifically validate that when checking a URI with an anchor:
+  - non-2xx HTTP responses raise HTTPError via response.raise_for_status() and are reported with
+    the HTTP error (e.g. 404) instead of being mis-reported as "Anchor 'x' not found".
+  - 401 responses are treated as "working - unauthorized".
+  - 503 responses are treated as "ignored".
+  - a 200 response with the anchor present is "working".
+  - a 200 response without the anchor is reported as "Anchor 'x' not found".
+  - a redirect (history) is reported as "redirected" with the last redirect code and URL including anchor.
+  - non-HTML responses with a missing anchor are still checked (the original/gold behavior) and reported
+    as broken when anchor not found (this detects an incorrect model patch that skips anchor checks
+    for non-HTML content).
+  - SSL-like exceptions are recognized via is_ssl_error and treated as "ignored".
+  - URIs with non-ASCII characters get encoded before being requested.
+  - anchors matching linkcheck_anchors_ignore are not checked for anchors (anchor stripped), causing normal
+    existence checks.
+
+  Each test initializes the builder (which starts worker threads), patches requests.get / requests.head
+  to return controlled DummyResponse objects (or to raise), submits a single work item to the builder's
+  work queue, obtains the result from the builder's result queue, processes it (so output files are written),
+  and asserts on the output.txt contents. After each test the worker threads are asked to finish.
+
+test_code: |
+  import pytest
+  from requests.exceptions import HTTPError
+  import types
+  
+  from sphinx.builders.linkcheck import CheckExternalLinksBuilder, is_ssl_error
+  
+  class DummyHistory:
+      def __init__(self, status_code):
+          self.status_code = status_code
+  
+  class DummyResponse:
+      def __init__(self, url, status_code=200, content='', history=None,
+                   headers=None, method='GET'):
+          self.url = url
+          self.status_code = status_code
+          self._content = content
+          self.history = history or []
+          self.headers = headers or {}
+          self.request = types.SimpleNamespace(method=method)
+  
+      def raise_for_status(self):
+          if self.status_code >= 400:
+              err = HTTPError(f"{self.status_code} Client Error for url: {self.url}")
+              err.response = self
+              raise err
+  
+      def iter_content(self, chunk_size=4096, decode_unicode=False):
+          # emulate requests.Response.iter_content with decode_unicode support
+          if decode_unicode:
+              # always yield text for simplicity
+              if isinstance(self._content, bytes):
+                  yield self._content.decode('utf-8', errors='ignore')
+              else:
+                  yield str(self._content)
+          else:
+              if isinstance(self._content, bytes):
+                  yield self._content
+              else:
+                  yield str(self._content).encode('utf-8')
+  
+  def _finish_builder(builder):
+      # signal workers to stop
+      builder.finish()
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_404_reports_http_error(app, monkeypatch):
+      builder = app.builder
+      builder.init()
+  
+      def fake_get(url, *args, **kwargs):
+          # GET on the page (without the anchor) returns 404
+          return DummyResponse(url, status_code=404, content='Not Found', method='GET')
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head',
+                          lambda *a, **k: DummyResponse(a[0], status_code=404, method='HEAD'))
+  
+      builder.wqueue.put(("https://example.com/page#nope", 'index', 1))
+      uri, docname, lineno, status, info, code = builder.rqueue.get(timeout=5)
+      builder.process_result((uri, docname, lineno, status, info, code))
+  
+      content = (app.outdir / 'output.txt').read_text()
+      assert "404 Client Error" in content
+      assert "Anchor 'nope' not found" not in content
+      _finish_builder(builder)
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_401_treated_as_working(app, monkeypatch):
+      builder = app.builder
+      builder.init()
+  
+      def fake_get(url, *args, **kwargs):
+          resp = DummyResponse(url, status_code=401, content='Unauthorized', method='GET')
+          return resp
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head',
+                          lambda *a, **k: DummyResponse(a[0], status_code=401, method='HEAD'))
+  
+      builder.wqueue.put(("https://example.com/protected#frag", 'index', 2))
+      uri, docname, lineno, status, info, code = builder.rqueue.get(timeout=5)
+      builder.process_result((uri, docname, lineno, status, info, code))
+  
+      content = (app.outdir / 'output.txt').read_text()
+      # 401 is considered "working" with note " - unauthorized"
+      assert " - unauthorized" in content or ("[working]" in content)
+      _finish_builder(builder)
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_503_treated_as_ignored(app, monkeypatch):
+      builder = app.builder
+      builder.init()
+  
+      def fake_get(url, *args, **kwargs):
+          return DummyResponse(url, status_code=503, content='Unavailable', method='GET')
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head',
+                          lambda *a, **k: DummyResponse(a[0], status_code=503, method='HEAD'))
+  
+      builder.wqueue.put(("https://example.com/down#frag", 'index', 3))
+      uri, docname, lineno, status, info, code = builder.rqueue.get(timeout=5)
+      builder.process_result((uri, docname, lineno, status, info, code))
+  
+      content = (app.outdir / 'output.txt').read_text()
+      # 503 are treated as ignored by the logic
+      assert "-ignored-" in content or "Service Unavailable" in content
+      _finish_builder(builder)
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_200_found_reports_working(app, monkeypatch):
+      builder = app.builder
+      builder.init()
+  
+      html_with_anchor = '<html><body><a id="target">x</a></body></html>'
+      def fake_get(url, *args, **kwargs):
+          return DummyResponse(url, status_code=200, content=html_with_anchor, method='GET')
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head',
+                          lambda *a, **k: DummyResponse(a[0], status_code=200, method='HEAD'))
+  
+      builder.wqueue.put(("https://example.com/page#target", 'index', 4))
+      uri, docname, lineno, status, info, code = builder.rqueue.get(timeout=5)
+      builder.process_result((uri, docname, lineno, status, info, code))
+  
+      content = (app.outdir / 'output.txt').read_text()
+      assert "ok" in content or "working" in content
+      _finish_builder(builder)
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_200_missing_reports_anchor_not_found(app, monkeypatch):
+      builder = app.builder
+      builder.init()
+  
+      html_without_anchor = '<html><body><p>No anchor here</p></body></html>'
+      def fake_get(url, *args, **kwargs):
+          return DummyResponse(url, status_code=200, content=html_without_anchor, method='GET')
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head',
+                          lambda *a, **k: DummyResponse(a[0], status_code=200, method='HEAD'))
+  
+      builder.wqueue.put(("https://example.com/page#missing", 'index', 5))
+      uri, docname, lineno, status, info, code = builder.rqueue.get(timeout=5)
+      builder.process_result((uri, docname, lineno, status, info, code))
+  
+      content = (app.outdir / 'output.txt').read_text()
+      assert "Anchor 'missing' not found" in content
+      _finish_builder(builder)
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_redirect_history_includes_anchor(app, monkeypatch):
+      builder = app.builder
+      builder.init()
+  
+      html_with_anchor = '<html><body><a id="a">x</a></body></html>'
+      def fake_get(url, *args, **kwargs):
+          # Simulate final response url different from requested one and with history
+          resp = DummyResponse(url + "/final", status_code=200, content=html_with_anchor, method='GET',
+                               history=[DummyHistory(301)])
+          return resp
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head',
+                          lambda *a, **k: DummyResponse(a[0], status_code=200, method='HEAD'))
+  
+      builder.wqueue.put(("https://example.com/orig#a", 'index', 6))
+      uri, docname, lineno, status, info, code = builder.rqueue.get(timeout=5)
+      builder.process_result((uri, docname, lineno, status, info, code))
+  
+      content = (app.outdir / 'output.txt').read_text()
+      # should be reported as redirected with the last history code (301)
+      assert "redirect" in content
+      assert "301" in content or "permanently" in content or "to https://example.com/orig/final" in content or "to https://example.com/orig/final#a" in content
+      _finish_builder(builder)
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_non_html_with_missing_anchor_reports_broken(app, monkeypatch):
+      """
+      The model patch attempted to skip anchor checks for non-HTML content.
+      The intended/gold behavior is to attempt to find anchors regardless of content-type
+      (so a missing anchor should be reported). This test ensures a non-HTML response
+      that does not contain the anchor is reported as broken (anchor not found).
+      """
+      builder = app.builder
+      builder.init()
+  
+      # non-HTML content, missing anchor
+      binary_content = b'\x00\x01\x02no anchor here'
+      def fake_get(url, *args, **kwargs):
+          return DummyResponse(url, status_code=200, content=binary_content.decode('latin1'), headers={'content-type': 'application/octet-stream'}, method='GET')
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head',
+                          lambda *a, **k: DummyResponse(a[0], status_code=200, headers={'content-type': 'application/octet-stream'}, method='HEAD'))
+  
+      builder.wqueue.put(("https://example.com/file#frag", 'index', 7))
+      uri, docname, lineno, status, info, code = builder.rqueue.get(timeout=5)
+      builder.process_result((uri, docname, lineno, status, info, code))
+  
+      content = (app.outdir / 'output.txt').read_text()
+      # Should report anchor not found (broken)
+      assert "Anchor 'frag' not found" in content
+      _finish_builder(builder)
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_ssl_error_is_ignored(app, monkeypatch):
+      builder = app.builder
+      builder.init()
+  
+      def fake_get(url, *args, **kwargs):
+          raise Exception("SSL error")
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head', lambda *a, **k: (_ for _ in ()).throw(Exception("SSL error")))
+  
+      # force is_ssl_error to say True for our Exception
+      monkeypatch.setattr('sphinx.builders.linkcheck.is_ssl_error', lambda e: True)
+  
+      builder.wqueue.put(("https://example.com/ssl#x", 'index', 8))
+      uri, docname, lineno, status, info, code = builder.rqueue.get(timeout=5)
+      builder.process_result((uri, docname, lineno, status, info, code))
+  
+      content = (app.outdir / 'output.txt').read_text()
+      assert "-ignored-" in content or "SSL error" in content
+      _finish_builder(builder)
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_unicode_uri_is_encoded_before_request(app, monkeypatch):
+      builder = app.builder
+      builder.init()
+  
+      seen = {}
+      def fake_get(url, *args, **kwargs):
+          seen['url'] = url
+          return DummyResponse(url, status_code=200, content='<html></html>', method='GET')
+      # HEAD won't be used for anchor-case but patch both to be safe
+      def fake_head(url, *args, **kwargs):
+          seen['url_head'] = url
+          return DummyResponse(url, status_code=200, content='', method='HEAD')
+  
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head', fake_head)
+  
+      # include a non-ascii character in the path
+      non_ascii_uri = "https://example.com/ümlaut#frag"
+      builder.wqueue.put((non_ascii_uri, 'index', 9))
+      uri, docname, lineno, status, info, code = builder.rqueue.get(timeout=5)
+      builder.process_result((uri, docname, lineno, status, info, code))
+  
+      # the request URL should be percent-encoded (i.e. contain %)
+      assert '%' in seen.get('url', '') or 'ü' not in seen.get('url', '')
+      _finish_builder(builder)
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchors_ignored_strips_anchor_and_checks_existence(app, monkeypatch):
+      # If the anchor matches linkcheck_anchors_ignore it should be stripped and not cause anchor checking
+      builder = app.builder
+      # override anchors ignore so the given anchor is ignored
+      app.config.linkcheck_anchors_ignore = [r"^ignoreme$"]
+      builder.init()
+  
+      def fake_get(url, *args, **kwargs):
+          # page exists
+          return DummyResponse(url, status_code=200, content='<html></html>', method='GET')
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head',
+                          lambda *a, **k: DummyResponse(a[0], status_code=200, method='HEAD'))
+  
+      builder.wqueue.put(("https://example.com/page#ignoreme", 'index', 10))
+      uri, docname, lineno, status, info, code = builder.rqueue.get(timeout=5)
+      builder.process_result((uri, docname, lineno, status, info, code))
+  
+      content = (app.outdir / 'output.txt').read_text()
+      # since anchor was ignored, it should perform a normal existence check which succeeds
+      assert "ok" in content or "working" in content
+      _finish_builder(builder)
+new_imports_code: |
+  import types
+  from requests.exceptions import HTTPError

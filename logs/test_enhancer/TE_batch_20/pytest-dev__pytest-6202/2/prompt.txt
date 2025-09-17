@@ -1,0 +1,2852 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `src/_pytest/python.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 """ Python test discovery, setup and run of test functions. """
+2 import enum
+3 import fnmatch
+4 import inspect
+5 import os
+6 import sys
+7 import warnings
+8 from collections import Counter
+9 from collections.abc import Sequence
+10 from functools import partial
+11 from textwrap import dedent
+12 
+13 import py
+14 
+15 import _pytest
+16 from _pytest import fixtures
+17 from _pytest import nodes
+18 from _pytest._code import filter_traceback
+19 from _pytest.compat import ascii_escaped
+20 from _pytest.compat import get_default_arg_names
+21 from _pytest.compat import get_real_func
+22 from _pytest.compat import getfslineno
+23 from _pytest.compat import getimfunc
+24 from _pytest.compat import getlocation
+25 from _pytest.compat import is_generator
+26 from _pytest.compat import iscoroutinefunction
+27 from _pytest.compat import NOTSET
+28 from _pytest.compat import REGEX_TYPE
+29 from _pytest.compat import safe_getattr
+30 from _pytest.compat import safe_isclass
+31 from _pytest.compat import STRING_TYPES
+32 from _pytest.config import hookimpl
+33 from _pytest.main import FSHookProxy
+34 from _pytest.mark import MARK_GEN
+35 from _pytest.mark.structures import get_unpacked_marks
+36 from _pytest.mark.structures import normalize_mark_list
+37 from _pytest.outcomes import fail
+38 from _pytest.outcomes import skip
+39 from _pytest.pathlib import parts
+40 from _pytest.warning_types import PytestCollectionWarning
+41 from _pytest.warning_types import PytestUnhandledCoroutineWarning
+42 
+43 
+44 def pyobj_property(name):
+45     def get(self):
+46         node = self.getparent(getattr(__import__("pytest"), name))
+47         if node is not None:
+48             return node.obj
+49 
+50     doc = "python {} object this node was collected from (can be None).".format(
+51         name.lower()
+52     )
+53     return property(get, None, None, doc)
+54 
+55 
+56 def pytest_addoption(parser):
+57     group = parser.getgroup("general")
+58     group.addoption(
+59         "--fixtures",
+60         "--funcargs",
+61         action="store_true",
+62         dest="showfixtures",
+63         default=False,
+64         help="show available fixtures, sorted by plugin appearance "
+65         "(fixtures with leading '_' are only shown with '-v')",
+66     )
+67     group.addoption(
+68         "--fixtures-per-test",
+69         action="store_true",
+70         dest="show_fixtures_per_test",
+71         default=False,
+72         help="show fixtures per test",
+73     )
+74     parser.addini(
+75         "python_files",
+76         type="args",
+77         # NOTE: default is also used in AssertionRewritingHook.
+78         default=["test_*.py", "*_test.py"],
+79         help="glob-style file patterns for Python test module discovery",
+80     )
+81     parser.addini(
+82         "python_classes",
+83         type="args",
+84         default=["Test"],
+85         help="prefixes or glob names for Python test class discovery",
+86     )
+87     parser.addini(
+88         "python_functions",
+89         type="args",
+90         default=["test"],
+91         help="prefixes or glob names for Python test function and method discovery",
+92     )
+93     parser.addini(
+94         "disable_test_id_escaping_and_forfeit_all_rights_to_community_support",
+95         type="bool",
+96         default=False,
+97         help="disable string escape non-ascii characters, might cause unwanted "
+98         "side effects(use at your own risk)",
+99     )
+100 
+101     group.addoption(
+102         "--import-mode",
+103         default="prepend",
+104         choices=["prepend", "append"],
+105         dest="importmode",
+106         help="prepend/append to sys.path when importing test modules, "
+107         "default is to prepend.",
+108     )
+109 
+110 
+111 def pytest_cmdline_main(config):
+112     if config.option.showfixtures:
+113         showfixtures(config)
+114         return 0
+115     if config.option.show_fixtures_per_test:
+116         show_fixtures_per_test(config)
+117         return 0
+118 
+119 
+120 def pytest_generate_tests(metafunc):
+121     # those alternative spellings are common - raise a specific error to alert
+122     # the user
+123     alt_spellings = ["parameterize", "parametrise", "parameterise"]
+124     for mark_name in alt_spellings:
+125         if metafunc.definition.get_closest_marker(mark_name):
+126             msg = "{0} has '{1}' mark, spelling should be 'parametrize'"
+127             fail(msg.format(metafunc.function.__name__, mark_name), pytrace=False)
+128     for marker in metafunc.definition.iter_markers(name="parametrize"):
+129         metafunc.parametrize(*marker.args, **marker.kwargs)
+130 
+131 
+132 def pytest_configure(config):
+133     config.addinivalue_line(
+134         "markers",
+135         "parametrize(argnames, argvalues): call a test function multiple "
+136         "times passing in different arguments in turn. argvalues generally "
+137         "needs to be a list of values if argnames specifies only one name "
+138         "or a list of tuples of values if argnames specifies multiple names. "
+139         "Example: @parametrize('arg1', [1,2]) would lead to two calls of the "
+140         "decorated test function, one with arg1=1 and another with arg1=2."
+141         "see https://docs.pytest.org/en/latest/parametrize.html for more info "
+142         "and examples.",
+143     )
+144     config.addinivalue_line(
+145         "markers",
+146         "usefixtures(fixturename1, fixturename2, ...): mark tests as needing "
+147         "all of the specified fixtures. see "
+148         "https://docs.pytest.org/en/latest/fixture.html#usefixtures ",
+149     )
+150 
+151 
+152 @hookimpl(trylast=True)
+153 def pytest_pyfunc_call(pyfuncitem):
+154     def async_warn():
+155         msg = "async def functions are not natively supported and have been skipped.\n"
+156         msg += "You need to install a suitable plugin for your async framework, for example:\n"
+157         msg += "  - pytest-asyncio\n"
+158         msg += "  - pytest-trio\n"
+159         msg += "  - pytest-tornasync"
+160         warnings.warn(PytestUnhandledCoroutineWarning(msg.format(pyfuncitem.nodeid)))
+161         skip(msg="async def function and no async plugin installed (see warnings)")
+162 
+163     testfunction = pyfuncitem.obj
+164     if iscoroutinefunction(testfunction) or (
+165         sys.version_info >= (3, 6) and inspect.isasyncgenfunction(testfunction)
+166     ):
+167         async_warn()
+168     funcargs = pyfuncitem.funcargs
+169     testargs = {arg: funcargs[arg] for arg in pyfuncitem._fixtureinfo.argnames}
+170     result = testfunction(**testargs)
+171     if hasattr(result, "__await__") or hasattr(result, "__aiter__"):
+172         async_warn()
+173     return True
+174 
+175 
+176 def pytest_collect_file(path, parent):
+177     ext = path.ext
+178     if ext == ".py":
+179         if not parent.session.isinitpath(path):
+180             if not path_matches_patterns(
+181                 path, parent.config.getini("python_files") + ["__init__.py"]
+182             ):
+183                 return
+184         ihook = parent.session.gethookproxy(path)
+185         return ihook.pytest_pycollect_makemodule(path=path, parent=parent)
+186 
+187 
+188 def path_matches_patterns(path, patterns):
+189     """Returns True if the given py.path.local matches one of the patterns in the list of globs given"""
+190     return any(path.fnmatch(pattern) for pattern in patterns)
+191 
+192 
+193 def pytest_pycollect_makemodule(path, parent):
+194     if path.basename == "__init__.py":
+195         return Package(path, parent)
+196     return Module(path, parent)
+197 
+198 
+199 @hookimpl(hookwrapper=True)
+200 def pytest_pycollect_makeitem(collector, name, obj):
+201     outcome = yield
+202     res = outcome.get_result()
+203     if res is not None:
+204         return
+205     # nothing was collected elsewhere, let's do it here
+206     if safe_isclass(obj):
+207         if collector.istestclass(obj, name):
+208             outcome.force_result(Class(name, parent=collector))
+209     elif collector.istestfunction(obj, name):
+210         # mock seems to store unbound methods (issue473), normalize it
+211         obj = getattr(obj, "__func__", obj)
+212         # We need to try and unwrap the function if it's a functools.partial
+213         # or a functools.wrapped.
+214         # We mustn't if it's been wrapped with mock.patch (python 2 only)
+215         if not (inspect.isfunction(obj) or inspect.isfunction(get_real_func(obj))):
+216             filename, lineno = getfslineno(obj)
+217             warnings.warn_explicit(
+218                 message=PytestCollectionWarning(
+219                     "cannot collect %r because it is not a function." % name
+220                 ),
+221                 category=None,
+222                 filename=str(filename),
+223                 lineno=lineno + 1,
+224             )
+225         elif getattr(obj, "__test__", True):
+226             if is_generator(obj):
+227                 res = Function(name, parent=collector)
+228                 reason = "yield tests were removed in pytest 4.0 - {name} will be ignored".format(
+229                     name=name
+230                 )
+231                 res.add_marker(MARK_GEN.xfail(run=False, reason=reason))
+232                 res.warn(PytestCollectionWarning(reason))
+233             else:
+234                 res = list(collector._genfunctions(name, obj))
+235             outcome.force_result(res)
+236 
+237 
+238 def pytest_make_parametrize_id(config, val, argname=None):
+239     return None
+240 
+241 
+242 class PyobjContext:
+243     module = pyobj_property("Module")
+244     cls = pyobj_property("Class")
+245     instance = pyobj_property("Instance")
+246 
+247 
+248 class PyobjMixin(PyobjContext):
+249     _ALLOW_MARKERS = True
+250 
+251     @property
+252     def obj(self):
+253         """Underlying Python object."""
+254         obj = getattr(self, "_obj", None)
+255         if obj is None:
+256             self._obj = obj = self._getobj()
+257             # XXX evil hack
+258             # used to avoid Instance collector marker duplication
+259             if self._ALLOW_MARKERS:
+260                 self.own_markers.extend(get_unpacked_marks(self.obj))
+261         return obj
+262 
+263     @obj.setter
+264     def obj(self, value):
+265         self._obj = value
+266 
+267     def _getobj(self):
+268         """Gets the underlying Python object. May be overwritten by subclasses."""
+269         return getattr(self.parent.obj, self.name)
+270 
+271     def getmodpath(self, stopatmodule=True, includemodule=False):
+272         """ return python path relative to the containing module. """
+273         chain = self.listchain()
+274         chain.reverse()
+275         parts = []
+276         for node in chain:
+277             if isinstance(node, Instance):
+278                 continue
+279             name = node.name
+280             if isinstance(node, Module):
+281                 name = os.path.splitext(name)[0]
+282                 if stopatmodule:
+283                     if includemodule:
+284                         parts.append(name)
+285                     break
+286             parts.append(name)
+287         parts.reverse()
+288         return ".".join(parts)
+289 
+290     def reportinfo(self):
+291         # XXX caching?
+292         obj = self.obj
+293         compat_co_firstlineno = getattr(obj, "compat_co_firstlineno", None)
+294         if isinstance(compat_co_firstlineno, int):
+295             # nose compatibility
+296             fspath = sys.modules[obj.__module__].__file__
+297             if fspath.endswith(".pyc"):
+298                 fspath = fspath[:-1]
+299             lineno = compat_co_firstlineno
+300         else:
+301             fspath, lineno = getfslineno(obj)
+302         modpath = self.getmodpath()
+303         assert isinstance(lineno, int)
+304         return fspath, lineno, modpath
+305 
+306 
+307 class PyCollector(PyobjMixin, nodes.Collector):
+308     def funcnamefilter(self, name):
+309         return self._matches_prefix_or_glob_option("python_functions", name)
+310 
+311     def isnosetest(self, obj):
+312         """ Look for the __test__ attribute, which is applied by the
+313         @nose.tools.istest decorator
+314         """
+315         # We explicitly check for "is True" here to not mistakenly treat
+316         # classes with a custom __getattr__ returning something truthy (like a
+317         # function) as test classes.
+318         return safe_getattr(obj, "__test__", False) is True
+319 
+320     def classnamefilter(self, name):
+321         return self._matches_prefix_or_glob_option("python_classes", name)
+322 
+323     def istestfunction(self, obj, name):
+324         if self.funcnamefilter(name) or self.isnosetest(obj):
+325             if isinstance(obj, staticmethod):
+326                 # static methods need to be unwrapped
+327                 obj = safe_getattr(obj, "__func__", False)
+328             return (
+329                 safe_getattr(obj, "__call__", False)
+330                 and fixtures.getfixturemarker(obj) is None
+331             )
+332         else:
+333             return False
+334 
+335     def istestclass(self, obj, name):
+336         return self.classnamefilter(name) or self.isnosetest(obj)
+337 
+338     def _matches_prefix_or_glob_option(self, option_name, name):
+339         """
+340         checks if the given name matches the prefix or glob-pattern defined
+341         in ini configuration.
+342         """
+343         for option in self.config.getini(option_name):
+344             if name.startswith(option):
+345                 return True
+346             # check that name looks like a glob-string before calling fnmatch
+347             # because this is called for every name in each collected module,
+348             # and fnmatch is somewhat expensive to call
+349             elif ("*" in option or "?" in option or "[" in option) and fnmatch.fnmatch(
+350                 name, option
+351             ):
+352                 return True
+353         return False
+354 
+355     def collect(self):
+356         if not getattr(self.obj, "__test__", True):
+357             return []
+358 
+359         # NB. we avoid random getattrs and peek in the __dict__ instead
+360         # (XXX originally introduced from a PyPy need, still true?)
+361         dicts = [getattr(self.obj, "__dict__", {})]
+362         for basecls in inspect.getmro(self.obj.__class__):
+363             dicts.append(basecls.__dict__)
+364         seen = {}
+365         values = []
+366         for dic in dicts:
+367             for name, obj in list(dic.items()):
+368                 if name in seen:
+369                     continue
+370                 seen[name] = True
+371                 res = self._makeitem(name, obj)
+372                 if res is None:
+373                     continue
+374                 if not isinstance(res, list):
+375                     res = [res]
+376                 values.extend(res)
+377         values.sort(key=lambda item: item.reportinfo()[:2])
+378         return values
+379 
+380     def _makeitem(self, name, obj):
+381         # assert self.ihook.fspath == self.fspath, self
+382         return self.ihook.pytest_pycollect_makeitem(collector=self, name=name, obj=obj)
+383 
+384     def _genfunctions(self, name, funcobj):
+385         module = self.getparent(Module).obj
+386         clscol = self.getparent(Class)
+387         cls = clscol and clscol.obj or None
+388         fm = self.session._fixturemanager
+389 
+390         definition = FunctionDefinition(name=name, parent=self, callobj=funcobj)
+391         fixtureinfo = fm.getfixtureinfo(definition, funcobj, cls)
+392 
+393         metafunc = Metafunc(
+394             definition, fixtureinfo, self.config, cls=cls, module=module
+395         )
+396         methods = []
+397         if hasattr(module, "pytest_generate_tests"):
+398             methods.append(module.pytest_generate_tests)
+399         if hasattr(cls, "pytest_generate_tests"):
+400             methods.append(cls().pytest_generate_tests)
+401 
+402         self.ihook.pytest_generate_tests.call_extra(methods, dict(metafunc=metafunc))
+403 
+404         if not metafunc._calls:
+405             yield Function(name, parent=self, fixtureinfo=fixtureinfo)
+406         else:
+407             # add funcargs() as fixturedefs to fixtureinfo.arg2fixturedefs
+408             fixtures.add_funcarg_pseudo_fixture_def(self, metafunc, fm)
+409 
+410             # add_funcarg_pseudo_fixture_def may have shadowed some fixtures
+411             # with direct parametrization, so make sure we update what the
+412             # function really needs.
+413             fixtureinfo.prune_dependency_tree()
+414 
+415             for callspec in metafunc._calls:
+416                 subname = "{}[{}]".format(name, callspec.id)
+417                 yield Function(
+418                     name=subname,
+419                     parent=self,
+420                     callspec=callspec,
+421                     callobj=funcobj,
+422                     fixtureinfo=fixtureinfo,
+423                     keywords={callspec.id: True},
+424                     originalname=name,
+425                 )
+426 
+427 
+428 class Module(nodes.File, PyCollector):
+429     """ Collector for test classes and functions. """
+430 
+431     def _getobj(self):
+432         return self._importtestmodule()
+433 
+434     def collect(self):
+435         self._inject_setup_module_fixture()
+436         self._inject_setup_function_fixture()
+437         self.session._fixturemanager.parsefactories(self)
+438         return super().collect()
+439 
+440     def _inject_setup_module_fixture(self):
+441         """Injects a hidden autouse, module scoped fixture into the collected module object
+442         that invokes setUpModule/tearDownModule if either or both are available.
+443 
+444         Using a fixture to invoke this methods ensures we play nicely and unsurprisingly with
+445         other fixtures (#517).
+446         """
+447         setup_module = _get_first_non_fixture_func(
+448             self.obj, ("setUpModule", "setup_module")
+449         )
+450         teardown_module = _get_first_non_fixture_func(
+451             self.obj, ("tearDownModule", "teardown_module")
+452         )
+453 
+454         if setup_module is None and teardown_module is None:
+455             return
+456 
+457         @fixtures.fixture(autouse=True, scope="module")
+458         def xunit_setup_module_fixture(request):
+459             if setup_module is not None:
+460                 _call_with_optional_argument(setup_module, request.module)
+461             yield
+462             if teardown_module is not None:
+463                 _call_with_optional_argument(teardown_module, request.module)
+464 
+465         self.obj.__pytest_setup_module = xunit_setup_module_fixture
+466 
+467     def _inject_setup_function_fixture(self):
+468         """Injects a hidden autouse, function scoped fixture into the collected module object
+469         that invokes setup_function/teardown_function if either or both are available.
+470 
+471         Using a fixture to invoke this methods ensures we play nicely and unsurprisingly with
+472         other fixtures (#517).
+473         """
+474         setup_function = _get_first_non_fixture_func(self.obj, ("setup_function",))
+475         teardown_function = _get_first_non_fixture_func(
+476             self.obj, ("teardown_function",)
+477         )
+478         if setup_function is None and teardown_function is None:
+479             return
+480 
+481         @fixtures.fixture(autouse=True, scope="function")
+482         def xunit_setup_function_fixture(request):
+483             if request.instance is not None:
+484                 # in this case we are bound to an instance, so we need to let
+485                 # setup_method handle this
+486                 yield
+487                 return
+488             if setup_function is not None:
+489                 _call_with_optional_argument(setup_function, request.function)
+490             yield
+491             if teardown_function is not None:
+492                 _call_with_optional_argument(teardown_function, request.function)
+493 
+494         self.obj.__pytest_setup_function = xunit_setup_function_fixture
+495 
+496     def _importtestmodule(self):
+497         # we assume we are only called once per module
+498         importmode = self.config.getoption("--import-mode")
+499         try:
+500             mod = self.fspath.pyimport(ensuresyspath=importmode)
+501         except SyntaxError:
+502             raise self.CollectError(
+503                 _pytest._code.ExceptionInfo.from_current().getrepr(style="short")
+504             )
+505         except self.fspath.ImportMismatchError:
+506             e = sys.exc_info()[1]
+507             raise self.CollectError(
+508                 "import file mismatch:\n"
+509                 "imported module %r has this __file__ attribute:\n"
+510                 "  %s\n"
+511                 "which is not the same as the test file we want to collect:\n"
+512                 "  %s\n"
+513                 "HINT: remove __pycache__ / .pyc files and/or use a "
+514                 "unique basename for your test file modules" % e.args
+515             )
+516         except ImportError:
+517             from _pytest._code.code import ExceptionInfo
+518 
+519             exc_info = ExceptionInfo.from_current()
+520             if self.config.getoption("verbose") < 2:
+521                 exc_info.traceback = exc_info.traceback.filter(filter_traceback)
+522             exc_repr = (
+523                 exc_info.getrepr(style="short")
+524                 if exc_info.traceback
+525                 else exc_info.exconly()
+526             )
+527             formatted_tb = str(exc_repr)
+528             raise self.CollectError(
+529                 "ImportError while importing test module '{fspath}'.\n"
+530                 "Hint: make sure your test modules/packages have valid Python names.\n"
+531                 "Traceback:\n"
+532                 "{traceback}".format(fspath=self.fspath, traceback=formatted_tb)
+533             )
+534         except _pytest.runner.Skipped as e:
+535             if e.allow_module_level:
+536                 raise
+537             raise self.CollectError(
+538                 "Using pytest.skip outside of a test is not allowed. "
+539                 "To decorate a test function, use the @pytest.mark.skip "
+540                 "or @pytest.mark.skipif decorators instead, and to skip a "
+541                 "module use `pytestmark = pytest.mark.{skip,skipif}."
+542             )
+543         self.config.pluginmanager.consider_module(mod)
+544         return mod
+545 
+546 
+547 class Package(Module):
+548     def __init__(self, fspath, parent=None, config=None, session=None, nodeid=None):
+549         session = parent.session
+550         nodes.FSCollector.__init__(
+551             self, fspath, parent=parent, config=config, session=session, nodeid=nodeid
+552         )
+553         self.name = fspath.dirname
+554         self.trace = session.trace
+555         self._norecursepatterns = session._norecursepatterns
+556         self.fspath = fspath
+557 
+558     def setup(self):
+559         # not using fixtures to call setup_module here because autouse fixtures
+560         # from packages are not called automatically (#4085)
+561         setup_module = _get_first_non_fixture_func(
+562             self.obj, ("setUpModule", "setup_module")
+563         )
+564         if setup_module is not None:
+565             _call_with_optional_argument(setup_module, self.obj)
+566 
+567         teardown_module = _get_first_non_fixture_func(
+568             self.obj, ("tearDownModule", "teardown_module")
+569         )
+570         if teardown_module is not None:
+571             func = partial(_call_with_optional_argument, teardown_module, self.obj)
+572             self.addfinalizer(func)
+573 
+574     def _recurse(self, dirpath):
+575         if dirpath.basename == "__pycache__":
+576             return False
+577         ihook = self.gethookproxy(dirpath.dirpath())
+578         if ihook.pytest_ignore_collect(path=dirpath, config=self.config):
+579             return
+580         for pat in self._norecursepatterns:
+581             if dirpath.check(fnmatch=pat):
+582                 return False
+583         ihook = self.gethookproxy(dirpath)
+584         ihook.pytest_collect_directory(path=dirpath, parent=self)
+585         return True
+586 
+587     def gethookproxy(self, fspath):
+588         # check if we have the common case of running
+589         # hooks with all conftest.py filesall conftest.py
+590         pm = self.config.pluginmanager
+591         my_conftestmodules = pm._getconftestmodules(fspath)
+592         remove_mods = pm._conftest_plugins.difference(my_conftestmodules)
+593         if remove_mods:
+594             # one or more conftests are not in use at this fspath
+595             proxy = FSHookProxy(fspath, pm, remove_mods)
+596         else:
+597             # all plugins are active for this fspath
+598             proxy = self.config.hook
+599         return proxy
+600 
+601     def _collectfile(self, path, handle_dupes=True):
+602         assert (
+603             path.isfile()
+604         ), "{!r} is not a file (isdir={!r}, exists={!r}, islink={!r})".format(
+605             path, path.isdir(), path.exists(), path.islink()
+606         )
+607         ihook = self.gethookproxy(path)
+608         if not self.isinitpath(path):
+609             if ihook.pytest_ignore_collect(path=path, config=self.config):
+610                 return ()
+611 
+612         if handle_dupes:
+613             keepduplicates = self.config.getoption("keepduplicates")
+614             if not keepduplicates:
+615                 duplicate_paths = self.config.pluginmanager._duplicatepaths
+616                 if path in duplicate_paths:
+617                     return ()
+618                 else:
+619                     duplicate_paths.add(path)
+620 
+621         if self.fspath == path:  # __init__.py
+622             return [self]
+623 
+624         return ihook.pytest_collect_file(path=path, parent=self)
+625 
+626     def isinitpath(self, path):
+627         return path in self.session._initialpaths
+628 
+629     def collect(self):
+630         this_path = self.fspath.dirpath()
+631         init_module = this_path.join("__init__.py")
+632         if init_module.check(file=1) and path_matches_patterns(
+633             init_module, self.config.getini("python_files")
+634         ):
+635             yield Module(init_module, self)
+636         pkg_prefixes = set()
+637         for path in this_path.visit(rec=self._recurse, bf=True, sort=True):
+638             # We will visit our own __init__.py file, in which case we skip it.
+639             is_file = path.isfile()
+640             if is_file:
+641                 if path.basename == "__init__.py" and path.dirpath() == this_path:
+642                     continue
+643 
+644             parts_ = parts(path.strpath)
+645             if any(
+646                 pkg_prefix in parts_ and pkg_prefix.join("__init__.py") != path
+647                 for pkg_prefix in pkg_prefixes
+648             ):
+649                 continue
+650 
+651             if is_file:
+652                 yield from self._collectfile(path)
+653             elif not path.isdir():
+654                 # Broken symlink or invalid/missing file.
+655                 continue
+656             elif path.join("__init__.py").check(file=1):
+657                 pkg_prefixes.add(path)
+658 
+659 
+660 def _call_with_optional_argument(func, arg):
+661     """Call the given function with the given argument if func accepts one argument, otherwise
+662     calls func without arguments"""
+663     arg_count = func.__code__.co_argcount
+664     if inspect.ismethod(func):
+665         arg_count -= 1
+666     if arg_count:
+667         func(arg)
+668     else:
+669         func()
+670 
+671 
+672 def _get_first_non_fixture_func(obj, names):
+673     """Return the attribute from the given object to be used as a setup/teardown
+674     xunit-style function, but only if not marked as a fixture to
+675     avoid calling it twice.
+676     """
+677     for name in names:
+678         meth = getattr(obj, name, None)
+679         if meth is not None and fixtures.getfixturemarker(meth) is None:
+680             return meth
+681 
+682 
+683 class Class(PyCollector):
+684     """ Collector for test methods. """
+685 
+686     def collect(self):
+687         if not safe_getattr(self.obj, "__test__", True):
+688             return []
+689         if hasinit(self.obj):
+690             self.warn(
+691                 PytestCollectionWarning(
+692                     "cannot collect test class %r because it has a "
+693                     "__init__ constructor (from: %s)"
+694                     % (self.obj.__name__, self.parent.nodeid)
+695                 )
+696             )
+697             return []
+698         elif hasnew(self.obj):
+699             self.warn(
+700                 PytestCollectionWarning(
+701                     "cannot collect test class %r because it has a "
+702                     "__new__ constructor (from: %s)"
+703                     % (self.obj.__name__, self.parent.nodeid)
+704                 )
+705             )
+706             return []
+707 
+708         self._inject_setup_class_fixture()
+709         self._inject_setup_method_fixture()
+710 
+711         return [Instance(name="()", parent=self)]
+712 
+713     def _inject_setup_class_fixture(self):
+714         """Injects a hidden autouse, class scoped fixture into the collected class object
+715         that invokes setup_class/teardown_class if either or both are available.
+716 
+717         Using a fixture to invoke this methods ensures we play nicely and unsurprisingly with
+718         other fixtures (#517).
+719         """
+720         setup_class = _get_first_non_fixture_func(self.obj, ("setup_class",))
+721         teardown_class = getattr(self.obj, "teardown_class", None)
+722         if setup_class is None and teardown_class is None:
+723             return
+724 
+725         @fixtures.fixture(autouse=True, scope="class")
+726         def xunit_setup_class_fixture(cls):
+727             if setup_class is not None:
+728                 func = getimfunc(setup_class)
+729                 _call_with_optional_argument(func, self.obj)
+730             yield
+731             if teardown_class is not None:
+732                 func = getimfunc(teardown_class)
+733                 _call_with_optional_argument(func, self.obj)
+734 
+735         self.obj.__pytest_setup_class = xunit_setup_class_fixture
+736 
+737     def _inject_setup_method_fixture(self):
+738         """Injects a hidden autouse, function scoped fixture into the collected class object
+739         that invokes setup_method/teardown_method if either or both are available.
+740 
+741         Using a fixture to invoke this methods ensures we play nicely and unsurprisingly with
+742         other fixtures (#517).
+743         """
+744         setup_method = _get_first_non_fixture_func(self.obj, ("setup_method",))
+745         teardown_method = getattr(self.obj, "teardown_method", None)
+746         if setup_method is None and teardown_method is None:
+747             return
+748 
+749         @fixtures.fixture(autouse=True, scope="function")
+750         def xunit_setup_method_fixture(self, request):
+751             method = request.function
+752             if setup_method is not None:
+753                 func = getattr(self, "setup_method")
+754                 _call_with_optional_argument(func, method)
+755             yield
+756             if teardown_method is not None:
+757                 func = getattr(self, "teardown_method")
+758                 _call_with_optional_argument(func, method)
+759 
+760         self.obj.__pytest_setup_method = xunit_setup_method_fixture
+761 
+762 
+763 class Instance(PyCollector):
+764     _ALLOW_MARKERS = False  # hack, destroy later
+765     # instances share the object with their parents in a way
+766     # that duplicates markers instances if not taken out
+767     # can be removed at node structure reorganization time
+768 
+769     def _getobj(self):
+770         return self.parent.obj()
+771 
+772     def collect(self):
+773         self.session._fixturemanager.parsefactories(self)
+774         return super().collect()
+775 
+776     def newinstance(self):
+777         self.obj = self._getobj()
+778         return self.obj
+779 
+780 
+781 class FunctionMixin(PyobjMixin):
+782     """ mixin for the code common to Function and Generator.
+783     """
+784 
+785     def setup(self):
+786         """ perform setup for this test function. """
+787         if isinstance(self.parent, Instance):
+788             self.parent.newinstance()
+789             self.obj = self._getobj()
+790 
+791     def _prunetraceback(self, excinfo):
+792         if hasattr(self, "_obj") and not self.config.getoption("fulltrace", False):
+793             code = _pytest._code.Code(get_real_func(self.obj))
+794             path, firstlineno = code.path, code.firstlineno
+795             traceback = excinfo.traceback
+796             ntraceback = traceback.cut(path=path, firstlineno=firstlineno)
+797             if ntraceback == traceback:
+798                 ntraceback = ntraceback.cut(path=path)
+799                 if ntraceback == traceback:
+800                     ntraceback = ntraceback.filter(filter_traceback)
+801                     if not ntraceback:
+802                         ntraceback = traceback
+803 
+804             excinfo.traceback = ntraceback.filter()
+805             # issue364: mark all but first and last frames to
+806             # only show a single-line message for each frame
+807             if self.config.getoption("tbstyle", "auto") == "auto":
+808                 if len(excinfo.traceback) > 2:
+809                     for entry in excinfo.traceback[1:-1]:
+810                         entry.set_repr_style("short")
+811 
+812     def repr_failure(self, excinfo, outerr=None):
+813         assert outerr is None, "XXX outerr usage is deprecated"
+814         style = self.config.getoption("tbstyle", "auto")
+815         if style == "auto":
+816             style = "long"
+817         return self._repr_failure_py(excinfo, style=style)
+818 
+819 
+820 def hasinit(obj):
+821     init = getattr(obj, "__init__", None)
+822     if init:
+823         return init != object.__init__
+824 
+825 
+826 def hasnew(obj):
+827     new = getattr(obj, "__new__", None)
+828     if new:
+829         return new != object.__new__
+830 
+831 
+832 class CallSpec2:
+833     def __init__(self, metafunc):
+834         self.metafunc = metafunc
+835         self.funcargs = {}
+836         self._idlist = []
+837         self.params = {}
+838         self._globalid = NOTSET
+839         self._globalparam = NOTSET
+840         self._arg2scopenum = {}  # used for sorting parametrized resources
+841         self.marks = []
+842         self.indices = {}
+843 
+844     def copy(self):
+845         cs = CallSpec2(self.metafunc)
+846         cs.funcargs.update(self.funcargs)
+847         cs.params.update(self.params)
+848         cs.marks.extend(self.marks)
+849         cs.indices.update(self.indices)
+850         cs._arg2scopenum.update(self._arg2scopenum)
+851         cs._idlist = list(self._idlist)
+852         cs._globalid = self._globalid
+853         cs._globalparam = self._globalparam
+854         return cs
+855 
+856     def _checkargnotcontained(self, arg):
+857         if arg in self.params or arg in self.funcargs:
+858             raise ValueError("duplicate {!r}".format(arg))
+859 
+860     def getparam(self, name):
+861         try:
+862             return self.params[name]
+863         except KeyError:
+864             if self._globalparam is NOTSET:
+865                 raise ValueError(name)
+866             return self._globalparam
+867 
+868     @property
+869     def id(self):
+870         return "-".join(map(str, filter(None, self._idlist)))
+871 
+872     def setmulti2(self, valtypes, argnames, valset, id, marks, scopenum, param_index):
+873         for arg, val in zip(argnames, valset):
+874             self._checkargnotcontained(arg)
+875             valtype_for_arg = valtypes[arg]
+876             getattr(self, valtype_for_arg)[arg] = val
+877             self.indices[arg] = param_index
+878             self._arg2scopenum[arg] = scopenum
+879         self._idlist.append(id)
+880         self.marks.extend(normalize_mark_list(marks))
+881 
+882 
+883 class Metafunc(fixtures.FuncargnamesCompatAttr):
+884     """
+885     Metafunc objects are passed to the :func:`pytest_generate_tests <_pytest.hookspec.pytest_generate_tests>` hook.
+886     They help to inspect a test function and to generate tests according to
+887     test configuration or values specified in the class or module where a
+888     test function is defined.
+889     """
+890 
+891     def __init__(self, definition, fixtureinfo, config, cls=None, module=None):
+892         assert (
+893             isinstance(definition, FunctionDefinition)
+894             or type(definition).__name__ == "DefinitionMock"
+895         )
+896         self.definition = definition
+897 
+898         #: access to the :class:`_pytest.config.Config` object for the test session
+899         self.config = config
+900 
+901         #: the module object where the test function is defined in.
+902         self.module = module
+903 
+904         #: underlying python test function
+905         self.function = definition.obj
+906 
+907         #: set of fixture names required by the test function
+908         self.fixturenames = fixtureinfo.names_closure
+909 
+910         #: class object where the test function is defined in or ``None``.
+911         self.cls = cls
+912 
+913         self._calls = []
+914         self._ids = set()
+915         self._arg2fixturedefs = fixtureinfo.name2fixturedefs
+916 
+917     def parametrize(self, argnames, argvalues, indirect=False, ids=None, scope=None):
+918         """ Add new invocations to the underlying test function using the list
+919         of argvalues for the given argnames.  Parametrization is performed
+920         during the collection phase.  If you need to setup expensive resources
+921         see about setting indirect to do it rather at test setup time.
+922 
+923         :arg argnames: a comma-separated string denoting one or more argument
+924                        names, or a list/tuple of argument strings.
+925 
+926         :arg argvalues: The list of argvalues determines how often a
+927             test is invoked with different argument values.  If only one
+928             argname was specified argvalues is a list of values.  If N
+929             argnames were specified, argvalues must be a list of N-tuples,
+930             where each tuple-element specifies a value for its respective
+931             argname.
+932 
+933         :arg indirect: The list of argnames or boolean. A list of arguments'
+934             names (subset of argnames). If True the list contains all names from
+935             the argnames. Each argvalue corresponding to an argname in this list will
+936             be passed as request.param to its respective argname fixture
+937             function so that it can perform more expensive setups during the
+938             setup phase of a test rather than at collection time.
+939 
+940         :arg ids: list of string ids, or a callable.
+941             If strings, each is corresponding to the argvalues so that they are
+942             part of the test id. If None is given as id of specific test, the
+943             automatically generated id for that argument will be used.
+944             If callable, it should take one argument (a single argvalue) and return
+945             a string or return None. If None, the automatically generated id for that
+946             argument will be used.
+947             If no ids are provided they will be generated automatically from
+948             the argvalues.
+949 
+950         :arg scope: if specified it denotes the scope of the parameters.
+951             The scope is used for grouping tests by parameter instances.
+952             It will also override any fixture-function defined scope, allowing
+953             to set a dynamic scope using test context or configuration.
+954         """
+955         from _pytest.fixtures import scope2index
+956         from _pytest.mark import ParameterSet
+957 
+958         argnames, parameters = ParameterSet._for_parametrize(
+959             argnames,
+960             argvalues,
+961             self.function,
+962             self.config,
+963             function_definition=self.definition,
+964         )
+965         del argvalues
+966 
+967         if "request" in argnames:
+968             fail(
+969                 "'request' is a reserved name and cannot be used in @pytest.mark.parametrize",
+970                 pytrace=False,
+971             )
+972 
+973         if scope is None:
+974             scope = _find_parametrized_scope(argnames, self._arg2fixturedefs, indirect)
+975 
+976         self._validate_if_using_arg_names(argnames, indirect)
+977 
+978         arg_values_types = self._resolve_arg_value_types(argnames, indirect)
+979 
+980         ids = self._resolve_arg_ids(argnames, ids, parameters, item=self.definition)
+981 
+982         scopenum = scope2index(
+983             scope, descr="parametrize() call in {}".format(self.function.__name__)
+984         )
+985 
+986         # create the new calls: if we are parametrize() multiple times (by applying the decorator
+987         # more than once) then we accumulate those calls generating the cartesian product
+988         # of all calls
+989         newcalls = []
+990         for callspec in self._calls or [CallSpec2(self)]:
+991             for param_index, (param_id, param_set) in enumerate(zip(ids, parameters)):
+992                 newcallspec = callspec.copy()
+993                 newcallspec.setmulti2(
+994                     arg_values_types,
+995                     argnames,
+996                     param_set.values,
+997                     param_id,
+998                     param_set.marks,
+999                     scopenum,
+1000                     param_index,
+1001                 )
+1002                 newcalls.append(newcallspec)
+1003         self._calls = newcalls
+1004 
+1005     def _resolve_arg_ids(self, argnames, ids, parameters, item):
+1006         """Resolves the actual ids for the given argnames, based on the ``ids`` parameter given
+1007         to ``parametrize``.
+1008 
+1009         :param List[str] argnames: list of argument names passed to ``parametrize()``.
+1010         :param ids: the ids parameter of the parametrized call (see docs).
+1011         :param List[ParameterSet] parameters: the list of parameter values, same size as ``argnames``.
+1012         :param Item item: the item that generated this parametrized call.
+1013         :rtype: List[str]
+1014         :return: the list of ids for each argname given
+1015         """
+1016         from _pytest._io.saferepr import saferepr
+1017 
+1018         idfn = None
+1019         if callable(ids):
+1020             idfn = ids
+1021             ids = None
+1022         if ids:
+1023             func_name = self.function.__name__
+1024             if len(ids) != len(parameters):
+1025                 msg = "In {}: {} parameter sets specified, with different number of ids: {}"
+1026                 fail(msg.format(func_name, len(parameters), len(ids)), pytrace=False)
+1027             for id_value in ids:
+1028                 if id_value is not None and not isinstance(id_value, str):
+1029                     msg = "In {}: ids must be list of strings, found: {} (type: {!r})"
+1030                     fail(
+1031                         msg.format(func_name, saferepr(id_value), type(id_value)),
+1032                         pytrace=False,
+1033                     )
+1034         ids = idmaker(argnames, parameters, idfn, ids, self.config, item=item)
+1035         return ids
+1036 
+1037     def _resolve_arg_value_types(self, argnames, indirect):
+1038         """Resolves if each parametrized argument must be considered a parameter to a fixture or a "funcarg"
+1039         to the function, based on the ``indirect`` parameter of the parametrized() call.
+1040 
+1041         :param List[str] argnames: list of argument names passed to ``parametrize()``.
+1042         :param indirect: same ``indirect`` parameter of ``parametrize()``.
+1043         :rtype: Dict[str, str]
+1044             A dict mapping each arg name to either:
+1045             * "params" if the argname should be the parameter of a fixture of the same name.
+1046             * "funcargs" if the argname should be a parameter to the parametrized test function.
+1047         """
+1048         if isinstance(indirect, bool):
+1049             valtypes = dict.fromkeys(argnames, "params" if indirect else "funcargs")
+1050         elif isinstance(indirect, Sequence):
+1051             valtypes = dict.fromkeys(argnames, "funcargs")
+1052             for arg in indirect:
+1053                 if arg not in argnames:
+1054                     fail(
+1055                         "In {}: indirect fixture '{}' doesn't exist".format(
+1056                             self.function.__name__, arg
+1057                         ),
+1058                         pytrace=False,
+1059                     )
+1060                 valtypes[arg] = "params"
+1061         else:
+1062             fail(
+1063                 "In {func}: expected Sequence or boolean for indirect, got {type}".format(
+1064                     type=type(indirect).__name__, func=self.function.__name__
+1065                 ),
+1066                 pytrace=False,
+1067             )
+1068         return valtypes
+1069 
+1070     def _validate_if_using_arg_names(self, argnames, indirect):
+1071         """
+1072         Check if all argnames are being used, by default values, or directly/indirectly.
+1073 
+1074         :param List[str] argnames: list of argument names passed to ``parametrize()``.
+1075         :param indirect: same ``indirect`` parameter of ``parametrize()``.
+1076         :raise ValueError: if validation fails.
+1077         """
+1078         default_arg_names = set(get_default_arg_names(self.function))
+1079         func_name = self.function.__name__
+1080         for arg in argnames:
+1081             if arg not in self.fixturenames:
+1082                 if arg in default_arg_names:
+1083                     fail(
+1084                         "In {}: function already takes an argument '{}' with a default value".format(
+1085                             func_name, arg
+1086                         ),
+1087                         pytrace=False,
+1088                     )
+1089                 else:
+1090                     if isinstance(indirect, (tuple, list)):
+1091                         name = "fixture" if arg in indirect else "argument"
+1092                     else:
+1093                         name = "fixture" if indirect else "argument"
+1094                     fail(
+1095                         "In {}: function uses no {} '{}'".format(func_name, name, arg),
+1096                         pytrace=False,
+1097                     )
+1098 
+1099 
+1100 def _find_parametrized_scope(argnames, arg2fixturedefs, indirect):
+1101     """Find the most appropriate scope for a parametrized call based on its arguments.
+1102 
+1103     When there's at least one direct argument, always use "function" scope.
+1104 
+1105     When a test function is parametrized and all its arguments are indirect
+1106     (e.g. fixtures), return the most narrow scope based on the fixtures used.
+1107 
+1108     Related to issue #1832, based on code posted by @Kingdread.
+1109     """
+1110     from _pytest.fixtures import scopes
+1111 
+1112     if isinstance(indirect, (list, tuple)):
+1113         all_arguments_are_fixtures = len(indirect) == len(argnames)
+1114     else:
+1115         all_arguments_are_fixtures = bool(indirect)
+1116 
+1117     if all_arguments_are_fixtures:
+1118         fixturedefs = arg2fixturedefs or {}
+1119         used_scopes = [
+1120             fixturedef[0].scope
+1121             for name, fixturedef in fixturedefs.items()
+1122             if name in argnames
+1123         ]
+1124         if used_scopes:
+1125             # Takes the most narrow scope from used fixtures
+1126             for scope in reversed(scopes):
+1127                 if scope in used_scopes:
+1128                     return scope
+1129 
+1130     return "function"
+1131 
+1132 
+1133 def _ascii_escaped_by_config(val, config):
+1134     if config is None:
+1135         escape_option = False
+1136     else:
+1137         escape_option = config.getini(
+1138             "disable_test_id_escaping_and_forfeit_all_rights_to_community_support"
+1139         )
+1140     return val if escape_option else ascii_escaped(val)
+1141 
+1142 
+1143 def _idval(val, argname, idx, idfn, item, config):
+1144     if idfn:
+1145         try:
+1146             generated_id = idfn(val)
+1147             if generated_id is not None:
+1148                 val = generated_id
+1149         except Exception as e:
+1150             # See issue https://github.com/pytest-dev/pytest/issues/2169
+1151             msg = "{}: error raised while trying to determine id of parameter '{}' at position {}\n"
+1152             msg = msg.format(item.nodeid, argname, idx)
+1153             raise ValueError(msg) from e
+1154     elif config:
+1155         hook_id = config.hook.pytest_make_parametrize_id(
+1156             config=config, val=val, argname=argname
+1157         )
+1158         if hook_id:
+1159             return hook_id
+1160 
+1161     if isinstance(val, STRING_TYPES):
+1162         return _ascii_escaped_by_config(val, config)
+1163     elif val is None or isinstance(val, (float, int, bool)):
+1164         return str(val)
+1165     elif isinstance(val, REGEX_TYPE):
+1166         return ascii_escaped(val.pattern)
+1167     elif isinstance(val, enum.Enum):
+1168         return str(val)
+1169     elif (inspect.isclass(val) or inspect.isfunction(val)) and hasattr(val, "__name__"):
+1170         return val.__name__
+1171     return str(argname) + str(idx)
+1172 
+1173 
+1174 def _idvalset(idx, parameterset, argnames, idfn, ids, item, config):
+1175     if parameterset.id is not None:
+1176         return parameterset.id
+1177     if ids is None or (idx >= len(ids) or ids[idx] is None):
+1178         this_id = [
+1179             _idval(val, argname, idx, idfn, item=item, config=config)
+1180             for val, argname in zip(parameterset.values, argnames)
+1181         ]
+1182         return "-".join(this_id)
+1183     else:
+1184         return _ascii_escaped_by_config(ids[idx], config)
+1185 
+1186 
+1187 def idmaker(argnames, parametersets, idfn=None, ids=None, config=None, item=None):
+1188     ids = [
+1189         _idvalset(valindex, parameterset, argnames, idfn, ids, config=config, item=item)
+1190         for valindex, parameterset in enumerate(parametersets)
+1191     ]
+1192     if len(set(ids)) != len(ids):
+1193         # The ids are not unique
+1194         duplicates = [testid for testid in ids if ids.count(testid) > 1]
+1195         counters = Counter()
+1196         for index, testid in enumerate(ids):
+1197             if testid in duplicates:
+1198                 ids[index] = testid + str(counters[testid])
+1199                 counters[testid] += 1
+1200     return ids
+1201 
+1202 
+1203 def show_fixtures_per_test(config):
+1204     from _pytest.main import wrap_session
+1205 
+1206     return wrap_session(config, _show_fixtures_per_test)
+1207 
+1208 
+1209 def _show_fixtures_per_test(config, session):
+1210     import _pytest.config
+1211 
+1212     session.perform_collect()
+1213     curdir = py.path.local()
+1214     tw = _pytest.config.create_terminal_writer(config)
+1215     verbose = config.getvalue("verbose")
+1216 
+1217     def get_best_relpath(func):
+1218         loc = getlocation(func, curdir)
+1219         return curdir.bestrelpath(loc)
+1220 
+1221     def write_fixture(fixture_def):
+1222         argname = fixture_def.argname
+1223         if verbose <= 0 and argname.startswith("_"):
+1224             return
+1225         if verbose > 0:
+1226             bestrel = get_best_relpath(fixture_def.func)
+1227             funcargspec = "{} -- {}".format(argname, bestrel)
+1228         else:
+1229             funcargspec = argname
+1230         tw.line(funcargspec, green=True)
+1231         fixture_doc = fixture_def.func.__doc__
+1232         if fixture_doc:
+1233             write_docstring(tw, fixture_doc)
+1234         else:
+1235             tw.line("    no docstring available", red=True)
+1236 
+1237     def write_item(item):
+1238         try:
+1239             info = item._fixtureinfo
+1240         except AttributeError:
+1241             # doctests items have no _fixtureinfo attribute
+1242             return
+1243         if not info.name2fixturedefs:
+1244             # this test item does not use any fixtures
+1245             return
+1246         tw.line()
+1247         tw.sep("-", "fixtures used by {}".format(item.name))
+1248         tw.sep("-", "({})".format(get_best_relpath(item.function)))
+1249         # dict key not used in loop but needed for sorting
+1250         for _, fixturedefs in sorted(info.name2fixturedefs.items()):
+1251             assert fixturedefs is not None
+1252             if not fixturedefs:
+1253                 continue
+1254             # last item is expected to be the one used by the test item
+1255             write_fixture(fixturedefs[-1])
+1256 
+1257     for session_item in session.items:
+1258         write_item(session_item)
+1259 
+1260 
+1261 def showfixtures(config):
+1262     from _pytest.main import wrap_session
+1263 
+1264     return wrap_session(config, _showfixtures_main)
+1265 
+1266 
+1267 def _showfixtures_main(config, session):
+1268     import _pytest.config
+1269 
+1270     session.perform_collect()
+1271     curdir = py.path.local()
+1272     tw = _pytest.config.create_terminal_writer(config)
+1273     verbose = config.getvalue("verbose")
+1274 
+1275     fm = session._fixturemanager
+1276 
+1277     available = []
+1278     seen = set()
+1279 
+1280     for argname, fixturedefs in fm._arg2fixturedefs.items():
+1281         assert fixturedefs is not None
+1282         if not fixturedefs:
+1283             continue
+1284         for fixturedef in fixturedefs:
+1285             loc = getlocation(fixturedef.func, curdir)
+1286             if (fixturedef.argname, loc) in seen:
+1287                 continue
+1288             seen.add((fixturedef.argname, loc))
+1289             available.append(
+1290                 (
+1291                     len(fixturedef.baseid),
+1292                     fixturedef.func.__module__,
+1293                     curdir.bestrelpath(loc),
+1294                     fixturedef.argname,
+1295                     fixturedef,
+1296                 )
+1297             )
+1298 
+1299     available.sort()
+1300     currentmodule = None
+1301     for baseid, module, bestrel, argname, fixturedef in available:
+1302         if currentmodule != module:
+1303             if not module.startswith("_pytest."):
+1304                 tw.line()
+1305                 tw.sep("-", "fixtures defined from {}".format(module))
+1306                 currentmodule = module
+1307         if verbose <= 0 and argname[0] == "_":
+1308             continue
+1309         tw.write(argname, green=True)
+1310         if fixturedef.scope != "function":
+1311             tw.write(" [%s scope]" % fixturedef.scope, cyan=True)
+1312         if verbose > 0:
+1313             tw.write(" -- %s" % bestrel, yellow=True)
+1314         tw.write("\n")
+1315         loc = getlocation(fixturedef.func, curdir)
+1316         doc = fixturedef.func.__doc__ or ""
+1317         if doc:
+1318             write_docstring(tw, doc)
+1319         else:
+1320             tw.line("    {}: no docstring available".format(loc), red=True)
+1321         tw.line()
+1322 
+1323 
+1324 def write_docstring(tw, doc, indent="    "):
+1325     doc = doc.rstrip()
+1326     if "\n" in doc:
+1327         firstline, rest = doc.split("\n", 1)
+1328     else:
+1329         firstline, rest = doc, ""
+1330 
+1331     if firstline.strip():
+1332         tw.line(indent + firstline.strip())
+1333 
+1334     if rest:
+1335         for line in dedent(rest).split("\n"):
+1336             tw.write(indent + line + "\n")
+1337 
+1338 
+1339 class Function(FunctionMixin, nodes.Item, fixtures.FuncargnamesCompatAttr):
+1340     """ a Function Item is responsible for setting up and executing a
+1341     Python test function.
+1342     """
+1343 
+1344     # disable since functions handle it themselves
+1345     _ALLOW_MARKERS = False
+1346 
+1347     def __init__(
+1348         self,
+1349         name,
+1350         parent,
+1351         args=None,
+1352         config=None,
+1353         callspec=None,
+1354         callobj=NOTSET,
+1355         keywords=None,
+1356         session=None,
+1357         fixtureinfo=None,
+1358         originalname=None,
+1359     ):
+1360         super().__init__(name, parent, config=config, session=session)
+1361         self._args = args
+1362         if callobj is not NOTSET:
+1363             self.obj = callobj
+1364 
+1365         self.keywords.update(self.obj.__dict__)
+1366         self.own_markers.extend(get_unpacked_marks(self.obj))
+1367         if callspec:
+1368             self.callspec = callspec
+1369             # this is total hostile and a mess
+1370             # keywords are broken by design by now
+1371             # this will be redeemed later
+1372             for mark in callspec.marks:
+1373                 # feel free to cry, this was broken for years before
+1374                 # and keywords cant fix it per design
+1375                 self.keywords[mark.name] = mark
+1376             self.own_markers.extend(normalize_mark_list(callspec.marks))
+1377         if keywords:
+1378             self.keywords.update(keywords)
+1379 
+1380         # todo: this is a hell of a hack
+1381         # https://github.com/pytest-dev/pytest/issues/4569
+1382 
+1383         self.keywords.update(
+1384             {
+1385                 mark.name: True
+1386                 for mark in self.iter_markers()
+1387                 if mark.name not in self.keywords
+1388             }
+1389         )
+1390 
+1391         if fixtureinfo is None:
+1392             fixtureinfo = self.session._fixturemanager.getfixtureinfo(
+1393                 self, self.obj, self.cls, funcargs=True
+1394             )
+1395         self._fixtureinfo = fixtureinfo
+1396         self.fixturenames = fixtureinfo.names_closure
+1397         self._initrequest()
+1398 
+1399         #: original function name, without any decorations (for example
+1400         #: parametrization adds a ``"[...]"`` suffix to function names).
+1401         #:
+1402         #: .. versionadded:: 3.0
+1403         self.originalname = originalname
+1404 
+1405     def _initrequest(self):
+1406         self.funcargs = {}
+1407         self._request = fixtures.FixtureRequest(self)
+1408 
+1409     @property
+1410     def function(self):
+1411         "underlying python 'function' object"
+1412         return getimfunc(self.obj)
+1413 
+1414     def _getobj(self):
+1415         name = self.name
+1416         i = name.find("[")  # parametrization
+1417         if i != -1:
+1418             name = name[:i]
+1419         return getattr(self.parent.obj, name)
+1420 
+1421     @property
+1422     def _pyfuncitem(self):
+1423         "(compatonly) for code expecting pytest-2.2 style request objects"
+1424         return self
+1425 
+1426     def runtest(self):
+1427         """ execute the underlying test function. """
+1428         self.ihook.pytest_pyfunc_call(pyfuncitem=self)
+1429 
+1430     def setup(self):
+1431         super().setup()
+1432         fixtures.fillfixtures(self)
+1433 
+1434 
+1435 class FunctionDefinition(Function):
+1436     """
+1437     internal hack until we get actual definition nodes instead of the
+1438     crappy metafunc hack
+1439     """
+1440 
+1441     def runtest(self):
+1442         raise RuntimeError("function definitions are not supposed to be used")
+1443 
+1444     setup = runtest
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `src/_pytest/python.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/src/_pytest/python.py b/src/_pytest/python.py
+--- a/src/_pytest/python.py
++++ b/src/_pytest/python.py
+@@ -285,8 +285,7 @@ def getmodpath(self, stopatmodule=True, includemodule=False):
+                     break
+             parts.append(name)
+         parts.reverse()
+-        s = ".".join(parts)
+-        return s.replace(".[", "[")
++        return ".".join(parts)
+ 
+     def reportinfo(self):
+         # XXX caching?
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/bug.py b/bug.py
+new file mode 100644
+index 000000000..b92490e0e
+--- /dev/null
++++ b/bug.py
+@@ -0,0 +1,5 @@
++import pytest
++
++@pytest.mark.parametrize("a",["..["])
++def test_boo(a):
++    assert 0
+\ No newline at end of file
+diff --git a/edge_case.py b/edge_case.py
+new file mode 100644
+index 000000000..774146d71
+--- /dev/null
++++ b/edge_case.py
+@@ -0,0 +1,5 @@
++import pytest
++
++@pytest.mark.parametrize("a,b",[("..[", ".[foo]"), (".[bar]", "..[baz]")])
++def test_edge(a, b):
++    assert 0
+\ No newline at end of file
+diff --git a/src/_pytest/python.py b/src/_pytest/python.py
+index b8b365ad3..5f2af31e2 100644
+--- a/src/_pytest/python.py
++++ b/src/_pytest/python.py
+@@ -286,7 +286,7 @@ class PyobjMixin(PyobjContext):
+             parts.append(name)
+         parts.reverse()
+         s = ".".join(parts)
+-        return s.replace(".[", "[")
++        return s
+ 
+     def reportinfo(self):
+         # XXX caching?
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `testing/test_collection.py` that contains the existing tests.
+-----------------------------------------------------------
+import os
+import pprint
+import sys
+import textwrap
+
+import py
+
+import pytest
+from _pytest.main import _in_venv
+from _pytest.main import ExitCode
+from _pytest.main import Session
+
+
+class TestCollector:
+    def test_collect_versus_item(self):
+        from pytest import Collector, Item
+
+        assert not issubclass(Collector, Item)
+        assert not issubclass(Item, Collector)
+
+    def test_check_equality(self, testdir):
+        modcol = testdir.getmodulecol(
+            """
+            def test_pass(): pass
+            def test_fail(): assert 0
+        """
+        )
+        fn1 = testdir.collect_by_name(modcol, "test_pass")
+        assert isinstance(fn1, pytest.Function)
+        fn2 = testdir.collect_by_name(modcol, "test_pass")
+        assert isinstance(fn2, pytest.Function)
+
+        assert fn1 == fn2
+        assert fn1 != modcol
+        assert hash(fn1) == hash(fn2)
+
+        fn3 = testdir.collect_by_name(modcol, "test_fail")
+        assert isinstance(fn3, pytest.Function)
+        assert not (fn1 == fn3)
+        assert fn1 != fn3
+
+        for fn in fn1, fn2, fn3:
+            assert fn != 3
+            assert fn != modcol
+            assert fn != [1, 2, 3]
+            assert [1, 2, 3] != fn
+            assert modcol != fn
+
+    def test_getparent(self, testdir):
+        modcol = testdir.getmodulecol(
+            """
+            class TestClass(object):
+                 def test_foo():
+                     pass
+        """
+        )
+        cls = testdir.collect_by_name(modcol, "TestClass")
+        fn = testdir.collect_by_name(testdir.collect_by_name(cls, "()"), "test_foo")
+
+        parent = fn.getparent(pytest.Module)
+        assert parent is modcol
+
+        parent = fn.getparent(pytest.Function)
+        assert parent is fn
+
+        parent = fn.getparent(pytest.Class)
+        assert parent is cls
+
+    def test_getcustomfile_roundtrip(self, testdir):
+        hello = testdir.makefile(".xxx", hello="world")
+        testdir.makepyfile(
+            conftest="""
+            import pytest
+            class CustomFile(pytest.File):
+                pass
+            def pytest_collect_file(path, parent):
+                if path.ext == ".xxx":
+                    return CustomFile(path, parent=parent)
+        """
+        )
+        node = testdir.getpathnode(hello)
+        assert isinstance(node, pytest.File)
+        assert node.name == "hello.xxx"
+        nodes = node.session.perform_collect([node.nodeid], genitems=False)
+        assert len(nodes) == 1
+        assert isinstance(nodes[0], pytest.File)
+
+    def test_can_skip_class_with_test_attr(self, testdir):
+        """Assure test class is skipped when using `__test__=False` (See #2007)."""
+        testdir.makepyfile(
+            """
+            class TestFoo(object):
+                __test__ = False
+                def __init__(self):
+                    pass
+                def test_foo():
+                    assert True
+        """
+        )
+        result = testdir.runpytest()
+        result.stdout.fnmatch_lines(["collected 0 items", "*no tests ran in*"])
+
+
+class TestCollectFS:
+    def test_ignored_certain_directories(self, testdir):
+        tmpdir = testdir.tmpdir
+        tmpdir.ensure("build", "test_notfound.py")
+        tmpdir.ensure("dist", "test_notfound.py")
+        tmpdir.ensure("_darcs", "test_notfound.py")
+        tmpdir.ensure("CVS", "test_notfound.py")
+        tmpdir.ensure("{arch}", "test_notfound.py")
+        tmpdir.ensure(".whatever", "test_notfound.py")
+        tmpdir.ensure(".bzr", "test_notfound.py")
+        tmpdir.ensure("normal", "test_found.py")
+        for x in tmpdir.visit("test_*.py"):
+            x.write("def test_hello(): pass")
+
+        result = testdir.runpytest("--collect-only")
+        s = result.stdout.str()
+        assert "test_notfound" not in s
+        assert "test_found" in s
+
+    @pytest.mark.parametrize(
+        "fname",
+        (
+            "activate",
+            "activate.csh",
+            "activate.fish",
+            "Activate",
+            "Activate.bat",
+            "Activate.ps1",
+        ),
+    )
+    def test_ignored_virtualenvs(self, testdir, fname):
+        bindir = "Scripts" if sys.platform.startswith("win") else "bin"
+        testdir.tmpdir.ensure("virtual", bindir, fname)
+        testfile = testdir.tmpdir.ensure("virtual", "test_invenv.py")
+        testfile.write("def test_hello(): pass")
+
+        # by default, ignore tests inside a virtualenv
+        result = testdir.runpytest()
+        assert "test_invenv" not in result.stdout.str()
+        # allow test collection if user insists
+        result = testdir.runpytest("--collect-in-virtualenv")
+        assert "test_invenv" in result.stdout.str()
+        # allow test collection if user directly passes in the directory
+        result = testdir.runpytest("virtual")
+        assert "test_invenv" in result.stdout.str()
+
+    @pytest.mark.parametrize(
+        "fname",
+        (
+            "activate",
+            "activate.csh",
+            "activate.fish",
+            "Activate",
+            "Activate.bat",
+            "Activate.ps1",
+        ),
+    )
+    def test_ignored_virtualenvs_norecursedirs_precedence(self, testdir, fname):
+        bindir = "Scripts" if sys.platform.startswith("win") else "bin"
+        # norecursedirs takes priority
+        testdir.tmpdir.ensure(".virtual", bindir, fname)
+        testfile = testdir.tmpdir.ensure(".virtual", "test_invenv.py")
+        testfile.write("def test_hello(): pass")
+        result = testdir.runpytest("--collect-in-virtualenv")
+        assert "test_invenv" not in result.stdout.str()
+        # ...unless the virtualenv is explicitly given on the CLI
+        result = testdir.runpytest("--collect-in-virtualenv", ".virtual")
+        assert "test_invenv" in result.stdout.str()
+
+    @pytest.mark.parametrize(
+        "fname",
+        (
+            "activate",
+            "activate.csh",
+            "activate.fish",
+            "Activate",
+            "Activate.bat",
+            "Activate.ps1",
+        ),
+    )
+    def test__in_venv(self, testdir, fname):
+        """Directly test the virtual env detection function"""
+        bindir = "Scripts" if sys.platform.startswith("win") else "bin"
+        # no bin/activate, not a virtualenv
+        base_path = testdir.tmpdir.mkdir("venv")
+        assert _in_venv(base_path) is False
+        # with bin/activate, totally a virtualenv
+        base_path.ensure(bindir, fname)
+        assert _in_venv(base_path) is True
+
+    def test_custom_norecursedirs(self, testdir):
+        testdir.makeini(
+            """
+            [pytest]
+            norecursedirs = mydir xyz*
+        """
+        )
+        tmpdir = testdir.tmpdir
+        tmpdir.ensure("mydir", "test_hello.py").write("def test_1(): pass")
+        tmpdir.ensure("xyz123", "test_2.py").write("def test_2(): 0/0")
+        tmpdir.ensure("xy", "test_ok.py").write("def test_3(): pass")
+        rec = testdir.inline_run()
+        rec.assertoutcome(passed=1)
+        rec = testdir.inline_run("xyz123/test_2.py")
+        rec.assertoutcome(failed=1)
+
+    def test_testpaths_ini(self, testdir, monkeypatch):
+        testdir.makeini(
+            """
+            [pytest]
+            testpaths = gui uts
+        """
+        )
+        tmpdir = testdir.tmpdir
+        tmpdir.ensure("env", "test_1.py").write("def test_env(): pass")
+        tmpdir.ensure("gui", "test_2.py").write("def test_gui(): pass")
+        tmpdir.ensure("uts", "test_3.py").write("def test_uts(): pass")
+
+        # executing from rootdir only tests from `testpaths` directories
+        # are collected
+        items, reprec = testdir.inline_genitems("-v")
+        assert [x.name for x in items] == ["test_gui", "test_uts"]
+
+        # check that explicitly passing directories in the command-line
+        # collects the tests
+        for dirname in ("env", "gui", "uts"):
+            items, reprec = testdir.inline_genitems(tmpdir.join(dirname))
+            assert [x.name for x in items] == ["test_%s" % dirname]
+
+        # changing cwd to each subdirectory and running pytest without
+        # arguments collects the tests in that directory normally
+        for dirname in ("env", "gui", "uts"):
+            monkeypatch.chdir(testdir.tmpdir.join(dirname))
+            items, reprec = testdir.inline_genitems()
+            assert [x.name for x in items] == ["test_%s" % dirname]
+
+
+class TestCollectPluginHookRelay:
+    def test_pytest_collect_file(self, testdir):
+        wascalled = []
+
+        class Plugin:
+            def pytest_collect_file(self, path, parent):
+                if not path.basename.startswith("."):
+                    # Ignore hidden files, e.g. .testmondata.
+                    wascalled.append(path)
+
+        testdir.makefile(".abc", "xyz")
+        pytest.main([testdir.tmpdir], plugins=[Plugin()])
+        assert len(wascalled) == 1
+        assert wascalled[0].ext == ".abc"
+
+    def test_pytest_collect_directory(self, testdir):
+        wascalled = []
+
+        class Plugin:
+            def pytest_collect_directory(self, path, parent):
+                wascalled.append(path.basename)
+
+        testdir.mkdir("hello")
+        testdir.mkdir("world")
+        pytest.main(testdir.tmpdir, plugins=[Plugin()])
+        assert "hello" in wascalled
+        assert "world" in wascalled
+
+
+class TestPrunetraceback:
+    def test_custom_repr_failure(self, testdir):
+        p = testdir.makepyfile(
+            """
+            import not_exists
+        """
+        )
+        testdir.makeconftest(
+            """
+            import pytest
+            def pytest_collect_file(path, parent):
+                return MyFile(path, parent)
+            class MyError(Exception):
+                pass
+            class MyFile(pytest.File):
+                def collect(self):
+                    raise MyError()
+                def repr_failure(self, excinfo):
+                    if excinfo.errisinstance(MyError):
+                        return "hello world"
+                    return pytest.File.repr_failure(self, excinfo)
+        """
+        )
+
+        result = testdir.runpytest(p)
+        result.stdout.fnmatch_lines(["*ERROR collecting*", "*hello world*"])
+
+    @pytest.mark.xfail(reason="other mechanism for adding to reporting needed")
+    def test_collect_report_postprocessing(self, testdir):
+        p = testdir.makepyfile(
+            """
+            import not_exists
+        """
+        )
+        testdir.makeconftest(
+            """
+            import pytest
+            @pytest.hookimpl(hookwrapper=True)
+            def pytest_make_collect_report():
+                outcome = yield
+                rep = outcome.get_result()
+                rep.headerlines += ["header1"]
+                outcome.force_result(rep)
+        """
+        )
+        result = testdir.runpytest(p)
+        result.stdout.fnmatch_lines(["*ERROR collecting*", "*header1*"])
+
+
+class TestCustomConftests:
+    def test_ignore_collect_path(self, testdir):
+        testdir.makeconftest(
+            """
+            def pytest_ignore_collect(path, config):
+                return path.basename.startswith("x") or \
+                       path.basename == "test_one.py"
+        """
+        )
+        sub = testdir.mkdir("xy123")
+        sub.ensure("test_hello.py").write("syntax error")
+        sub.join("conftest.py").write("syntax error")
+        testdir.makepyfile("def test_hello(): pass")
+        testdir.makepyfile(test_one="syntax error")
+        result = testdir.runpytest("--fulltrace")
+        assert result.ret == 0
+        result.stdout.fnmatch_lines(["*1 passed*"])
+
+    def test_ignore_collect_not_called_on_argument(self, testdir):
+        testdir.makeconftest(
+            """
+            def pytest_ignore_collect(path, config):
+                return True
+        """
+        )
+        p = testdir.makepyfile("def test_hello(): pass")
+        result = testdir.runpytest(p)
+        assert result.ret == 0
+        result.stdout.fnmatch_lines(["*1 passed*"])
+        result = testdir.runpytest()
+        assert result.ret == ExitCode.NO_TESTS_COLLECTED
+        result.stdout.fnmatch_lines(["*collected 0 items*"])
+
+    def test_collectignore_exclude_on_option(self, testdir):
+        testdir.makeconftest(
+            """
+            collect_ignore = ['hello', 'test_world.py']
+            def pytest_addoption(parser):
+                parser.addoption("--XX", action="store_true", default=False)
+            def pytest_configure(config):
+                if config.getvalue("XX"):
+                    collect_ignore[:] = []
+        """
+        )
+        testdir.mkdir("hello")
+        testdir.makepyfile(test_world="def test_hello(): pass")
+        result = testdir.runpytest()
+        assert result.ret == ExitCode.NO_TESTS_COLLECTED
+        assert "passed" not in result.stdout.str()
+        result = testdir.runpytest("--XX")
+        assert result.ret == 0
+        assert "passed" in result.stdout.str()
+
+    def test_collectignoreglob_exclude_on_option(self, testdir):
+        testdir.makeconftest(
+            """
+            collect_ignore_glob = ['*w*l[dt]*']
+            def pytest_addoption(parser):
+                parser.addoption("--XX", action="store_true", default=False)
+            def pytest_configure(config):
+                if config.getvalue("XX"):
+                    collect_ignore_glob[:] = []
+        """
+        )
+        testdir.makepyfile(test_world="def test_hello(): pass")
+        testdir.makepyfile(test_welt="def test_hallo(): pass")
+        result = testdir.runpytest()
+        assert result.ret == ExitCode.NO_TESTS_COLLECTED
+        result.stdout.fnmatch_lines(["*collected 0 items*"])
+        result = testdir.runpytest("--XX")
+        assert result.ret == 0
+        result.stdout.fnmatch_lines(["*2 passed*"])
+
+    def test_pytest_fs_collect_hooks_are_seen(self, testdir):
+        testdir.makeconftest(
+            """
+            import pytest
+            class MyModule(pytest.Module):
+                pass
+            def pytest_collect_file(path, parent):
+                if path.ext == ".py":
+                    return MyModule(path, parent)
+        """
+        )
+        testdir.mkdir("sub")
+        testdir.makepyfile("def test_x(): pass")
+        result = testdir.runpytest("--collect-only")
+        result.stdout.fnmatch_lines(["*MyModule*", "*test_x*"])
+
+    def test_pytest_collect_file_from_sister_dir(self, testdir):
+        sub1 = testdir.mkpydir("sub1")
+        sub2 = testdir.mkpydir("sub2")
+        conf1 = testdir.makeconftest(
+            """
+            import pytest
+            class MyModule1(pytest.Module):
+                pass
+            def pytest_collect_file(path, parent):
+                if path.ext == ".py":
+                    return MyModule1(path, parent)
+        """
+        )
+        conf1.move(sub1.join(conf1.basename))
+        conf2 = testdir.makeconftest(
+            """
+            import pytest
+            class MyModule2(pytest.Module):
+                pass
+            def pytest_collect_file(path, parent):
+                if path.ext == ".py":
+                    return MyModule2(path, parent)
+        """
+        )
+        conf2.move(sub2.join(conf2.basename))
+        p = testdir.makepyfile("def test_x(): pass")
+        p.copy(sub1.join(p.basename))
+        p.copy(sub2.join(p.basename))
+        result = testdir.runpytest("--collect-only")
+        result.stdout.fnmatch_lines(["*MyModule1*", "*MyModule2*", "*test_x*"])
+
+
+class TestSession:
+    def test_parsearg(self, testdir):
+        p = testdir.makepyfile("def test_func(): pass")
+        subdir = testdir.mkdir("sub")
+        subdir.ensure("__init__.py")
+        target = subdir.join(p.basename)
+        p.move(target)
+        subdir.chdir()
+        config = testdir.parseconfig(p.basename)
+        rcol = Session(config=config)
+        assert rcol.fspath == subdir
+        parts = rcol._parsearg(p.basename)
+
+        assert parts[0] == target
+        assert len(parts) == 1
+        parts = rcol._parsearg(p.basename + "::test_func")
+        assert parts[0] == target
+        assert parts[1] == "test_func"
+        assert len(parts) == 2
+
+    def test_collect_topdir(self, testdir):
+        p = testdir.makepyfile("def test_func(): pass")
+        id = "::".join([p.basename, "test_func"])
+        # XXX migrate to collectonly? (see below)
+        config = testdir.parseconfig(id)
+        topdir = testdir.tmpdir
+        rcol = Session(config)
+        assert topdir == rcol.fspath
+        # rootid = rcol.nodeid
+        # root2 = rcol.perform_collect([rcol.nodeid], genitems=False)[0]
+        # assert root2 == rcol, rootid
+        colitems = rcol.perform_collect([rcol.nodeid], genitems=False)
+        assert len(colitems) == 1
+        assert colitems[0].fspath == p
+
+    def get_reported_items(self, hookrec):
+        """Return pytest.Item instances reported by the pytest_collectreport hook"""
+        calls = hookrec.getcalls("pytest_collectreport")
+        return [
+            x
+            for call in calls
+            for x in call.report.result
+            if isinstance(x, pytest.Item)
+        ]
+
+    def test_collect_protocol_single_function(self, testdir):
+        p = testdir.makepyfile("def test_func(): pass")
+        id = "::".join([p.basename, "test_func"])
+        items, hookrec = testdir.inline_genitems(id)
+        item, = items
+        assert item.name == "test_func"
+        newid = item.nodeid
+        assert newid == id
+        pprint.pprint(hookrec.calls)
+        topdir = testdir.tmpdir  # noqa
+        hookrec.assert_contains(
+            [
+                ("pytest_collectstart", "collector.fspath == topdir"),
+                ("pytest_make_collect_report", "collector.fspath == topdir"),
+                ("pytest_collectstart", "collector.fspath == p"),
+                ("pytest_make_collect_report", "collector.fspath == p"),
+                ("pytest_pycollect_makeitem", "name == 'test_func'"),
+                ("pytest_collectreport", "report.result[0].name == 'test_func'"),
+            ]
+        )
+        # ensure we are reporting the collection of the single test item (#2464)
+        assert [x.name for x in self.get_reported_items(hookrec)] == ["test_func"]
+
+    def test_collect_protocol_method(self, testdir):
+        p = testdir.makepyfile(
+            """
+            class TestClass(object):
+                def test_method(self):
+                    pass
+        """
+        )
+        normid = p.basename + "::TestClass::test_method"
+        for id in [p.basename, p.basename + "::TestClass", normid]:
+            items, hookrec = testdir.inline_genitems(id)
+            assert len(items) == 1
+            assert items[0].name == "test_method"
+            newid = items[0].nodeid
+            assert newid == normid
+            # ensure we are reporting the collection of the single test item (#2464)
+            assert [x.name for x in self.get_reported_items(hookrec)] == ["test_method"]
+
+    def test_collect_custom_nodes_multi_id(self, testdir):
+        p = testdir.makepyfile("def test_func(): pass")
+        testdir.makeconftest(
+            """
+            import pytest
+            class SpecialItem(pytest.Item):
+                def runtest(self):
+                    return # ok
+            class SpecialFile(pytest.File):
+                def collect(self):
+                    return [SpecialItem(name="check", parent=self)]
+            def pytest_collect_file(path, parent):
+                if path.basename == %r:
+                    return SpecialFile(fspath=path, parent=parent)
+        """
+            % p.basename
+        )
+        id = p.basename
+
+        items, hookrec = testdir.inline_genitems(id)
+        pprint.pprint(hookrec.calls)
+        assert len(items) == 2
+        hookrec.assert_contains(
+            [
+                ("pytest_collectstart", "collector.fspath == collector.session.fspath"),
+                (
+                    "pytest_collectstart",
+                    "collector.__class__.__name__ == 'SpecialFile'",
+                ),
+                ("pytest_collectstart", "collector.__class__.__name__ == 'Module'"),
+                ("pytest_pycollect_makeitem", "name == 'test_func'"),
+                ("pytest_collectreport", "report.nodeid.startswith(p.basename)"),
+            ]
+        )
+        assert len(self.get_reported_items(hookrec)) == 2
+
+    def test_collect_subdir_event_ordering(self, testdir):
+        p = testdir.makepyfile("def test_func(): pass")
+        aaa = testdir.mkpydir("aaa")
+        test_aaa = aaa.join("test_aaa.py")
+        p.move(test_aaa)
+
+        items, hookrec = testdir.inline_genitems()
+        assert len(items) == 1
+        pprint.pprint(hookrec.calls)
+        hookrec.assert_contains(
+            [
+                ("pytest_collectstart", "collector.fspath == test_aaa"),
+                ("pytest_pycollect_makeitem", "name == 'test_func'"),
+                ("pytest_collectreport", "report.nodeid.startswith('aaa/test_aaa.py')"),
+            ]
+        )
+
+    def test_collect_two_commandline_args(self, testdir):
+        p = testdir.makepyfile("def test_func(): pass")
+        aaa = testdir.mkpydir("aaa")
+        bbb = testdir.mkpydir("bbb")
+        test_aaa = aaa.join("test_aaa.py")
+        p.copy(test_aaa)
+        test_bbb = bbb.join("test_bbb.py")
+        p.move(test_bbb)
+
+        id = "."
+
+        items, hookrec = testdir.inline_genitems(id)
+        assert len(items) == 2
+        pprint.pprint(hookrec.calls)
+        hookrec.assert_contains(
+            [
+                ("pytest_collectstart", "collector.fspath == test_aaa"),
+                ("pytest_pycollect_makeitem", "name == 'test_func'"),
+                ("pytest_collectreport", "report.nodeid == 'aaa/test_aaa.py'"),
+                ("pytest_collectstart", "collector.fspath == test_bbb"),
+                ("pytest_pycollect_makeitem", "name == 'test_func'"),
+                ("pytest_collectreport", "report.nodeid == 'bbb/test_bbb.py'"),
+            ]
+        )
+
+    def test_serialization_byid(self, testdir):
+        testdir.makepyfile("def test_func(): pass")
+        items, hookrec = testdir.inline_genitems()
+        assert len(items) == 1
+        item, = items
+        items2, hookrec = testdir.inline_genitems(item.nodeid)
+        item2, = items2
+        assert item2.name == item.name
+        assert item2.fspath == item.fspath
+
+    def test_find_byid_without_instance_parents(self, testdir):
+        p = testdir.makepyfile(
+            """
+            class TestClass(object):
+                def test_method(self):
+                    pass
+        """
+        )
+        arg = p.basename + "::TestClass::test_method"
+        items, hookrec = testdir.inline_genitems(arg)
+        assert len(items) == 1
+        item, = items
+        assert item.nodeid.endswith("TestClass::test_method")
+        # ensure we are reporting the collection of the single test item (#2464)
+        assert [x.name for x in self.get_reported_items(hookrec)] == ["test_method"]
+
+
+class Test_getinitialnodes:
+    def test_global_file(self, testdir, tmpdir):
+        x = tmpdir.ensure("x.py")
+        with tmpdir.as_cwd():
+            config = testdir.parseconfigure(x)
+        col = testdir.getnode(config, x)
+        assert isinstance(col, pytest.Module)
+        assert col.name == "x.py"
+        assert col.parent.parent is None
+        for col in col.listchain():
+            assert col.config is config
+
+    def test_pkgfile(self, testdir):
+        """Verify nesting when a module is within a package.
+        The parent chain should match: Module<x.py> -> Package<subdir> -> Session.
+            Session's parent should always be None.
+        """
+        tmpdir = testdir.tmpdir
+        subdir = tmpdir.join("subdir")
+        x = subdir.ensure("x.py")
+        subdir.ensure("__init__.py")
+        with subdir.as_cwd():
+            config = testdir.parseconfigure(x)
+        col = testdir.getnode(config, x)
+        assert col.name == "x.py"
+        assert isinstance(col, pytest.Module)
+        assert isinstance(col.parent, pytest.Package)
+        assert isinstance(col.parent.parent, pytest.Session)
+        # session is batman (has no parents)
+        assert col.parent.parent.parent is None
+        for col in col.listchain():
+            assert col.config is config
+
+
+class Test_genitems:
+    def test_check_collect_hashes(self, testdir):
+        p = testdir.makepyfile(
+            """
+            def test_1():
+                pass
+
+            def test_2():
+                pass
+        """
+        )
+        p.copy(p.dirpath(p.purebasename + "2" + ".py"))
+        items, reprec = testdir.inline_genitems(p.dirpath())
+        assert len(items) == 4
+        for numi, i in enumerate(items):
+            for numj, j in enumerate(items):
+                if numj != numi:
+                    assert hash(i) != hash(j)
+                    assert i != j
+
+    def test_example_items1(self, testdir):
+        p = testdir.makepyfile(
+            """
+            import pytest
+
+            def testone():
+                pass
+
+            class TestX(object):
+                def testmethod_one(self):
+                    pass
+
+            class TestY(TestX):
+                @pytest.mark.parametrize("arg0", [".["])
+                def testmethod_two(self, arg0):
+                    pass
+        """
+        )
+        items, reprec = testdir.inline_genitems(p)
+        assert len(items) == 4
+        assert items[0].name == "testone"
+        assert items[1].name == "testmethod_one"
+        assert items[2].name == "testmethod_one"
+        assert items[3].name == "testmethod_two[.[]"
+
+        # let's also test getmodpath here
+        assert items[0].getmodpath() == "testone"
+        assert items[1].getmodpath() == "TestX.testmethod_one"
+        assert items[2].getmodpath() == "TestY.testmethod_one"
+        # PR #6202: Fix incorrect result of getmodpath method. (Resolves issue #6189)
+        assert items[3].getmodpath() == "TestY.testmethod_two[.[]"
+
+        s = items[0].getmodpath(stopatmodule=False)
+        assert s.endswith("test_example_items1.testone")
+        print(s)
+
+    def test_class_and_functions_discovery_using_glob(self, testdir):
+        """
+        tests that python_classes and python_functions config options work
+        as prefixes and glob-like patterns (issue #600).
+        """
+        testdir.makeini(
+            """
+            [pytest]
+            python_classes = *Suite Test
+            python_functions = *_test test
+        """
+        )
+        p = testdir.makepyfile(
+            """
+            class MyTestSuite(object):
+                def x_test(self):
+                    pass
+
+            class TestCase(object):
+                def test_y(self):
+                    pass
+        """
+        )
+        items, reprec = testdir.inline_genitems(p)
+        ids = [x.getmodpath() for x in items]
+        assert ids == ["MyTestSuite.x_test", "TestCase.test_y"]
+
+
+def test_matchnodes_two_collections_same_file(testdir):
+    testdir.makeconftest(
+        """
+        import pytest
+        def pytest_configure(config):
+            config.pluginmanager.register(Plugin2())
+
+        class Plugin2(object):
+            def pytest_collect_file(self, path, parent):
+                if path.ext == ".abc":
+                    return MyFile2(path, parent)
+
+        def pytest_collect_file(path, parent):
+            if path.ext == ".abc":
+                return MyFile1(path, parent)
+
+        class MyFile1(pytest.Item, pytest.File):
+            def runtest(self):
+                pass
+        class MyFile2(pytest.File):
+            def collect(self):
+                return [Item2("hello", parent=self)]
+
+        class Item2(pytest.Item):
+            def runtest(self):
+                pass
+    """
+    )
+    p = testdir.makefile(".abc", "")
+    result = testdir.runpytest()
+    assert result.ret == 0
+    result.stdout.fnmatch_lines(["*2 passed*"])
+    res = testdir.runpytest("%s::hello" % p.basename)
+    res.stdout.fnmatch_lines(["*1 passed*"])
+
+
+class TestNodekeywords:
+    def test_no_under(self, testdir):
+        modcol = testdir.getmodulecol(
+            """
+            def test_pass(): pass
+            def test_fail(): assert 0
+        """
+        )
+        values = list(modcol.keywords)
+        assert modcol.name in values
+        for x in values:
+            assert not x.startswith("_")
+        assert modcol.name in repr(modcol.keywords)
+
+    def test_issue345(self, testdir):
+        testdir.makepyfile(
+            """
+            def test_should_not_be_selected():
+                assert False, 'I should not have been selected to run'
+
+            def test___repr__():
+                pass
+        """
+        )
+        reprec = testdir.inline_run("-k repr")
+        reprec.assertoutcome(passed=1, failed=0)
+
+
+COLLECTION_ERROR_PY_FILES = dict(
+    test_01_failure="""
+        def test_1():
+            assert False
+        """,
+    test_02_import_error="""
+        import asdfasdfasdf
+        def test_2():
+            assert True
+        """,
+    test_03_import_error="""
+        import asdfasdfasdf
+        def test_3():
+            assert True
+    """,
+    test_04_success="""
+        def test_4():
+            assert True
+    """,
+)
+
+
+def test_exit_on_collection_error(testdir):
+    """Verify that all collection errors are collected and no tests executed"""
+    testdir.makepyfile(**COLLECTION_ERROR_PY_FILES)
+
+    res = testdir.runpytest()
+    assert res.ret == 2
+
+    res.stdout.fnmatch_lines(
+        [
+            "collected 2 items / 2 errors",
+            "*ERROR collecting test_02_import_error.py*",
+            "*No module named *asdfa*",
+            "*ERROR collecting test_03_import_error.py*",
+            "*No module named *asdfa*",
+        ]
+    )
+
+
+def test_exit_on_collection_with_maxfail_smaller_than_n_errors(testdir):
+    """
+    Verify collection is aborted once maxfail errors are encountered ignoring
+    further modules which would cause more collection errors.
+    """
+    testdir.makepyfile(**COLLECTION_ERROR_PY_FILES)
+
+    res = testdir.runpytest("--maxfail=1")
+    assert res.ret == 1
+
+    res.stdout.fnmatch_lines(
+        ["*ERROR collecting test_02_import_error.py*", "*No module named *asdfa*"]
+    )
+
+    assert "test_03" not in res.stdout.str()
+
+
+def test_exit_on_collection_with_maxfail_bigger_than_n_errors(testdir):
+    """
+    Verify the test run aborts due to collection errors even if maxfail count of
+    errors was not reached.
+    """
+    testdir.makepyfile(**COLLECTION_ERROR_PY_FILES)
+
+    res = testdir.runpytest("--maxfail=4")
+    assert res.ret == 2
+
+    res.stdout.fnmatch_lines(
+        [
+            "collected 2 items / 2 errors",
+            "*ERROR collecting test_02_import_error.py*",
+            "*No module named *asdfa*",
+            "*ERROR collecting test_03_import_error.py*",
+            "*No module named *asdfa*",
+        ]
+    )
+
+
+def test_continue_on_collection_errors(testdir):
+    """
+    Verify tests are executed even when collection errors occur when the
+    --continue-on-collection-errors flag is set
+    """
+    testdir.makepyfile(**COLLECTION_ERROR_PY_FILES)
+
+    res = testdir.runpytest("--continue-on-collection-errors")
+    assert res.ret == 1
+
+    res.stdout.fnmatch_lines(
+        ["collected 2 items / 2 errors", "*1 failed, 1 passed, 2 error*"]
+    )
+
+
+def test_continue_on_collection_errors_maxfail(testdir):
+    """
+    Verify tests are executed even when collection errors occur and that maxfail
+    is honoured (including the collection error count).
+    4 tests: 2 collection errors + 1 failure + 1 success
+    test_4 is never executed because the test run is with --maxfail=3 which
+    means it is interrupted after the 2 collection errors + 1 failure.
+    """
+    testdir.makepyfile(**COLLECTION_ERROR_PY_FILES)
+
+    res = testdir.runpytest("--continue-on-collection-errors", "--maxfail=3")
+    assert res.ret == 1
+
+    res.stdout.fnmatch_lines(["collected 2 items / 2 errors", "*1 failed, 2 error*"])
+
+
+def test_fixture_scope_sibling_conftests(testdir):
+    """Regression test case for https://github.com/pytest-dev/pytest/issues/2836"""
+    foo_path = testdir.mkdir("foo")
+    foo_path.join("conftest.py").write(
+        textwrap.dedent(
+            """\
+            import pytest
+            @pytest.fixture
+            def fix():
+                return 1
+            """
+        )
+    )
+    foo_path.join("test_foo.py").write("def test_foo(fix): assert fix == 1")
+
+    # Tests in `food/` should not see the conftest fixture from `foo/`
+    food_path = testdir.mkpydir("food")
+    food_path.join("test_food.py").write("def test_food(fix): assert fix == 1")
+
+    res = testdir.runpytest()
+    assert res.ret == 1
+
+    res.stdout.fnmatch_lines(
+        [
+            "*ERROR at setup of test_food*",
+            "E*fixture 'fix' not found",
+            "*1 passed, 1 error*",
+        ]
+    )
+
+
+def test_collect_init_tests(testdir):
+    """Check that we collect files from __init__.py files when they patch the 'python_files' (#3773)"""
+    p = testdir.copy_example("collect/collect_init_tests")
+    result = testdir.runpytest(p, "--collect-only")
+    result.stdout.fnmatch_lines(
+        [
+            "collected 2 items",
+            "<Package *",
+            "  <Module __init__.py>",
+            "    <Function test_init>",
+            "  <Module test_foo.py>",
+            "    <Function test_foo>",
+        ]
+    )
+    result = testdir.runpytest("./tests", "--collect-only")
+    result.stdout.fnmatch_lines(
+        [
+            "collected 2 items",
+            "<Package *",
+            "  <Module __init__.py>",
+            "    <Function test_init>",
+            "  <Module test_foo.py>",
+            "    <Function test_foo>",
+        ]
+    )
+    # Ignores duplicates with "." and pkginit (#4310).
+    result = testdir.runpytest("./tests", ".", "--collect-only")
+    result.stdout.fnmatch_lines(
+        [
+            "collected 2 items",
+            "<Package */tests>",
+            "  <Module __init__.py>",
+            "    <Function test_init>",
+            "  <Module test_foo.py>",
+            "    <Function test_foo>",
+        ]
+    )
+    # Same as before, but different order.
+    result = testdir.runpytest(".", "tests", "--collect-only")
+    result.stdout.fnmatch_lines(
+        [
+            "collected 2 items",
+            "<Package */tests>",
+            "  <Module __init__.py>",
+            "    <Function test_init>",
+            "  <Module test_foo.py>",
+            "    <Function test_foo>",
+        ]
+    )
+    result = testdir.runpytest("./tests/test_foo.py", "--collect-only")
+    result.stdout.fnmatch_lines(
+        ["<Package */tests>", "  <Module test_foo.py>", "    <Function test_foo>"]
+    )
+    assert "test_init" not in result.stdout.str()
+    result = testdir.runpytest("./tests/__init__.py", "--collect-only")
+    result.stdout.fnmatch_lines(
+        ["<Package */tests>", "  <Module __init__.py>", "    <Function test_init>"]
+    )
+    assert "test_foo" not in result.stdout.str()
+
+
+def test_collect_invalid_signature_message(testdir):
+    """Check that we issue a proper message when we can't determine the signature of a test
+    function (#4026).
+    """
+    testdir.makepyfile(
+        """
+        import pytest
+
+        class TestCase:
+            @pytest.fixture
+            def fix():
+                pass
+    """
+    )
+    result = testdir.runpytest()
+    result.stdout.fnmatch_lines(
+        ["Could not determine arguments of *.fix *: invalid method signature"]
+    )
+
+
+def test_collect_handles_raising_on_dunder_class(testdir):
+    """Handle proxy classes like Django's LazySettings that might raise on
+    ``isinstance`` (#4266).
+    """
+    testdir.makepyfile(
+        """
+        class ImproperlyConfigured(Exception):
+            pass
+
+        class RaisesOnGetAttr(object):
+            def raises(self):
+                raise ImproperlyConfigured
+
+            __class__ = property(raises)
+
+        raises = RaisesOnGetAttr()
+
+
+        def test_1():
+            pass
+    """
+    )
+    result = testdir.runpytest()
+    result.stdout.fnmatch_lines(["*1 passed in*"])
+    assert result.ret == 0
+
+
+def test_collect_with_chdir_during_import(testdir):
+    subdir = testdir.tmpdir.mkdir("sub")
+    testdir.tmpdir.join("conftest.py").write(
+        textwrap.dedent(
+            """
+            import os
+            os.chdir(%r)
+            """
+            % (str(subdir),)
+        )
+    )
+    testdir.makepyfile(
+        """
+        def test_1():
+            import os
+            assert os.getcwd() == %r
+        """
+        % (str(subdir),)
+    )
+    with testdir.tmpdir.as_cwd():
+        result = testdir.runpytest()
+    result.stdout.fnmatch_lines(["*1 passed in*"])
+    assert result.ret == 0
+
+    # Handles relative testpaths.
+    testdir.makeini(
+        """
+        [pytest]
+        testpaths = .
+    """
+    )
+    with testdir.tmpdir.as_cwd():
+        result = testdir.runpytest("--collect-only")
+    result.stdout.fnmatch_lines(["collected 1 item"])
+
+
+def test_collect_pyargs_with_testpaths(testdir, monkeypatch):
+    testmod = testdir.mkdir("testmod")
+    # NOTE: __init__.py is not collected since it does not match python_files.
+    testmod.ensure("__init__.py").write("def test_func(): pass")
+    testmod.ensure("test_file.py").write("def test_func(): pass")
+
+    root = testdir.mkdir("root")
+    root.ensure("pytest.ini").write(
+        textwrap.dedent(
+            """
+        [pytest]
+        addopts = --pyargs
+        testpaths = testmod
+    """
+        )
+    )
+    monkeypatch.setenv("PYTHONPATH", str(testdir.tmpdir), prepend=os.pathsep)
+    with root.as_cwd():
+        result = testdir.runpytest_subprocess()
+    result.stdout.fnmatch_lines(["*1 passed in*"])
+
+
+@pytest.mark.skipif(
+    not hasattr(py.path.local, "mksymlinkto"),
+    reason="symlink not available on this platform",
+)
+def test_collect_symlink_file_arg(testdir):
+    """Test that collecting a direct symlink, where the target does not match python_files works (#4325)."""
+    real = testdir.makepyfile(
+        real="""
+        def test_nodeid(request):
+            assert request.node.nodeid == "real.py::test_nodeid"
+        """
+    )
+    symlink = testdir.tmpdir.join("symlink.py")
+    symlink.mksymlinkto(real)
+    result = testdir.runpytest("-v", symlink)
+    result.stdout.fnmatch_lines(["real.py::test_nodeid PASSED*", "*1 passed in*"])
+    assert result.ret == 0
+
+
+@pytest.mark.skipif(
+    not hasattr(py.path.local, "mksymlinkto"),
+    reason="symlink not available on this platform",
+)
+def test_collect_symlink_out_of_tree(testdir):
+    """Test collection of symlink via out-of-tree rootdir."""
+    sub = testdir.tmpdir.join("sub")
+    real = sub.join("test_real.py")
+    real.write(
+        textwrap.dedent(
+            """
+        def test_nodeid(request):
+            # Should not contain sub/ prefix.
+            assert request.node.nodeid == "test_real.py::test_nodeid"
+        """
+        ),
+        ensure=True,
+    )
+
+    out_of_tree = testdir.tmpdir.join("out_of_tree").ensure(dir=True)
+    symlink_to_sub = out_of_tree.join("symlink_to_sub")
+    symlink_to_sub.mksymlinkto(sub)
+    sub.chdir()
+    result = testdir.runpytest("-vs", "--rootdir=%s" % sub, symlink_to_sub)
+    result.stdout.fnmatch_lines(
+        [
+            # Should not contain "sub/"!
+            "test_real.py::test_nodeid PASSED"
+        ]
+    )
+    assert result.ret == 0
+
+
+def test_collectignore_via_conftest(testdir, monkeypatch):
+    """collect_ignore in parent conftest skips importing child (issue #4592)."""
+    tests = testdir.mkpydir("tests")
+    tests.ensure("conftest.py").write("collect_ignore = ['ignore_me']")
+
+    ignore_me = tests.mkdir("ignore_me")
+    ignore_me.ensure("__init__.py")
+    ignore_me.ensure("conftest.py").write("assert 0, 'should_not_be_called'")
+
+    result = testdir.runpytest()
+    assert result.ret == ExitCode.NO_TESTS_COLLECTED
+
+
+def test_collect_pkg_init_and_file_in_args(testdir):
+    subdir = testdir.mkdir("sub")
+    init = subdir.ensure("__init__.py")
+    init.write("def test_init(): pass")
+    p = subdir.ensure("test_file.py")
+    p.write("def test_file(): pass")
+
+    # NOTE: without "-o python_files=*.py" this collects test_file.py twice.
+    # This changed/broke with "Add package scoped fixtures #2283" (2b1410895)
+    # initially (causing a RecursionError).
+    result = testdir.runpytest("-v", str(init), str(p))
+    result.stdout.fnmatch_lines(
+        [
+            "sub/test_file.py::test_file PASSED*",
+            "sub/test_file.py::test_file PASSED*",
+            "*2 passed in*",
+        ]
+    )
+
+    result = testdir.runpytest("-v", "-o", "python_files=*.py", str(init), str(p))
+    result.stdout.fnmatch_lines(
+        [
+            "sub/__init__.py::test_init PASSED*",
+            "sub/test_file.py::test_file PASSED*",
+            "*2 passed in*",
+        ]
+    )
+
+
+def test_collect_pkg_init_only(testdir):
+    subdir = testdir.mkdir("sub")
+    init = subdir.ensure("__init__.py")
+    init.write("def test_init(): pass")
+
+    result = testdir.runpytest(str(init))
+    result.stdout.fnmatch_lines(["*no tests ran in*"])
+
+    result = testdir.runpytest("-v", "-o", "python_files=*.py", str(init))
+    result.stdout.fnmatch_lines(["sub/__init__.py::test_init PASSED*", "*1 passed in*"])
+
+
+@pytest.mark.skipif(
+    not hasattr(py.path.local, "mksymlinkto"),
+    reason="symlink not available on this platform",
+)
+@pytest.mark.parametrize("use_pkg", (True, False))
+def test_collect_sub_with_symlinks(use_pkg, testdir):
+    sub = testdir.mkdir("sub")
+    if use_pkg:
+        sub.ensure("__init__.py")
+    sub.ensure("test_file.py").write("def test_file(): pass")
+
+    # Create a broken symlink.
+    sub.join("test_broken.py").mksymlinkto("test_doesnotexist.py")
+
+    # Symlink that gets collected.
+    sub.join("test_symlink.py").mksymlinkto("test_file.py")
+
+    result = testdir.runpytest("-v", str(sub))
+    result.stdout.fnmatch_lines(
+        [
+            "sub/test_file.py::test_file PASSED*",
+            "sub/test_symlink.py::test_file PASSED*",
+            "*2 passed in*",
+        ]
+    )
+
+
+def test_collector_respects_tbstyle(testdir):
+    p1 = testdir.makepyfile("assert 0")
+    result = testdir.runpytest(p1, "--tb=native")
+    assert result.ret == ExitCode.INTERRUPTED
+    result.stdout.fnmatch_lines(
+        [
+            "*_ ERROR collecting test_collector_respects_tbstyle.py _*",
+            "Traceback (most recent call last):",
+            '  File "*/test_collector_respects_tbstyle.py", line 1, in <module>',
+            "    assert 0",
+            "AssertionError: assert 0",
+            "*! Interrupted: 1 errors during collection !*",
+            "*= 1 error in *",
+        ]
+    )
+
+
+def test_does_not_eagerly_collect_packages(testdir):
+    testdir.makepyfile("def test(): pass")
+    pydir = testdir.mkpydir("foopkg")
+    pydir.join("__init__.py").write("assert False")
+    result = testdir.runpytest()
+    assert result.ret == ExitCode.OK
+
+
+def test_does_not_put_src_on_path(testdir):
+    # `src` is not on sys.path so it should not be importable
+    testdir.tmpdir.join("src/nope/__init__.py").ensure()
+    testdir.makepyfile(
+        "import pytest\n"
+        "def test():\n"
+        "    with pytest.raises(ImportError):\n"
+        "        import nope\n"
+    )
+    result = testdir.runpytest()
+    assert result.ret == ExitCode.OK
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""

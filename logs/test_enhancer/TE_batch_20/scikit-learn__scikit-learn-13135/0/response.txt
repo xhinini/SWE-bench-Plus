@@ -1,0 +1,153 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests simulate a KMeans implementation that returns cluster centers in a non-sorted (reversed) order to reproduce the original bug where KBinsDiscretizer did not sort centers before computing bin edges. Each test monkeypatches sklearn.cluster.KMeans with a FakeKMeans that returns reversed centers based on the provided init; the tests then assert that KBinsDiscretizer produces monotonically increasing bin edges and that transform/inverse_transform round-trip behavior is preserved. The patched implementation (gold patch) sorts centers and will pass these tests; the original (unsorted centers used directly) would fail.
+test_code: |
+  import numpy as np
+  import pytest
+  from numpy.testing import assert_array_equal, assert_allclose
+  from sklearn.preprocessing import KBinsDiscretizer
+
+  # A Fake KMeans that returns unsorted (reversed) cluster centers derived
+  # from the provided init. This lets us deterministically simulate the
+  # scenario where cluster_centers_ come back in a non-monotonic order.
+  class FakeKMeans:
+      def __init__(self, n_clusters, init=None, n_init=None, **kwargs):
+          self.n_clusters = n_clusters
+          self.init = init
+
+      def fit(self, X):
+          # init is expected to be an array of shape (n_clusters, 1)
+          init = np.asarray(self.init).squeeze()
+          # produce an intentionally unsorted (reversed) centers array
+          centers = init[::-1][:self.n_clusters]
+          self.cluster_centers_ = centers.reshape(-1, 1)
+          return self
+
+  def _patch_kmeans(monkeypatch):
+      # Patch sklearn.cluster.KMeans used inside KBinsDiscretizer
+      import sklearn.cluster as cluster_mod
+      monkeypatch.setattr(cluster_mod, "KMeans", FakeKMeans)
+
+  def _clustered_1d_data(centers, n_samples_per_center=30, scale=0.5, rng=None):
+      rng = rng or np.random.RandomState(0)
+      X_parts = [rng.normal(loc=c, scale=scale, size=(n_samples_per_center, 1))
+                 for c in centers]
+      return np.vstack(X_parts)
+
+  def _assert_monotonic_bin_edges(est):
+      # All bin edge arrays must be non-decreasing
+      for edges in est.bin_edges_:
+          # edges is a 1D array of length n_bins + 1
+          diffs = np.diff(edges)
+          assert np.all(diffs >= 0), "Found non-monotonic bin edges: %r" % edges
+
+  def _roundtrip_ordinal(est, Xt):
+      # For ordinal encoding, inverse_transform then transform should round-trip
+      Xinv = est.inverse_transform(Xt)
+      Xt2 = est.transform(Xinv)
+      assert_array_equal(Xt2, Xt)
+
+  def test_kmeans_bin_edges_sorted_n3(monkeypatch):
+      _patch_kmeans(monkeypatch)
+      # create three well separated clusters at 0, 10, 20
+      X = _clustered_1d_data([0.0, 10.0, 20.0])
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      _assert_monotonic_bin_edges(est)
+
+  def test_kmeans_roundtrip_transform_inverse_n3(monkeypatch):
+      _patch_kmeans(monkeypatch)
+      X = _clustered_1d_data([0.0, 10.0, 20.0])
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      Xt = est.fit_transform(X)
+      # Check round-trip transform -> inverse_transform -> transform
+      _roundtrip_ordinal(est, Xt)
+
+  def test_kmeans_bin_edges_sorted_n4(monkeypatch):
+      _patch_kmeans(monkeypatch)
+      # clusters at four positions
+      centers = [0.0, 5.0, 15.0, 30.0]
+      X = _clustered_1d_data(centers)
+      est = KBinsDiscretizer(n_bins=4, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      _assert_monotonic_bin_edges(est)
+
+  def test_kmeans_roundtrip_transform_inverse_n4(monkeypatch):
+      _patch_kmeans(monkeypatch)
+      centers = [0.0, 5.0, 15.0, 30.0]
+      X = _clustered_1d_data(centers)
+      est = KBinsDiscretizer(n_bins=4, strategy='kmeans', encode='ordinal')
+      Xt = est.fit_transform(X)
+      _roundtrip_ordinal(est, Xt)
+
+  def test_kmeans_multiple_features_bin_edges_sorted(monkeypatch):
+      _patch_kmeans(monkeypatch)
+      # construct a 2-feature dataset, each feature has 3 clusters
+      Xf1 = _clustered_1d_data([0.0, 10.0, 20.0], rng=np.random.RandomState(1))
+      Xf2 = _clustered_1d_data([-50.0, -30.0, 0.0], rng=np.random.RandomState(2))
+      # stack as two features
+      X = np.hstack([Xf1, Xf2])
+      est = KBinsDiscretizer(n_bins=[3, 3], strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      # Both features must have monotonic bin edges
+      _assert_monotonic_bin_edges(est)
+
+  def test_kmeans_inverse_transform_centers_match_monotonic_edges(monkeypatch):
+      _patch_kmeans(monkeypatch)
+      # Three clusters where centers would be reversed by FakeKMeans
+      centers = [1.0, 4.0, 7.0]
+      X = _clustered_1d_data(centers, n_samples_per_center=10)
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      Xt = est.fit_transform(X)
+      # inverse_transform returns center of each bin; these centers must be
+      # ordered according to monotonic bin edges.
+      Xinv = est.inverse_transform(Xt)
+      # Compute centers from bin_edges_ and compare to inverse_transform output
+      edges = est.bin_edges_[0]
+      bin_centers = (edges[1:] + edges[:-1]) * 0.5
+      # All returned values should be one of the bin_centers
+      unique_inv = np.unique(Xinv.ravel())
+      for val in unique_inv:
+          assert_any = np.any(np.isclose(bin_centers, val))
+          assert assert_any, "inverse_transform produced a value not in bin centers"
+
+  def test_kmeans_with_onehot_encode_bin_edges_sorted(monkeypatch):
+      _patch_kmeans(monkeypatch)
+      X = _clustered_1d_data([0.0, 10.0, 20.0])
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='onehot-dense')
+      Xt = est.fit_transform(X)
+      # After fitting, bin_edges_ must be monotonic
+      _assert_monotonic_bin_edges(est)
+      # For onehot-dense, transform followed by inverse_transform should roundtrip
+      Xinv = est.inverse_transform(Xt)
+      Xt2 = est.transform(Xinv)
+      # Since encode='onehot-dense', transform returns dense ndarray
+      assert_array_equal(Xt2, Xt)
+
+  def test_kmeans_transform_outside_fit_range_with_unsorted_centers(monkeypatch):
+      _patch_kmeans(monkeypatch)
+      # cluster centers and some test points outside fit range
+      X = _clustered_1d_data([0.0, 3.0, 6.0])
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      # Values outside the fitted min/max must still be clipped to [0, n_bins-1]
+      X_out = np.array([[-100.0], [100.0]])
+      Xt_out = est.transform(X_out)
+      assert Xt_out.min() >= 0
+      assert Xt_out.max() <= est.n_bins_[0] - 1
+
+  def test_kmeans_numeric_stability_small_values_with_unsorted_centers(monkeypatch):
+      _patch_kmeans(monkeypatch)
+      # Use very small magnitudes to ensure eps handling works with sorted edges
+      X_big = _clustered_1d_data([0.0, 1.0, 2.0], n_samples_per_center=10)
+      X = X_big / 1e8
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      Xt = est.fit_transform(X)
+      # Should produce valid integer bin indices 0..2
+      assert Xt.min() >= 0
+      assert Xt.max() <= 2
+  # End of tests
+new_imports_code: |
+  # No additional third-party imports required beyond those already in the
+  # test environment (pytest, numpy, sklearn). The tests monkeypatch
+  # sklearn.cluster.KMeans at runtime using pytest's monkeypatch fixture.

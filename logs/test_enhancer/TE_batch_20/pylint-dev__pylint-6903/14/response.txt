@@ -1,0 +1,176 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests exercise pylint.lint.run._query_cpu and pylint.lint.run._cpu_count under
+  a variety of cgroup file presence and contents. They validate that fractional CPU
+  allocations (where integer division would yield 0) are normalized to 1 CPU, that the
+  cpu.cfs_quota_us/cpu.cfs_period_us quota branch takes precedence over cpu.shares when
+  appropriate, and that the integration with _cpu_count and Run does not crash when
+  --jobs=0 is requested in such environments. The tests are designed to fail for the
+  candidate/model patch that does not correctly normalize the fractional quota case
+  (returning 0 instead of 1), but they pass for the gold patch which ensures avail_cpu
+  becomes 1 when the computed value is 0.
+test_code: |
+  # Licensed under the GPL: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+  # For details: https://github.com/PyCQA/pylint/blob/main/LICENSE
+  # Copyright (c) https://github.com/PyCQA/pylint/blob/main/CONTRIBUTORS.txt
+  # pylint: disable=missing-module-docstring, missing-function-docstring
+
+  from __future__ import annotations
+
+  import os
+  from unittest.mock import MagicMock, mock_open, patch
+
+  import pytest
+
+  from pylint.lint import run as run_mod
+  from pylint.lint import Run
+  from pylint.testutils import GenericTestReporter as Reporter
+
+  # Helpers to create an open that returns different contents based on path
+  def make_mock_open(mapping):
+      builtin_open = open
+
+      def _mock_open(*args, **kwargs):
+          path = args[0]
+          if path in mapping:
+              data = mapping[path]
+              # mock_open wants str data
+              return mock_open(read_data=str(data))(*args, **kwargs)
+          return builtin_open(*args, **kwargs)
+
+      return _mock_open
+
+  # Helper to mock pathlib.Path behaviour for is_file checks
+  def make_mock_path(existing_paths):
+      def _mock_path(path, *args, **kwargs):
+          # Return object with is_file method
+          return MagicMock(is_file=lambda: path in existing_paths)
+      return _mock_path
+
+
+  def test_query_cpu_quota_fractional_returns_one():
+      # quota < period -> int(quota/period) == 0 -> should normalize to 1
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "500\n",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "1000000\n",
+      }
+      with patch("builtins.open", make_mock_open(files)):
+          with patch("pylint.lint.run.Path", make_mock_path(set(files.keys()))):
+              assert run_mod._query_cpu() == 1
+
+
+  def test_query_cpu_quota_exact_one():
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "100000\n",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+      }
+      with patch("builtins.open", make_mock_open(files)):
+          with patch("pylint.lint.run.Path", make_mock_path(set(files.keys()))):
+              assert run_mod._query_cpu() == 1
+
+
+  def test_query_cpu_quota_large_value():
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "400000\n",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+      }
+      with patch("builtins.open", make_mock_open(files)):
+          with patch("pylint.lint.run.Path", make_mock_path(set(files.keys()))):
+              assert run_mod._query_cpu() == 4
+
+
+  def test_query_cpu_shares_fractional_returns_one_when_quota_is_minus_one():
+      # quota == -1 -> fallback to shares branch. shares=2 -> int(2/1024)=0 -> normalize to 1
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",
+          "/sys/fs/cgroup/cpu/cpu.shares": "2\n",
+      }
+      with patch("builtins.open", make_mock_open(files)):
+          with patch(
+              "pylint.lint.run.Path",
+              make_mock_path(
+                  {"/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.shares"}
+              ),
+          ):
+              assert run_mod._query_cpu() == 1
+
+
+  def test_query_cpu_shares_exact_one_cpu():
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.shares": "1024\n",
+      }
+      with patch("builtins.open", make_mock_open(files)):
+          with patch("pylint.lint.run.Path", make_mock_path(set(files.keys()))):
+              assert run_mod._query_cpu() == 1
+
+
+  def test_query_cpu_shares_multiple_cpus():
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.shares": "2048\n",
+      }
+      with patch("builtins.open", make_mock_open(files)):
+          with patch("pylint.lint.run.Path", make_mock_path(set(files.keys()))):
+              assert run_mod._query_cpu() == 2
+
+
+  def test_query_cpu_prefers_quota_over_shares_when_quota_valid():
+      # quota takes precedence when it's not -1 and cpu_period file exists
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "300000\n",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+          "/sys/fs/cgroup/cpu/cpu.shares": "1024\n",
+      }
+      with patch("builtins.open", make_mock_open(files)):
+          with patch(
+              "pylint.lint.run.Path",
+              make_mock_path(
+                  {
+                      "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+                      "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
+                      "/sys/fs/cgroup/cpu/cpu.shares",
+                  }
+              ),
+          ):
+              # quota 300000/100000 == 3 -> should be used
+              assert run_mod._query_cpu() == 3
+
+
+  def test_query_cpu_no_files_returns_none():
+      # No cgroup files present -> should return None
+      with patch("pylint.lint.run.Path", make_mock_path(set())):
+          assert run_mod._query_cpu() is None
+
+
+  def test_cpu_count_with_sched_affinity_and_fractional_quota_becomes_one():
+      # Ensure _cpu_count returns at least 1 when quota indicates a fractional CPU
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "500\n",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "1000000\n",
+      }
+      with patch("builtins.open", make_mock_open(files)):
+          with patch("pylint.lint.run.Path", make_mock_path(set(files.keys()))):
+              # Mock a machine with 4 CPUs available according to sched_getaffinity
+              with patch.object(os, "sched_getaffinity", lambda pid: {0, 1, 2, 3}):
+                  assert run_mod._cpu_count() == 1
+
+
+  def test_run_does_not_crash_when_jobs_zero_and_quota_fractional(tmp_path):
+      # Integration-style test: Run() should not crash when --jobs=0 and cgroup quota is fractional
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "500\n",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "1000000\n",
+      }
+      # create a dummy file so pylint has something to lint (a simple python file)
+      sample = tmp_path / "sample.py"
+      sample.write_text("x = 1\n")
+      testargs = [str(sample), "--jobs=0"]
+      with patch("builtins.open", make_mock_open(files)):
+          with patch("pylint.lint.run.Path", make_mock_path(set(files.keys()))):
+              with pytest.raises(SystemExit) as err:
+                  Run(testargs, reporter=Reporter())
+              # Should exit 0 (no lint problems for this tiny file)
+              assert err.value.code == 0
+new_imports_code: |
+  from unittest.mock import MagicMock, mock_open, patch
+  import pytest

@@ -1,0 +1,78 @@
+pass
+import numpy as np
+import xarray as xr
+import pytest
+
+def test_construct_preserves_data_vars_order():
+    ds = xr.Dataset({'a': ('time', np.arange(24)), 'b': ('time', np.arange(24) + 10), 'c': ('time', np.arange(24) + 20)}, coords={'time': np.arange(24), 'static': 1})
+    result = ds.coarsen(time=12).construct(time=('year', 'month'))
+    assert list(ds.data_vars.keys()) == list(result.data_vars.keys())
+
+def test_construct_preserves_variables_keys_including_coords():
+    ds = xr.Dataset({'x': ('time', np.arange(24)), 'y': ('time', np.arange(24) + 100)}, coords={'time': np.arange(24), 'scalar': 5})
+    result = ds.coarsen(time=12).construct(time=('year', 'month'))
+    assert list(ds.variables.keys()) == list(result.variables.keys())
+
+def test_construct_complex_ordering_with_coords_and_data_vars():
+    ds = xr.Dataset()
+    ds['a'] = ('time', np.arange(24))
+    ds = ds.assign_coords(c1=('time', np.arange(24)))
+    ds['b'] = ('time', np.arange(24) + 100)
+    ds = ds.assign_coords(c2=('time', np.arange(24) + 200))
+    original_variables = list(ds.variables.keys())
+    result = ds.coarsen(time=12).construct(time=('year', 'month'))
+    assert list(result.variables.keys()) == original_variables
+
+import numpy as np
+import xarray as xr
+import pytest
+import numpy as np
+import xarray as xr
+import pytest
+
+def test_non_coarsened_variable_remains_in_position():
+    ds = xr.Dataset({'first': ('time', np.arange(24)), 'coarsened': ('time', np.arange(24) + 10), 'static': ('z', np.arange(3)), 'last': (('x', 'time'), np.arange(48).reshape(2, 24))}, coords={'time': np.arange(24), 'x': np.arange(2), 'z': np.arange(3)})
+    result = ds.coarsen(time=12, boundary='trim').construct(time=('year', 'month'))
+    assert list(result.data_vars.keys()) == list(ds.data_vars.keys())
+    assert list(result.data_vars.keys()).index('static') == list(ds.data_vars.keys()).index('static')
+
+def test_multiple_dims_preserve_order_mixed_deps():
+    ds = xr.Dataset({'A': ('time', np.arange(24)), 'B': (('y', 'time'), np.arange(48).reshape(2, 24)), 'C': (('x',), np.arange(3)), 'D': (('x', 'time'), np.arange(72).reshape(3, 24))}, coords={'time': np.arange(24), 'x': np.arange(3), 'y': np.arange(2)})
+    result = ds.coarsen(time=12, x=3, boundary='trim').construct({'time': ('year', 'month'), 'x': ('x1', 'x2')})
+    assert list(result.data_vars.keys()) == list(ds.data_vars.keys())
+
+def test_construct_preserves_order_when_some_vars_unaffected_by_windows():
+    ds = xr.Dataset({'v1': ('time', np.arange(24)), 'v2': ('z', np.arange(4)), 'v3': (('time', 'x'), np.arange(240).reshape(24, 10))}, coords={'time': np.arange(24), 'x': np.arange(10), 'z': np.arange(4)})
+    result = ds.coarsen(time=12, x=5, boundary='trim').construct({'time': ('year', 'month'), 'x': ('x1', 'x2')})
+    assert list(result.data_vars.keys()) == list(ds.data_vars.keys())
+
+from __future__ import annotations
+import numpy as np
+import pytest
+import xarray as xr
+from xarray import Dataset, DataArray
+from . import assert_identical, assert_equal
+
+def test_construct_preserves_data_vars_order_even_with_noncoarsened_vars():
+    ds = Dataset({'first': ('time', np.arange(12)), 'second': ('x', np.arange(3)), 'third': (('x', 'time'), np.arange(36).reshape(3, 12)), 'fourth': ('y', np.arange(4))}, coords={'time': np.arange(12), 'x': np.arange(3), 'y': np.arange(4)})
+    result = ds.coarsen(time=6).construct(time=('a', 'b'))
+    assert list(ds.data_vars.keys()) == list(result.data_vars.keys())
+
+def test_construct_multiple_dims_order_and_attrs():
+    ds = Dataset({'d1': (('time', 'x'), np.arange(24).reshape(6, 4), {'a': 1}), 'd2': ('time', np.arange(6), {'b': 2}), 'd3': ('y', np.arange(3), {'c': 3})}, coords={'time': np.arange(6), 'x': np.arange(4), 'y': np.arange(3)}, attrs={'root': True})
+    result = ds.coarsen(time=2, x=2).construct(time=('T1', 'T2'), x=('X1', 'X2'))
+    assert list(result.data_vars.keys()) == list(ds.data_vars.keys())
+    assert result.attrs == ds.attrs
+    assert result['d1'].attrs == ds['d1'].attrs
+    assert result['d3'].dims == ds['d3'].dims
+
+import numpy as np
+import xarray as xr
+import pytest
+from numpy.testing import assert_array_equal
+
+def test_construct_data_var_order_preserved():
+    ds = xr.Dataset({'a': ('time', np.arange(24)), 'b': ('time', np.arange(24) + 100), 'c': ('time', np.arange(24) + 200)}, coords={'time': np.arange(24)})
+    expect_order = list(ds.data_vars.keys())
+    res = ds.coarsen(time=12).construct(time=('year', 'month'))
+    assert list(res.data_vars.keys()) == expect_order

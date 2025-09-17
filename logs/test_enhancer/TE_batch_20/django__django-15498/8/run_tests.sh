@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 view_tests.tests.test_static_llm.BadHeader.__str__ view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attrerror_propagates_multiple_calls_consistent view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attrerror_propagates_when_header_passed_as_named_arg view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attrerror_propagates_when_only_header_passed view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attrerror_propagates_when_size_nonzero view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attrerror_propagates_with_float_mtime view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attrerror_propagates_with_integer_mtime view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attrerror_propagates_with_large_size view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attrerror_propagates_with_negative_mtime view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attrerror_propagates_with_unusual_mtime view_tests.tests.test_static_llm.WasModifiedSinceAttributeErrorTests.test_attrerror_propagates_with_zero_mtime
+coverage json -o coverage.json
+: '>>>>> End Test Output'

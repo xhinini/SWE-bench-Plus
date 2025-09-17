@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_autodetector_llm.RegressionMissingToKeyTests.make_project_state migrations.test_autodetector_llm.RegressionMissingToKeyTests.test_detect_changes_with_hardcoded_fk_and_index migrations.test_autodetector_llm.RegressionMissingToKeyTests.test_detect_create_model_hardcoded_fk_primary_key migrations.test_autodetector_llm.RegressionMissingToKeyTests.test_detect_create_model_with_fk_deconstruct_missing_to migrations.test_autodetector_llm.RegressionMissingToKeyTests.test_detect_create_model_with_m2m_deconstruct_missing_to migrations.test_autodetector_llm.RegressionMissingToKeyTests.test_multiple_fields_missing_to_key migrations.test_autodetector_llm.RegressionMissingToKeyTests.test_only_relation_agnostic_fields_handles_missing_to_key migrations.test_autodetector_llm.RegressionMissingToKeyTests.test_only_relation_agnostic_fields_with_field_missing_to_among_others migrations.test_autodetector_llm.RegressionMissingToKeyTests.test_rename_model_detection_with_fk_deconstruct_missing_to migrations.test_autodetector_llm.RegressionMissingToKeyTests.test_rename_model_with_m2m_deconstruct_missing_to
+coverage json -o coverage.json
+: '>>>>> End Test Output'

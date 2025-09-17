@@ -1,0 +1,187 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise ForeignKey.validate(...) to ensure it uses the model's _base_manager for existence checks (so objects filtered out by the default manager are still considered valid), that it raises ValidationError for missing targets, skips validation for parent_link, handles None values, accepts model instances as values, invokes router.db_for_read, calls complex_filter with limit_choices_to, prefers _base_manager over _default_manager, and exposes ValidationError params correctly.
+test_code: |
+  from unittest import mock
+
+  from django.core.exceptions import ValidationError
+  from django.test import TestCase
+  from django.db.models.query import QuerySet
+
+  import datetime
+
+  from tests.model_forms import models as mf_models
+  from django.db import router
+
+
+  class ForeignKeyValidateTests(TestCase):
+      def setUp(self):
+          # Ensure there is at least one Writer created via base manager for tests.
+          self.writer_base = mf_models.Writer._base_manager.create(name='base_created', archived=True)
+          # Prepare a minimal Article instance as model_instance for validate()
+          self.article_instance = mf_models.Article(
+              headline='h',
+              slug='s',
+              pub_date=datetime.date.today(),
+              created=datetime.date.today(),
+              writer=None,
+              article='body',
+          )
+          self.writer_field = mf_models.Article._meta.get_field('writer')
+
+      def test_validate_accepts_archived_writer_using_base_manager(self):
+          """
+          If the default manager filters out archived writers, validation should
+          still succeed because ForeignKey.validate uses the model's _base_manager.
+          """
+          # The writer created in setUp is archived=True and would be filtered out
+          # by the custom default manager (Writer.objects). Validate should pass.
+          try:
+              self.writer_field.validate(self.writer_base.pk, self.article_instance)
+          except ValidationError:
+              self.fail("ForeignKey.validate raised ValidationError for an existing object reachable via _base_manager.")
+
+      def test_validate_rejects_nonexistent_writer_raises_validationerror(self):
+          """ValidationError is raised when the target does not exist."""
+          non_existent_pk = 999999
+          with self.assertRaises(ValidationError):
+              self.writer_field.validate(non_existent_pk, self.article_instance)
+
+      def test_validate_allows_none_value(self):
+          """None values are allowed and should not raise."""
+          # This simulates a blank/nullable FK where value is None.
+          try:
+              self.writer_field.validate(None, self.article_instance)
+          except ValidationError:
+              self.fail("ForeignKey.validate raised ValidationError for None value.")
+
+      def test_parent_link_skips_validation(self):
+          """If the FK is a parent_link, validation is skipped."""
+          orig_parent_link = self.writer_field.remote_field.parent_link
+          try:
+              self.writer_field.remote_field.parent_link = True
+              # Now calling validate with a non-existent pk must not raise.
+              try:
+                  self.writer_field.validate(12345678, self.article_instance)
+              except ValidationError:
+                  self.fail("ForeignKey.validate raised ValidationError when parent_link=True.")
+          finally:
+              self.writer_field.remote_field.parent_link = orig_parent_link
+
+      def test_validate_error_message_contains_field_and_model(self):
+          """ValidationError message should indicate which field/value caused it."""
+          non_existent_pk = 888888
+          with self.assertRaises(ValidationError) as cm:
+              self.writer_field.validate(non_existent_pk, self.article_instance)
+          exc = cm.exception
+          # The error message template includes 'does not exist.' and the field name.
+          self.assertTrue('does not exist' in str(exc))
+          # Ensure params contain 'field' and 'value' keys as populated by validate()
+          self.assertIn('field', exc.params)
+          self.assertIn('value', exc.params)
+
+      def test_validate_accepts_model_instance_value_instead_of_pk(self):
+          """Passing a model instance as the value should also validate correctly."""
+          # Create another writer via base manager (archived True).
+          writer_inst = mf_models.Writer._base_manager.create(name='inst_val', archived=True)
+          # Pass the actual model instance as the value
+          try:
+              self.writer_field.validate(writer_inst, self.article_instance)
+          except ValidationError:
+              self.fail("ForeignKey.validate raised ValidationError when passed a model instance that exists.")
+
+      def test_validate_uses_router_db_for_read_called(self):
+          """router.db_for_read should be called with the related model and instance."""
+          with mock.patch.object(router, 'db_for_read', wraps=router.db_for_read) as mock_db_for_read:
+              # Use an existing writer pk so validation proceeds
+              self.writer_field.validate(self.writer_base.pk, self.article_instance)
+              mock_db_for_read.assert_called_once()
+              # Check that the first arg passed was the related model class
+              called_args = mock_db_for_read.call_args[0]
+              self.assertEqual(called_args[0], self.writer_field.remote_field.model)
+              # The second arg should be the model instance passed to validate()
+              self.assertEqual(called_args[1], self.article_instance)
+
+      def test_validate_calls_complex_filter_with_limit_choices_to_callable(self):
+          """
+          If limit_choices_to is callable, it should be passed to QuerySet.complex_filter.
+          We patch QuerySet.complex_filter to detect that it's invoked.
+          """
+          orig_limit = self.writer_field.remote_field.limit_choices_to
+          try:
+              called = {}
+
+              def fake_limit():
+                  return {'id__isnull': False}
+
+              def fake_complex_filter(self_qs, q_object):
+                  # Mark that complex_filter was called and return self for chaining
+                  called['was_called'] = True
+                  # Return a queryset object that will still respond to exists()
+                  return self_qs
+
+              # Assign a callable limit_choices_to
+              self.writer_field.remote_field.limit_choices_to = fake_limit
+              with mock.patch.object(QuerySet, 'complex_filter', new=fake_complex_filter):
+                  # Use existing writer pk; this should call complex_filter
+                  self.writer_field.validate(self.writer_base.pk, self.article_instance)
+                  self.assertTrue(called.get('was_called', False), "complex_filter was not called with limit_choices_to callable.")
+          finally:
+              self.writer_field.remote_field.limit_choices_to = orig_limit
+
+      def test_validate_prefers_base_manager_over_default_manager(self):
+          """
+          Ensure that even if _default_manager would find an object, _base_manager
+          is the manager consulted by validate(). We simulate _base_manager returning
+          no results while _default_manager would return results.
+          """
+          Model = mf_models.Writer
+          field = self.writer_field
+
+          # Save original managers to restore later
+          orig_base = Model._base_manager
+          orig_default = Model._default_manager
+          try:
+              class FakeQS:
+                  def __init__(self, exists_value):
+                      self._exists = exists_value
+                  def complex_filter(self, *args, **kwargs):
+                      return self
+                  def exists(self):
+                      return self._exists
+
+              class FakeMgr:
+                  def __init__(self, exists_value):
+                      self._exists = exists_value
+                  def using(self, alias):
+                      return FakeQS(self._exists)
+
+              # Make base manager report "not found"
+              Model._base_manager = FakeMgr(False)
+              # Make default manager report "found"
+              Model._default_manager = FakeMgr(True)
+
+              # Call validate with a pk that actually exists in DB but base manager
+              # is faked to return False; validate should raise because it must use base_manager.
+              with self.assertRaises(ValidationError):
+                  field.validate(self.writer_base.pk, self.article_instance)
+          finally:
+              Model._base_manager = orig_base
+              Model._default_manager = orig_default
+
+      def test_validation_error_params_include_expected_values(self):
+          """ValidationError.params should contain 'model', 'field' and 'value' keys."""
+          non_existent_pk = 424242
+          with self.assertRaises(ValidationError) as cm:
+              self.writer_field.validate(non_existent_pk, self.article_instance)
+          params = cm.exception.params
+          # 'model' is included (verbose_name), 'field' is field name, 'value' is the provided value
+          self.assertIn('model', params)
+          self.assertIn('field', params)
+          self.assertIn('value', params)
+new_imports_code: |
+  from django.test import TestCase
+  from django.core.exceptions import ValidationError
+  from django.db.models.query import QuerySet
+  from django.db import router
+  from unittest import mock

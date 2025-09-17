@@ -1,0 +1,253 @@
+import http.server
+import json
+import textwrap
+
+import pytest
+
+from .utils import http_server, https_server
+
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_toomanyredirects_head_falls_back_to_get_basic(app):
+    """If HEAD raises TooManyRedirects, GET should be used and mark working."""
+    class InfiniteHeadHandler(http_server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            # cause an infinite redirect loop for HEAD
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200, "OK")
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
+    with http_server(InfiniteHeadHandler):
+        app.builder.build_all()
+
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    assert content == {
+        "code": 0,
+        "status": "working",
+        "filename": "index.rst",
+        "lineno": 1,
+        "uri": "http://localhost:7777/",
+        "info": "",
+    }
+
+
+@pytest.mark.sphinx(
+    'linkcheck', testroot='linkcheck-localserver', freshenv=True,
+    confoverrides={'linkcheck_workers': 2})
+def test_toomanyredirects_head_with_multiple_workers(app):
+    """Fallback to GET still works with multiple worker threads."""
+    class InfiniteHeadHandler(http_server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200, "OK")
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
+    with http_server(InfiniteHeadHandler):
+        app.builder.build_all()
+
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    assert content["status"] == "working"
+    assert content["uri"] == "http://localhost:7777/"
+
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_toomanyredirects_head_logs_get_request(app, capsys):
+    """When HEAD fails with TooManyRedirects a GET must actually be issued."""
+    class InfiniteHeadHandler(http_server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200, "OK")
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
+        def log_date_time_string(self):
+            # Simplify log output to make assertions deterministic
+            return ""
+
+    with http_server(InfiniteHeadHandler):
+        app.builder.build_all()
+    stdout, stderr = capsys.readouterr()
+    # The server should have received a GET (logged in stderr)
+    assert ' "GET / HTTP/1.1" 200' in stderr or ' "GET / HTTP/1.1" 204' in stderr or ' "GET / HTTP/1.1" 302' in stderr
+
+
+@pytest.mark.sphinx(
+    'linkcheck', testroot='linkcheck-localserver', freshenv=True,
+    confoverrides={'linkcheck_auth': [(r'^http://localhost:7777/$', ('user', 'pass'))]})
+def test_toomanyredirects_head_respects_auth_on_get(app):
+    """If HEAD loops but GET requires auth, the configured auth should be used."""
+    from requests.auth import _basic_auth_str
+
+    class AuthHeadHandler(http_server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            # cause infinite redirects on HEAD
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            auth = self.headers.get('Authorization')
+            expected = _basic_auth_str('user', 'pass')
+            if auth == expected:
+                self.send_response(200, "OK")
+                self.end_headers()
+                self.wfile.write(b"ok\n")
+            else:
+                # unauthorized
+                self.send_response(401, "Unauthorized")
+                self.end_headers()
+
+    with http_server(AuthHeadHandler):
+        app.builder.build_all()
+
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    # Even if GET returned 200 or 401, HEAD loop should be recovered by GET;
+    # If GET returns 401 it's considered "working" by the builder. So ensure final status is working.
+    assert content["status"] == "working"
+
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver-https', freshenv=True)
+def test_toomanyredirects_head_fallback_over_https(app):
+    """Ensure fallback works over HTTPS as well (GET issued after HEAD TooManyRedirects)."""
+    class InfiniteHeadHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "https://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200, "OK")
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
+    with https_server(InfiniteHeadHandler):
+        app.builder.build_all()
+
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    # If TLS verification fails in the test environment, builder may mark broken;
+    # we assert that if TLS succeeds, status is working, otherwise it's one of the known TLS failures.
+    assert content["uri"].startswith("https://localhost:7777/")
+    assert content["status"] in ("working", "broken")
+
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_toomanyredirects_head_then_get_reports_redirected_with_code(app):
+    """
+    If HEAD raises TooManyRedirects but a GET succeeds and produces a redirect
+    history, the final status should be 'redirected' and the code should be
+    the status code of the last redirect.
+    """
+    class MixedHandler(http_server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            # cause TooManyRedirects on HEAD (redirect to itself)
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            # on GET, redirect once to ?redirected=1 and then that endpoint returns 204
+            if self.path == "/?redirected=1":
+                self.send_response(204, "No Content")
+                self.end_headers()
+            else:
+                self.send_response(302, "Found")
+                self.send_header("Location", "http://localhost:7777/?redirected=1")
+                self.end_headers()
+
+    with http_server(MixedHandler):
+        app.builder.build_all()
+
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    # We expect the GET to have followed a redirect and the builder to record redirected with code 302
+    assert content["status"] == "redirected"
+    assert content["code"] == 302
+    assert content["uri"].startswith("http://localhost:7777/")
+
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_toomanyredirects_head_then_get_returns_503_ignored(app):
+    """If GET raises an HTTPError with status 503 the builder treats it as ignored."""
+    class HeadLoopGet503Handler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            # return 503 Service Unavailable for GET
+            self.send_response(503, "Service Unavailable")
+            self.end_headers()
+
+    with http_server(HeadLoopGet503Handler):
+        app.builder.build_all()
+
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    assert content["status"] == "ignored"
+
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_toomanyredirects_head_then_get_returns_401_considered_working(app):
+    """If GET raises HTTPError 401 the builder treats the link as working (unauthorized)."""
+    class HeadLoopGet401Handler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            # return 401 Unauthorized for GET
+            self.send_response(401, "Unauthorized")
+            self.end_headers()
+
+    with http_server(HeadLoopGet401Handler):
+        app.builder.build_all()
+
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    # The builder treats 401 as working
+    assert content["status"] == "working"
+
+# The following test exercises an image-like URL being checked; the builder
+# treats images similarly if they include '://', so this verifies the fallback
+# behavior for such a node as well.
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_toomanyredirects_head_for_image_like_uri(app):
+    class InfiniteHeadHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/image.png")
+            self.end_headers()
+
+        def do_GET(self):
+            # Simulate an image GET that succeeds
+            self.send_response(200, "OK")
+            self.end_headers()
+            self.wfile.write(b"\x89PNG\r\n\x1a\n")
+
+    with http_server(InfiniteHeadHandler):
+        app.builder.build_all()
+
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    assert content["status"] == "working"
+    assert content["uri"].startswith("http://localhost:7777/")

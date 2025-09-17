@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_widgets.tests_llm.ManyToManyWidgetOverrideCallOrderTests.test_explicit_widget_kwarg_respected_and_autocomplete_not_called admin_widgets.tests_llm.ManyToManyWidgetOverrideCallOrderTests.test_explicit_widget_with_autocomplete_field_config_does_not_invoke_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideCallOrderTests.test_explicit_widget_with_filter_vertical_does_not_invoke_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideCallOrderTests.test_explicit_widget_with_raw_id_fields_does_not_invoke_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideCallOrderTests.test_explicit_widget_with_using_kwarg_does_not_invoke_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideCallOrderTests.test_formfield_overrides_respects_widget_and_does_not_call_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideCallOrderTests.test_formfield_overrides_with_autocomplete_field_config_does_not_invoke_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideCallOrderTests.test_formfield_overrides_with_filter_horizontal_does_not_invoke_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideCallOrderTests.test_formfield_overrides_with_filter_vertical_does_not_invoke_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideCallOrderTests.test_formfield_overrides_with_raw_id_fields_does_not_invoke_autocomplete admin_widgets.tests_llm._unwrap_widget
+coverage json -o coverage.json
+: '>>>>> End Test Output'

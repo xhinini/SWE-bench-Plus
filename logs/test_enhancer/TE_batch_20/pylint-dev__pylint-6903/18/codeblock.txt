@@ -1,0 +1,125 @@
+from unittest.mock import MagicMock, mock_open, patch
+import pytest
+# Licensed under the GPL: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+# For details: https://github.com/PyCQA/pylint/blob/main/LICENSE
+# Copyright (c) https://github.com/PyCQA/pylint/blob/main/CONTRIBUTORS.txt
+# pylint: disable=missing-module-docstring, missing-function-docstring
+
+from __future__ import annotations
+
+import os
+import pathlib
+from unittest.mock import MagicMock, mock_open, patch
+
+import pytest
+
+from pylint.lint import Run
+from pylint.testutils import GenericTestReporter as Reporter
+
+# Helper factory to create mocks for quota/period/shares
+def make_open_and_path_mocks(quota_value=None, period_value=None, shares_value=None):
+    builtin_open = open
+
+    def _mock_open(*args, **kwargs):
+        path = args[0]
+        if path == "/sys/fs/cgroup/cpu/cpu.cfs_quota_us" and quota_value is not None:
+            return mock_open(read_data=str(quota_value))(*args, **kwargs)
+        if path == "/sys/fs/cgroup/cpu/cpu.cfs_period_us" and period_value is not None:
+            return mock_open(read_data=str(period_value))(*args, **kwargs)
+        if path == "/sys/fs/cgroup/cpu/cpu.shares" and shares_value is not None:
+            return mock_open(read_data=str(shares_value))(*args, **kwargs)
+        return builtin_open(*args, **kwargs)
+
+    pathlib_path = pathlib.Path
+
+    def _mock_path(*args, **kwargs):
+        # emulate existence of the specified files only
+        file_path = args[0]
+        if file_path in (
+            "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+            "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
+            "/sys/fs/cgroup/cpu/cpu.shares",
+        ):
+            # If a value is provided for this path, say the file exists.
+            if (file_path.endswith("cpu.cfs_quota_us") and quota_value is not None) or (
+                file_path.endswith("cpu.cfs_period_us") and period_value is not None
+            ) or (file_path.endswith("cpu.shares") and shares_value is not None):
+                return MagicMock(is_file=lambda: True)
+            return MagicMock(is_file=lambda: False)
+        return pathlib_path(*args, **kwargs)
+
+    return _mock_open, _mock_path
+
+# Each of these tests simulates quota/period that results in a fractional CPU (<1),
+# causing int(quota/period) == 0. The gold patch guarantees that _query_cpu returns
+# at least 1 in that case; the candidate patch fails to do so for the quota branch.
+
+def _run_with_mocks(quota_value, period_value, shares_value=None):
+    filepath = os.path.abspath(__file__)
+    testargs = [filepath, "--jobs=0"]
+    _mock_open, _mock_path = make_open_and_path_mocks(
+        quota_value=quota_value, period_value=period_value, shares_value=shares_value
+    )
+    with patch("builtins.open", _mock_open):
+        with patch("pylint.lint.run.Path", _mock_path):
+            # We expect the run to exit with code 0 (no crash, jobs resolved to >=1).
+            with pytest.raises(SystemExit) as err:
+                Run(testargs, reporter=Reporter())
+    return err
+
+def test_quota_fraction_simple():
+    # quota 50000, period 100000 => int(50000/100000) == 0 -> should be treated as 1
+    err = _run_with_mocks(quota_value="50000\n", period_value="100000\n")
+    assert err.value.code == 0
+
+def test_quota_fraction_with_shares_present():
+    # Both quota/period and shares exist. quota branch should take precedence,
+    # but fractional quota should still result in at least 1 CPU.
+    err = _run_with_mocks(quota_value="50000\n", period_value="100000\n", shares_value="2\n")
+    assert err.value.code == 0
+
+def test_quota_fraction_trimmed_whitespace():
+    # Files may contain trailing spaces/newlines
+    err = _run_with_mocks(quota_value=" 50000 \n", period_value=" 100000 \n")
+    assert err.value.code == 0
+
+def test_quota_fraction_one_less_than_period():
+    # Very close to 1 but still fractional
+    err = _run_with_mocks(quota_value="99999\n", period_value="100000\n")
+    assert err.value.code == 0
+
+def test_quota_fraction_minimal_quota():
+    # Extremely small quota still yields fractional result
+    err = _run_with_mocks(quota_value="1\n", period_value="100000\n")
+    assert err.value.code == 0
+
+def test_quota_fraction_large_period():
+    # Large period, small quota
+    err = _run_with_mocks(quota_value="12345\n", period_value="2000000\n")
+    assert err.value.code == 0
+
+def test_quota_fraction_no_shares_file():
+    # Ensure behavior is correct when shares file does not exist
+    err = _run_with_mocks(quota_value="50000\n", period_value="100000\n", shares_value=None)
+    assert err.value.code == 0
+
+def test_quota_fraction_nonstandard_newline():
+    # Windows-style newline shouldn't affect parsing
+    err = _run_with_mocks(quota_value="50000\r\n", period_value="100000\r\n")
+    assert err.value.code == 0
+
+def test_quota_fraction_leading_plus_sign():
+    # Plus sign should still be int-parsable and fractional
+    err = _run_with_mocks(quota_value="+50000\n", period_value="100000\n")
+    assert err.value.code == 0
+
+def test_quota_fraction_with_extra_text_fallback():
+    # If extra whitespace/text is present, int conversion of rstrip should still handle numeric prefix;
+    # simulate numeric value followed by comment (we rely on rstrip in production code which would keep comment,
+    # but this test simulates typical small variations ensuring behavior stays consistent).
+    # Using pure numeric still to ensure deterministic behavior in test environment.
+    err = _run_with_mocks(quota_value="50000 # comment\n", period_value="100000\n")
+    # If the code tries to int() a string with extra text, ValueError may be raised; the purpose of this test is
+    # primarily to ensure the quota-fraction handling results in safe outcome under the gold patch.
+    # Under gold patch this should exit with code 0; under the broken candidate it may raise or exit differently.
+    assert err.value.code == 0

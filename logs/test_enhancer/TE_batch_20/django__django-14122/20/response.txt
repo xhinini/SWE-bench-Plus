@@ -1,0 +1,171 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise SQL generation around GROUP BY when default Meta.ordering is present vs. when explicit ordering/values/annotations are used. They assert that ordering from Meta.ordering does not leak into GROUP BY clauses, that explicit order_by() contributions are included when appropriate, that duplicates are removed, and that annotation-based ordering is handled correctly. The tests are written to fail for the model-generated candidate patch (which alters the logic that decides when ORDER BY expressions contribute to GROUP BY) but pass for the provided gold patch.
+test_code: |
+  from datetime import datetime
+  from operator import attrgetter
+
+  from django.db.models import Count, F, Value, CharField
+  from django.db.models.functions import Upper
+  from django.test import TestCase
+
+  from .models import Article, Author, ChildArticle, OrderedByFArticle, Reference, OrderedByFArticle
+  # Note: models used are the same as in tests/ordering/tests.py
+
+  def _group_by_fragment(qs):
+      """
+      Return normalized GROUP BY fragment (uppercase) of the SQL for the given queryset.
+      If there is no GROUP BY, return an empty string.
+      """
+      sql = str(qs.query).upper()
+      if 'GROUP BY' not in sql:
+          return ''
+      start = sql.find('GROUP BY')
+      # End at ORDER BY if present, else end of string
+      end = sql.find('ORDER BY', start)
+      if end == -1:
+          return sql[start:].strip()
+      return sql[start:end].strip()
+
+  class GroupByCompilerTests(TestCase):
+      @classmethod
+      def setUpTestData(cls):
+          cls.a1 = Article.objects.create(headline="Article 1", pub_date=datetime(2005, 7, 26))
+          cls.a2 = Article.objects.create(headline="Article 2", pub_date=datetime(2005, 7, 27))
+          cls.a3 = Article.objects.create(headline="Article 3", pub_date=datetime(2005, 7, 27))
+          cls.a4 = Article.objects.create(headline="Article 4", pub_date=datetime(2005, 7, 28))
+          cls.author_1 = Author.objects.create(name="Name 1")
+          cls.author_2 = Author.objects.create(name="Name 2")
+
+      def test_meta_ordering_does_not_contribute_to_group_by(self):
+          """
+          When a model has a default Meta.ordering, that ordering should not be
+          injected into the GROUP BY clause for aggregate queries.
+          """
+          qs = Article.objects.values('author').annotate(count=Count('author'))
+          gb = _group_by_fragment(qs)
+          # The GROUP BY should only reference the explicit values() field (AUTHOR)
+          self.assertIn('GROUP BY', gb)
+          # Should not contain default ordering columns (PUB_DATE or HEADLINE)
+          self.assertNotIn('PUB_DATE', gb)
+          self.assertNotIn('HEADLINE', gb)
+
+      def test_explicit_order_by_contributes_to_group_by_when_no_meta_ordering(self):
+          """
+          When order_by() is explicitly provided (overriding Meta.ordering) the
+          ORDER BY expressions should be added to GROUP BY for aggregation.
+          """
+          qs = Article.objects.order_by('headline').values('author').annotate(count=Count('author'))
+          gb = _group_by_fragment(qs)
+          # Values('author') should be grouped, and explicit order_by('headline')
+          # must also contribute to GROUP BY (headline column should appear).
+          self.assertIn('GROUP BY', gb)
+          self.assertIn('AUTHOR', gb)
+          self.assertIn('HEADLINE', gb)
+
+      def test_values_of_ordering_field_still_grouped_once(self):
+          """
+          If the values() list already includes a field that is also in the
+          explicit ordering, the GROUP BY should not duplicate that column.
+          """
+          qs = Article.objects.order_by('pub_date').values('pub_date').annotate(count=Count('pub_date'))
+          gb = _group_by_fragment(qs)
+          # pub_date should appear exactly once in GROUP BY fragment
+          # Count occurrences in the fragment string.
+          occurrences = gb.count('PUB_DATE')
+          self.assertEqual(occurrences, 1)
+
+      def test_annotation_ordering_outside_selection_still_added_to_group_by(self):
+          """
+          Ordering by an annotation not included in the select should cause
+          that annotation expression to be added to GROUP BY (when appropriate).
+          """
+          qs = Article.objects.annotate(
+              const=Value('1', output_field=CharField()),
+          ).order_by('const').values('author').annotate(count=Count('author'))
+          gb = _group_by_fragment(qs)
+          self.assertIn('GROUP BY', gb)
+          # 'const' is a constant annotation; ensure ordering by it does not
+          # inject unrelated columns, but the values('author') must be present.
+          self.assertIn('AUTHOR', gb)
+
+      def test_meta_ordering_ignored_even_if_values_reference_same_field(self):
+          """
+          Even if values() explicitly references a field that is also present
+          in Meta.ordering, meta ordering must not add additional grouping
+          columns beyond the explicit values() list.
+          """
+          # Article Meta.ordering includes 'pub_date'. Here we values('pub_date')
+          qs = Article.objects.values('pub_date').annotate(count=Count('pub_date'))
+          gb = _group_by_fragment(qs)
+          # Should group only by PUB_DATE once, and not add HEADLINE or other meta ordering extras.
+          self.assertIn('GROUP BY', gb)
+          self.assertEqual(gb.count('PUB_DATE'), 1)
+          self.assertNotIn('HEADLINE', gb)
+
+      def test_order_by_expression_from_related_model_resolved_into_group_by(self):
+          """
+          Ordering by a related model field should cause the underlying column
+          to be added to GROUP BY when ordering is explicit (not meta).
+          """
+          # Assign authors to articles
+          self.a1.author = self.author_1
+          self.a1.save()
+          self.a2.author = self.author_2
+          self.a2.save()
+          qs = Article.objects.order_by('author__name').values('author').annotate(count=Count('author'))
+          gb = _group_by_fragment(qs)
+          self.assertIn('GROUP BY', gb)
+          # Grouping must include the author column (values) and the ordered column
+          self.assertIn('AUTHOR', gb)
+          # The resolved ordering should refer to the related author's name column;
+          # ensure that some form of NAME or AUTHOR.NAME appears in the GROUP BY SQL.
+          self.assertTrue('NAME' in gb or 'AUTHOR.NAME' in gb)
+
+      def test_random_ordering_does_not_affect_group_by(self):
+          """
+          ORDER BY '?' (random) should not introduce extra GROUP BY columns.
+          """
+          qs = Article.objects.order_by('?').values('author').annotate(count=Count('author'))
+          gb = _group_by_fragment(qs)
+          # Should only group by the values() field.
+          self.assertIn('GROUP BY', gb)
+          self.assertIn('AUTHOR', gb)
+          # Random ordering should not inject other column names.
+          self.assertNotIn('HEADLINE', gb)
+          self.assertNotIn('PUB_DATE', gb)
+
+      def test_order_by_annotation_reference_in_select_becomes_group_by(self):
+          """
+          If ordering references an annotation that is present in the select/values,
+          it should be considered a reference and not re-added to group_by.
+          """
+          qs = Article.objects.annotate(
+              last=Count('pk'),
+          ).order_by('last').values('last')
+          gb = _group_by_fragment(qs)
+          # The GROUP BY should reference only the 'last' annotation (once).
+          self.assertIn('GROUP BY', gb)
+          # Ensure 'LAST' appears once (no duplicate injection).
+          self.assertEqual(gb.count('LAST'), 1)
+
+      def test_order_by_using_function_expression_added_when_explicit(self):
+          """
+          Ordering by a function expression (Upper()) should be added to the
+          GROUP BY when order_by() is explicitly called (and not relying on meta).
+          """
+          # Make sure authors are set so ordering by name has effect.
+          self.a1.author = self.author_1
+          self.a1.save()
+          self.a2.author = self.author_2
+          self.a2.save()
+          qs = Article.objects.order_by(Upper('author__name')).values('author').annotate(count=Count('author'))
+          gb = _group_by_fragment(qs)
+          self.assertIn('GROUP BY', gb)
+          # The grouping must include the author values field. The Upper() SQL
+          # will usually reference the author's name; ensure NAME is present.
+          self.assertIn('AUTHOR', gb)
+          self.assertTrue('NAME' in gb or 'AUTHOR.NAME' in gb)
+new_imports_code: |
+  # No additional imports required beyond Django's testing framework and
+  # models already available in the tests package.

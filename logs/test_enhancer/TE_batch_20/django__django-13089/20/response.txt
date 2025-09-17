@@ -1,0 +1,230 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise DatabaseCache._cull() behavior when the cursor.fetchone() call returns None (no last cache key), when a last cache key is present, and for a number of edge cases (different types returned by fetchone(), cull frequency calculations, and the cull-frequency-zero branch). They ensure that _cull() does not raise when fetchone() returns None (the bug fixed by the patch), that it issues the expected DELETE when a last key exists, that it calls clear() when cull frequency is zero, and that the computed cull_num is passed through. Tests are implemented by calling the _cull() method directly with a mocked cursor to precisely control cursor.fetchone() return values and to inspect cursor.execute() calls.
+test_code: |
+  # Additional regression tests for DatabaseCache._cull()
+  from unittest import mock
+  
+  from django.core.cache import caches
+  from django.utils import timezone
+  
+  # These tests belong to the DBCacheTests TransactionTestCase (the test setting
+  # that configures DatabaseCache is applied there). Define the tests as methods
+  # that will be mixed into that class. We assume `caches['cull']` is present
+  # (see caches_setting_for_tests in the test module).
+  
+  def test__cull_handles_none_last_cache_key_no_delete(self):
+      """
+      If the cache_key_culling_sql() query doesn't return a last cache key
+      (cursor.fetchone() is None), _cull() must not attempt to subscript None
+      and should not execute the final DELETE ... WHERE cache_key < ... query.
+      """
+      cache_obj = caches['cull']
+      now = timezone.now()
+      # Create a mock cursor. The first fetchone() call is for SELECT COUNT(*)
+      # and should return a large count to trigger culling. The second
+      # fetchone() simulates no rows returned (None).
+      m_cursor = mock.MagicMock()
+      m_cursor.fetchone.side_effect = [(100,), None]
+      m_cursor.execute = mock.MagicMock()
+  
+      # Should not raise
+      cache_obj._cull('default', m_cursor, now)
+  
+      # Collect executed SQL statements
+      executed_sqls = [call_args[0][0] for call_args in m_cursor.execute.call_args_list]
+      # Ensure the final delete-by-cache-key query wasn't executed.
+      assert not any('WHERE cache_key <' in sql for sql in executed_sqls), (
+          "Expected no 'WHERE cache_key <' delete to be executed when "
+          "cursor.fetchone() returned None for last cache key."
+      )
+  
+  def test__cull_deletes_when_last_cache_key_present(self):
+      """
+      When a last cache key is returned by cache_key_culling_sql(), _cull()
+      should execute a DELETE ... WHERE cache_key < <last_key> query with the
+      last key passed as a parameter.
+      """
+      cache_obj = caches['cull']
+      now = timezone.now()
+      m_cursor = mock.MagicMock()
+      m_cursor.fetchone.side_effect = [(100,), ('last-cache-key',)]
+      m_cursor.execute = mock.MagicMock()
+  
+      cache_obj._cull('default', m_cursor, now)
+  
+      # Find the delete call and check its arguments
+      for args, kwargs in m_cursor.execute.call_args_list:
+          sql = args[0]
+          if 'WHERE cache_key <' in sql:
+              # The parameters are passed as the 2nd positional argument to execute
+              params = args[1]
+              assert params == ['last-cache-key'], (
+                  "DELETE should be executed with the last cache key as parameter."
+              )
+              break
+      else:
+          raise AssertionError("Expected a delete-by-cache-key SQL to be executed.")
+  
+  def test__cull_no_culling_if_count_not_exceeding_max_entries(self):
+      """
+      If the rowcount returned by SELECT COUNT(*) is not greater than
+      _max_entries, _cull() should not call the cache_key_culling_sql() path.
+      """
+      cache_obj = caches['cull']
+      now = timezone.now()
+      m_cursor = mock.MagicMock()
+      # Return a small count so culling is not triggered.
+      m_cursor.fetchone.side_effect = [(1,)]
+      m_cursor.execute = mock.MagicMock()
+  
+      cache_obj._cull('default', m_cursor, now)
+  
+      executed_sqls = [call_args[0][0] for call_args in m_cursor.execute.call_args_list]
+      # Ensure we don't try to run the cache_key_culling_sql() query
+      assert not any('cache_key_culling' in sql or 'WHERE cache_key <' in sql for sql in executed_sqls)
+  
+  def test__cull_calls_clear_when_cull_frequency_zero(self):
+      """
+      If _cull_frequency is 0, _cull() should call clear() instead of trying
+      to perform culling.
+      """
+      cache_obj = caches['cull']
+      # Force the cull frequency branch that calls clear()
+      old_frequency = cache_obj._cull_frequency
+      try:
+          cache_obj._cull_frequency = 0
+          cache_obj.clear = mock.MagicMock()
+          now = timezone.now()
+          m_cursor = mock.MagicMock()
+          # fetchone isn't used (clear() is called), but provide a return to be safe
+          m_cursor.fetchone.return_value = (0,)
+          cache_obj._cull('default', m_cursor, now)
+          assert cache_obj.clear.called, "clear() should be called when _cull_frequency == 0"
+      finally:
+          cache_obj._cull_frequency = old_frequency
+  
+  def test__cull_passes_computed_cull_num_to_culling_sql(self):
+      """
+      Ensure the cull_num (num // _cull_frequency) is passed as the parameter
+      to the cache_key_culling_sql() execute call.
+      """
+      cache_obj = caches['cull']
+      now = timezone.now()
+      m_cursor = mock.MagicMock()
+      # Make the count large enough to trigger culling.
+      num = 100
+      # Pick a custom cull frequency so the computation is predictable.
+      old_cull_freq = cache_obj._cull_frequency
+      try:
+          cache_obj._cull_frequency = 4
+          m_cursor.fetchone.side_effect = [(num,), ('lastkey',)]
+          m_cursor.execute = mock.MagicMock()
+  
+          cache_obj._cull('default', m_cursor, now)
+  
+          # Find the call that invoked the cache_key_culling_sql() query and
+          # check the parameters passed to it are [num // cull_frequency].
+          found = False
+          expected_cull_num = num // cache_obj._cull_frequency
+          for args, kwargs in m_cursor.execute.call_args_list:
+              # The culling SQL call is the one whose 2nd arg is a list/tuple with the cull_num
+              if len(args) >= 2 and isinstance(args[1], (list, tuple)) and args[1] == [expected_cull_num]:
+                  found = True
+                  break
+          assert found, "cull_num was not passed correctly to the culling SQL execute() call."
+      finally:
+          cache_obj._cull_frequency = old_cull_freq
+  
+  def test__cull_handles_last_cache_key_with_none_element(self):
+      """
+      If cursor.fetchone() returns a tuple where the first element is None
+      (e.g. (None,)), _cull() should still attempt the delete (the tuple is
+      truthy) and pass None as the parameter. This verifies handling of
+      truthy-but-empty values and ensures no TypeError is raised.
+      """
+      cache_obj = caches['cull']
+      now = timezone.now()
+      m_cursor = mock.MagicMock()
+      m_cursor.fetchone.side_effect = [(100,), (None,)]
+      m_cursor.execute = mock.MagicMock()
+  
+      # Should not raise
+      cache_obj._cull('default', m_cursor, now)
+  
+      # Confirm a delete was attempted and that its parameter list contains None
+      for args, kwargs in m_cursor.execute.call_args_list:
+          sql = args[0]
+          if 'WHERE cache_key <' in sql:
+              params = args[1]
+              assert params == [None], "Expected the delete to be called with [None] as parameter."
+              break
+      else:
+          raise AssertionError("Expected a delete-by-cache-key SQL to be executed.")
+  
+  def test__cull_handles_last_cache_key_as_bytes(self):
+      """
+      If the last cache key returned is bytes, the code should use it as-is
+      and pass it to the delete query as the parameter.
+      """
+      cache_obj = caches['cull']
+      now = timezone.now()
+      m_cursor = mock.MagicMock()
+      m_cursor.fetchone.side_effect = [(100,), (b'byte-key',)]
+      m_cursor.execute = mock.MagicMock()
+  
+      cache_obj._cull('default', m_cursor, now)
+  
+      # Confirm the delete was called with the bytes key
+      for args, kwargs in m_cursor.execute.call_args_list:
+          sql = args[0]
+          if 'WHERE cache_key <' in sql:
+              params = args[1]
+              assert params == [b'byte-key'], "Expected the delete to be called with the bytes key as parameter."
+              break
+      else:
+          raise AssertionError("Expected a delete-by-cache-key SQL to be executed.")
+  
+  def test__cull_no_exception_when_cull_num_is_zero_and_no_last_key(self):
+      """
+      If the cull_num computes to zero (num // _cull_frequency == 0) but the
+      cache_key_culling_sql() still runs and fetchone() returns None, _cull()
+      must not raise.
+      """
+      cache_obj = caches['cull']
+      now = timezone.now()
+      m_cursor = mock.MagicMock()
+      # Choose values that produce cull_num == 0 but still num > _max_entries:
+      # Use a large _cull_frequency so that num // _cull_frequency == 0.
+      old_cull_freq = cache_obj._cull_frequency
+      try:
+          cache_obj._cull_frequency = 99999
+          m_cursor.fetchone.side_effect = [(1000,), None]
+          m_cursor.execute = mock.MagicMock()
+          # Should not raise
+          cache_obj._cull('default', m_cursor, now)
+      finally:
+          cache_obj._cull_frequency = old_cull_freq
+  
+  def test__cull_multiple_execute_calls_observed(self):
+      """
+      Ensure that when last_cache_key is present, _cull() performs the sequence
+      of SQL execution calls including the culling SQL and the subsequent
+      delete-by-cache-key. This is a sanity check that validates the expected
+      call ordering.
+      """
+      cache_obj = caches['cull']
+      now = timezone.now()
+      m_cursor = mock.MagicMock()
+      m_cursor.fetchone.side_effect = [(200,), ('last-key',)]
+      m_cursor.execute = mock.MagicMock()
+  
+      cache_obj._cull('default', m_cursor, now)
+  
+      # There should be at least 3 execute() calls:
+      # 1) DELETE expired rows, 2) SELECT COUNT(*), 3) cache_key_culling_sql(), and
+      # 4) DELETE ... WHERE cache_key < ...
+      assert len(m_cursor.execute.call_args_list) >= 3, "Expected multiple execute() calls during culling."
+new_imports_code: |
+  # No new imports necessary; existing test module already imports `mock`, `caches`,
+  # and `timezone`. These helpers are used by the tests above.

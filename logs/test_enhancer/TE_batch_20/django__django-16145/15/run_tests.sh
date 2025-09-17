@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.RunserverDisplayAndRunCallTests.setUp admin_scripts.tests_llm.RunserverDisplayAndRunCallTests.test_default_ipv6_when_use_ipv6_true admin_scripts.tests_llm.RunserverDisplayAndRunCallTests.test_fqdn_display_and_run_args admin_scripts.tests_llm.RunserverDisplayAndRunCallTests.test_ipv4_addr_display_and_run_args admin_scripts.tests_llm.RunserverDisplayAndRunCallTests.test_ipv6_addr_bracketed_display_and_run_args admin_scripts.tests_llm.RunserverDisplayAndRunCallTests.test_oserror_permission_denied_writes_helpful_message admin_scripts.tests_llm.RunserverDisplayAndRunCallTests.test_shutdown_message_on_keyboardinterrupt admin_scripts.tests_llm.RunserverDisplayAndRunCallTests.test_skip_checks_false_prints_system_checks admin_scripts.tests_llm.RunserverDisplayAndRunCallTests.test_threading_and_server_cls_forwards_to_run admin_scripts.tests_llm.RunserverDisplayAndRunCallTests.test_zero_ip_addr_display_and_run_args
+coverage json -o coverage.json
+: '>>>>> End Test Output'

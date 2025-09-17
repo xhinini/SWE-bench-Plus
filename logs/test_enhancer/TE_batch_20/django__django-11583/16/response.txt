@@ -1,0 +1,163 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that ValueError raised from Path.resolve() (with messages other than 'embedded null byte') is quietly ignored by iter_modules_and_files() and sys_path_directories(), i.e. those functions continue processing and do not re-raise the ValueError. The candidate model patch re-raises ValueError unless the message equals 'embedded null byte', so these tests would fail for that patch but pass with the gold patch which always ignores ValueError when resolving paths.
+test_code: |
+  from unittest import mock
+  import tempfile
+  import types
+  from pathlib import Path
+  from django.test import SimpleTestCase
+  from django.utils import autoreload
+  
+  
+  class ValueErrorHandlingTests(SimpleTestCase):
+      def setUp(self):
+          # Ensure cached results don't interfere between tests.
+          try:
+              autoreload.iter_modules_and_files.cache_clear()
+          except AttributeError:
+              pass
+  
+      def _make_fake_resolve(self, bad_paths, message='boom'):
+          """
+          Return a function to patch Path.resolve that raises ValueError for any
+          path matching one in bad_paths (by string) and returns the Path
+          unchanged for others.
+          """
+          def fake_resolve(self, strict=True):
+              if str(self) in bad_paths:
+                  raise ValueError(message)
+              return self
+          return fake_resolve
+  
+      def test_iter_modules_and_files_ignores_value_error_for_extra_files_path_obj(self):
+          bad = Path('/nonexistent/bad_extra_file.py')
+          fake = self._make_fake_resolve({str(bad)}, message='unexpected error')
+          with mock.patch.object(Path, 'resolve', side_effect=fake):
+              # Should not raise, and should return empty frozenset because the only file raised.
+              autoreload.iter_modules_and_files.cache_clear()
+              result = autoreload.iter_modules_and_files((), frozenset([bad]))
+              self.assertEqual(result, frozenset())
+  
+      def test_iter_modules_and_files_ignores_value_error_for_extra_files_string(self):
+          bad = '/nonexistent/bad_extra_file_str.py'
+          fake = self._make_fake_resolve({bad}, message='another error')
+          with mock.patch.object(Path, 'resolve', side_effect=fake):
+              autoreload.iter_modules_and_files.cache_clear()
+              # Passing a string as extra_files should also be ignored when resolve() raises ValueError.
+              result = autoreload.iter_modules_and_files((), frozenset([bad]))
+              self.assertEqual(result, frozenset())
+  
+      def test_iter_modules_and_files_ignores_value_error_from_module_origin(self):
+          bad_origin = '/nonexistent/module_origin.py'
+          # Create a dummy module with a spec that indicates a location.
+          module = types.ModuleType('fake_mod')
+          module.__spec__ = types.SimpleNamespace(has_location=True, origin=bad_origin, loader=object())
+          fake = self._make_fake_resolve({bad_origin}, message='module origin failure')
+          with mock.patch.object(Path, 'resolve', side_effect=fake):
+              autoreload.iter_modules_and_files.cache_clear()
+              # Module origin resolution should be ignored on ValueError.
+              result = autoreload.iter_modules_and_files((module,), frozenset())
+              self.assertEqual(result, frozenset())
+  
+      def test_iter_modules_and_files_ignores_value_error_from_zip_loader_origin(self):
+          # When spec.loader is a zipimporter, origin is taken from spec.loader.archive.
+          # Simulate a loader object with an 'archive' attribute pointing to a bad path.
+          bad_archive = '/nonexistent/archive.zip'
+          loader = types.SimpleNamespace(archive=bad_archive)
+          module = types.ModuleType('fake_zip_mod')
+          module.__spec__ = types.SimpleNamespace(has_location=True, origin='unused', loader=loader)
+          fake = self._make_fake_resolve({bad_archive}, message='zip archive failure')
+          with mock.patch.object(Path, 'resolve', side_effect=fake):
+              autoreload.iter_modules_and_files.cache_clear()
+              result = autoreload.iter_modules_and_files((module,), frozenset())
+              self.assertEqual(result, frozenset())
+  
+      def test_sys_path_directories_ignores_value_error_for_directory_entry(self):
+          bad = '/nonexistent/sys_path_dir'
+          fake = self._make_fake_resolve({bad}, message='sys.path dir error')
+          with mock.patch.object(Path, 'resolve', side_effect=fake):
+              # Insert the bad entry into sys.path temporarily via extend_sys_path-like behavior.
+              import sys
+              sys_path_backup = list(sys.path)
+              try:
+                  sys.path.append(bad)
+                  # Should not raise; the bad entry should simply be ignored.
+                  dirs = list(autoreload.sys_path_directories())
+                  # The bad entry must not be present in the returned directories.
+                  str_dirs = [str(d) for d in dirs]
+                  self.assertNotIn(bad, str_dirs)
+              finally:
+                  sys.path[:] = sys_path_backup
+  
+      def test_sys_path_directories_ignores_value_error_for_file_entry(self):
+          bad = '/nonexistent/sys_path_file.zip'
+          fake = self._make_fake_resolve({bad}, message='sys.path file error')
+          with mock.patch.object(Path, 'resolve', side_effect=fake):
+              import sys
+              sys_path_backup = list(sys.path)
+              try:
+                  sys.path.append(bad)
+                  dirs = list(autoreload.sys_path_directories())
+                  str_dirs = [str(d) for d in dirs]
+                  self.assertNotIn(bad, str_dirs)
+              finally:
+                  sys.path[:] = sys_path_backup
+  
+      def test_sys_path_directories_mixed_good_and_bad_entries_returns_only_good(self):
+          # Create a real temporary directory to be the "good" entry.
+          with tempfile.TemporaryDirectory() as td:
+              good = str(Path(td))
+              bad = '/nonexistent/mixed_bad'
+              fake = self._make_fake_resolve({bad}, message='mixed failure')
+              with mock.patch.object(Path, 'resolve', side_effect=fake):
+                  import sys
+                  sys_path_backup = list(sys.path)
+                  try:
+                      sys.path[:] = [good, bad] + sys.path
+                      dirs = list(autoreload.sys_path_directories())
+                      str_dirs = [str(d) for d in dirs]
+                      # Good directory must be present; bad must not.
+                      self.assertIn(str(Path(good).resolve().absolute()), str_dirs)
+                      self.assertNotIn(bad, str_dirs)
+                  finally:
+                      sys.path[:] = sys_path_backup
+  
+      def test_iter_modules_and_files_mixed_extra_files_one_bad_one_good(self):
+          # One good Path and one bad Path; only good should be returned.
+          with tempfile.TemporaryDirectory() as td:
+              good = Path(td) / 'good.py'
+              good.touch()
+              bad = Path('/nonexistent/mixed_bad_extra.py')
+              fake = self._make_fake_resolve({str(bad)}, message='mixed extra failure')
+              with mock.patch.object(Path, 'resolve', side_effect=fake):
+                  autoreload.iter_modules_and_files.cache_clear()
+                  result = autoreload.iter_modules_and_files((), frozenset([good, bad]))
+                  # Should contain the good file path (as resolved Path) and ignore the bad one.
+                  self.assertIn(good, result)
+                  self.assertNotIn(bad, result)
+  
+      def test_iter_modules_and_files_handles_value_error_with_empty_message(self):
+          # ValueError with empty string message should also be ignored.
+          bad = Path('/nonexistent/empty_message.py')
+          fake = self._make_fake_resolve({str(bad)}, message='')
+          with mock.patch.object(Path, 'resolve', side_effect=fake):
+              autoreload.iter_modules_and_files.cache_clear()
+              result = autoreload.iter_modules_and_files((), frozenset([bad]))
+              self.assertEqual(result, frozenset())
+  
+      def test_sys_path_directories_handles_value_error_with_empty_message(self):
+          bad = '/nonexistent/empty_msg_sys_path'
+          fake = self._make_fake_resolve({bad}, message='')
+          with mock.patch.object(Path, 'resolve', side_effect=fake):
+              import sys
+              sys_path_backup = list(sys.path)
+              try:
+                  sys.path.append(bad)
+                  dirs = list(autoreload.sys_path_directories())
+                  str_dirs = [str(d) for d in dirs]
+                  self.assertNotIn(bad, str_dirs)
+              finally:
+                  sys.path[:] = sys_path_backup
+new_imports_code: |
+  # No additional imports required; tests include their own imports.

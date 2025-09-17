@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_views.test_adminsite_llm.AdminSiteModelKeyTests.setUp admin_views.test_adminsite_llm.AdminSiteModelKeyTests.setUpTestData admin_views.test_adminsite_llm.AdminSiteModelKeyTests.test__build_app_dict_with_label_contains_model_key admin_views.test_adminsite_llm.AdminSiteModelKeyTests.test__build_app_dict_without_label_contains_model_key admin_views.test_adminsite_llm.AdminSiteModelKeyTests.test_app_index_context_models_have_model_key admin_views.test_adminsite_llm.AdminSiteModelKeyTests.test_build_app_dict_handles_noreversematch_and_still_has_model_key admin_views.test_adminsite_llm.AdminSiteModelKeyTests.test_build_app_dict_skips_models_without_module_perms admin_views.test_adminsite_llm.AdminSiteModelKeyTests.test_index_view_context_available_apps_models_have_model_key admin_views.test_adminsite_llm.AdminSiteRegistrationTests.test_app_index_raises_for_missing_app_label
+coverage json -o coverage.json
+: '>>>>> End Test Output'

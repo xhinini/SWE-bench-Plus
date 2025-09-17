@@ -1,0 +1,180 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that Apps.clear_cache() reliably clears the cache of get_swappable_settings_name(), even if model._meta._expire_cache() calls get_swappable_settings_name() (which would repopulate that cache during the clear_cache process). They cover single and multiple models, different matching strategies (swapped vs swappable/label_lower), multiple app configs, and ensure behavior both when the registry is ready (so the expire loop runs) and when it's not.
+test_code: |
+  from django.test import SimpleTestCase
+  from django.apps.registry import Apps
+  
+  
+  class FakeMeta:
+      def __init__(self, registry, app_label, model_name, swappable=None, swapped=None, label_lower=None):
+          self.apps = registry
+          self.app_label = app_label
+          self.model_name = model_name
+          self.swappable = swappable
+          self.swapped = swapped
+          self.label_lower = label_lower or f"{app_label}.{model_name}".lower()
+  
+      def _expire_cache(self):
+          # Simulate code that touches the swappable cache while being expired.
+          # This is the key behavior that can cause the swappable cache to be
+          # repopulated during Apps.clear_cache().
+          self.apps.get_swappable_settings_name(self.label_lower)
+  
+  
+  class FakeModel:
+      def __init__(self, meta):
+          self._meta = meta
+  
+  
+  class FakeAppConfig:
+      def __init__(self, registry, metas):
+          self._registry = registry
+          # metas: list of dicts with keys suitable for FakeMeta
+          self._metas = metas
+  
+      def get_models(self, include_auto_created=False, include_swapped=False):
+          # Return model instances with _meta objects bound to the registry.
+          return [FakeModel(FakeMeta(self._registry, **m)) for m in self._metas]
+  
+  
+  class ClearCacheSwappableTests(SimpleTestCase):
+      def make_registry(self, app_configs_list):
+          """
+          Create an Apps instance and replace its app_configs with the provided
+          list of FakeAppConfig instances (mapped by unique labels).
+          """
+          reg = Apps([])  # create a non-main, prepopulated registry
+          # Build mapping like {"a": appconfig_a, "b": appconfig_b, ...}
+          reg.app_configs = {
+              f"app{i}": FakeAppConfig(reg, metas) for i, metas in enumerate(app_configs_list)
+          }
+          # Prepare registry state so clear_cache's model-expiry loop runs.
+          reg.ready = True
+          reg.models_ready = True
+          # Ensure any leftover caches on this instance are cleared before tests.
+          try:
+              reg.get_models.cache_clear()
+          except Exception:
+              pass
+          try:
+              reg.get_swappable_settings_name.cache_clear()
+          except Exception:
+              pass
+          return reg
+  
+      def assert_swappable_cache_cleared_after_clear(self, reg, key_to_populate):
+          # Populate the swappable cache.
+          _ = reg.get_swappable_settings_name(key_to_populate)
+          # Ensure it's populated.
+          self.assertGreater(reg.get_swappable_settings_name.cache_info().currsize, 0)
+          # Run clear_cache which should clear and leave cache empty (even if
+          # _expire_cache repopulates it while clear_cache is running).
+          reg.clear_cache()
+          self.assertEqual(reg.get_swappable_settings_name.cache_info().currsize, 0)
+  
+      def test_single_model_swapped_attribute(self):
+          # Model reports being swapped to "target.model"; get_swappable_settings_name
+          # should be populated then cleared despite expire_cache touching it.
+          metas = [
+              {"app_label": "fake", "model_name": "m1", "swapped": "target.model", "swappable": "apps.Fake", "label_lower": "fake.m1"}
+          ]
+          reg = self.make_registry([metas])
+          self.assert_swappable_cache_cleared_after_clear(reg, "target.model")
+  
+      def test_single_model_swappable_label_match(self):
+          # The swappable attribute matches by label_lower.
+          metas = [
+              {"app_label": "fake", "model_name": "m1", "swappable": "apps.Fake", "label_lower": "fake.m1"}
+          ]
+          reg = self.make_registry([metas])
+          self.assert_swappable_cache_cleared_after_clear(reg, "fake.m1")
+  
+      def test_multiple_models_same_key(self):
+          # Several models that all, when expired, touch the same swappable key.
+          metas1 = [
+              {"app_label": "a", "model_name": "one", "swappable": "apps.One", "label_lower": "a.one"},
+          ]
+          metas2 = [
+              {"app_label": "b", "model_name": "two", "swappable": "apps.One", "label_lower": "b.two"},
+          ]
+          reg = self.make_registry([metas1, metas2])
+          # Populate a key that at least one model will reference during expiration.
+          self.assert_swappable_cache_cleared_after_clear(reg, "a.one")
+  
+      def test_multiple_models_different_keys(self):
+          # Models that touch different keys during expiration; final cache should
+          # still be empty after clear_cache.
+          metas1 = [
+              {"app_label": "a", "model_name": "one", "swappable": "apps.One", "label_lower": "a.one"},
+          ]
+          metas2 = [
+              {"app_label": "b", "model_name": "two", "swappable": "apps.Two", "label_lower": "b.two"},
+          ]
+          reg = self.make_registry([metas1, metas2])
+          # Populate one key, but _expire_cache will touch both; final cache must be empty.
+          self.assert_swappable_cache_cleared_after_clear(reg, "a.one")
+  
+      def test_clear_cache_with_prepopulated_models_cache(self):
+          # Ensure that even if get_models() cache is populated before clear,
+          # clear_cache still results in an empty swappable cache.
+          metas = [
+              {"app_label": "fake", "model_name": "m1", "swappable": "apps.Fake", "label_lower": "fake.m1"},
+          ]
+          reg = self.make_registry([metas])
+          # Populate the get_models cache as well.
+          list(reg.get_models())
+          self.assertGreater(reg.get_models.cache_info().currsize, 0)
+          self.assert_swappable_cache_cleared_after_clear(reg, "fake.m1")
+  
+      def test_clear_cache_when_registry_not_ready(self):
+          # If registry isn't ready, clear_cache should still clear the swappable cache
+          # (the model-expiry loop won't run).
+          metas = [
+              {"app_label": "fake", "model_name": "m1", "swappable": "apps.Fake", "label_lower": "fake.m1"},
+          ]
+          reg = self.make_registry([metas])
+          # Make registry not ready (so no expiry loop)
+          reg.ready = False
+          # Populate cache
+          _ = reg.get_swappable_settings_name("fake.m1")
+          self.assertGreater(reg.get_swappable_settings_name.cache_info().currsize, 0)
+          reg.clear_cache()
+          self.assertEqual(reg.get_swappable_settings_name.cache_info().currsize, 0)
+  
+      def test_many_models_repopping(self):
+          # A larger set of models all touching the swappable cache during expiration.
+          metas = [
+              {"app_label": f"a{i}", "model_name": f"m{i}", "swappable": f"apps.M{i}", "label_lower": f"a{i}.m{i}"}
+              for i in range(6)
+          ]
+          reg = self.make_registry([metas])
+          # Populate with one of the labels; expiration will touch many entries.
+          self.assert_swappable_cache_cleared_after_clear(reg, "a0.m0")
+  
+      def test_multiple_appconfigs_expire_and_touch_cache(self):
+          # Two separate app configs, both of which will touch the swappable cache.
+          metas1 = [
+              {"app_label": "x", "model_name": "mx", "swappable": "apps.X", "label_lower": "x.mx"},
+          ]
+          metas2 = [
+              {"app_label": "y", "model_name": "my", "swappable": "apps.Y", "label_lower": "y.my"},
+          ]
+          reg = self.make_registry([metas1, metas2])
+          self.assert_swappable_cache_cleared_after_clear(reg, "x.mx")
+  
+      def test_clear_cache_clears_multiple_cached_keys(self):
+          # Populate multiple keys in the swappable cache and ensure final state is empty.
+          metas = [
+              {"app_label": "fake", "model_name": "a", "swappable": "apps.A", "label_lower": "fake.a"},
+              {"app_label": "fake", "model_name": "b", "swappable": "apps.B", "label_lower": "fake.b"},
+          ]
+          reg = self.make_registry([metas])
+          # Populate both keys
+          _ = reg.get_swappable_settings_name("fake.a")
+          _ = reg.get_swappable_settings_name("fake.b")
+          self.assertGreater(reg.get_swappable_settings_name.cache_info().currsize, 0)
+          reg.clear_cache()
+          self.assertEqual(reg.get_swappable_settings_name.cache_info().currsize, 0)
+new_imports_code: |
+  # No new global imports required beyond what's in the test file.

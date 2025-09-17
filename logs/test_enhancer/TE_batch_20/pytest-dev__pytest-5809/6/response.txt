@@ -1,0 +1,258 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  A suite of 10 regression tests for _pytest.pastebin.create_new_paste and the pastebin-related hooks.
+  These tests verify:
+  - The "lexer" parameter is set to "text" in the payload sent to the paste service.
+  - Binary (bytes) and unicode (str) contents are encoded correctly (percent-encoding for non-ASCII).
+  - The function does not include Python's bytes repr (b'...') in the URL-encoded payload.
+  - The function returns the expected "show" URL when the remote response contains a raw link.
+  - When the remote response does not match the expected pattern, the function returns a decoded string (not raising TypeError).
+  - The bytes passed to urlopen are ASCII-only bytes.
+  - pytest_terminal_summary triggers create_new_paste for failed tests and writes the expected lines.
+  - pytest_unconfigure reads the pastebin file, calls create_new_paste, writes summary lines, and cleans up the _pastebinfile attribute.
+test_code: |
+  # -*- coding: utf-8 -*-
+  from __future__ import absolute_import, division, print_function
+  import sys
+  import io
+  import types
+  import re
+  import pytest
+  import _pytest.pastebin as pastebin
+  
+  # Helper to monkeypatch urlopen in a py2/py3 compatible way
+  def _monkeypatch_urlopen(monkeypatch, mocked_callable):
+      if sys.version_info < (3, 0):
+          import urllib
+          monkeypatch.setattr(urllib, "urlopen", mocked_callable)
+      else:
+          import urllib.request
+          monkeypatch.setattr(urllib.request, "urlopen", mocked_callable)
+  
+  def test_lexer_is_text_and_payload_contains_expected_fields(monkeypatch):
+      calls = []
+  
+      def mocked(url, data):
+          calls.append((url, data))
+  
+          class Dummy:
+              def read(self_inner):
+                  return b'View <a href="/raw/abcdef">raw</a>.'
+  
+          return Dummy()
+  
+      _monkeypatch_urlopen(monkeypatch, mocked)
+      res = pastebin.create_new_paste(b"sample-contents")
+      assert res == "https://bpaste.net/show/abcdef"
+      assert len(calls) == 1
+      url, data = calls[0]
+      assert url == "https://bpaste.net"
+      # data is bytes and ASCII-only due to .encode('ascii')
+      assert isinstance(data, bytes)
+      data_str = data.decode("ascii")
+      assert "lexer=text" in data_str
+      assert "expiry=1week" in data_str
+      assert "code=sample-contents" in data_str
+  
+  def test_no_bytes_repr_in_payload_for_bytes_input(monkeypatch):
+      # Ensure bytes input isn't represented as "b'...'" in the urlencode output
+      calls = []
+  
+      def mocked(url, data):
+          calls.append(data)
+  
+          class Dummy:
+              def read(self_inner):
+                  return b'View <a href="/raw/111">raw</a>.'
+  
+          return Dummy()
+  
+      _monkeypatch_urlopen(monkeypatch, mocked)
+      pastebin.create_new_paste(b"binary:\xc3\xa2")
+      assert calls, "urlopen should have been called"
+      payload = calls[0].decode("ascii")
+      # Should not contain Python bytes repr
+      assert "b'" not in payload
+      # Should contain percent-encoded sequence, not raw bytes
+      assert "%C3%A2" in payload.upper()
+  
+  def test_unicode_string_input_is_percent_encoded(monkeypatch):
+      calls = []
+  
+      def mocked(url, data):
+          calls.append(data)
+  
+          class Dummy:
+              def read(self_inner):
+                  return b'View <a href="/raw/222">raw</a>.'
+  
+          return Dummy()
+  
+      _monkeypatch_urlopen(monkeypatch, mocked)
+      # pass a unicode string with a non-ascii char
+      pastebin.create_new_paste("smile: \u263A")
+      assert calls
+      payload = calls[0].decode("ascii")
+      # The unicode should be percent-encoded in UTF-8 bytes -> %E2%98%BA
+      assert "%E2%98%BA" in payload.upper()
+      assert "code=" in payload
+  
+  def test_returns_bad_response_decoded_string_not_bytes(monkeypatch):
+      # When the response doesn't match the expected regex, ensure a decoded string is returned
+      def mocked(url, data):
+          class Dummy:
+              def read(self_inner):
+                  return b'no matching link here: \xc3\xa2'
+          return Dummy()
+  
+      _monkeypatch_urlopen(monkeypatch, mocked)
+      result = pastebin.create_new_paste(b"anything")
+      # Should return a str (decoded) and include the decoded content
+      assert isinstance(result, str)
+      assert "no matching link here" in result
+      # ensure non-ascii bytes were decoded and are visible (as utf-8 decoded text)
+      assert "â" in result or "Ã" in result or "%C3%A2" in result
+  
+  def test_data_passed_to_urlopen_is_ascii_bytes(monkeypatch):
+      captured = []
+  
+      def mocked(url, data):
+          captured.append(data)
+  
+          class Dummy:
+              def read(self_inner):
+                  return b'View <a href="/raw/333">raw</a>.'
+  
+          return Dummy()
+  
+      _monkeypatch_urlopen(monkeypatch, mocked)
+      pastebin.create_new_paste(b"ascii-only-123")
+      assert captured
+      data = captured[0]
+      # ensure it's bytes and decodable as ascii
+      assert isinstance(data, bytes)
+      # decode shouldn't raise
+      data.decode("ascii")
+  
+  def test_create_new_paste_matches_various_raw_url_patterns(monkeypatch):
+      # Test that the regex extracts the correct token from different html variants
+      tokens = ["aaa", "BBB123", "3c0c6750bd"]
+      for token in tokens:
+          def make_mock(tok):
+              def mocked(url, data):
+                  class Dummy:
+                      def read(self_inner):
+                          return ('Some html <a href="/raw/%s">raw</a> end' % tok).encode("utf-8")
+                  return Dummy()
+              return mocked
+          _monkeypatch_urlopen(monkeypatch, make_mock(token))
+          res = pastebin.create_new_paste(b"x")
+          assert res.endswith("/show/%s" % token)
+  
+  def test_pytest_terminal_summary_uses_create_new_paste_and_reports(monkeypatch):
+      # Create a fake terminalreporter
+      class FakeTw(object):
+          def __init__(self):
+              self.stringio = io.StringIO()
+          def write(self, s, **kwargs):
+              # simulate TerminalWriter.write used by toterminal
+              if isinstance(s, six_text):
+                  self.stringio.write(s)
+              else:
+                  # if bytes, decode
+                  self.stringio.write(s.decode("utf-8"))
+  
+      # minimal fake objects
+      six_text = str
+      class FakeRep(object):
+          def __init__(self):
+              # longrepr that causes AttributeError on .reprtraceback access
+              self.longrepr = None
+          def toterminal(self, tw):
+              tw.stringio.write("failure-repr\n")
+      class FakeTR(object):
+          def __init__(self):
+              self.written = []
+              self.config = types.SimpleNamespace(option=types.SimpleNamespace(pastebin="failed"))
+              self.stats = {"failed": [FakeRep()]}
+          def write_sep(self, ch, title):
+              self.written.append(("sep", ch, title))
+          def write_line(self, s):
+              self.written.append(("line", s))
+          def _getfailureheadline(self, rep):
+              return "headline"
+  
+      fake_tr = FakeTR()
+      # monkeypatch create_terminal_writer used inside pytest_terminal_summary
+      def fake_create_terminal_writer(cfg, stringio=True):
+          tw = FakeTw()
+          return types.SimpleNamespace(stringio=tw.stringio)
+  
+      # capture calls to create_new_paste
+      created = []
+      monkeypatch.setattr(pastebin, "create_new_paste", lambda contents: created.append(contents) or "http://paste/xyz")
+      # monkeypatch the create_terminal_writer used by pytest_terminal_summary
+      import _pytest.config as _pconfig
+      monkeypatch.setattr(_pconfig, "create_terminal_writer", fake_create_terminal_writer)
+      # Call summary
+      pastebin.pytest_terminal_summary(fake_tr)
+      # ensure create_new_paste was called with the string produced by rep.toterminal
+      assert created
+      assert b"failure-repr" in created[0] or "failure-repr" in created[0].decode("utf-8")
+      # ensure tr.write_line got the paste url
+      assert any("http://paste/xyz" in entry[1] for entry in fake_tr.written if entry[0] == "line")
+  
+  def test_pytest_unconfigure_reads_pastebinfile_and_calls_create_new_paste(monkeypatch):
+      # Prepare a fake config with a _pastebinfile-like object and a pluginmanager that returns a fake tr
+      cfg = types.SimpleNamespace()
+      # use BytesIO to simulate tempfile.TemporaryFile("w+b")
+      cfg._pastebinfile = io.BytesIO(b"session-log-bytes")
+      # pluginmanager.getplugin should return a tr with expected attributes
+      class FakeTwObj(object):
+          def __init__(self):
+              # store a write function in __dict__ so del tr._tw.__dict__['write'] works
+              self.__dict__['write'] = lambda s, **kwargs: None
+      class FakeTR(object):
+          def __init__(self):
+              self._tw = FakeTwObj()
+              self.written = []
+          def write_sep(self, ch, title):
+              self.written.append(("sep", ch, title))
+          def write_line(self, s):
+              self.written.append(("line", s))
+      fake_tr = FakeTR()
+      pm = types.SimpleNamespace(getplugin=lambda name: fake_tr)
+      cfg.pluginmanager = pm
+      # patch create_new_paste to observe call and return URL
+      created = []
+      monkeypatch.setattr(pastebin, "create_new_paste", lambda contents: created.append(contents) or "http://paste/bye")
+      # Call unconfigure
+      pastebin.pytest_unconfigure(cfg)
+      # config should no longer have _pastebinfile
+      assert not hasattr(cfg, "_pastebinfile")
+      # create_new_paste should have been called with the bytes read from the file
+      assert created
+      assert b"session-log-bytes" in created[0]
+      # ensure tr.write_line got the paste url
+      assert any("http://paste/bye" in entry[1] for entry in fake_tr.written if entry[0] == "line")
+  
+  def test_create_new_paste_handles_various_byte_sequences_without_error(monkeypatch):
+      # ensure percent-encoding works for multiple byte sequences and no exceptions are raised
+      sequences = [b"\xc3\xa2", b"\xf0\x9f\x98\x80", b"plain-ascii"]
+      called = []
+      def mocked(url, data):
+          called.append(data)
+          class Dummy:
+              def read(self_inner):
+                  return b'View <a href="/raw/zzz">raw</a>.'
+          return Dummy()
+      _monkeypatch_urlopen(monkeypatch, mocked)
+      for seq in sequences:
+          # should not raise
+          pastebin.create_new_paste(seq)
+      assert called
+new_imports_code: |
+  import io
+  import types
+  import _pytest.config as _pconfig

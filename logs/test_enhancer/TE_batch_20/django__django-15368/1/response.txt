@@ -1,0 +1,167 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise QuerySet.bulk_update()'s detection and handling of "expression-like" objects. They verify that objects which implement resolve_expression(...) are treated as expressions (and thus resolved by the query compiler) rather than being coerced to plain Values. The tests cover custom expression-like objects, combinations with Value and F expressions, boolean and numeric fields, multiple-object updates, and JSONField support (skipped if unsupported). These would detect the bug where isinstance(..., Expression) was used (or Expression was missing), causing expression-like objects to be mishandled.
+test_code: |
+  import datetime
+
+  from django.test import TestCase, skipUnlessDBFeature
+  from django.db.models import F, Value
+  from django.db.models.functions import Lower
+
+  from .models import (
+      Note, Number, Individual, JSONFieldNullable, Tag,
+  )
+
+  class BulkUpdateRegressionTests(TestCase):
+      @classmethod
+      def setUpTestData(cls):
+          # Notes for char-field tests
+          cls.notes = [
+              Note.objects.create(note='orig-%s' % i, misc='m-%s' % i)
+              for i in range(5)
+          ]
+          # Numbers for numeric-field tests
+          cls.numbers = [Number.objects.create(num=0) for _ in range(5)]
+          # Individuals for boolean tests
+          cls.individuals = [Individual.objects.create(alive=False) for _ in range(5)]
+          # Tags for FK-related tests
+          cls.tags = [Tag.objects.create(name='tag-%s' % i) for i in range(2)]
+
+      def test_custom_expression_like_object_updates_charfield(self):
+          """
+          Custom class with a resolve_expression method should be treated as an
+          expression. Its resolve_expression returns a Value(...) which should be
+          applied to the DB when bulk_update is used.
+          """
+          class MyExpr:
+              def __init__(self, value):
+                  self._value = value
+              def resolve_expression(self, *args, **kwargs):
+                  # Return a real expression so the compiler can work with it.
+                  return Value(self._value)
+
+          note = self.notes[0]
+          note.note = MyExpr('custom-val')
+          Note.objects.bulk_update([note], ['note'])
+          note.refresh_from_db()
+          self.assertEqual(note.note, 'custom-val')
+
+      def test_custom_expression_like_object_on_misc_field(self):
+          class MyExpr:
+              def __init__(self, value):
+                  self._value = value
+              def resolve_expression(self, *args, **kwargs):
+                  return Value(self._value)
+
+          note = self.notes[1]
+          note.misc = MyExpr('misc-custom')
+          Note.objects.bulk_update([note], ['misc'])
+          note.refresh_from_db()
+          self.assertEqual(note.misc, 'misc-custom')
+
+      def test_custom_expression_returning_F_expression(self):
+          """
+          Custom expression object's resolve_expression may itself return an
+          expression constructed from F() and should be resolved correctly.
+          """
+          class ReturnF:
+              def resolve_expression(self, *args, **kwargs):
+                  return F('note')
+
+          # Ensure the source value we expect exists
+          src = self.notes[2]
+          src.note = 'source-value'
+          src.save()
+
+          target = self.notes[3]
+          target.misc = ReturnF()
+          Note.objects.bulk_update([target], ['misc'])
+          target.refresh_from_db()
+          # misc should equal the 'note' value from the same instance (source-value remains in DB only for src)
+          # Since we're assigning F('note') on the SAME instance, it should copy its own note.
+          # For our 'target' instance, 'note' was originally 'orig-3', so misc becomes that.
+          self.assertEqual(target.misc, target.note)
+
+      def test_value_instance_numeric_field_updates(self):
+          # Value() is an expression; ensure numeric fields accept Value instances.
+          obj = self.numbers[0]
+          obj.num = Value(7)
+          Number.objects.bulk_update([obj], ['num'])
+          obj.refresh_from_db()
+          self.assertEqual(obj.num, 7)
+
+      def test_combined_F_expression_arithmetic_on_numeric_field(self):
+          # Use an arithmetic expression (F + const)
+          objs = self.numbers
+          for i, o in enumerate(objs):
+              o.num = F('num') + (i + 1)
+          Number.objects.bulk_update(objs, ['num'])
+          self.assertCountEqual(Number.objects.values_list('num', flat=True), [i + 1 for i in range(len(objs))])
+
+      def test_custom_expr_on_boolean_field(self):
+          class BoolExpr:
+              def resolve_expression(self, *args, **kwargs):
+                  # Return a Value that will be interpreted as boolean True.
+                  return Value(True)
+          ind = self.individuals[0]
+          ind.alive = BoolExpr()
+          Individual.objects.bulk_update([ind], ['alive'])
+          ind.refresh_from_db()
+          self.assertTrue(ind.alive)
+
+      @skipUnlessDBFeature('supports_json_field')
+      def test_custom_expr_on_json_field(self):
+          # For databases supporting JSONField, ensure a custom expression that
+          # returns a JSON Value works.
+          JSONFieldNullable.objects.bulk_create([
+              JSONFieldNullable(json_field={'a': i}) for i in range(3)
+          ])
+          objs = list(JSONFieldNullable.objects.all())
+          class JsonExpr:
+              def __init__(self, obj):
+                  self._obj = obj
+              def resolve_expression(self, *args, **kwargs):
+                  return Value({'new': self._obj.json_field['a'] + 1})
+          for obj in objs:
+              obj.json_field = JsonExpr(obj)
+          JSONFieldNullable.objects.bulk_update(objs, ['json_field'])
+          # Each object should now have the 'new' key in the json_field
+          self.assertCountEqual(
+              JSONFieldNullable.objects.filter(json_field__has_key='new'),
+              objs
+          )
+
+      def test_bulk_update_multiple_objects_with_mixed_expressions(self):
+          """
+          Update multiple objects in one call where some values are expression-like
+          objects and others are plain Values.
+          """
+          class ExprA:
+              def resolve_expression(self, *args, **kwargs):
+                  return Value('A')
+
+          class ExprB:
+              def resolve_expression(self, *args, **kwargs):
+                  return Value('B')
+
+          n1, n2, n3 = self.notes[0], self.notes[1], self.notes[2]
+          n1.note = ExprA()
+          n2.note = Value('V')
+          n3.note = ExprB()
+          Note.objects.bulk_update([n1, n2, n3], ['note'])
+          self.assertCountEqual(Note.objects.filter(note__in=['A', 'V', 'B']), [n1, n2, n3])
+
+      def test_bulk_update_with_functions_and_expressions(self):
+          """
+          Combining Django DB functions (e.g., Lower) with custom expression-like
+          objects should work. Lower(...) is an expression and should be respected.
+          """
+          note = self.notes[4]
+          note.note = Lower('note')  # Lower is an expression; should be used as-is
+          Note.objects.bulk_update([note], ['note'])
+          note.refresh_from_db()
+          # The Lower('note') resolves to the lower-cased value of the instance's note.
+          # Since the instance had 'orig-4', lowercasing yields 'orig-4'.
+          self.assertEqual(note.note, note.note.lower())
+new_imports_code: |
+  # No additional imports required beyond what is included in the test file.

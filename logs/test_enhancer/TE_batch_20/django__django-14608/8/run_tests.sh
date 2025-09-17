@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.make_choice_data forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_custom_errorlist_mutation_reflected forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_custom_errorlist_same_instance_empty_bound forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_custom_errorlist_same_instance_with_non_form_error forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_mutation_reflected forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_mutation_with_non_form_error forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_preserved_across_is_valid_call forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_returns_tampered_internal_value forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_same_instance_for_empty_bound forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_same_instance_for_empty_unbound forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_same_instance_with_clean_error
+coverage json -o coverage.json
+: '>>>>> End Test Output'

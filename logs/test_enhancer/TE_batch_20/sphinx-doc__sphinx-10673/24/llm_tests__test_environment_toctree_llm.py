@@ -1,0 +1,1 @@
+from sphinx.environment.collectors.toctree import TocTreeCollector

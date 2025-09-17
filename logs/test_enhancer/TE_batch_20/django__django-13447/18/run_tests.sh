@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_views.test_adminsite_llm.BuildAppDictRegressionTests._get_request admin_views.test_adminsite_llm.BuildAppDictRegressionTests.setUpTestData admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test__build_app_dict_includes_model_key admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test__build_app_dict_label_filter_returns_app_dict admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test__build_app_dict_label_missing_returns_none admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test__build_app_dict_method_exists admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test_admin_and_add_urls_present_when_perms admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test_app_index_raises_404_for_unknown_app admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test_app_index_returns_template_response_and_context admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test_get_app_list_models_are_sorted admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test_models_with_no_permissions_are_excluded admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test_view_only_flag_set_when_change_false_but_view_true
+coverage json -o coverage.json
+: '>>>>> End Test Output'

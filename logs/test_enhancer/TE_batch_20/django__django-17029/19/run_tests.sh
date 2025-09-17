@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 apps.tests_llm.ClearCacheRegressionsTests._get_currsize apps.tests_llm.ClearCacheRegressionsTests._monkeypatch_expire apps.tests_llm.ClearCacheRegressionsTests._populate_swappable_cache apps.tests_llm.ClearCacheRegressionsTests.test_clear_cache_allows_repopulation_after_clear apps.tests_llm.ClearCacheRegressionsTests.test_clear_cache_clears_all_keys_even_when_some_repopulate apps.tests_llm.ClearCacheRegressionsTests.test_clear_cache_clears_models_cache_too apps.tests_llm.ClearCacheRegressionsTests.test_clear_cache_clears_swappable_when_expire_calls_swappable apps.tests_llm.ClearCacheRegressionsTests.test_clear_cache_clears_swappable_when_multiple_models_repopulate apps.tests_llm.ClearCacheRegressionsTests.test_clear_cache_final_zero_after_repopulation_during_expire_loop apps.tests_llm.ClearCacheRegressionsTests.test_clear_cache_handles_none_values_in_swappable_cache apps.tests_llm.ClearCacheRegressionsTests.test_clear_cache_idempotent_multiple_calls apps.tests_llm.ClearCacheRegressionsTests.test_clear_cache_with_expire_raising_exception_still_clears_swappable_first apps.tests_llm.ClearCacheRegressionsTests.test_clear_cache_with_ready_false_clears_swappable_without_expire
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,177 @@
+import types
+from types import SimpleNamespace
+import types
+import unittest
+from types import SimpleNamespace
+from django.db.models.sql.compiler import SQLCompiler
+from django.db.models.expressions import OrderBy
+from django.db.models.constants import LOOKUP_SEP
+
+class DummyExpr:
+    def __init__(self, name):
+        self.name = name
+    def __repr__(self):
+        return f"<DummyExpr {self.name}>"
+
+class DummyField:
+    def __init__(self, is_relation, attname):
+        self.is_relation = is_relation
+        self.attname = attname
+
+class DummyQuery:
+    def __init__(self):
+        # alias_map entries must be present for joins referenced by _setup_joins
+        self.alias_map = {'alias': SimpleNamespace(join_cols=('col',))}
+        # trim_joins should return targets unchanged, an alias string, and None
+        self.trim_joins_calls = []
+    def trim_joins(self, targets, joins, path):
+        self.trim_joins_calls.append((tuple(targets), tuple(joins), path))
+        # emulate trimming: return targets, last join as alias, and None
+        alias = joins[-1] if joins else 'alias'
+        return targets, alias, None
+
+def make_compiler(field_is_relation, field_attname, targets, opts_ordering):
+    """
+    Create an SQLCompiler instance with a stubbed _setup_joins which returns
+    the provided fake field, targets, alias/joins, path, opts and transform_function.
+    """
+    query = DummyQuery()
+    compiler = SQLCompiler(query=query, connection=None, using='default')
+
+    # transform_function: returns a DummyExpr for given target and alias
+    def transform_function(target, alias):
+        return DummyExpr(f"{target}-{alias}")
+
+    # _setup_joins signature: (pieces, opts, alias) -> field, targets, opts, joins, path, transform_function
+    def _setup_joins(self, pieces, opts_param, alias_param):
+        # Return the DummyField, the provided targets, the opts object, a single join name,
+        # a None path, and the transform_function.
+        field = DummyField(field_is_relation, field_attname)
+        joins = ['alias']
+        path = None
+        # For opts, just pass through the provided opts object
+        return field, targets, opts_param, joins, path, transform_function
+
+    # Bind the stub to the instance
+    compiler._setup_joins = types.MethodType(_setup_joins, compiler)
+
+    # Create a simple opts object holding ordering list
+    opts = SimpleNamespace(ordering=opts_ordering)
+
+    return compiler, opts
+
+class FindOrderingNameTests(unittest.TestCase):
+    def test_attname_matches_last_piece_no_default_ordering(self):
+        # field.attname == 'root', name = 'record__root' -> should not append default ordering
+        targets = ['t1', 't2']
+        compiler, opts = make_compiler(field_is_relation=True, field_attname='root', targets=targets, opts_ordering=['-id'])
+        result = compiler.find_ordering_name('record__root', opts)
+        # Expect one OrderBy per target
+        self.assertEqual(len(result), len(targets))
+        for (orderby, flag), target in zip(result, targets):
+            self.assertIsInstance(orderby, OrderBy)
+            # underlying expression should be our DummyExpr with alias 'alias'
+            expr = orderby.get_source_expressions()[0]
+            self.assertEqual(expr.name, f"{target}-alias")
+
+    def test_attname_matches_last_piece_no_default_ordering_descending(self):
+        # same as above but descending
+        targets = ['x']
+        compiler, opts = make_compiler(field_is_relation=True, field_attname='root', targets=targets, opts_ordering=['id'])
+        result = compiler.find_ordering_name('-record__root', opts)
+        self.assertEqual(len(result), 1)
+        orderby, flag = result[0]
+        self.assertIsInstance(orderby, OrderBy)
+        # descending should be True
+        self.assertTrue(orderby.descending)
+        expr = orderby.get_source_expressions()[0]
+        self.assertEqual(expr.name, "x-alias")
+
+    def test_name_is_pk_avoids_appending_default_ordering(self):
+        # When ordering by 'pk', do not append default ordering
+        targets = ['only']
+        compiler, opts = make_compiler(field_is_relation=True, field_attname='pk', targets=targets, opts_ordering=['-id'])
+        result = compiler.find_ordering_name('pk', opts)
+        self.assertEqual(len(result), 1)
+        orderby, flag = result[0]
+        expr = orderby.get_source_expressions()[0]
+        self.assertEqual(expr.name, "only-alias")
+
+    def test_non_relation_field_returns_transforms(self):
+        # For non-relation fields just return transformed targets
+        targets = ['nr1', 'nr2', 'nr3']
+        compiler, opts = make_compiler(field_is_relation=False, field_attname='some', targets=targets, opts_ordering=['-id'])
+        result = compiler.find_ordering_name('somefield', opts)
+        self.assertEqual(len(result), len(targets))
+        for (orderby, flag), target in zip(result, targets):
+            expr = orderby.get_source_expressions()[0]
+            self.assertEqual(expr.name, f"{target}-alias")
+
+    def test_single_target_with_attname_match(self):
+        targets = ['single']
+        compiler, opts = make_compiler(field_is_relation=True, field_attname='root', targets=targets, opts_ordering=['-pub_date'])
+        result = compiler.find_ordering_name('record__root', opts)
+        self.assertEqual(len(result), 1)
+        expr = result[0][0].get_source_expressions()[0]
+        self.assertEqual(expr.name, "single-alias")
+
+    def test_multiple_targets_with_attname_match(self):
+        targets = [f"t{i}" for i in range(5)]
+        compiler, opts = make_compiler(field_is_relation=True, field_attname='root', targets=targets, opts_ordering=['-pub_date'])
+        result = compiler.find_ordering_name('record__root', opts)
+        self.assertEqual(len(result), 5)
+        for idx, ((orderby, _), target) in enumerate(zip(result, targets)):
+            expr = orderby.get_source_expressions()[0]
+            self.assertEqual(expr.name, f"{target}-alias")
+
+    def test_last_piece_comparison_uses_last_segment_not_full_lookup(self):
+        # name='parent__child', attname='child' must match; original buggy comparison against full name would not match
+        targets = ['a']
+        compiler, opts = make_compiler(field_is_relation=True, field_attname='child', targets=targets, opts_ordering=['-id'])
+        result = compiler.find_ordering_name('parent__child', opts)
+        self.assertEqual(len(result), 1)
+        expr = result[0][0].get_source_expressions()[0]
+        self.assertEqual(expr.name, "a-alias")
+
+    def test_hyphen_in_name_produces_descending_ordering(self):
+        targets = ['h']
+        compiler, opts = make_compiler(field_is_relation=True, field_attname='root', targets=targets, opts_ordering=['-id'])
+        result = compiler.find_ordering_name('-record__root', opts)
+        self.assertEqual(len(result), 1)
+        orderby, _ = result[0]
+        self.assertTrue(orderby.descending)
+
+    def test_find_ordering_name_with_unusual_alias(self):
+        # Ensure alias propagation works even if alias name is different
+        # Patch the DummyQuery alias_map and _setup_joins to use 'custom_alias'
+        targets = ['z']
+        query = DummyQuery()
+        query.alias_map = {'custom_alias': SimpleNamespace(join_cols=('c',))}
+        compiler = SQLCompiler(query=query, connection=None, using='default')
+
+        def transform_function(target, alias):
+            return DummyExpr(f"{target}-{alias}")
+
+        def _setup_joins(self, pieces, opts_param, alias_param):
+            field = DummyField(True, 'leaf')
+            joins = ['custom_alias']
+            return field, targets, opts_param, joins, None, transform_function
+
+        compiler._setup_joins = types.MethodType(_setup_joins, compiler)
+        opts = SimpleNamespace(ordering=['-id'])
+        result = compiler.find_ordering_name('rel__leaf', opts)
+        self.assertEqual(len(result), 1)
+        expr = result[0][0].get_source_expressions()[0]
+        self.assertEqual(expr.name, "z-custom_alias")
+
+    def test_find_ordering_name_with_numeric_like_suffix(self):
+        # name ending with '_id' should be handled correctly (last piece comparison)
+        targets = ['n']
+        compiler, opts = make_compiler(field_is_relation=True, field_attname='parent_id', targets=targets, opts_ordering=['-id'])
+        result = compiler.find_ordering_name('rel__parent_id', opts)
+        self.assertEqual(len(result), 1)
+        expr = result[0][0].get_source_expressions()[0]
+        self.assertEqual(expr.name, "n-alias")
+
+if __name__ == '__main__':
+    unittest.main()

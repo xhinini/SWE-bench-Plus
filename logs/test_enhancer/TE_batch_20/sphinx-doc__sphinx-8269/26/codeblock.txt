@@ -1,0 +1,224 @@
+from types import SimpleNamespace
+from requests.exceptions import HTTPError
+import types
+from types import SimpleNamespace
+from unittest import mock
+import pytest
+from requests.exceptions import HTTPError
+from sphinx.builders.linkcheck import CheckExternalLinksBuilder, check_anchor
+
+class DummyApp:
+    def __init__(self, tmpdir, config_overrides=None):
+        cfg = dict(
+            linkcheck_ignore=[],
+            linkcheck_anchors_ignore=["^!"],
+            linkcheck_auth=[],
+            linkcheck_request_headers={},
+            linkcheck_retries=1,
+            linkcheck_timeout=None,
+            linkcheck_workers=0,
+            linkcheck_anchors=True,
+        )
+        if config_overrides:
+            cfg.update(config_overrides)
+        self.config = SimpleNamespace(**cfg)
+        self.outdir = str(tmpdir)
+        self.srcdir = str(tmpdir)
+        self.env = SimpleNamespace(doc2path=lambda doc, none: 'docfile', found_docs=set())
+        self.quiet = False
+        self.warningiserror = False
+        self.statuscode = 0
+
+class FakeResponse:
+    def __init__(self, url='http://example.com', status_code=200, body='', headers=None, history=None, request_method='GET'):
+        self.url = url
+        self.status_code = status_code
+        self._body = body
+        self.headers = headers or {}
+        self.history = history or []
+        self.request = SimpleNamespace(method=request_method)
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            err = HTTPError(f"{self.status_code} Error for url: {self.url}")
+            err.response = self
+            raise err
+
+    def iter_content(self, chunk_size=4096, decode_unicode=False):
+        # Yield the body in one chunk; if bytes provided, possibly return bytes
+        data = self._body
+        if isinstance(data, bytes):
+            if decode_unicode:
+                yield data.decode()
+            else:
+                yield data
+        else:
+            # string
+            yield data
+
+def make_builder(tmp_path, config_overrides=None):
+    app = DummyApp(tmp_path, config_overrides=config_overrides)
+    builder = CheckExternalLinksBuilder(app)
+    # call init to set up queues and files; linkcheck_workers is 0 so no threads started
+    builder.init()
+    return builder, app
+
+def run_single_check(builder, url, mock_get, mock_head):
+    # Put task and sentinel
+    builder.wqueue.put((url, 'sourcedoc', 42))
+    builder.wqueue.put((None, None, None))
+    # Patch requests in module
+    import sphinx.builders.linkcheck as mod
+    with mock.patch.object(mod, 'requests', SimpleNamespace(get=mock_get, head=mock_head)):
+        # Run the check thread (it will process the one URL and exit)
+        builder.check_thread()
+    # Retrieve result
+    uri, docname, lineno, status, info, code = builder.rqueue.get()
+    return uri, status, info, code
+
+def test_anchor_html_found(tmp_path):
+    builder, app = make_builder(tmp_path)
+    url = "http://example.com/page#frag"
+    body = '<html><body><a id="frag"></a></body></html>'
+    resp = FakeResponse(url="http://example.com/page", status_code=200, body=body, headers={"content-type":"text/html"}, request_method='GET')
+
+    def mget(u, **kwargs):
+        return resp
+    def mhead(u, **kwargs):
+        # HEAD not used for anchor in original code path, but provide a 200 anyway
+        return FakeResponse(url=u, status_code=200, body='', headers={"content-type":"text/html"}, request_method='HEAD')
+
+    uri, status, info, code = run_single_check(builder, url, mget, mhead)
+    assert uri == url
+    assert status == 'working'
+    assert info == ''
+
+def test_anchor_html_missing_should_be_broken(tmp_path):
+    builder, app = make_builder(tmp_path)
+    url = "http://example.com/page#nope"
+    body = '<html><body><p>no such anchor</p></body></html>'
+    resp = FakeResponse(url="http://example.com/page", status_code=200, body=body, headers={"content-type":"text/html"}, request_method='GET')
+
+    def mget(u, **kwargs):
+        return resp
+    def mhead(u, **kwargs):
+        return FakeResponse(url=u, status_code=200, body='', headers={"content-type":"text/html"}, request_method='HEAD')
+
+    uri, status, info, code = run_single_check(builder, url, mget, mhead)
+    assert uri == url
+    assert status == 'broken'
+    assert "Anchor 'nope' not found" in info
+
+def test_anchor_get_404_raises_and_marks_broken(tmp_path):
+    builder, app = make_builder(tmp_path)
+    url = "http://example.com/missing#x"
+    # GET will return 404; raise_for_status should propagate to broken
+    get_resp = FakeResponse(url="http://example.com/missing", status_code=404, body='<html></html>', headers={"content-type":"text/html"}, request_method='GET')
+
+    def mget(u, **kwargs):
+        return get_resp
+    def mhead(u, **kwargs):
+        # If HEAD is tried first and yields 404, the code should fallback and eventually raise
+        return FakeResponse(url=u, status_code=404, body='', headers={"content-type":"text/html"}, request_method='HEAD')
+
+    uri, status, info, code = run_single_check(builder, url, mget, mhead)
+    assert uri == url
+    assert status == 'broken'
+    # Expect HTTPError info referencing 404 or "404 Error"
+    assert '404' in info
+
+def test_non_html_missing_anchor_must_not_be_accepted(tmp_path):
+    # This is the key regression test: candidate/model patch incorrectly
+    # skips anchor checks for non-HTML content and returns 'working'.
+    builder, app = make_builder(tmp_path)
+    url = "http://example.com/file.txt#foo"
+    # content-type is text/plain and body doesn't include anchor id/name,
+    # original/gold behavior: check_anchor runs and should report broken.
+    resp = FakeResponse(url="http://example.com/file.txt", status_code=200, body='plain text without anchor', headers={"content-type":"text/plain"}, request_method='GET')
+
+    def mget(u, **kwargs):
+        return resp
+    def mhead(u, **kwargs):
+        # HEAD returns 200; candidate patch may try HEAD and skip anchor-check incorrectly
+        return FakeResponse(url=u, status_code=200, body='', headers={"content-type":"text/plain"}, request_method='HEAD')
+
+    uri, status, info, code = run_single_check(builder, url, mget, mhead)
+    assert uri == url
+    # Gold patch: this should be 'broken' because the anchor is not found
+    assert status == 'broken', "Non-HTML missing anchor was incorrectly accepted as working"
+    assert "Anchor 'foo' not found" in info
+
+def test_non_html_with_anchor_found(tmp_path):
+    builder, app = make_builder(tmp_path)
+    url = "http://example.com/file.txt#anchor"
+    # body contains an element like id="anchor" even though content-type is not HTML;
+    # original behavior tries to find anchor in the retrieved body and should succeed.
+    resp = FakeResponse(url="http://example.com/file.txt", status_code=200,
+                        body='<div id="anchor">ok</div>', headers={"content-type":"text/plain"}, request_method='GET')
+
+    def mget(u, **kwargs):
+        return resp
+    def mhead(u, **kwargs):
+        return FakeResponse(url=u, status_code=200, body='', headers={"content-type":"text/plain"}, request_method='HEAD')
+
+    uri, status, info, code = run_single_check(builder, url, mget, mhead)
+    assert uri == url
+    assert status == 'working'
+
+def test_anchor_ignored_by_pattern(tmp_path):
+    # anchors_ignore contains "^!" by default; test that if anchor matches ignore
+    # it will be treated as no-anchor (i.e., perform normal HEAD/GET checks)
+    builder, app = make_builder(tmp_path, config_overrides={'linkcheck_anchors_ignore': ["^!","^ignored$"]})
+    url = "http://example.com/page#ignored"
+    # Since anchor is ignored, code should not attempt anchor check and a HEAD=200 means working.
+    def mget(u, **kwargs):
+        # not expected to be called here, but return 200 just in case
+        return FakeResponse(url=u, status_code=200, body='<html></html>', headers={"content-type":"text/html"}, request_method='GET')
+    def mhead(u, **kwargs):
+        return FakeResponse(url=u, status_code=200, body='', headers={"content-type":"text/html"}, request_method='HEAD')
+
+    uri, status, info, code = run_single_check(builder, url, mget, mhead)
+    assert status == 'working'
+
+def test_percent_encoded_anchor_is_unquoted_and_found(tmp_path):
+    builder, app = make_builder(tmp_path)
+    # anchor is percent-encoded for 'ä' -> %C3%A4
+    url = "http://example.com/page#%C3%A4"
+    body = '<html><body><a id="ä"></a></body></html>'
+    resp = FakeResponse(url="http://example.com/page", status_code=200, body=body, headers={"content-type":"text/html"}, request_method='GET')
+
+    def mget(u, **kwargs):
+        return resp
+    def mhead(u, **kwargs):
+        return FakeResponse(url=u, status_code=200, body='', headers={"content-type":"text/html"}, request_method='HEAD')
+
+    uri, status, info, code = run_single_check(builder, url, mget, mhead)
+    assert status == 'working'
+
+def test_iter_content_bytes_decoded_and_anchor_found(tmp_path):
+    builder, app = make_builder(tmp_path)
+    url = "http://example.com/page#b"
+    # iter_content yields bytes; check_anchor should decode and find anchor
+    body_bytes = b'<html><body><a id="b"></a></body></html>'
+    resp = FakeResponse(url="http://example.com/page", status_code=200, body=body_bytes, headers={"content-type":"text/html"}, request_method='GET')
+
+    def mget(u, **kwargs):
+        return resp
+    def mhead(u, **kwargs):
+        return FakeResponse(url=u, status_code=200, body=b'', headers={"content-type":"text/html"}, request_method='HEAD')
+
+    uri, status, info, code = run_single_check(builder, url, mget, mhead)
+    assert status == 'working'
+
+def test_head_used_for_no_anchor_returns_working(tmp_path):
+    builder, app = make_builder(tmp_path)
+    url = "http://example.com/noanchor"
+    # No anchor in URL: HEAD should be tried and since it returns 200, status=working
+    def mget(u, **kwargs):
+        # Should not be used since HEAD succeeds for no anchor
+        return FakeResponse(url=u, status_code=200, body='<html></html>', headers={"content-type":"text/html"}, request_method='GET')
+    def mhead(u, **kwargs):
+        return FakeResponse(url=u, status_code=200, body='', headers={"content-type":"text/html"}, request_method='HEAD')
+
+    uri, status, info, code = run_single_check(builder, url, mget, mhead)
+    assert status == 'working'

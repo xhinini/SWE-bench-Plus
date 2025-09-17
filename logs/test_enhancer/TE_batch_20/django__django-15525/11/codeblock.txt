@@ -1,0 +1,233 @@
+from types import SimpleNamespace
+from django.test import SimpleTestCase
+from django.core.serializers.base import build_instance
+
+
+class FakeField:
+    def __init__(self, remote=False):
+        self.remote_field = object() if remote else None
+
+
+class PKDescriptor:
+    def __init__(self, attname="id", to_python=lambda v: v):
+        self.attname = attname
+        self.to_python = to_python
+
+
+class FakeMeta:
+    def __init__(self, default_manager, pk_descriptor, fields):
+        self.default_manager = default_manager
+        self.pk = pk_descriptor
+        # fields: dict name -> FakeField
+        self._fields = fields
+
+    def get_field(self, name):
+        # Simulate the behavior used by build_instance for get_field
+        try:
+            return self._fields[name]
+        except KeyError:
+            raise AttributeError("Field not found: %s" % name)
+
+
+class FakeManager:
+    def __init__(self, return_pk=None, raise_does_not_exist=False):
+        self._return_pk = return_pk
+        self.raise_dne = raise_does_not_exist
+        self.last_db = None
+
+    def db_manager(self, db):
+        # Record the db passed in and return self to chain get_by_natural_key
+        self.last_db = db
+        return self
+
+    def get_by_natural_key(self, *args):
+        if self.raise_dne:
+            raise FakeModel.DoesNotExist()
+        # Return object with a pk attribute
+        return SimpleNamespace(pk=self._return_pk)
+
+
+class FakeModel:
+    # Provide a DoesNotExist exception class like Django models do
+    class DoesNotExist(Exception):
+        pass
+
+    def __init__(self, **data):
+        # Model(**data) should set attributes from data
+        for k, v in data.items():
+            setattr(self, k, v)
+        # default state object with db attribute
+        self._state = SimpleNamespace(db=None)
+
+    # natural_key implementations are provided by test factories below
+    # _meta is injected per-test
+
+    def __repr__(self):
+        return "<FakeModel>"
+
+
+# Helper to create a FakeModel class with specified natural_key behavior
+def make_model_class(natural_key_func, fields_map, pk_to_python=lambda v: int(v)):
+    """
+    natural_key_func: function(self) -> tuple used as natural key
+    fields_map: dict name -> FakeField (remote True/False)
+    """
+    manager = FakeManager(return_pk=7)
+    pk_descriptor = PKDescriptor(attname="id", to_python=pk_to_python)
+    meta = FakeMeta(default_manager=manager, pk_descriptor=pk_descriptor, fields=fields_map)
+
+    class M(FakeModel):
+        _meta = meta
+        # Use the manager on the class as default_manager as well
+        _meta.default_manager = manager
+
+        def natural_key(self):
+            return natural_key_func(self)
+
+    return M, manager
+
+
+class BuildInstanceTests(SimpleTestCase):
+    def test_sets_pk_from_natural_key_with_related_object(self):
+        # natural_key uses a related attribute (remote field 'author')
+        def nk(self):
+            return (self.author.name,)
+
+        fields = {"author": FakeField(remote=True), "id": FakeField(remote=False)}
+        M, manager = make_model_class(nk, fields)
+
+        author_obj = SimpleNamespace(name="JR Tolkien")
+        data = {"author": author_obj, "id": None}
+        inst = build_instance(M, data, db="other_db")
+
+        # The returned instance should have its pk set to manager return value (converted)
+        self.assertEqual(inst.id, 7)
+
+    def test_uses_provided_db_in_db_manager_call(self):
+        def nk(self):
+            return (self.author.name,)
+
+        fields = {"author": FakeField(remote=True), "id": FakeField(remote=False)}
+        M, manager = make_model_class(nk, fields)
+
+        author_obj = SimpleNamespace(name="Author Name")
+        data = {"author": author_obj, "id": None}
+        _ = build_instance(M, data, db="my_database")
+
+        # The manager.db_manager should have been called with the provided db
+        self.assertEqual(manager.last_db, "my_database")
+
+    def test_does_not_override_existing_pk(self):
+        def nk(self):
+            # Would raise if called, but should not be called because id is present
+            raise AssertionError("Should not call natural_key when PK exists")
+
+        fields = {"author": FakeField(remote=True), "id": FakeField(remote=False)}
+        M, manager = make_model_class(nk, fields)
+
+        data = {"author": SimpleNamespace(name="X"), "id": 10}
+        inst = build_instance(M, data, db="any_db")
+        self.assertEqual(inst.id, 10)
+
+    def test_converts_pk_using_to_python(self):
+        def nk(self):
+            return (self.author.name,)
+
+        # pk to_python converts '42' -> 42
+        def to_python(v):
+            return int(v)
+
+        fields = {"author": FakeField(remote=True), "id": FakeField(remote=False)}
+        M, manager = make_model_class(nk, fields, pk_to_python=to_python)
+        # Set manager to return '42' as pk (string) to be converted
+        M._meta.default_manager._return_pk = "42"
+
+        data = {"author": SimpleNamespace(name="A"), "id": None}
+        inst = build_instance(M, data, db="db")
+        self.assertEqual(inst.id, 42)
+
+    def test_multiple_components_natural_key(self):
+        def nk(self):
+            return (self.author.name, self.slug)
+
+        fields = {"author": FakeField(remote=True), "slug": FakeField(remote=False), "id": FakeField(remote=False)}
+        M, manager = make_model_class(nk, fields)
+
+        data = {"author": SimpleNamespace(name="multi"), "slug": "s1", "id": None}
+        inst = build_instance(M, data, db="db")
+        self.assertEqual(inst.id, 7)
+
+    def test_nested_related_object_natural_key(self):
+        def nk(self):
+            # author.profile.username: nested access to related attribute
+            return (self.author.profile.username,)
+
+        # author is remote, id is non-remote
+        fields = {"author": FakeField(remote=True), "id": FakeField(remote=False)}
+        M, manager = make_model_class(nk, fields)
+
+        profile = SimpleNamespace(username="nested_user")
+        author_obj = SimpleNamespace(profile=profile)
+        data = {"author": author_obj, "id": None}
+        inst = build_instance(M, data, db="db")
+        self.assertEqual(inst.id, 7)
+
+    def test_handles_manager_does_not_exist_without_error(self):
+        def nk(self):
+            return (self.author.name,)
+
+        fields = {"author": FakeField(remote=True), "id": FakeField(remote=False)}
+        M, manager = make_model_class(nk, fields)
+        # Make the manager raise DoesNotExist so build_instance should swallow and continue
+        M._meta.default_manager.raise_dne = True
+
+        data = {"author": SimpleNamespace(name="Nope"), "id": None}
+        inst = build_instance(M, data, db="db")
+        # Since get_by_natural_key raised DoesNotExist, id remains None on returned object
+        self.assertIsNone(getattr(inst, "id", None))
+
+    def test_handles_db_none(self):
+        def nk(self):
+            return (self.author.name,)
+
+        fields = {"author": FakeField(remote=True), "id": FakeField(remote=False)}
+        M, manager = make_model_class(nk, fields)
+
+        data = {"author": SimpleNamespace(name="Name"), "id": None}
+        inst = build_instance(M, data, db=None)
+        # Should still set id using db=None (manager captures last_db)
+        self.assertEqual(inst.id, 7)
+        self.assertIsNone(manager.last_db)
+
+    def test_handles_string_pk_conversion(self):
+        def nk(self):
+            return (self.author.name,)
+
+        # pk to_python returns the original string appended with '-converted'
+        def to_python(v):
+            return f"{v}-converted"
+
+        fields = {"author": FakeField(remote=True), "id": FakeField(remote=False)}
+        M, manager = make_model_class(nk, fields, pk_to_python=to_python)
+        M._meta.default_manager._return_pk = "pkstr"
+
+        data = {"author": SimpleNamespace(name="S"), "id": None}
+        inst = build_instance(M, data, db="db")
+        self.assertEqual(inst.id, "pkstr-converted")
+
+    def test_multiple_relational_fields_in_data(self):
+        def nk(self):
+            # natural key composed from two related objects
+            return (self.author.name, self.editor.name)
+
+        fields = {
+            "author": FakeField(remote=True),
+            "editor": FakeField(remote=True),
+            "id": FakeField(remote=False),
+        }
+        M, manager = make_model_class(nk, fields)
+
+        data = {"author": SimpleNamespace(name="A"), "editor": SimpleNamespace(name="E"), "id": None}
+        inst = build_instance(M, data, db="db")
+        self.assertEqual(inst.id, 7)
+new_imports_code: ""

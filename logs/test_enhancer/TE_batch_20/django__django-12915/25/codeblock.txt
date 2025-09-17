@@ -1,0 +1,145 @@
+# These imports are required by the tests above
+import asyncio
+import time
+import importlib
+import pytest
+from django.http import HttpResponse, Http404
+from django.contrib.staticfiles.handlers import StaticFilesHandlerMixin
+import django.contrib.staticfiles.handlers as handlers_module
+import asyncio
+import time
+import importlib
+import pytest
+from django.http import HttpResponse, Http404
+from django.contrib.staticfiles.handlers import StaticFilesHandlerMixin
+import django.contrib.staticfiles.handlers as handlers_module
+
+@pytest.mark.asyncio
+async def test_get_response_async_does_not_block_on_blocking_serve():
+    # serve blocks via time.sleep, but get_response_async must offload to a thread
+    handler = StaticFilesHandlerMixin()
+    def serve_blocking(request):
+        time.sleep(0.2)
+        return HttpResponse("ok")
+    handler.serve = serve_blocking
+
+    flag = {"set": False}
+    async def set_flag():
+        # yield control to event loop, should be able to run while serve runs in thread
+        await asyncio.sleep(0)
+        flag["set"] = True
+
+    t1 = asyncio.create_task(handler.get_response_async(None))
+    t2 = asyncio.create_task(set_flag())
+    # t2 should complete quickly if serve is offloaded to a thread
+    await asyncio.wait_for(t2, timeout=0.5)
+    assert flag["set"] is True
+    resp = await asyncio.wait_for(t1, timeout=1.0)
+    assert isinstance(resp, HttpResponse)
+    assert resp.content == b"ok"
+
+@pytest.mark.asyncio
+async def test_get_response_async_does_not_block_when_response_for_exception_blocks(monkeypatch):
+    # serve raises Http404; response_for_exception blocks (simulated),
+    # get_response_async must offload response_for_exception to a thread
+    handler = StaticFilesHandlerMixin()
+    def serve_raising(request):
+        raise Http404("not found")
+    handler.serve = serve_raising
+
+    def blocking_response_for_exception(request, exc):
+        time.sleep(0.2)
+        return HttpResponse("handled404", status=404)
+    # Monkeypatch the function used by the module under test
+    monkeypatch.setattr(handlers_module, "response_for_exception", blocking_response_for_exception)
+
+    flag = {"set": False}
+    async def set_flag():
+        await asyncio.sleep(0)
+        flag["set"] = True
+
+    t1 = asyncio.create_task(handler.get_response_async(None))
+    t2 = asyncio.create_task(set_flag())
+    # set_flag must be able to run while response_for_exception is executed in a thread
+    await asyncio.wait_for(t2, timeout=0.5)
+    assert flag["set"] is True
+    resp = await asyncio.wait_for(t1, timeout=1.0)
+    assert isinstance(resp, HttpResponse)
+    assert resp.status_code == 404
+    assert resp.content == b"handled404"
+
+@pytest.mark.asyncio
+async def test_multiple_concurrent_get_response_async_calls_are_parallel():
+    # Schedule several blocking serves; they should execute in parallel in threads.
+    handler = StaticFilesHandlerMixin()
+    def serve_blocking(request):
+        time.sleep(0.25)
+        return HttpResponse("ok")
+    handler.serve = serve_blocking
+
+    tasks = [asyncio.create_task(handler.get_response_async(None)) for _ in range(3)]
+    # If served serially, this would take ~0.75s. Expect to complete within ~0.35s if parallel.
+    results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=0.6)
+    assert all(isinstance(r, HttpResponse) and r.content == b"ok" for r in results)
+
+@pytest.mark.asyncio
+async def test_get_response_async_returns_value_without_blocking_for_quick_serves():
+    # Quick serve should simply return the HttpResponse; still must not block event loop.
+    handler = StaticFilesHandlerMixin()
+    def serve_quick(request):
+        return HttpResponse("quick")
+    handler.serve = serve_quick
+
+    flag = {"set": False}
+    async def set_flag():
+        await asyncio.sleep(0)
+        flag["set"] = True
+
+    t1 = asyncio.create_task(handler.get_response_async(None))
+    t2 = asyncio.create_task(set_flag())
+    await asyncio.wait_for(t2, timeout=0.2)
+    assert flag["set"] is True
+    resp = await asyncio.wait_for(t1, timeout=0.2)
+    assert resp.content == b"quick"
+
+@pytest.mark.asyncio
+async def test_get_response_async_handles_http404_and_uses_response_for_exception(monkeypatch):
+    handler = StaticFilesHandlerMixin()
+    def serve_raising(request):
+        raise Http404("nope")
+    handler.serve = serve_raising
+
+    def dummy_response_for_exception(request, exc):
+        return HttpResponse("handled", status=404)
+    monkeypatch.setattr(handlers_module, "response_for_exception", dummy_response_for_exception)
+
+    resp = await handler.get_response_async(None)
+    assert isinstance(resp, HttpResponse)
+    assert resp.status_code == 404
+    assert resp.content == b"handled"
+
+def test_file_path_uses_url2pathname_for_urlencoded_paths():
+    handler = StaticFilesHandlerMixin()
+    # Set base_url to a path prefix '/static/'
+    handler.base_url = importlib.import_module("urllib.parse").urlparse("/static/")
+    # URL contains %20 encoded space
+    result = handler.file_path("/static/some%20file.txt")
+    # url2pathname should decode %20 to space
+    assert result.endswith("some file.txt")
+
+def test__should_handle_respects_netloc():
+    handler = StaticFilesHandlerMixin()
+    # base_url with netloc (host present) -> don't handle
+    handler.base_url = importlib.import_module("urllib.parse").urlparse("https://example.com/static/")
+    assert handler._should_handle("/static/thing") is False
+    # base_url without netloc and path prefix -> handle
+    handler.base_url = importlib.import_module("urllib.parse").urlparse("/static/")
+    assert handler._should_handle("/static/thing") is True
+    # path not under prefix -> don't handle
+    assert handler._should_handle("/other/thing") is False
+
+def test_file_path_strips_base_url_prefix_correctly():
+    handler = StaticFilesHandlerMixin()
+    handler.base_url = importlib.import_module("urllib.parse").urlparse("/static/")
+    res = handler.file_path("/static/path/to/file.txt")
+    assert res == importlib.import_module("urllib.request").url2pathname("path/to/file.txt")

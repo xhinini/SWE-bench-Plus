@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 cache.tests_llm.AdditionalFileBasedCacheRaceTests.setUp cache.tests_llm.AdditionalFileBasedCacheRaceTests.tearDown cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_does_not_call_os_path_exists cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_empty_cache_file_considered_expired_and_removed cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_handles_context_manager_enter_raising_filenotfound cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_open_called_once_on_race cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_propagates_non_filenotfound_errors cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_returns_false_when_open_fails_but_exists_true cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_returns_false_when_open_fails_with_version cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_version_isolated_when_one_version_expires cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_with_real_file_expired_is_false_and_file_removed cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_with_real_file_not_expired
+coverage json -o coverage.json
+: '>>>>> End Test Output'

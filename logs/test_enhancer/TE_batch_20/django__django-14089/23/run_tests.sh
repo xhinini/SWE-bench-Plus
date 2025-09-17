@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_add_raises_runtime_error utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_discard_existing_raises_runtime_error utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_multiple_mutations_raise_runtime_error utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_mutation_via_dict_clear_raises utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_mutation_via_dict_delitem_raises utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_mutation_via_dict_pop_raises utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_mutation_via_dict_setitem_raises utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_partial_iteration_then_add_raises_runtime_error utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_partial_iteration_then_remove_raises_runtime_error utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_remove_raises_runtime_error
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,186 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify how the linkcheck builder handles links that contain an anchor (#fragment) when the target resource is not HTML (e.g. images, PDFs, plain text, binaries). The intended (gold) behavior is to attempt to fetch the resource and then try to find the anchor (which will fail for non-HTML), resulting in a "broken" report with an "Anchor '...' not found" message. The candidate (model) patch incorrectly treats non-HTML targets with anchors as "working" (skipping the anchor check). Each test creates a small doctree with either a reference node or an image node referencing a URL with an anchor, patches the network requests (HEAD and GET) to return controlled Response-like objects, runs the builder's write_doc to process the link, and asserts that the output contains the expected "Anchor 'x' not found" entry. These tests will FAIL on the candidate patch (which returns "working" for non-HTML+anchor) but PASS with the gold patch that enforces checking and status raising.
+new_imports_code: |
+  from docutils import nodes
+  from requests.exceptions import HTTPError
+  from sphinx.builders.linkcheck import CheckExternalLinksBuilder
+  import time
+test_code: |
+  import io
+  import threading
+  from unittest import mock
+
+  import pytest
+  from docutils import nodes
+  from requests.exceptions import HTTPError
+
+  from sphinx.builders import linkcheck as linkcheck_mod
+
+  class DummyResponse:
+      def __init__(self, status_code=200, headers=None, chunks=None, url=None,
+                   history=None, method='GET'):
+          self.status_code = status_code
+          self.headers = headers or {}
+          self._chunks = chunks or []
+          self.url = url or 'https://example.com/resource'
+          self.history = history or []
+          # emulate requests' response.request.method
+          self.request = mock.Mock()
+          self.request.method = method
+
+      def iter_content(self, chunk_size=4096, decode_unicode=False):
+          for c in self._chunks:
+              # emulate requests behavior: if decode_unicode True and chunk is bytes,
+              # real requests yields decoded string if possible; we emulate by returning as-is.
+              yield c
+
+      def raise_for_status(self):
+          if self.status_code >= 400:
+              # Raise an HTTPError similar to requests
+              raise HTTPError(f"{self.status_code} Client Error", response=self)
+
+  def _run_linkcheck_for_uri(app, uri, head_resp, get_resp, is_image_node=False):
+      """
+      Helper that patches requests.get and requests.head used by the linkcheck builder,
+      initializes the builder (starting worker threads), pushes a single URI via
+      write_doc (reference or image node), and returns the contents of output.txt.
+      """
+      builder = app.builder
+
+      # Patch the requests used inside the linkcheck module
+      patch_target = 'sphinx.builders.linkcheck.requests'
+      with mock.patch(f'{patch_target}.head', return_value=head_resp) as mock_head, \
+           mock.patch(f'{patch_target}.get', return_value=get_resp) as mock_get:
+
+          # Ensure builder is initialized (creates worker threads)
+          # Some test fixtures may have already initialized builder; safe to call init again only if needed.
+          if not hasattr(builder, 'wqueue'):
+              builder.init()
+          # If already initialized, make sure workers exist
+          if not getattr(builder, 'workers', None):
+              builder.init()
+
+          # Build a minimal doctree with one reference or image node
+          doctree = nodes.document('', '')
+          if is_image_node:
+              # image node: builder looks at node['candidates'].get('?')
+              img = nodes.image()
+              img['candidates'] = {'?': uri}
+              img['line'] = 42
+              doctree += img
+          else:
+              ref = nodes.reference('', 'link', refuri=uri)
+              # set a line number so output includes it
+              ref['line'] = 17
+              doctree += ref
+
+          # Ensure the env knows about the docname used
+          docname = 'index'
+          # Make sure env has doc2path implementation and found_docs contains the docname
+          builder.env.found_docs.add(docname)
+
+          # Run write_doc which enqueues the URI and then processes results
+          # This will interact with the worker threads (which call our patched functions)
+          builder.write_doc(docname, doctree)
+
+          # Allow a tiny moment for background threads to process (if needed)
+          time_waited = 0.0
+          # The builder.write_doc waits for results already; this loop is just extra safety
+          while time_waited < 0.5:
+              time_waited += 0.01
+
+          # read output
+          out = (app.outdir / 'output.txt').read_text()
+          # Tear down worker threads by sending stop signals
+          builder.finish()
+          # join worker threads to make sure they exit cleanly
+          for t in builder.workers:
+              t.join(timeout=0.5)
+          return out
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_nonhtml_anchor_image_png(app, status, warning):
+      # image/png with anchor -> should attempt anchor check -> Anchor 'foo' not found
+      uri = 'https://example.com/image.png#foo'
+      head_resp = DummyResponse(status_code=200, headers={'content-type': 'image/png'}, url='https://example.com/image.png', method='HEAD')
+      # GET returns binary content (non-HTML) simulated as bytes chunks
+      get_resp = DummyResponse(status_code=200, headers={'content-type': 'image/png'}, chunks=[b'\x89PNG\r\n\x1a\n'], url='https://example.com/image.png', method='GET')
+      out = _run_linkcheck_for_uri(app, uri, head_resp, get_resp, is_image_node=False)
+      assert "Anchor 'foo' not found" in out
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_nonhtml_anchor_pdf(app, status, warning):
+      uri = 'https://example.org/doc.pdf#section'
+      head_resp = DummyResponse(status_code=200, headers={'content-type': 'application/pdf'}, url=uri.split('#')[0], method='HEAD')
+      get_resp = DummyResponse(status_code=200, headers={'content-type': 'application/pdf'}, chunks=[b'%PDF-1.4\n%...'], url=uri.split('#')[0], method='GET')
+      out = _run_linkcheck_for_uri(app, uri, head_resp, get_resp, is_image_node=False)
+      assert "Anchor 'section' not found" in out
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_nonhtml_anchor_plain_text(app, status, warning):
+      uri = 'https://example.net/readme.txt#intro'
+      head_resp = DummyResponse(status_code=200, headers={'content-type': 'text/plain'}, url=uri.split('#')[0], method='HEAD')
+      # GET returns textual content without the anchor
+      get_resp = DummyResponse(status_code=200, headers={'content-type': 'text/plain'}, chunks=['This is a readme file.\nNo anchors here.\n'], url=uri.split('#')[0], method='GET')
+      out = _run_linkcheck_for_uri(app, uri, head_resp, get_resp, is_image_node=False)
+      assert "Anchor 'intro' not found" in out
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_nonhtml_anchor_octet_stream(app, status, warning):
+      uri = 'https://files.example.org/binary.bin#part'
+      head_resp = DummyResponse(status_code=200, headers={'content-type': 'application/octet-stream'}, url=uri.split('#')[0], method='HEAD')
+      get_resp = DummyResponse(status_code=200, headers={'content-type': 'application/octet-stream'}, chunks=[b'\x00\x01\x02\x03'], url=uri.split('#')[0], method='GET')
+      out = _run_linkcheck_for_uri(app, uri, head_resp, get_resp, is_image_node=False)
+      assert "Anchor 'part' not found" in out
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_nonhtml_anchor_video_mp4(app, status, warning):
+      uri = 'https://media.example.com/video.mp4#t=10'
+      head_resp = DummyResponse(status_code=200, headers={'content-type': 'video/mp4'}, url=uri.split('#')[0], method='HEAD')
+      get_resp = DummyResponse(status_code=200, headers={'content-type': 'video/mp4'}, chunks=[b'\x00\x00\x00 ftyp'], url=uri.split('#')[0], method='GET')
+      out = _run_linkcheck_for_uri(app, uri, head_resp, get_resp, is_image_node=False)
+      assert "Anchor 't=10' not found" in out
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_nonhtml_anchor_image_node(app, status, warning):
+      # Use an image node to exercise that code path as well
+      uri = 'https://cdn.example.com/img.jpg#part'
+      head_resp = DummyResponse(status_code=200, headers={'content-type': 'image/jpeg'}, url=uri.split('#')[0], method='HEAD')
+      get_resp = DummyResponse(status_code=200, headers={'content-type': 'image/jpeg'}, chunks=[b'\xff\xd8\xff\xe0'], url=uri.split('#')[0], method='GET')
+      out = _run_linkcheck_for_uri(app, uri, head_resp, get_resp, is_image_node=True)
+      assert "Anchor 'part' not found" in out
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_html_anchor_found_is_ok(app, status, warning):
+      # Control: HTML content that contains the anchor should be considered working
+      uri = 'https://html.example.com/page.html#good'
+      head_resp = DummyResponse(status_code=200, headers={'content-type': 'text/html'}, url=uri.split('#')[0], method='HEAD')
+      # GET returns HTML containing the anchor id
+      get_resp = DummyResponse(status_code=200, headers={'content-type': 'text/html'},
+                               chunks=['<html><body><a id="good"></a></body></html>'],
+                               url=uri.split('#')[0], method='GET')
+      out = _run_linkcheck_for_uri(app, uri, head_resp, get_resp, is_image_node=False)
+      # For working anchors, the builder writes an "ok" entry; assert the anchor failure is not present
+      assert "Anchor 'good' not found" not in out
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_html_anchor_missing_is_broken(app, status, warning):
+      # Control: HTML without the requested anchor should be broken
+      uri = 'https://html.example.com/page2.html#missing'
+      head_resp = DummyResponse(status_code=200, headers={'content-type': 'text/html'}, url=uri.split('#')[0], method='HEAD')
+      get_resp = DummyResponse(status_code=200, headers={'content-type': 'text/html'},
+                               chunks=['<html><body><p>No anchor here</p></body></html>'],
+                               url=uri.split('#')[0], method='GET')
+      out = _run_linkcheck_for_uri(app, uri, head_resp, get_resp, is_image_node=False)
+      assert "Anchor 'missing' not found" in out
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_nonhtml_anchor_bytes_chunk(app, status, warning):
+      # Provide bytes chunks (instead of strings) to ensure decode path is hit and still treated as missing anchor
+      uri = 'https://bin.example.com/data.bin#x'
+      head_resp = DummyResponse(status_code=200, headers={'content-type': 'application/octet-stream'}, url=uri.split('#')[0], method='HEAD')
+      get_resp = DummyResponse(status_code=200, headers={'content-type': 'application/octet-stream'},
+                               chunks=[b'\x00\xff\x00\xff', b'\x01\x02'], url=uri.split('#')[0], method='GET')
+      out = _run_linkcheck_for_uri(app, uri, head_resp, get_resp, is_image_node=False)
+      assert "Anchor 'x' not found" in out

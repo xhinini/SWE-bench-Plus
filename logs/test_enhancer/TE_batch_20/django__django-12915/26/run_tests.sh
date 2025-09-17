@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 staticfiles_tests.test_handlers_llm.GetResponseAsyncThreadingTests.run_async staticfiles_tests.test_handlers_llm.GetResponseAsyncThreadingTests.test_get_response_async_called_multiple_times_runs_in_thread_each_time staticfiles_tests.test_handlers_llm.GetResponseAsyncThreadingTests.test_get_response_async_executes_response_for_exception_in_thread_on_http404 staticfiles_tests.test_handlers_llm.GetResponseAsyncThreadingTests.test_get_response_async_executes_serve_in_thread_bound_method_on_mixin_instance_success staticfiles_tests.test_handlers_llm.GetResponseAsyncThreadingTests.test_get_response_async_propagates_non_http404_exception staticfiles_tests.test_handlers_llm.GetResponseAsyncThreadingTests.test_get_response_async_response_for_exception_receives_correct_args_and_threaded staticfiles_tests.test_handlers_llm.GetResponseAsyncThreadingTests.test_get_response_async_returns_value_from_serve_when_serve_is_function_attribute staticfiles_tests.test_handlers_llm.GetResponseAsyncThreadingTests.test_get_response_async_serve_is_lambda_threaded staticfiles_tests.test_handlers_llm.GetResponseAsyncThreadingTests.test_get_response_async_with_asgi_handler_exception_threaded staticfiles_tests.test_handlers_llm.GetResponseAsyncThreadingTests.test_get_response_async_with_asgi_handler_success_threaded
+coverage json -o coverage.json
+: '>>>>> End Test Output'

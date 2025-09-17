@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_checks.tests_llm.ReadonlyFieldMessageTests.test_error_obj_and_id_for_modeladmin admin_checks.tests_llm.ReadonlyFieldMessageTests.test_error_obj_is_the_admin_class_for_inline admin_checks.tests_llm.ReadonlyFieldMessageTests.test_high_index_missing_field_reports_correct_index_in_label admin_checks.tests_llm.ReadonlyFieldMessageTests.test_inline_missing_field_reports_field_name_and_inline_class admin_checks.tests_llm.ReadonlyFieldMessageTests.test_message_includes_model_label admin_checks.tests_llm.ReadonlyFieldMessageTests.test_missing_field_messages_are_exact_and_use_refers_to_phrase admin_checks.tests_llm.ReadonlyFieldMessageTests.test_modeladmin_missing_field_at_index_one_reports_correct_label_and_field admin_checks.tests_llm.ReadonlyFieldMessageTests.test_modeladmin_single_missing_field_reports_field_name_and_label admin_checks.tests_llm.ReadonlyFieldMessageTests.test_multiple_missing_readonly_fields_produce_individual_messages admin_checks.tests_llm.ReadonlyFieldMessageTests.test_various_admin_class_names_reflected_in_message
+coverage json -o coverage.json
+: '>>>>> End Test Output'

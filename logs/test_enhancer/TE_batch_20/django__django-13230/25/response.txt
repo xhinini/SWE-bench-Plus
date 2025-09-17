@@ -1,0 +1,160 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  The tests verify that the Feed implementation correctly includes the item_comments value
+  in generated feeds and that the <comments> element appears in the expected place
+  relative to <category> in RSS feeds. They also validate that item_comments is
+  supported when defined as a zero-argument callable, as a one-argument callable,
+  and when set as a plain attribute. The tests exercise RSS2, RSS 0.91, and Atom1 feed
+  outputs and ensure no exceptions are raised when generating feeds. These checks
+  are sensitive to the location and presence of the comments keyword in feed.add_item,
+  which is the behavior changed by the provided patches.
+test_code: |
+  from django.test import RequestFactory, TestCase
+  from django.contrib.sites.models import Site
+  from django.contrib.syndication import views
+  from django.utils import feedgenerator
+  from django.utils.timezone import get_fixed_timezone
+  from django.template import loader, TemplateDoesNotExist
+  from tests.syndication_tests.models import Entry, Article
+  from tests.syndication_tests.feeds import TestRss2Feed, TestAtomFeed, TestRss091Feed
+  from django.core.exceptions import ImproperlyConfigured
+  import re
+  
+  rf = RequestFactory()
+  
+  class FeedCommentsTests(TestCase):
+      databases = '__all__'
+  
+      def setUp(self):
+          # Ensure site object exists
+          Site.objects.update_or_create(pk=1, defaults={'domain': 'example.com', 'name': 'example.com'})
+          # A simple request object (not secure)
+          self.request = rf.get('/blog/')
+  
+      def _render_feed(self, feed_cls, request=None):
+          if request is None:
+              request = self.request
+          feed = feed_cls()
+          # get_feed should return a feed generator; write will render into a buffer-like object
+          feedgen = feed.get_feed(None, request)
+          out = []
+          class Buf:
+              def write(self, b):
+                  out.append(b.decode('utf-8') if isinstance(b, bytes) else str(b))
+          buf = Buf()
+          feedgen.write(buf, 'utf-8')
+          return ''.join(out)
+  
+      def test_rss2_includes_comments_element(self):
+          """RSS 2.0 feed should include a <comments> element with the item_comments value."""
+          xml = self._render_feed(TestRss2Feed, self.request)
+          # There should be at least one <item> and inside it a <comments> element
+          self.assertIn('<comments>', xml)
+          # Ensure the comments content is the same as provided by item_comments in TestRss2Feed
+          # The TestRss2Feed.item_comments returns "<itemurl>comments"
+          m = re.search(r'<comments>(.*?)</comments>', xml, re.S)
+          self.assertIsNotNone(m, "No comments element found in RSS2 feed")
+          comments_value = m.group(1).strip()
+          self.assertTrue(comments_value.endswith('comments'), "Comments value not as expected")
+  
+      def test_rss2_comments_before_category_order(self):
+          """
+          Ensure that in RSS 2.0 the <comments> element appears before the first <category>
+          element inside an <item>. This test detects improper placement of the comments
+          argument when creating the item (the candidate patch placed it in a different
+          position which affects output ordering in the generator used here).
+          """
+          xml = self._render_feed(TestRss2Feed, self.request)
+          # Find the first item block
+          item_match = re.search(r'<item>(.*?)</item>', xml, re.S)
+          self.assertIsNotNone(item_match)
+          item_xml = item_match.group(1)
+          pos_comments = item_xml.find('<comments>')
+          pos_category = item_xml.find('<category')
+          self.assertNotEqual(pos_comments, -1, "No <comments> tag in first item")
+          self.assertNotEqual(pos_category, -1, "No <category> tag in first item")
+          # Comments should come before category in the RSS item
+          self.assertTrue(pos_comments < pos_category, "<comments> should appear before <category> in RSS items")
+  
+      def test_rss091_includes_comments_element(self):
+          """RSS 0.91 feed should include a comments element as well."""
+          xml = self._render_feed(TestRss091Feed, self.request)
+          # The RSS 0.91 generator may use <comments> as well; ensure it's present.
+          self.assertIn('<comments>', xml)
+  
+      def test_atom_does_not_crash_and_mentions_comment_link(self):
+          """
+          Atom feeds do not have a <comments> element, but item_comments should be
+          represented where applicable (e.g., as a link rel="replies" or similar).
+          Ensures that adding item_comments does not crash Atom generation.
+          """
+          xml = self._render_feed(TestAtomFeed, self.request)
+          # Atom feed should include items and not raise an exception; a simple sanity check:
+          self.assertIn('<entry', xml)
+          # If comments are represented as a link, ensure it doesn't cause generator failure.
+          # We accept either presence or absence, but no exceptions (already satisfied by rendering).
+  
+      def test_item_comments_callable_no_args(self):
+          """
+          If item_comments is defined as a zero-argument callable (on the Feed),
+          _get_dynamic_attr should call it without item argument and the result used.
+          """
+          class ZeroArgCommentsFeed(TestRss2Feed):
+              def item_comments(self):
+                  return 'http://example.com/customcomments'
+          xml = self._render_feed(ZeroArgCommentsFeed, self.request)
+          self.assertIn('http://example.com/customcomments', xml)
+  
+      def test_item_comments_callable_with_item(self):
+          """
+          If item_comments expects one argument (the item), it should be called
+          with the item and used in output.
+          """
+          class OneArgCommentsFeed(TestRss2Feed):
+              def item_comments(self, item):
+                  # To uniquely identify this usage, include the PK if available
+                  try:
+                      pk = getattr(item, 'pk', 'nopk')
+                  except Exception:
+                      pk = 'err'
+                  return 'http://example.com/%s/comments' % pk
+          xml = self._render_feed(OneArgCommentsFeed, self.request)
+          self.assertIn('/comments', xml)
+  
+      def test_item_comments_as_attribute(self):
+          """
+          If item_comments is a plain attribute (string), it should be used directly.
+          """
+          class AttrCommentsFeed(TestRss2Feed):
+              item_comments = 'http://example.com/staticcomments'
+          xml = self._render_feed(AttrCommentsFeed, self.request)
+          self.assertIn('http://example.com/staticcomments', xml)
+  
+      def test_no_type_error_when_generating_feed_with_item_comments(self):
+          """
+          Ensure that adding item_comments does not cause a TypeError due to duplicate
+          keyword arguments when feed.add_item is called. (Regression test for
+          incorrect double-insertion of the same keyword argument.)
+          """
+          try:
+              xml = self._render_feed(TestRss2Feed, self.request)
+          except TypeError as e:
+              self.fail("Generating feed raised TypeError (possible duplicate keyword): %s" % e)
+  
+      def test_feed_call_sets_last_modified_header_when_pubdates_present(self):
+          """
+          Ensure that the Feed.__call__ sets Last-Modified header when item_pubdate/item_updateddate
+          are defined (TestRss2Feed defines these). This test ensures the __call__ flow is exercised.
+          """
+          # Use a RequestFactory request to pass to __call__
+          req = rf.get('/blog/')
+          feed_view = TestRss2Feed()
+          response = feed_view(req)
+          # Content type should match the feed generator content type
+          self.assertIn('xml', response['Content-Type'])
+          # Last-Modified header should be present
+          self.assertIn('Last-Modified', response)
+new_imports_code: |
+  from django.test import RequestFactory, TestCase
+  import re

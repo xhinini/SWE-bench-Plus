@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.TemplateCommandTargetNormalizationTests._run_variant admin_scripts.tests_llm.TemplateCommandTargetNormalizationTests.setUp admin_scripts.tests_llm.TemplateCommandTargetNormalizationTests.tearDown admin_scripts.tests_llm.TemplateCommandTargetNormalizationTests.test_child_dot_then_dotdot admin_scripts.tests_llm.TemplateCommandTargetNormalizationTests.test_child_dotdot admin_scripts.tests_llm.TemplateCommandTargetNormalizationTests.test_child_dotdot_with_trailing_slash admin_scripts.tests_llm.TemplateCommandTargetNormalizationTests.test_dot admin_scripts.tests_llm.TemplateCommandTargetNormalizationTests.test_dot_with_trailing_slash admin_scripts.tests_llm.TemplateCommandTargetNormalizationTests.test_multiple_trailing_separators_and_dot admin_scripts.tests_llm.TemplateCommandTargetNormalizationTests.test_nested_dot_then_dotdot admin_scripts.tests_llm.TemplateCommandTargetNormalizationTests.test_nested_dot_then_dotdot_with_trailing_slash admin_scripts.tests_llm.TemplateCommandTargetNormalizationTests.test_parent_reference admin_scripts.tests_llm.TemplateCommandTargetNormalizationTests.test_parent_reference_with_trailing_slash
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,144 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests create temporary file-system based ManifestStaticFilesStorage instances (and simple hashed-storage combinations) with various max_post_process_passes configurations (including 0) and exercise post_process(), hashed_name(), and stored_name() behaviours. They assert that no UnboundLocalError (or other unexpected exceptions) is raised when max_post_process_passes == 0, that hashing and manifest-related logic behaves correctly (including handling of "?#" font hack fragments and directory-open OSError cases), and that dry_run short-circuits as expected.
+test_code: |
+  import os
+  import shutil
+  import tempfile
+  import unittest
+  from django.core.files.base import ContentFile
+  from django.contrib.staticfiles.storage import ManifestFilesMixin, StaticFilesStorage, ManifestStaticFilesStorage
+  from django.contrib.staticfiles.storage import HashedFilesMixin
+  from django.conf import settings
+
+  class TempManifestStorage(ManifestStaticFilesStorage):
+      """
+      Helper subclass where we can set max_post_process_passes via constructor.
+      """
+      def __init__(self, location, base_url, max_passes=5, manifest_strict=True):
+          # Dynamically set attributes on the class instance
+          self.max_post_process_passes = max_passes
+          self.manifest_strict = manifest_strict
+          super().__init__(location=location, base_url=base_url)
+
+  class TestZeroMaxPostProcessPasses(unittest.TestCase):
+      def setUp(self):
+          self.tmpdir = tempfile.mkdtemp()
+          # Ensure STATIC_URL is set for URL-related logic.
+          self.base_url = '/static/'
+          # Create ephemeral STATIC_ROOT-like area
+          # No need to alter Django settings; pass location to storage directly.
+
+      def tearDown(self):
+          shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+      def _save(self, storage, name, content_bytes):
+          return storage._save(name, ContentFile(content_bytes))
+
+      def test_post_process_with_zero_passes_does_not_raise_and_updates_hashed_files(self):
+          storage = TempManifestStorage(location=self.tmpdir, base_url=self.base_url, max_passes=0)
+          # Save an image and a css that references it.
+          self._save(storage, 'img.png', b'PNGDATA')
+          self._save(storage, 'a.css', b'body { background: url("img.png"); }')
+
+          paths = {'a.css': (storage, 'a.css')}
+          # Should not raise and should process files
+          result = list(storage.post_process(paths, dry_run=False))
+          # After processing, the manifest/hased mapping should contain the original key
+          self.assertIn('a.css', storage.hashed_files)
+          # The result should include the processed 'a.css'
+          processed_names = [r[0] for r in result]
+          self.assertIn('a.css', processed_names)
+
+      def test_post_process_dry_run_returns_none(self):
+          storage = TempManifestStorage(location=self.tmpdir, base_url=self.base_url, max_passes=0)
+          self._save(storage, 'c.css', b'body {}')
+          paths = {'c.css': (storage, 'c.css')}
+          # For dry_run True, post_process should return immediately.
+          self.assertIsNone(storage.post_process(paths, dry_run=True))
+
+      def test_stored_name_with_zero_passes_recomputes_hash(self):
+          storage = TempManifestStorage(location=self.tmpdir, base_url=self.base_url, max_passes=0)
+          self._save(storage, 'b.css', b'body {}')
+          # Ensure no manifest entry exists initially
+          storage.hashed_files.clear()
+          # This should compute and return a hashed name without raising
+          hashed = storage.stored_name('b.css')
+          self.assertIsInstance(hashed, str)
+          self.assertTrue(hashed.endswith('.css') and 'b.' in hashed)
+
+      def test_hashed_name_returns_original_on_opening_directory(self):
+          storage = TempManifestStorage(location=self.tmpdir, base_url=self.base_url, max_passes=0)
+          # Create a directory so that storage.open on it raises an OSError (IsADirectoryError)
+          os.makedirs(os.path.join(self.tmpdir, 'some_dir'))
+          # Call hashed_name providing filename that points to the directory we created.
+          # Since open will raise OSError, hashed_name should return the original name unmodified.
+          returned = storage.hashed_name('foo.css', content=None, filename='some_dir')
+          self.assertEqual(returned, 'foo.css')
+
+      def test_stored_name_preserves_font_face_question_mark_fragment(self):
+          storage = TempManifestStorage(location=self.tmpdir, base_url=self.base_url, max_passes=0)
+          # save a font file and a css referencing it with the '?#' hack
+          self._save(storage, 'fonts/font.eot', b'FONTDATA')
+          self._save(storage, 'fonts_ref.css', b'@font-face { src: url("fonts/font.eot?#iefix"); }')
+          paths = {'fonts_ref.css': (storage, 'fonts_ref.css')}
+          list(storage.post_process(paths, dry_run=False))
+          # Querying stored_name with the special fragment should include the '?' as per the hack
+          stored = storage.stored_name('fonts_ref.css?#iefix')
+          self.assertIn('?', stored)
+
+      def test_manifest_strict_false_computes_hashed_name_when_missing(self):
+          storage = TempManifestStorage(location=self.tmpdir, base_url=self.base_url, max_passes=0, manifest_strict=False)
+          # Save a file that won't have a manifest entry initially
+          self._save(storage, 'missing.css', b'body {}')
+          # Ensure manifest is empty
+          storage.hashed_files.clear()
+          # With manifest_strict False, stored_name should compute instead of raising
+          result = storage.stored_name('missing.css')
+          self.assertIsInstance(result, str)
+          self.assertTrue(result.endswith('.css'))
+
+      def test_post_process_with_fragment_and_query_preserved(self):
+          storage = TempManifestStorage(location=self.tmpdir, base_url=self.base_url, max_passes=0)
+          # Save a font and a css referencing it and including both fragment and query
+          self._save(storage, 'font.woff', b'WOFF')
+          self._save(storage, 'frag.css', b'body { src: url("font.woff#webfont?query"); }')
+          paths = {'frag.css': (storage, 'frag.css')}
+          list(storage.post_process(paths, dry_run=False))
+          # stored_name should preserve fragments and queries when presented
+          out = storage.stored_name('frag.css#webfont?query')
+          self.assertIn('#', out) or self.assertIn('?', out)
+
+      def test_hasher_and_post_process_with_multiple_adjustable_files_zero_passes(self):
+          storage = TempManifestStorage(location=self.tmpdir, base_url=self.base_url, max_passes=0)
+          # Two adjustable css files referencing each other (simple references)
+          self._save(storage, 'one.css', b'url("two.css")')
+          self._save(storage, 'two.css', b'url("one.css")')
+          paths = {'one.css': (storage, 'one.css'), 'two.css': (storage, 'two.css')}
+          # Should not raise UnboundLocalError even though max_passes is 0
+          result = list(storage.post_process(paths, dry_run=False))
+          # Both should be present in the storage.hashed_files mapping
+          self.assertIn('one.css', storage.hashed_files)
+          self.assertIn('two.css', storage.hashed_files)
+
+      def test_hashedfiles_mixin_direct_use_zero_passes(self):
+          """
+          Test HashedFilesMixin when combined with FileSystem storage directly,
+          ensuring zero passes doesn't cause issues.
+          """
+          class DirectHashedStorage(HashedFilesMixin, StaticFilesStorage):
+              def __init__(self, location, base_url, max_passes=0):
+                  self.max_post_process_passes = max_passes
+                  super().__init__(location=location, base_url=base_url)
+
+          storage = DirectHashedStorage(location=self.tmpdir, base_url=self.base_url, max_passes=0)
+          self._save(storage, 'plain.css', b'body{}')
+          paths = {'plain.css': (storage, 'plain.css')}
+          # Should run without raising
+          result = list(storage.post_process(paths, dry_run=False))
+          self.assertIn('plain.css', storage.hashed_files)
+
+  if __name__ == "__main__":
+      unittest.main()
+new_imports_code: |
+  from django.core.files.base import ContentFile

@@ -1,0 +1,176 @@
+from django.apps import AppConfig, apps
+from django.apps.registry import Apps
+from django.test import SimpleTestCase, override_settings
+from django.test.utils import isolate_apps
+from types import SimpleNamespace
+
+
+class ClearCacheRegressionTests(SimpleTestCase):
+    def _make_dummy_model(self, registry, app_label="dummy", model_name="mymodel",
+                          expire_calls_swappable=False, swapped=None, swappable=None):
+        """
+        Create a dummy "model" class with a ._meta object providing the
+        attributes get_swappable_settings_name expects, plus an _expire_cache
+        that optionally calls back into registry.get_swappable_settings_name()
+        to simulate side-effects that might repopulate the cache during
+        clear_cache().
+        """
+        class DummyMeta:
+            def __init__(self):
+                self.model_name = model_name
+                self.app_label = app_label
+                self.swapped = swapped
+                self.swappable = swappable
+                # label_lower used by get_swappable_settings_name
+                self.label_lower = f"{app_label}.{model_name}".lower()
+
+            def _expire_cache(self):
+                # Simulate behavior where expiring a model touches the
+                # swappable lookup, potentially repopulating that cache.
+                if expire_calls_swappable:
+                    # This call would repopulate the swappable cache if it
+                    # is not cleared at the correct time.
+                    registry.get_swappable_settings_name("auth.user")
+
+        model = type(model_name, (), {"_meta": DummyMeta()})
+        return model
+
+    def test_clear_cache_clears_swappable_simple(self):
+        # Populate the swappable cache on the main registry and ensure clear_cache clears it.
+        # Use a likely-non-swappable string to populate a cache entry (None result still caches).
+        apps.get_swappable_settings_name("admin.LogEntry")
+        # Prime get_models cache too
+        try:
+            apps.get_models()
+        except Exception:
+            # If models_ready isn't set in some environments, ignore; caching still applies for swappable
+            pass
+        apps.clear_cache()
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(apps.get_models.cache_info().currsize, 0)
+
+    def test_clear_cache_with_expire_side_effect_does_not_leave_swappable_cached(self):
+        # Create a custom Apps registry so we can control app_configs and models.
+        registry = Apps(installed_apps=[])
+        # Ensure the registry is marked ready so clear_cache will run the "expire" loop.
+        registry.ready = True
+        # Create a dummy AppConfig-like object that returns our dummy model in get_models()
+        class DummyAppConfig:
+            def __init__(self, name, registry, model):
+                self.name = name
+                self.apps = registry
+                self._model = model
+            def get_models(self, include_auto_created=False, include_swapped=False):
+                return [self._model]
+
+        # Dummy model whose _expire_cache calls back into get_swappable_settings_name
+        model = self._make_dummy_model(registry, expire_calls_swappable=True, swapped="auth.User", swappable="AUTH_USER_MODEL")
+        config = DummyAppConfig("dummy", registry, model)
+        registry.app_configs["dummy"] = config
+
+        # Populate the swappable cache
+        registry.get_swappable_settings_name("auth.user")
+        # Sanity: cache should be populated now
+        self.assertGreaterEqual(registry.get_swappable_settings_name.cache_info().currsize, 1)
+        # Now clear cache; this should leave the swappable cache empty at the end.
+        registry.clear_cache()
+        self.assertEqual(registry.get_swappable_settings_name.cache_info().currsize, 0)
+
+    def test_clear_cache_is_idempotent(self):
+        registry = Apps(installed_apps=[])
+        # populate caches
+        registry.get_swappable_settings_name("admin.logentry")
+        try:
+            registry.get_models()
+        except Exception:
+            pass
+        registry.clear_cache()
+        registry.clear_cache()
+        self.assertEqual(registry.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(registry.get_models.cache_info().currsize, 0)
+
+    @override_settings(INSTALLED_APPS=["apps.apps.RelabeledAppsConfig"])
+    def test_set_available_apps_clears_swappable_cache(self):
+        # Use main apps registry populated via override_settings
+        apps.get_swappable_settings_name("admin.logentry")
+        # Now call set_available_apps which calls clear_cache internally
+        available = {apps.get_app_config("relabeled").name}
+        apps.set_available_apps(available)
+        try:
+            # After set_available_apps, swappable cache must be cleared.
+            self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        finally:
+            apps.unset_available_apps()
+
+    def test_unset_available_apps_restores_and_clears_cache(self):
+        # Operate on a temporary Apps instance
+        registry = Apps(installed_apps=["apps"])
+        registry.get_swappable_settings_name("admin.logentry")
+        initial_app_configs = registry.app_configs
+        registry.set_available_apps([ac.name for ac in initial_app_configs.values()])
+        registry.unset_available_apps()
+        # After unset, caches should be empty (clear_cache called by unset)
+        self.assertEqual(registry.get_swappable_settings_name.cache_info().currsize, 0)
+
+    def test_set_installed_apps_clears_swappable_cache_and_restores_on_unset(self):
+        # Work with the global apps registry; it must be ready to call set_installed_apps
+        self.assertTrue(apps.ready)
+        apps.get_swappable_settings_name("admin.logentry")
+        # Call set_installed_apps (it calls clear_cache internally)
+        installed = ["apps.apps.RelabeledAppsConfig"]
+        apps.set_installed_apps(installed)
+        try:
+            # After switching installed apps, swappable cache must have been cleared.
+            self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        finally:
+            apps.unset_installed_apps()
+
+    def test_clear_cache_after_register_model(self):
+        # Register a model into a custom registry and ensure clear_cache empties swappable cache.
+        registry = Apps(installed_apps=[])
+        # Create model with swappable information
+        model = self._make_dummy_model(registry, app_label="myapp", model_name="Thing",
+                                      swapped="auth.User", swappable="AUTH_USER_MODEL")
+        # Register model (this will call clear_cache internally from register_model)
+        registry.register_model("myapp", model)
+        # Populate swappable cache
+        registry.get_swappable_settings_name("auth.user")
+        self.assertGreaterEqual(registry.get_swappable_settings_name.cache_info().currsize, 1)
+        registry.clear_cache()
+        self.assertEqual(registry.get_swappable_settings_name.cache_info().currsize, 0)
+
+    def test_clear_cache_resets_get_models_cache(self):
+        registry = Apps(installed_apps=[])
+        # Populate caches
+        try:
+            registry.get_models()
+        except Exception:
+            # In minimal registries, get_models may raise AppRegistryNotReady; ignore
+            pass
+        # Ensure get_models cache clear happens
+        registry.clear_cache()
+        self.assertEqual(registry.get_models.cache_info().currsize, 0)
+
+    def test_clear_cache_with_swappable_model_entry(self):
+        # Create a registry and a model that will cause get_swappable_settings_name to return a non-None value.
+        registry = Apps(installed_apps=[])
+        model = self._make_dummy_model(registry, app_label="swapp", model_name="UserProxy",
+                                      swapped=None, swappable="AUTH_USER_MODEL")
+        # Add a dummy app_config so clear_cache will iterate and call _expire_cache
+        class DummyConfig:
+            def __init__(self, model, registry):
+                self._model = model
+                self.apps = registry
+                self.name = "swapp"
+            def get_models(self, include_auto_created=False, include_swapped=False):
+                return [self._model]
+        config = DummyConfig(model, registry)
+        registry.app_configs["swapp"] = config
+        registry.ready = True
+        # Populate swappable cache by querying the model label_lower
+        result = registry.get_swappable_settings_name(model._meta.label_lower)
+        # It should have cached an entry (possibly None or string)
+        self.assertGreaterEqual(registry.get_swappable_settings_name.cache_info().currsize, 1)
+        registry.clear_cache()
+        self.assertEqual(registry.get_swappable_settings_name.cache_info().currsize, 0)
+new_imports_code: ""

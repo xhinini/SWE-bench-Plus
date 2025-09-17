@@ -1,0 +1,235 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests validate that _log_reg_scoring_path computes scores consistent with the expected probability calculation for both multinomial (softmax) and OvR (binary logistic) modes, under various situations: with/without sample weights, with class_weight dict, with pos_class for OvR, using sparse input, using string scoring and callable scorers. They are aimed at catching issues where the temporary LogisticRegression used by _log_reg_scoring_path has an incorrect multi_class or intercept-related configuration that leads to wrong scoring.
+new_imports_code: |
+  from sklearn.utils.extmath import softmax
+test_code: |
+  import numpy as np
+  import scipy.sparse as sp
+  from sklearn.metrics import log_loss, accuracy_score
+  from sklearn.metrics.scorer import get_scorer
+  from sklearn.model_selection import StratifiedKFold
+  from sklearn.linear_model.logistic import _log_reg_scoring_path, logistic_regression_path
+  from sklearn.linear_model import LogisticRegression
+  from sklearn.utils.extmath import softmax
+
+  rng = np.random.RandomState(0)
+
+  def _manual_multinomial_score_from_coefs(X_test, y_test, w):
+      # w: shape (n_classes, n_features + intercept) if intercept present
+      if w.ndim == 1:
+          # Binary case where logistic_regression_path may return row vector
+          w = w.reshape(1, -1)
+      if w.shape[1] == X_test.shape[1] + 1:
+          intercept = w[:, -1]
+          coef = w[:, :-1]
+      else:
+          intercept = np.zeros(w.shape[0])
+          coef = w
+      # compute decision matrix and softmax probabilities
+      dec = X_test.dot(coef.T) + intercept
+      probs = softmax(dec, copy=False)
+      return -log_loss(y_test, probs)
+
+  def _manual_ovr_score_from_coefs(X_test, y_test, w, pos_class=None):
+      # w is for one-vs-rest: shape (n_classes, n_features + maybe intercept) or (n_features + 1,)
+      # If w is 1D, treat as single binary classifier (pos_class handling outside)
+      if w.ndim == 1:
+          # binary decision function
+          if w.size == X_test.shape[1] + 1:
+              coef = w[:-1]
+              intercept = w[-1]
+          else:
+              coef = w
+              intercept = 0.0
+          dec = X_test.dot(coef) + intercept
+          probs_pos = 1.0 / (1.0 + np.exp(-dec))
+          probs = np.vstack([1 - probs_pos, probs_pos]).T
+          return -log_loss(y_test, probs)
+      else:
+          # multi-class OvR: compute probability of each class as sigmoid(dec) and normalize
+          n_classes, n_feat_plus = w.shape
+          if n_feat_plus == X_test.shape[1] + 1:
+              intercept = w[:, -1]
+              coef = w[:, :-1]
+          else:
+              intercept = np.zeros(n_classes)
+              coef = w
+          dec = X_test.dot(coef.T) + intercept
+          sig = 1.0 / (1.0 + np.exp(-dec))
+          # normalize across classes to get a probability distribution
+          probs = sig / sig.sum(axis=1, keepdims=True)
+          return -log_loss(y_test, probs)
+
+  def test_multinomial_scoring_path_matches_manual_softmax():
+      # Multiclass dataset
+      X = rng.randn(80, 6)
+      y = rng.randint(0, 3, size=80)
+      train = np.arange(60)
+      test = np.arange(60, 80)
+
+      # Use _log_reg_scoring_path to compute scores
+      coefs, Cs, scores, n_iter = _log_reg_scoring_path(
+          X, y, train, test, Cs=[1.0], scoring='neg_log_loss',
+          fit_intercept=False, solver='lbfgs', multi_class='multinomial'
+      )
+
+      # coefs[0] holds multinomial coef matrix; compute manual score
+      w = coefs[0]
+      manual = _manual_multinomial_score_from_coefs(X[test], y[test], w)
+      # _log_reg_scoring_path returns score already as neg_log_loss
+      assert np.allclose(scores[0], manual, atol=1e-6)
+
+  def test_multinomial_with_sample_weight_scoring_path():
+      # Same as above but with sample weights
+      X = rng.randn(100, 4)
+      y = rng.randint(0, 3, size=100)
+      train = np.arange(70)
+      test = np.arange(70, 100)
+      sample_weight = np.ones(X.shape[0])
+      # make some variation in weights
+      sample_weight[test] = 2.0
+
+      coefs, Cs, scores, n_iter = _log_reg_scoring_path(
+          X, y, train, test, Cs=[1.0], scoring='neg_log_loss',
+          fit_intercept=True, solver='lbfgs', multi_class='multinomial',
+          sample_weight=sample_weight
+      )
+
+      w = coefs[0]
+      # The helper used in _log_reg_scoring_path applies class/sample weights
+      # Recompute weighted log loss manually to compare sign
+      if w.shape[1] == X.shape[1] + 1:
+          intercept = w[:, -1]
+          coef = w[:, :-1]
+      else:
+          intercept = np.zeros(w.shape[0])
+          coef = w
+      dec = X[test].dot(coef.T) + intercept
+      probs = softmax(dec, copy=False)
+      # sklearn's log_loss handles sample_weight but our _log_reg_scoring_path
+      # passed sample_weight restricted to train only; for scoring we expect the
+      # output to reflect the scorer(log_reg, X_test, y_test) without extra weights.
+      manual_score = -log_loss(y[test], probs)
+      assert np.allclose(scores[0], manual_score, atol=1e-6)
+
+  def test_ovr_scoring_path_matches_manual_sigmoid_normalized():
+      # OvR multi-class (computed as OvR probabilities normalized)
+      X = rng.randn(90, 5)
+      y = rng.randint(0, 4, size=90)
+      train = np.arange(60)
+      test = np.arange(60, 90)
+
+      coefs, Cs, scores, n_iter = _log_reg_scoring_path(
+          X, y, train, test, Cs=[1.0], scoring='neg_log_loss',
+          fit_intercept=True, solver='lbfgs', multi_class='ovr'
+      )
+
+      # For OvR, logistic_regression_path returns per-class binary coefs.
+      w = coefs[0]
+      manual = _manual_ovr_score_from_coefs(X[test], y[test], w)
+      assert np.allclose(scores[0], manual, atol=1e-6)
+
+  def test_scoring_path_with_pos_class_binary():
+      # Test specifying pos_class for binary decision (ovr)
+      X = rng.randn(50, 3)
+      y = rng.choice([0, 1], size=50)
+      # choose pos_class 1
+      train = np.arange(40)
+      test = np.arange(40, 50)
+
+      coefs, Cs, scores, n_iter = _log_reg_scoring_path(
+          X, y, train, test, pos_class=1, Cs=[1.0],
+          scoring='accuracy', fit_intercept=False, multi_class='ovr',
+          solver='lbfgs'
+      )
+
+      # Manual compute accuracy using decision function derived from coefs
+      w = coefs[0]
+      # coefs for ovr when binary may be 1D or 2 rows depending; handle both
+      if w.ndim == 1:
+          if w.size == X.shape[1] + 1:
+              coef = w[:-1]; intercept = w[-1]
+          else:
+              coef = w; intercept = 0.0
+          dec = X[test].dot(coef) + intercept
+          preds = (dec > 0).astype(int)
+      else:
+          # take class corresponding to pos_class as done in path (pos_class maps to label 1)
+          # Use first row as positive class
+          if w.shape[1] == X.shape[1] + 1:
+              coef = w[0, :-1]; intercept = w[0, -1]
+          else:
+              coef = w[0]; intercept = 0.0
+          dec = X[test].dot(coef) + intercept
+          preds = (dec > 0).astype(int)
+      manual_accuracy = (preds == y[test]).mean()
+      # _log_reg_scoring_path returns scores computed with estimator.score (accuracy)
+      assert np.allclose(scores[0], manual_accuracy, atol=1e-6)
+
+  def test_scoring_path_with_callable_scorer_equals_string_scorer():
+      # Ensure callable scorer and string scorer produce same value
+      X = rng.randn(60, 4)
+      y = rng.randint(0, 3, size=60)
+      train = np.arange(40)
+      test = np.arange(40, 60)
+
+      scorer_callable = get_scorer('accuracy')
+      coefs_a, Cs_a, scores_a, _ = _log_reg_scoring_path(
+          X, y, train, test, Cs=[1.0], scoring=scorer_callable,
+          fit_intercept=True, multi_class='multinomial', solver='lbfgs'
+      )
+      coefs_b, Cs_b, scores_b, _ = _log_reg_scoring_path(
+          X, y, train, test, Cs=[1.0], scoring='accuracy',
+          fit_intercept=True, multi_class='multinomial', solver='lbfgs'
+      )
+      assert np.allclose(scores_a, scores_b)
+
+  def test_scoring_path_with_sparse_input_matches_dense():
+      # Sparse and dense inputs should give similar scoring outputs
+      X = rng.randn(100, 6)
+      X[X < 0.5] = 0.0
+      X_sp = sp.csr_matrix(X)
+      y = rng.randint(0, 3, size=100)
+      train = np.arange(70)
+      test = np.arange(70, 100)
+
+      coefs_dense, Cs, scores_dense, _ = _log_reg_scoring_path(
+          X, y, train, test, Cs=[1.0], scoring='neg_log_loss',
+          fit_intercept=True, solver='lbfgs', multi_class='multinomial'
+      )
+      coefs_sparse, Cs, scores_sparse, _ = _log_reg_scoring_path(
+          X_sp, y, train, test, Cs=[1.0], scoring='neg_log_loss',
+          fit_intercept=True, solver='lbfgs', multi_class='multinomial'
+      )
+      assert np.allclose(scores_dense, scores_sparse, atol=1e-6)
+
+  def test_logreg_scoring_path_vs_direct_logistic_regression_prediction():
+      # Compare score from _log_reg_scoring_path to explicitly creating a
+      # LogisticRegression (with multi_class set) and using its predict_proba.
+      X = rng.randn(80, 5)
+      y = rng.randint(0, 3, size=80)
+      train = np.arange(60)
+      test = np.arange(60, 80)
+
+      # get coefs via logistic_regression_path (used by _log_reg_scoring_path)
+      coefs, Cs, n_iter = logistic_regression_path(
+          X[train], y[train], Cs=[1.0], fit_intercept=True,
+          solver='lbfgs', multi_class='multinomial'
+      )
+      w = coefs[0]  # shape: (n_classes, n_features + 1)
+      # build an estimator similar to what _log_reg_scoring_path does
+      log_reg = LogisticRegression(multi_class='multinomial')
+      # assign coef_ and intercept_ as done in function
+      log_reg.coef_ = w[:, :-1]
+      log_reg.intercept_ = w[:, -1]
+      # scorer
+      scorer = get_scorer('neg_log_loss')
+      expected = scorer(log_reg, X[test], y[test])
+
+      # Now compute via scoring_path
+      _, _, scores, _ = _log_reg_scoring_path(
+          X, y, train, test, Cs=[1.0], scoring='neg_log_loss',
+          fit_intercept=True, solver='lbfgs', multi_class='multinomial'
+      )
+      assert np.allclose(scores[0], expected, atol=1e-6)

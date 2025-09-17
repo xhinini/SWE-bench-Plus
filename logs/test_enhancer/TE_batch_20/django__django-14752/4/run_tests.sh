@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_views.test_autocomplete_view_llm.test_default_serialize_result_returns_id_and_text admin_views.test_autocomplete_view_llm.test_serialize_result_adds_extra_key admin_views.test_autocomplete_view_llm.test_serialize_result_applies_for_fk_pk_to_field admin_views.test_autocomplete_view_llm.test_serialize_result_applies_for_mti_to_field admin_views.test_autocomplete_view_llm.test_serialize_result_applies_on_paginated_second_page admin_views.test_autocomplete_view_llm.test_serialize_result_applies_with_search_use_distinct admin_views.test_autocomplete_view_llm.test_serialize_result_called_for_each_result admin_views.test_autocomplete_view_llm.test_serialize_result_exception_propagates admin_views.test_autocomplete_view_llm.test_serialize_result_prefixes_id_for_custom_to_field admin_views.test_autocomplete_view_llm.test_serialize_result_preserves_ordering_and_adds_posted
+coverage json -o coverage.json
+: '>>>>> End Test Output'

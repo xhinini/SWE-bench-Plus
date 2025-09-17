@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_autodetector_llm.OnlyRelationAgnosticFieldsTests.setUp migrations.test_autodetector_llm.OnlyRelationAgnosticFieldsTests.test_builtin_foreignkey_to_removed migrations.test_autodetector_llm.OnlyRelationAgnosticFieldsTests.test_many_fields_missing_to_keys_all_handled migrations.test_autodetector_llm.OnlyRelationAgnosticFieldsTests.test_many_to_many_field_to_removed migrations.test_autodetector_llm.OnlyRelationAgnosticFieldsTests.test_missing_to_key_does_not_raise migrations.test_autodetector_llm.OnlyRelationAgnosticFieldsTests.test_mix_of_fields_handles_missing_and_present_to migrations.test_autodetector_llm.OnlyRelationAgnosticFieldsTests.test_nested_deconstruction_and_regex_handling migrations.test_autodetector_llm.OnlyRelationAgnosticFieldsTests.test_present_to_key_is_removed migrations.test_autodetector_llm.OnlyRelationAgnosticFieldsTests.test_preserves_other_kwargs migrations.test_autodetector_llm.OnlyRelationAgnosticFieldsTests.test_remote_field_model_none_keeps_to migrations.test_autodetector_llm.OnlyRelationAgnosticFieldsTests.test_sorted_field_order_is_stable
+coverage json -o coverage.json
+: '>>>>> End Test Output'

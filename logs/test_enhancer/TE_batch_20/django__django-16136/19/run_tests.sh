@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 async.tests_llm.AsyncGetView.get async.tests_llm.AsyncPostOnlyView.post async.tests_llm.HttpMethodNotAllowedTests.setUp async.tests_llm.HttpMethodNotAllowedTests.test_awaited_http_method_not_allowed_has_allowed_methods_attribute async.tests_llm.HttpMethodNotAllowedTests.test_direct_call_async_post_only_view_http_method_not_allowed_is_coroutine async.tests_llm.HttpMethodNotAllowedTests.test_direct_call_async_view_http_method_not_allowed_is_coroutine async.tests_llm.HttpMethodNotAllowedTests.test_direct_call_sync_view_http_method_not_allowed_is_not_coroutine async.tests_llm.HttpMethodNotAllowedTests.test_dispatch_async_post_only_view_get_returns_coroutine async.tests_llm.HttpMethodNotAllowedTests.test_dispatch_async_view_custom_method_not_in_http_method_names_returns_coroutine async.tests_llm.HttpMethodNotAllowedTests.test_dispatch_async_view_post_not_allowed_returns_coroutine async.tests_llm.HttpMethodNotAllowedTests.test_dispatch_returns_coroutine_for_async_view_even_when_method_name_not_recognized async.tests_llm.HttpMethodNotAllowedTests.test_dispatch_sync_view_post_not_allowed_returns_response async.tests_llm.HttpMethodNotAllowedTests.test_multiple_consecutive_calls_to_http_method_not_allowed_do_not_consume_coroutine async.tests_llm.SyncOnlyView.get
+coverage json -o coverage.json
+: '>>>>> End Test Output'

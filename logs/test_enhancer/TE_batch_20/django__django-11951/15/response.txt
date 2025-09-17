@@ -1,0 +1,153 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests assert that bulk_create respects the database backend's maximum batch size (as returned by ops.bulk_batch_size) even when an explicit, larger batch_size is provided. They patch connection.ops.bulk_batch_size to simulate small max batch sizes and verify the number of SQL queries executed matches the expected number of batches. They also cover variants with all objects having PKs, mixed PK presence, zero returned max batch size (treated as 1), using None for batch_size, and the can_return_rows_from_bulk_insert code-path.
+test_code: |
+  from contextlib import contextmanager
+  from math import ceil
+  from unittest import skipUnless
+  
+  from django.db import connection
+  from django.test import TestCase, override_settings, skipUnlessDBFeature
+  
+  from .models import Country, TwoFields
+  
+  @contextmanager
+  def patched_bulk_batch_size(value):
+      """
+      Temporarily patch connection.ops.bulk_batch_size to return `value`.
+      The original method is restored after the context exits.
+      """
+      orig = connection.ops.bulk_batch_size
+      try:
+          # Assign a callable on the instance that matches the call signature
+          # used in the QuerySet implementation (fields, objs).
+          connection.ops.bulk_batch_size = lambda fields, objs: value
+          yield
+      finally:
+          connection.ops.bulk_batch_size = orig
+  
+  
+  class BulkCreateBatchingTests(TestCase):
+      # These tests rely on the database supporting the bulk insert path.
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batched_insert_caps_batch_size_all_without_pk(self):
+          objs = [Country() for i in range(25)]
+          with patched_bulk_batch_size(10):
+              # Provide a very large explicit batch_size; it should be capped to 10.
+              with override_settings(DEBUG=True):
+                  connection.queries_log.clear()
+                  with self.assertNumQueries(ceil(len(objs) / 10)):
+                      Country.objects.bulk_create(objs, batch_size=1000)
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batched_insert_caps_batch_size_all_with_pk(self):
+          # All objects have a primary key set; ensure the "objs_with_pk" path is capped.
+          objs = [TwoFields(id=i, f1=i, f2=i + 1) for i in range(25)]
+          with patched_bulk_batch_size(10):
+              with override_settings(DEBUG=True):
+                  connection.queries_log.clear()
+                  with self.assertNumQueries(ceil(len(objs) / 10)):
+                      TwoFields.objects.bulk_create(objs, batch_size=1000)
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batched_insert_caps_batch_size_mixed_pk(self):
+          # Mixed objects (half with PK, half without) exercise both batched insert paths.
+          total = 50
+          objs = [TwoFields(id=i if i % 2 == 0 else None, f1=i, f2=i + 1) for i in range(total)]
+          with patched_bulk_batch_size(7):
+              # Expect batches for objs_with_pk and objs_without_pk separately.
+              with override_settings(DEBUG=True):
+                  connection.queries_log.clear()
+                  half = total // 2
+                  expected = ceil(half / 7) + ceil(half / 7)
+                  with self.assertNumQueries(expected):
+                      TwoFields.objects.bulk_create(objs, batch_size=100)
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batched_insert_handles_zero_max_batch_size(self):
+          # If ops.bulk_batch_size returns 0, max(..., 1) makes it 1, so each object -> one batch.
+          objs = [Country() for i in range(5)]
+          with patched_bulk_batch_size(0):
+              with override_settings(DEBUG=True):
+                  connection.queries_log.clear()
+                  with self.assertNumQueries(len(objs)):
+                      Country.objects.bulk_create(objs, batch_size=100)
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batched_insert_respects_smaller_batch_size(self):
+          # When explicit batch_size is smaller than max_batch_size, the explicit size should be used.
+          objs = [Country() for i in range(30)]
+          with patched_bulk_batch_size(100):
+              with override_settings(DEBUG=True):
+                  connection.queries_log.clear()
+                  expected = ceil(len(objs) / 10)
+                  with self.assertNumQueries(expected):
+                      Country.objects.bulk_create(objs, batch_size=10)
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batched_insert_respects_equal_batch_size(self):
+          objs = [Country() for i in range(30)]
+          with patched_bulk_batch_size(10):
+              with override_settings(DEBUG=True):
+                  connection.queries_log.clear()
+                  expected = ceil(len(objs) / 10)
+                  with self.assertNumQueries(expected):
+                      Country.objects.bulk_create(objs, batch_size=10)
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batched_insert_none_batch_size_uses_max(self):
+          # batch_size=None should use the backend max batch size.
+          objs = [Country() for i in range(23)]
+          with patched_bulk_batch_size(6):
+              with override_settings(DEBUG=True):
+                  connection.queries_log.clear()
+                  expected = ceil(len(objs) / 6)
+                  with self.assertNumQueries(expected):
+                      Country.objects.bulk_create(objs, batch_size=None)
+  
+      @skipUnlessDBFeature('can_return_rows_from_bulk_insert')
+      def test_batched_insert_returning_rows_counts_batches(self):
+          # When the backend returns rows from bulk insert, batches are still applied.
+          objs = [Country(name=str(i), iso_two_letter=str(i)[:2]) for i in range(20)]
+          with patched_bulk_batch_size(3):
+              with override_settings(DEBUG=True):
+                  connection.queries_log.clear()
+                  expected = ceil(len(objs) / 3)
+                  with self.assertNumQueries(expected):
+                      Country.objects.bulk_create(objs, batch_size=100)
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batched_insert_mixed_small_and_large_batches(self):
+          # Mixed sizes: ensure capping applies correctly for various counts.
+          objs_small = [Country() for i in range(5)]
+          objs_large = [Country() for i in range(47)]
+          with patched_bulk_batch_size(10):
+              with override_settings(DEBUG=True):
+                  connection.queries_log.clear()
+                  expected_small = ceil(len(objs_small) / 10)
+                  expected_large = ceil(len(objs_large) / 10)
+                  with self.assertNumQueries(expected_small):
+                      Country.objects.bulk_create(objs_small, batch_size=1000)
+                  connection.queries_log.clear()
+                  with self.assertNumQueries(expected_large):
+                      Country.objects.bulk_create(objs_large, batch_size=1000)
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batched_insert_many_batches_with_mixed_pks_efficiency(self):
+          # Larger mixed set to exercise multiple iterations and ensure capping remains.
+          total = 200
+          objs = [TwoFields(id=i if i % 3 == 0 else None, f1=i, f2=i + 1) for i in range(total)]
+          # Count how many have pk and how many don't
+          with patched_bulk_batch_size(8):
+              with override_settings(DEBUG=True):
+                  connection.queries_log.clear()
+                  with_pk = sum(1 for o in objs if o.id is not None)
+                  without_pk = total - with_pk
+                  expected = ceil(with_pk / 8) + ceil(without_pk / 8) if with_pk and without_pk else ceil(total / 8)
+                  with self.assertNumQueries(expected):
+                      TwoFields.objects.bulk_create(objs, batch_size=1000)
+new_imports_code: |
+  from contextlib import contextmanager
+  from math import ceil
+  from django.db import connection
+  from django.test import override_settings, TestCase, skipUnlessDBFeature

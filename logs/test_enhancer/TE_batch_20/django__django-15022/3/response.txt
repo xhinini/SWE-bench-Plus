@@ -1,0 +1,130 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise ModelAdmin.get_search_results combinations of single/multi-term queries, quoted phrases, prefix/exact lookup markers, pk alias, relational lookups (which may spawn duplicates), and multiple search_fields. They assert that search behaves as an AND of terms (each term OR-ing across lookups), quoted phrases are treated as single terms, prefix/equals markers change the lookup, and that may_have_duplicates is set correctly for relational lookups. The tests are written as Django TestCase tests and assume the test models from tests/admin_changelist (Child, Parent, Band, Swallow, Event) exist as in the existing test suite. These tests are intended to fail for the candidate patch but pass with the gold patch.
+new_imports_code: |
+  from django.test import TestCase, RequestFactory
+  from django.contrib import admin
+  from django.contrib.admin.sites import AdminSite
+  from django.contrib.auth.models import AnonymousUser
+  from django.http import HttpRequest
+  from django.db import transaction
+test_code: |
+  from django.test import TestCase, RequestFactory
+  from django.contrib import admin
+  from django.contrib.admin.sites import AdminSite
+  from django.contrib.auth.models import AnonymousUser
+  from django.http import HttpRequest
+  from django.db import transaction
+  from .models import Child, Parent, Band, Swallow, Event
+
+  class GetSearchResultsTests(TestCase):
+      def setUp(self):
+          self.site = AdminSite()
+          self.factory = RequestFactory()
+          # Create some objects for use in tests
+          # Children/Parents for relational lookup tests
+          self.parent1 = Parent.objects.create(name="Parent One")
+          self.parent2 = Parent.objects.create(name="Parent Two")
+          self.child_a = Child.objects.create(name="foo bar", age=5, parent=self.parent1)
+          self.child_b = Child.objects.create(name="foo", age=7, parent=self.parent1)
+          self.child_c = Child.objects.create(name="bar", age=9, parent=self.parent2)
+          # Bands for multi-field searches
+          self.band1 = Band.objects.create(name="The Foo Band", nr_of_members=4)
+          self.band2 = Band.objects.create(name="Bar Ensemble", nr_of_members=6)
+          # Swallow simple objects
+          self.sw1 = Swallow.objects.create(origin="Africa", load=1, speed=10)
+          self.sw2 = Swallow.objects.create(origin="Europe", load=2, speed=20)
+          # Event for date prefix tests
+          self.ev = Event.objects.create(date="2020-01-01")
+
+      def _get_admin(self, model, search_fields):
+          ma = admin.ModelAdmin(model, self.site)
+          ma.search_fields = search_fields
+          # Use a simple request object
+          request = self.factory.get('/')
+          request.user = AnonymousUser()
+          return ma, request
+
+      def test_single_term_single_field(self):
+          ma, request = self._get_admin(Child, ['name'])
+          qs = ma.get_queryset(request)
+          res_qs, may_dup = ma.get_search_results(request, qs, "foo")
+          # Should find both 'foo' and 'foo bar'
+          self.assertEqual(set(res_qs.values_list('pk', flat=True)), {self.child_a.pk, self.child_b.pk})
+          self.assertFalse(may_dup)
+
+      def test_two_terms_and_logic_across_terms(self):
+          # Two terms should be ANDed: both terms must match (each term can match any lookup)
+          ma, request = self._get_admin(Child, ['name'])
+          qs = ma.get_queryset(request)
+          # Only child_a has both 'foo' and 'bar' in name ("foo bar")
+          res_qs, may_dup = ma.get_search_results(request, qs, "foo bar")
+          self.assertEqual(list(res_qs), [self.child_a])
+          self.assertFalse(may_dup)
+
+      def test_quoted_phrase_search_treated_as_single_term(self):
+          ma, request = self._get_admin(Child, ['name'])
+          qs = ma.get_queryset(request)
+          # Quoted phrase should be considered a single search term
+          res_qs, may_dup = ma.get_search_results(request, qs, '"foo bar"')
+          self.assertEqual(list(res_qs), [self.child_a])
+          self.assertFalse(may_dup)
+
+      def test_prefix_and_exact_lookups(self):
+          # ^ prefix -> istartswith, = prefix -> iexact
+          ma_caret, request = self._get_admin(Band, ['^name'])
+          qs_caret = ma_caret.get_queryset(request)
+          res_qs_caret, _ = ma_caret.get_search_results(request, qs_caret, "The")
+          self.assertIn(self.band1, res_qs_caret)
+          ma_equal, request = self._get_admin(Band, ['=name'])
+          qs_equal = ma_equal.get_queryset(request)
+          # Exact match should be case-insensitive exact
+          res_qs_equal, _ = ma_equal.get_search_results(request, qs_equal, "Bar Ensemble")
+          self.assertIn(self.band2, res_qs_equal)
+
+      def test_search_pk_alias(self):
+          ma, request = self._get_admin(Child, ['pk'])
+          qs = ma.get_queryset(request)
+          # Search by primary key should find the corresponding instance
+          res_qs, _ = ma.get_search_results(request, qs, str(self.child_b.pk))
+          self.assertEqual(list(res_qs), [self.child_b])
+
+      def test_relational_lookup_and_may_have_duplicates(self):
+          # Searching across related fields (parent__name) can spawn duplicates depending on joins.
+          ma, request = self._get_admin(Child, ['parent__name'])
+          qs = ma.get_queryset(request)
+          # parent1 has two children so searching for 'Parent' should return both children,
+          # and may_have_duplicates should reflect whether duplicates are possible.
+          res_qs, may_dup = ma.get_search_results(request, qs, "Parent")
+          self.assertIn(self.child_a, res_qs)
+          self.assertIn(self.child_b, res_qs)
+          # For relational lookups we expect may_have_duplicates to be a boolean (True/False).
+          self.assertIsInstance(may_dup, bool)
+
+      def test_multiple_search_fields_or_within_term(self):
+          # Multiple search_fields: a single search term should OR across the fields
+          ma, request = self._get_admin(Band, ['name', 'nr_of_members'])
+          qs = ma.get_queryset(request)
+          res_qs, _ = ma.get_search_results(request, qs, "Foo")
+          self.assertIn(self.band1, res_qs)
+          # Numeric field in search_fields should not error when term is non-numeric;
+          # results should simply not include the numeric-only match.
+          res_qs_num, _ = ma.get_search_results(request, qs, "6")
+          self.assertIn(self.band2, res_qs_num)
+
+      def test_multiple_terms_with_multiple_fields(self):
+          # Two terms across two fields: each term must be found in some search_field
+          ma, request = self._get_admin(Child, ['name', 'age'])
+          qs = ma.get_queryset(request)
+          # Search for 'foo 5' should match child_a (name 'foo bar', age 5)
+          res_qs, _ = ma.get_search_results(request, qs, "foo 5")
+          self.assertIn(self.child_a, res_qs)
+          # And should not match child_b (age 7)
+          self.assertNotIn(self.child_b, res_qs)
+
+      def test_search_with_mixed_term_types(self):
+          # Mixed quoted and unquoted terms: '"foo bar" 5' should find child_a
+          ma, request = self._get_admin(Child, ['name', 'age'])
+          qs = ma.get_queryset(request)
+          res_qs, _ = ma.get_search_results(request, qs, '"foo bar" 5')
+          self.assertEqual(list(res_qs), [self.child_a])

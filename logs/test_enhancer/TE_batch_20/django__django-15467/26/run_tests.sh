@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_widgets.tests_llm.RegressionFormfieldEmptyLabelTests.test_explicit_kwarg_empty_label_emptystring_horizontal admin_widgets.tests_llm.RegressionFormfieldEmptyLabelTests.test_explicit_kwarg_empty_label_emptystring_vertical admin_widgets.tests_llm.RegressionFormfieldEmptyLabelTests.test_explicit_kwarg_empty_label_false_vertical admin_widgets.tests_llm.RegressionFormfieldEmptyLabelTests.test_explicit_kwarg_empty_label_none_horizontal admin_widgets.tests_llm.RegressionFormfieldEmptyLabelTests.test_explicit_kwarg_empty_label_none_vertical admin_widgets.tests_llm.RegressionFormfieldEmptyLabelTests.test_formfield_overrides_empty_label_emptystring_horizontal admin_widgets.tests_llm.RegressionFormfieldEmptyLabelTests.test_formfield_overrides_empty_label_emptystring_vertical admin_widgets.tests_llm.RegressionFormfieldEmptyLabelTests.test_formfield_overrides_empty_label_false_vertical admin_widgets.tests_llm.RegressionFormfieldEmptyLabelTests.test_formfield_overrides_empty_label_none_horizontal admin_widgets.tests_llm.RegressionFormfieldEmptyLabelTests.test_formfield_overrides_empty_label_none_vertical
+coverage json -o coverage.json
+: '>>>>> End Test Output'

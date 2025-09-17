@@ -1,0 +1,1084 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `django/db/models/query_utils.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 """
+2 Various data structures used in query construction.
+3 
+4 Factored out from django.db.models.query to avoid making the main module very
+5 large and/or so that they can be used by other modules without getting into
+6 circular import difficulties.
+7 """
+8 import copy
+9 import functools
+10 import inspect
+11 from collections import namedtuple
+12 
+13 from django.core.exceptions import FieldError
+14 from django.db.models.constants import LOOKUP_SEP
+15 from django.utils import tree
+16 
+17 # PathInfo is used when converting lookups (fk__somecol). The contents
+18 # describe the relation in Model terms (model Options and Fields for both
+19 # sides of the relation. The join_field is the field backing the relation.
+20 PathInfo = namedtuple(
+21     "PathInfo",
+22     "from_opts to_opts target_fields join_field m2m direct filtered_relation",
+23 )
+24 
+25 
+26 def subclasses(cls):
+27     yield cls
+28     for subclass in cls.__subclasses__():
+29         yield from subclasses(subclass)
+30 
+31 
+32 class Q(tree.Node):
+33     """
+34     Encapsulate filters as objects that can then be combined logically (using
+35     `&` and `|`).
+36     """
+37 
+38     # Connection types
+39     AND = "AND"
+40     OR = "OR"
+41     XOR = "XOR"
+42     default = AND
+43     conditional = True
+44 
+45     def __init__(self, *args, _connector=None, _negated=False, **kwargs):
+46         super().__init__(
+47             children=[*args, *sorted(kwargs.items())],
+48             connector=_connector,
+49             negated=_negated,
+50         )
+51 
+52     def _combine(self, other, conn):
+53         if not (isinstance(other, Q) or getattr(other, "conditional", False) is True):
+54             raise TypeError(other)
+55 
+56         if not self:
+57             return other.copy() if hasattr(other, "copy") else copy.copy(other)
+58         elif isinstance(other, Q) and not other:
+59             _, args, kwargs = self.deconstruct()
+60             return type(self)(*args, **kwargs)
+61 
+62         obj = type(self)()
+63         obj.connector = conn
+64         obj.add(self, conn)
+65         obj.add(other, conn)
+66         return obj
+67 
+68     def __or__(self, other):
+69         return self._combine(other, self.OR)
+70 
+71     def __and__(self, other):
+72         return self._combine(other, self.AND)
+73 
+74     def __xor__(self, other):
+75         return self._combine(other, self.XOR)
+76 
+77     def __invert__(self):
+78         obj = type(self)()
+79         obj.add(self, self.AND)
+80         obj.negate()
+81         return obj
+82 
+83     def resolve_expression(
+84         self, query=None, allow_joins=True, reuse=None, summarize=False, for_save=False
+85     ):
+86         # We must promote any new joins to left outer joins so that when Q is
+87         # used as an expression, rows aren't filtered due to joins.
+88         clause, joins = query._add_q(
+89             self,
+90             reuse,
+91             allow_joins=allow_joins,
+92             split_subq=False,
+93             check_filterable=False,
+94         )
+95         query.promote_joins(joins)
+96         return clause
+97 
+98     def deconstruct(self):
+99         path = "%s.%s" % (self.__class__.__module__, self.__class__.__name__)
+100         if path.startswith("django.db.models.query_utils"):
+101             path = path.replace("django.db.models.query_utils", "django.db.models")
+102         args = tuple(self.children)
+103         kwargs = {}
+104         if self.connector != self.default:
+105             kwargs["_connector"] = self.connector
+106         if self.negated:
+107             kwargs["_negated"] = True
+108         return path, args, kwargs
+109 
+110 
+111 class DeferredAttribute:
+112     """
+113     A wrapper for a deferred-loading field. When the value is read from this
+114     object the first time, the query is executed.
+115     """
+116 
+117     def __init__(self, field):
+118         self.field = field
+119 
+120     def __get__(self, instance, cls=None):
+121         """
+122         Retrieve and caches the value from the datastore on the first lookup.
+123         Return the cached value.
+124         """
+125         if instance is None:
+126             return self
+127         data = instance.__dict__
+128         field_name = self.field.attname
+129         if field_name not in data:
+130             # Let's see if the field is part of the parent chain. If so we
+131             # might be able to reuse the already loaded value. Refs #18343.
+132             val = self._check_parent_chain(instance)
+133             if val is None:
+134                 instance.refresh_from_db(fields=[field_name])
+135             else:
+136                 data[field_name] = val
+137         return data[field_name]
+138 
+139     def _check_parent_chain(self, instance):
+140         """
+141         Check if the field value can be fetched from a parent field already
+142         loaded in the instance. This can be done if the to-be fetched
+143         field is a primary key field.
+144         """
+145         opts = instance._meta
+146         link_field = opts.get_ancestor_link(self.field.model)
+147         if self.field.primary_key and self.field != link_field:
+148             return getattr(instance, link_field.attname)
+149         return None
+150 
+151 
+152 class RegisterLookupMixin:
+153     @classmethod
+154     def _get_lookup(cls, lookup_name):
+155         return cls.get_lookups().get(lookup_name, None)
+156 
+157     @classmethod
+158     @functools.lru_cache(maxsize=None)
+159     def get_lookups(cls):
+160         class_lookups = [
+161             parent.__dict__.get("class_lookups", {}) for parent in inspect.getmro(cls)
+162         ]
+163         return cls.merge_dicts(class_lookups)
+164 
+165     def get_lookup(self, lookup_name):
+166         from django.db.models.lookups import Lookup
+167 
+168         found = self._get_lookup(lookup_name)
+169         if found is None and hasattr(self, "output_field"):
+170             return self.output_field.get_lookup(lookup_name)
+171         if found is not None and not issubclass(found, Lookup):
+172             return None
+173         return found
+174 
+175     def get_transform(self, lookup_name):
+176         from django.db.models.lookups import Transform
+177 
+178         found = self._get_lookup(lookup_name)
+179         if found is None and hasattr(self, "output_field"):
+180             return self.output_field.get_transform(lookup_name)
+181         if found is not None and not issubclass(found, Transform):
+182             return None
+183         return found
+184 
+185     @staticmethod
+186     def merge_dicts(dicts):
+187         """
+188         Merge dicts in reverse to preference the order of the original list. e.g.,
+189         merge_dicts([a, b]) will preference the keys in 'a' over those in 'b'.
+190         """
+191         merged = {}
+192         for d in reversed(dicts):
+193             merged.update(d)
+194         return merged
+195 
+196     @classmethod
+197     def _clear_cached_lookups(cls):
+198         for subclass in subclasses(cls):
+199             subclass.get_lookups.cache_clear()
+200 
+201     @classmethod
+202     def register_lookup(cls, lookup, lookup_name=None):
+203         if lookup_name is None:
+204             lookup_name = lookup.lookup_name
+205         if "class_lookups" not in cls.__dict__:
+206             cls.class_lookups = {}
+207         cls.class_lookups[lookup_name] = lookup
+208         cls._clear_cached_lookups()
+209         return lookup
+210 
+211     @classmethod
+212     def _unregister_lookup(cls, lookup, lookup_name=None):
+213         """
+214         Remove given lookup from cls lookups. For use in tests only as it's
+215         not thread-safe.
+216         """
+217         if lookup_name is None:
+218             lookup_name = lookup.lookup_name
+219         del cls.class_lookups[lookup_name]
+220         cls._clear_cached_lookups()
+221 
+222 
+223 def select_related_descend(field, restricted, requested, load_fields, reverse=False):
+224     """
+225     Return True if this field should be used to descend deeper for
+226     select_related() purposes. Used by both the query construction code
+227     (compiler.get_related_selections()) and the model instance creation code
+228     (compiler.klass_info).
+229 
+230     Arguments:
+231      * field - the field to be checked
+232      * restricted - a boolean field, indicating if the field list has been
+233        manually restricted using a requested clause)
+234      * requested - The select_related() dictionary.
+235      * load_fields - the set of fields to be loaded on this model
+236      * reverse - boolean, True if we are checking a reverse select related
+237     """
+238     if not field.remote_field:
+239         return False
+240     if field.remote_field.parent_link and not reverse:
+241         return False
+242     if restricted:
+243         if reverse and field.related_query_name() not in requested:
+244             return False
+245         if not reverse and field.name not in requested:
+246             return False
+247     if not restricted and field.null:
+248         return False
+249     if load_fields:
+250         if field.attname not in load_fields:
+251             if restricted and field.name in requested:
+252                 msg = (
+253                     "Field %s.%s cannot be both deferred and traversed using "
+254                     "select_related at the same time."
+255                 ) % (field.model._meta.object_name, field.name)
+256                 raise FieldError(msg)
+257     return True
+258 
+259 
+260 def refs_expression(lookup_parts, annotations):
+261     """
+262     Check if the lookup_parts contains references to the given annotations set.
+263     Because the LOOKUP_SEP is contained in the default annotation names, check
+264     each prefix of the lookup_parts for a match.
+265     """
+266     for n in range(1, len(lookup_parts) + 1):
+267         level_n_lookup = LOOKUP_SEP.join(lookup_parts[0:n])
+268         if level_n_lookup in annotations and annotations[level_n_lookup]:
+269             return annotations[level_n_lookup], lookup_parts[n:]
+270     return False, ()
+271 
+272 
+273 def check_rel_lookup_compatibility(model, target_opts, field):
+274     """
+275     Check that self.model is compatible with target_opts. Compatibility
+276     is OK if:
+277       1) model and opts match (where proxy inheritance is removed)
+278       2) model is parent of opts' model or the other way around
+279     """
+280 
+281     def check(opts):
+282         return (
+283             model._meta.concrete_model == opts.concrete_model
+284             or opts.concrete_model in model._meta.get_parent_list()
+285             or model in opts.get_parent_list()
+286         )
+287 
+288     # If the field is a primary key, then doing a query against the field's
+289     # model is ok, too. Consider the case:
+290     # class Restaurant(models.Model):
+291     #     place = OneToOneField(Place, primary_key=True):
+292     # Restaurant.objects.filter(pk__in=Restaurant.objects.all()).
+293     # If we didn't have the primary key check, then pk__in (== place__in) would
+294     # give Place's opts as the target opts, but Restaurant isn't compatible
+295     # with that. This logic applies only to primary keys, as when doing __in=qs,
+296     # we are going to turn this into __in=qs.values('pk') later on.
+297     return check(target_opts) or (
+298         getattr(field, "primary_key", False) and check(field.model._meta)
+299     )
+300 
+301 
+302 class FilteredRelation:
+303     """Specify custom filtering in the ON clause of SQL joins."""
+304 
+305     def __init__(self, relation_name, *, condition=Q()):
+306         if not relation_name:
+307             raise ValueError("relation_name cannot be empty.")
+308         self.relation_name = relation_name
+309         self.alias = None
+310         if not isinstance(condition, Q):
+311             raise ValueError("condition argument must be a Q() instance.")
+312         self.condition = condition
+313         self.path = []
+314 
+315     def __eq__(self, other):
+316         if not isinstance(other, self.__class__):
+317             return NotImplemented
+318         return (
+319             self.relation_name == other.relation_name
+320             and self.alias == other.alias
+321             and self.condition == other.condition
+322         )
+323 
+324     def clone(self):
+325         clone = FilteredRelation(self.relation_name, condition=self.condition)
+326         clone.alias = self.alias
+327         clone.path = self.path[:]
+328         return clone
+329 
+330     def resolve_expression(self, *args, **kwargs):
+331         """
+332         QuerySet.annotate() only accepts expression-like arguments
+333         (with a resolve_expression() method).
+334         """
+335         raise NotImplementedError("FilteredRelation.resolve_expression() is unused.")
+336 
+337     def as_sql(self, compiler, connection):
+338         # Resolve the condition in Join.filtered_relation.
+339         query = compiler.query
+340         where = query.build_filtered_relation_q(self.condition, reuse=set(self.path))
+341         return compiler.compile(where)
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `django/db/models/query_utils.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/django/db/models/query_utils.py b/django/db/models/query_utils.py
+--- a/django/db/models/query_utils.py
++++ b/django/db/models/query_utils.py
+@@ -217,6 +217,7 @@ def _unregister_lookup(cls, lookup, lookup_name=None):
+         if lookup_name is None:
+             lookup_name = lookup.lookup_name
+         del cls.class_lookups[lookup_name]
++        cls._clear_cached_lookups()
+ 
+ 
+ def select_related_descend(field, restricted, requested, load_fields, reverse=False):
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/django/db/models/query_utils.py b/django/db/models/query_utils.py
+index 0caa165e15..6917820604 100644
+--- a/django/db/models/query_utils.py
++++ b/django/db/models/query_utils.py
+@@ -217,6 +217,7 @@ class RegisterLookupMixin:
+         if lookup_name is None:
+             lookup_name = lookup.lookup_name
+         del cls.class_lookups[lookup_name]
++        cls._clear_cached_lookups()
+ 
+ 
+ def select_related_descend(field, restricted, requested, load_fields, reverse=False):
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `tests/custom_lookups/tests.py` that contains the existing tests.
+-----------------------------------------------------------
+import time
+import unittest
+from datetime import date, datetime
+
+from django.core.exceptions import FieldError
+from django.db import connection, models
+from django.test import SimpleTestCase, TestCase, override_settings
+from django.test.utils import register_lookup
+from django.utils import timezone
+
+from .models import Article, Author, MySQLUnixTimestamp
+
+
+class Div3Lookup(models.Lookup):
+    lookup_name = "div3"
+
+    def as_sql(self, compiler, connection):
+        lhs, params = self.process_lhs(compiler, connection)
+        rhs, rhs_params = self.process_rhs(compiler, connection)
+        params.extend(rhs_params)
+        return "(%s) %%%% 3 = %s" % (lhs, rhs), params
+
+    def as_oracle(self, compiler, connection):
+        lhs, params = self.process_lhs(compiler, connection)
+        rhs, rhs_params = self.process_rhs(compiler, connection)
+        params.extend(rhs_params)
+        return "mod(%s, 3) = %s" % (lhs, rhs), params
+
+
+class Div3Transform(models.Transform):
+    lookup_name = "div3"
+
+    def as_sql(self, compiler, connection):
+        lhs, lhs_params = compiler.compile(self.lhs)
+        return "(%s) %%%% 3" % lhs, lhs_params
+
+    def as_oracle(self, compiler, connection, **extra_context):
+        lhs, lhs_params = compiler.compile(self.lhs)
+        return "mod(%s, 3)" % lhs, lhs_params
+
+
+class Div3BilateralTransform(Div3Transform):
+    bilateral = True
+
+
+class Mult3BilateralTransform(models.Transform):
+    bilateral = True
+    lookup_name = "mult3"
+
+    def as_sql(self, compiler, connection):
+        lhs, lhs_params = compiler.compile(self.lhs)
+        return "3 * (%s)" % lhs, lhs_params
+
+
+class LastDigitTransform(models.Transform):
+    lookup_name = "lastdigit"
+
+    def as_sql(self, compiler, connection):
+        lhs, lhs_params = compiler.compile(self.lhs)
+        return "SUBSTR(CAST(%s AS CHAR(2)), 2, 1)" % lhs, lhs_params
+
+
+class UpperBilateralTransform(models.Transform):
+    bilateral = True
+    lookup_name = "upper"
+
+    def as_sql(self, compiler, connection):
+        lhs, lhs_params = compiler.compile(self.lhs)
+        return "UPPER(%s)" % lhs, lhs_params
+
+
+class YearTransform(models.Transform):
+    # Use a name that avoids collision with the built-in year lookup.
+    lookup_name = "testyear"
+
+    def as_sql(self, compiler, connection):
+        lhs_sql, params = compiler.compile(self.lhs)
+        return connection.ops.date_extract_sql("year", lhs_sql), params
+
+    @property
+    def output_field(self):
+        return models.IntegerField()
+
+
+@YearTransform.register_lookup
+class YearExact(models.lookups.Lookup):
+    lookup_name = "exact"
+
+    def as_sql(self, compiler, connection):
+        # We will need to skip the extract part, and instead go
+        # directly with the originating field, that is self.lhs.lhs
+        lhs_sql, lhs_params = self.process_lhs(compiler, connection, self.lhs.lhs)
+        rhs_sql, rhs_params = self.process_rhs(compiler, connection)
+        # Note that we must be careful so that we have params in the
+        # same order as we have the parts in the SQL.
+        params = lhs_params + rhs_params + lhs_params + rhs_params
+        # We use PostgreSQL specific SQL here. Note that we must do the
+        # conversions in SQL instead of in Python to support F() references.
+        return (
+            "%(lhs)s >= (%(rhs)s || '-01-01')::date "
+            "AND %(lhs)s <= (%(rhs)s || '-12-31')::date"
+            % {"lhs": lhs_sql, "rhs": rhs_sql},
+            params,
+        )
+
+
+@YearTransform.register_lookup
+class YearLte(models.lookups.LessThanOrEqual):
+    """
+    The purpose of this lookup is to efficiently compare the year of the field.
+    """
+
+    def as_sql(self, compiler, connection):
+        # Skip the YearTransform above us (no possibility for efficient
+        # lookup otherwise).
+        real_lhs = self.lhs.lhs
+        lhs_sql, params = self.process_lhs(compiler, connection, real_lhs)
+        rhs_sql, rhs_params = self.process_rhs(compiler, connection)
+        params.extend(rhs_params)
+        # Build SQL where the integer year is concatenated with last month
+        # and day, then convert that to date. (We try to have SQL like:
+        #     WHERE somecol <= '2013-12-31')
+        # but also make it work if the rhs_sql is field reference.
+        return "%s <= (%s || '-12-31')::date" % (lhs_sql, rhs_sql), params
+
+
+class Exactly(models.lookups.Exact):
+    """
+    This lookup is used to test lookup registration.
+    """
+
+    lookup_name = "exactly"
+
+    def get_rhs_op(self, connection, rhs):
+        return connection.operators["exact"] % rhs
+
+
+class SQLFuncMixin:
+    def as_sql(self, compiler, connection):
+        return "%s()" % self.name, []
+
+    @property
+    def output_field(self):
+        return CustomField()
+
+
+class SQLFuncLookup(SQLFuncMixin, models.Lookup):
+    def __init__(self, name, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.name = name
+
+
+class SQLFuncTransform(SQLFuncMixin, models.Transform):
+    def __init__(self, name, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.name = name
+
+
+class SQLFuncFactory:
+    def __init__(self, key, name):
+        self.key = key
+        self.name = name
+
+    def __call__(self, *args, **kwargs):
+        if self.key == "lookupfunc":
+            return SQLFuncLookup(self.name, *args, **kwargs)
+        return SQLFuncTransform(self.name, *args, **kwargs)
+
+
+class CustomField(models.TextField):
+    def get_lookup(self, lookup_name):
+        if lookup_name.startswith("lookupfunc_"):
+            key, name = lookup_name.split("_", 1)
+            return SQLFuncFactory(key, name)
+        return super().get_lookup(lookup_name)
+
+    def get_transform(self, lookup_name):
+        if lookup_name.startswith("transformfunc_"):
+            key, name = lookup_name.split("_", 1)
+            return SQLFuncFactory(key, name)
+        return super().get_transform(lookup_name)
+
+
+class CustomModel(models.Model):
+    field = CustomField()
+
+
+# We will register this class temporarily in the test method.
+
+
+class InMonth(models.lookups.Lookup):
+    """
+    InMonth matches if the column's month is the same as value's month.
+    """
+
+    lookup_name = "inmonth"
+
+    def as_sql(self, compiler, connection):
+        lhs, lhs_params = self.process_lhs(compiler, connection)
+        rhs, rhs_params = self.process_rhs(compiler, connection)
+        # We need to be careful so that we get the params in right
+        # places.
+        params = lhs_params + rhs_params + lhs_params + rhs_params
+        return (
+            "%s >= date_trunc('month', %s) and "
+            "%s < date_trunc('month', %s) + interval '1 months'" % (lhs, rhs, lhs, rhs),
+            params,
+        )
+
+
+class DateTimeTransform(models.Transform):
+    lookup_name = "as_datetime"
+
+    @property
+    def output_field(self):
+        return models.DateTimeField()
+
+    def as_sql(self, compiler, connection):
+        lhs, params = compiler.compile(self.lhs)
+        return "from_unixtime({})".format(lhs), params
+
+
+class LookupTests(TestCase):
+    def test_custom_name_lookup(self):
+        a1 = Author.objects.create(name="a1", birthdate=date(1981, 2, 16))
+        Author.objects.create(name="a2", birthdate=date(2012, 2, 29))
+        with register_lookup(models.DateField, YearTransform), register_lookup(
+            models.DateField, YearTransform, lookup_name="justtheyear"
+        ), register_lookup(YearTransform, Exactly), register_lookup(
+            YearTransform, Exactly, lookup_name="isactually"
+        ):
+            qs1 = Author.objects.filter(birthdate__testyear__exactly=1981)
+            qs2 = Author.objects.filter(birthdate__justtheyear__isactually=1981)
+            self.assertSequenceEqual(qs1, [a1])
+            self.assertSequenceEqual(qs2, [a1])
+
+    def test_custom_exact_lookup_none_rhs(self):
+        """
+        __exact=None is transformed to __isnull=True if a custom lookup class
+        with lookup_name != 'exact' is registered as the `exact` lookup.
+        """
+        field = Author._meta.get_field("birthdate")
+        OldExactLookup = field.get_lookup("exact")
+        author = Author.objects.create(name="author", birthdate=None)
+        try:
+            field.register_lookup(Exactly, "exact")
+            self.assertEqual(Author.objects.get(birthdate__exact=None), author)
+        finally:
+            field.register_lookup(OldExactLookup, "exact")
+
+    def test_basic_lookup(self):
+        a1 = Author.objects.create(name="a1", age=1)
+        a2 = Author.objects.create(name="a2", age=2)
+        a3 = Author.objects.create(name="a3", age=3)
+        a4 = Author.objects.create(name="a4", age=4)
+        with register_lookup(models.IntegerField, Div3Lookup):
+            self.assertSequenceEqual(Author.objects.filter(age__div3=0), [a3])
+            self.assertSequenceEqual(
+                Author.objects.filter(age__div3=1).order_by("age"), [a1, a4]
+            )
+            self.assertSequenceEqual(Author.objects.filter(age__div3=2), [a2])
+            self.assertSequenceEqual(Author.objects.filter(age__div3=3), [])
+
+    @unittest.skipUnless(
+        connection.vendor == "postgresql", "PostgreSQL specific SQL used"
+    )
+    def test_birthdate_month(self):
+        a1 = Author.objects.create(name="a1", birthdate=date(1981, 2, 16))
+        a2 = Author.objects.create(name="a2", birthdate=date(2012, 2, 29))
+        a3 = Author.objects.create(name="a3", birthdate=date(2012, 1, 31))
+        a4 = Author.objects.create(name="a4", birthdate=date(2012, 3, 1))
+        with register_lookup(models.DateField, InMonth):
+            self.assertSequenceEqual(
+                Author.objects.filter(birthdate__inmonth=date(2012, 1, 15)), [a3]
+            )
+            self.assertSequenceEqual(
+                Author.objects.filter(birthdate__inmonth=date(2012, 2, 1)), [a2]
+            )
+            self.assertSequenceEqual(
+                Author.objects.filter(birthdate__inmonth=date(1981, 2, 28)), [a1]
+            )
+            self.assertSequenceEqual(
+                Author.objects.filter(birthdate__inmonth=date(2012, 3, 12)), [a4]
+            )
+            self.assertSequenceEqual(
+                Author.objects.filter(birthdate__inmonth=date(2012, 4, 1)), []
+            )
+
+    def test_div3_extract(self):
+        with register_lookup(models.IntegerField, Div3Transform):
+            a1 = Author.objects.create(name="a1", age=1)
+            a2 = Author.objects.create(name="a2", age=2)
+            a3 = Author.objects.create(name="a3", age=3)
+            a4 = Author.objects.create(name="a4", age=4)
+            baseqs = Author.objects.order_by("name")
+            self.assertSequenceEqual(baseqs.filter(age__div3=2), [a2])
+            self.assertSequenceEqual(baseqs.filter(age__div3__lte=3), [a1, a2, a3, a4])
+            self.assertSequenceEqual(baseqs.filter(age__div3__in=[0, 2]), [a2, a3])
+            self.assertSequenceEqual(baseqs.filter(age__div3__in=[2, 4]), [a2])
+            self.assertSequenceEqual(baseqs.filter(age__div3__gte=3), [])
+            self.assertSequenceEqual(
+                baseqs.filter(age__div3__range=(1, 2)), [a1, a2, a4]
+            )
+
+    def test_foreignobject_lookup_registration(self):
+        field = Article._meta.get_field("author")
+
+        with register_lookup(models.ForeignObject, Exactly):
+            self.assertIs(field.get_lookup("exactly"), Exactly)
+
+        # ForeignObject should ignore regular Field lookups
+        with register_lookup(models.Field, Exactly):
+            self.assertIsNone(field.get_lookup("exactly"))
+
+    def test_lookups_caching(self):
+        field = Article._meta.get_field("author")
+
+        # clear and re-cache
+        field.get_lookups.cache_clear()
+        self.assertNotIn("exactly", field.get_lookups())
+
+        # registration should bust the cache
+        with register_lookup(models.ForeignObject, Exactly):
+            # getting the lookups again should re-cache
+            self.assertIn("exactly", field.get_lookups())
+        # Unregistration should bust the cache.
+        self.assertNotIn("exactly", field.get_lookups())
+
+
+class BilateralTransformTests(TestCase):
+    def test_bilateral_upper(self):
+        with register_lookup(models.CharField, UpperBilateralTransform):
+            author1 = Author.objects.create(name="Doe")
+            author2 = Author.objects.create(name="doe")
+            author3 = Author.objects.create(name="Foo")
+            self.assertCountEqual(
+                Author.objects.filter(name__upper="doe"),
+                [author1, author2],
+            )
+            self.assertSequenceEqual(
+                Author.objects.filter(name__upper__contains="f"),
+                [author3],
+            )
+
+    def test_bilateral_inner_qs(self):
+        with register_lookup(models.CharField, UpperBilateralTransform):
+            msg = "Bilateral transformations on nested querysets are not implemented."
+            with self.assertRaisesMessage(NotImplementedError, msg):
+                Author.objects.filter(
+                    name__upper__in=Author.objects.values_list("name")
+                )
+
+    def test_bilateral_multi_value(self):
+        with register_lookup(models.CharField, UpperBilateralTransform):
+            Author.objects.bulk_create(
+                [
+                    Author(name="Foo"),
+                    Author(name="Bar"),
+                    Author(name="Ray"),
+                ]
+            )
+            self.assertQuerysetEqual(
+                Author.objects.filter(name__upper__in=["foo", "bar", "doe"]).order_by(
+                    "name"
+                ),
+                ["Bar", "Foo"],
+                lambda a: a.name,
+            )
+
+    def test_div3_bilateral_extract(self):
+        with register_lookup(models.IntegerField, Div3BilateralTransform):
+            a1 = Author.objects.create(name="a1", age=1)
+            a2 = Author.objects.create(name="a2", age=2)
+            a3 = Author.objects.create(name="a3", age=3)
+            a4 = Author.objects.create(name="a4", age=4)
+            baseqs = Author.objects.order_by("name")
+            self.assertSequenceEqual(baseqs.filter(age__div3=2), [a2])
+            self.assertSequenceEqual(baseqs.filter(age__div3__lte=3), [a3])
+            self.assertSequenceEqual(baseqs.filter(age__div3__in=[0, 2]), [a2, a3])
+            self.assertSequenceEqual(baseqs.filter(age__div3__in=[2, 4]), [a1, a2, a4])
+            self.assertSequenceEqual(baseqs.filter(age__div3__gte=3), [a1, a2, a3, a4])
+            self.assertSequenceEqual(
+                baseqs.filter(age__div3__range=(1, 2)), [a1, a2, a4]
+            )
+
+    def test_bilateral_order(self):
+        with register_lookup(
+            models.IntegerField, Mult3BilateralTransform, Div3BilateralTransform
+        ):
+            a1 = Author.objects.create(name="a1", age=1)
+            a2 = Author.objects.create(name="a2", age=2)
+            a3 = Author.objects.create(name="a3", age=3)
+            a4 = Author.objects.create(name="a4", age=4)
+            baseqs = Author.objects.order_by("name")
+
+            # mult3__div3 always leads to 0
+            self.assertSequenceEqual(
+                baseqs.filter(age__mult3__div3=42), [a1, a2, a3, a4]
+            )
+            self.assertSequenceEqual(baseqs.filter(age__div3__mult3=42), [a3])
+
+    def test_transform_order_by(self):
+        with register_lookup(models.IntegerField, LastDigitTransform):
+            a1 = Author.objects.create(name="a1", age=11)
+            a2 = Author.objects.create(name="a2", age=23)
+            a3 = Author.objects.create(name="a3", age=32)
+            a4 = Author.objects.create(name="a4", age=40)
+            qs = Author.objects.order_by("age__lastdigit")
+            self.assertSequenceEqual(qs, [a4, a1, a3, a2])
+
+    def test_bilateral_fexpr(self):
+        with register_lookup(models.IntegerField, Mult3BilateralTransform):
+            a1 = Author.objects.create(name="a1", age=1, average_rating=3.2)
+            a2 = Author.objects.create(name="a2", age=2, average_rating=0.5)
+            a3 = Author.objects.create(name="a3", age=3, average_rating=1.5)
+            a4 = Author.objects.create(name="a4", age=4)
+            baseqs = Author.objects.order_by("name")
+            self.assertSequenceEqual(
+                baseqs.filter(age__mult3=models.F("age")), [a1, a2, a3, a4]
+            )
+            # Same as age >= average_rating
+            self.assertSequenceEqual(
+                baseqs.filter(age__mult3__gte=models.F("average_rating")), [a2, a3]
+            )
+
+
+@override_settings(USE_TZ=True)
+class DateTimeLookupTests(TestCase):
+    @unittest.skipUnless(connection.vendor == "mysql", "MySQL specific SQL used")
+    def test_datetime_output_field(self):
+        with register_lookup(models.PositiveIntegerField, DateTimeTransform):
+            ut = MySQLUnixTimestamp.objects.create(timestamp=time.time())
+            y2k = timezone.make_aware(datetime(2000, 1, 1))
+            self.assertSequenceEqual(
+                MySQLUnixTimestamp.objects.filter(timestamp__as_datetime__gt=y2k), [ut]
+            )
+
+
+class YearLteTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.a1 = Author.objects.create(name="a1", birthdate=date(1981, 2, 16))
+        cls.a2 = Author.objects.create(name="a2", birthdate=date(2012, 2, 29))
+        cls.a3 = Author.objects.create(name="a3", birthdate=date(2012, 1, 31))
+        cls.a4 = Author.objects.create(name="a4", birthdate=date(2012, 3, 1))
+
+    def setUp(self):
+        models.DateField.register_lookup(YearTransform)
+
+    def tearDown(self):
+        models.DateField._unregister_lookup(YearTransform)
+
+    @unittest.skipUnless(
+        connection.vendor == "postgresql", "PostgreSQL specific SQL used"
+    )
+    def test_year_lte(self):
+        baseqs = Author.objects.order_by("name")
+        self.assertSequenceEqual(
+            baseqs.filter(birthdate__testyear__lte=2012),
+            [self.a1, self.a2, self.a3, self.a4],
+        )
+        self.assertSequenceEqual(
+            baseqs.filter(birthdate__testyear=2012), [self.a2, self.a3, self.a4]
+        )
+
+        self.assertNotIn("BETWEEN", str(baseqs.filter(birthdate__testyear=2012).query))
+        self.assertSequenceEqual(
+            baseqs.filter(birthdate__testyear__lte=2011), [self.a1]
+        )
+        # The non-optimized version works, too.
+        self.assertSequenceEqual(baseqs.filter(birthdate__testyear__lt=2012), [self.a1])
+
+    @unittest.skipUnless(
+        connection.vendor == "postgresql", "PostgreSQL specific SQL used"
+    )
+    def test_year_lte_fexpr(self):
+        self.a2.age = 2011
+        self.a2.save()
+        self.a3.age = 2012
+        self.a3.save()
+        self.a4.age = 2013
+        self.a4.save()
+        baseqs = Author.objects.order_by("name")
+        self.assertSequenceEqual(
+            baseqs.filter(birthdate__testyear__lte=models.F("age")), [self.a3, self.a4]
+        )
+        self.assertSequenceEqual(
+            baseqs.filter(birthdate__testyear__lt=models.F("age")), [self.a4]
+        )
+
+    def test_year_lte_sql(self):
+        # This test will just check the generated SQL for __lte. This
+        # doesn't require running on PostgreSQL and spots the most likely
+        # error - not running YearLte SQL at all.
+        baseqs = Author.objects.order_by("name")
+        self.assertIn(
+            "<= (2011 || ", str(baseqs.filter(birthdate__testyear__lte=2011).query)
+        )
+        self.assertIn("-12-31", str(baseqs.filter(birthdate__testyear__lte=2011).query))
+
+    def test_postgres_year_exact(self):
+        baseqs = Author.objects.order_by("name")
+        self.assertIn("= (2011 || ", str(baseqs.filter(birthdate__testyear=2011).query))
+        self.assertIn("-12-31", str(baseqs.filter(birthdate__testyear=2011).query))
+
+    def test_custom_implementation_year_exact(self):
+        try:
+            # Two ways to add a customized implementation for different backends:
+            # First is MonkeyPatch of the class.
+            def as_custom_sql(self, compiler, connection):
+                lhs_sql, lhs_params = self.process_lhs(
+                    compiler, connection, self.lhs.lhs
+                )
+                rhs_sql, rhs_params = self.process_rhs(compiler, connection)
+                params = lhs_params + rhs_params + lhs_params + rhs_params
+                return (
+                    "%(lhs)s >= "
+                    "str_to_date(concat(%(rhs)s, '-01-01'), '%%%%Y-%%%%m-%%%%d') "
+                    "AND %(lhs)s <= "
+                    "str_to_date(concat(%(rhs)s, '-12-31'), '%%%%Y-%%%%m-%%%%d')"
+                    % {"lhs": lhs_sql, "rhs": rhs_sql},
+                    params,
+                )
+
+            setattr(YearExact, "as_" + connection.vendor, as_custom_sql)
+            self.assertIn(
+                "concat(", str(Author.objects.filter(birthdate__testyear=2012).query)
+            )
+        finally:
+            delattr(YearExact, "as_" + connection.vendor)
+        try:
+            # The other way is to subclass the original lookup and register the
+            # subclassed lookup instead of the original.
+            class CustomYearExact(YearExact):
+                # This method should be named "as_mysql" for MySQL,
+                # "as_postgresql" for postgres and so on, but as we don't know
+                # which DB we are running on, we need to use setattr.
+                def as_custom_sql(self, compiler, connection):
+                    lhs_sql, lhs_params = self.process_lhs(
+                        compiler, connection, self.lhs.lhs
+                    )
+                    rhs_sql, rhs_params = self.process_rhs(compiler, connection)
+                    params = lhs_params + rhs_params + lhs_params + rhs_params
+                    return (
+                        "%(lhs)s >= "
+                        "str_to_date(CONCAT(%(rhs)s, '-01-01'), '%%%%Y-%%%%m-%%%%d') "
+                        "AND %(lhs)s <= "
+                        "str_to_date(CONCAT(%(rhs)s, '-12-31'), '%%%%Y-%%%%m-%%%%d')"
+                        % {"lhs": lhs_sql, "rhs": rhs_sql},
+                        params,
+                    )
+
+            setattr(
+                CustomYearExact,
+                "as_" + connection.vendor,
+                CustomYearExact.as_custom_sql,
+            )
+            YearTransform.register_lookup(CustomYearExact)
+            self.assertIn(
+                "CONCAT(", str(Author.objects.filter(birthdate__testyear=2012).query)
+            )
+        finally:
+            YearTransform._unregister_lookup(CustomYearExact)
+            YearTransform.register_lookup(YearExact)
+
+
+class TrackCallsYearTransform(YearTransform):
+    # Use a name that avoids collision with the built-in year lookup.
+    lookup_name = "testyear"
+    call_order = []
+
+    def as_sql(self, compiler, connection):
+        lhs_sql, params = compiler.compile(self.lhs)
+        return connection.ops.date_extract_sql("year", lhs_sql), params
+
+    @property
+    def output_field(self):
+        return models.IntegerField()
+
+    def get_lookup(self, lookup_name):
+        self.call_order.append("lookup")
+        return super().get_lookup(lookup_name)
+
+    def get_transform(self, lookup_name):
+        self.call_order.append("transform")
+        return super().get_transform(lookup_name)
+
+
+class LookupTransformCallOrderTests(SimpleTestCase):
+    def test_call_order(self):
+        with register_lookup(models.DateField, TrackCallsYearTransform):
+            # junk lookup - tries lookup, then transform, then fails
+            msg = (
+                "Unsupported lookup 'junk' for IntegerField or join on the field not "
+                "permitted."
+            )
+            with self.assertRaisesMessage(FieldError, msg):
+                Author.objects.filter(birthdate__testyear__junk=2012)
+            self.assertEqual(
+                TrackCallsYearTransform.call_order, ["lookup", "transform"]
+            )
+            TrackCallsYearTransform.call_order = []
+            # junk transform - tries transform only, then fails
+            with self.assertRaisesMessage(FieldError, msg):
+                Author.objects.filter(birthdate__testyear__junk__more_junk=2012)
+            self.assertEqual(TrackCallsYearTransform.call_order, ["transform"])
+            TrackCallsYearTransform.call_order = []
+            # Just getting the year (implied __exact) - lookup only
+            Author.objects.filter(birthdate__testyear=2012)
+            self.assertEqual(TrackCallsYearTransform.call_order, ["lookup"])
+            TrackCallsYearTransform.call_order = []
+            # Just getting the year (explicit __exact) - lookup only
+            Author.objects.filter(birthdate__testyear__exact=2012)
+            self.assertEqual(TrackCallsYearTransform.call_order, ["lookup"])
+
+
+class CustomisedMethodsTests(SimpleTestCase):
+    def test_overridden_get_lookup(self):
+        q = CustomModel.objects.filter(field__lookupfunc_monkeys=3)
+        self.assertIn("monkeys()", str(q.query))
+
+    def test_overridden_get_transform(self):
+        q = CustomModel.objects.filter(field__transformfunc_banana=3)
+        self.assertIn("banana()", str(q.query))
+
+    def test_overridden_get_lookup_chain(self):
+        q = CustomModel.objects.filter(
+            field__transformfunc_banana__lookupfunc_elephants=3
+        )
+        self.assertIn("elephants()", str(q.query))
+
+    def test_overridden_get_transform_chain(self):
+        q = CustomModel.objects.filter(
+            field__transformfunc_banana__transformfunc_pear=3
+        )
+        self.assertIn("pear()", str(q.query))
+
+
+class SubqueryTransformTests(TestCase):
+    def test_subquery_usage(self):
+        with register_lookup(models.IntegerField, Div3Transform):
+            Author.objects.create(name="a1", age=1)
+            a2 = Author.objects.create(name="a2", age=2)
+            Author.objects.create(name="a3", age=3)
+            Author.objects.create(name="a4", age=4)
+            qs = Author.objects.order_by("name").filter(
+                id__in=Author.objects.filter(age__div3=2)
+            )
+            self.assertSequenceEqual(qs, [a2])
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""

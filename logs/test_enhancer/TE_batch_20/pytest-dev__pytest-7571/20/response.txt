@@ -1,0 +1,152 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  Each test creates a small pytest session (via Testdir) that defines a custom Logger
+  whose setLevel emits an INFO log ("SFX"). The test within that session sets the
+  caplog handler level to WARNING and then calls caplog.set_level(INFO, logger='mylogger')
+  so that during caplog._finalize the logger restoration will trigger the side-effect log.
+  The correct (gold) implementation restores the handler level before restoring logger
+  levels, so the "SFX" INFO log should NOT be captured/present in the test report.
+  The candidate (incorrect) implementation restores the handler after restoring logger levels
+  (or otherwise allows the side effect to be captured), so "SFX" would appear and the
+  assertions here will fail. Each test asserts that "SFX" does NOT appear in pytest output.
+test_code: |
+  import logging
+  import textwrap
+  import pytest
+  from _pytest.pytester import Testdir
+  
+  # Helper that returns a test module string which installs a custom Logger class
+  # with a side-effect in setLevel that logs an INFO message "SFX".
+  def make_sideeffect_module(assert_fail=True, use_at_level=False, extra_setup=""):
+      mod = textwrap.dedent(
+          f'''
+          import logging
+          
+          class SideEffectLogger(logging.getLoggerClass()):
+              def setLevel(self, level):
+                  super().setLevel(level)
+                  # Side effect: emit an INFO message when setLevel is called.
+                  logging.getLogger("side").info("SFX")
+          
+          logging.setLoggerClass(SideEffectLogger)
+          
+          def test_sideeffect(caplog):
+              # Make sure the handler's original level is WARNING so the INFO
+              # side effect should not be captured if the handler is restored
+              # before the logger levels are restored.
+              caplog.handler.setLevel(logging.WARNING)
+              {extra_setup}
+              # This registers 'mylogger' in the fixture's _initial_logger_levels
+              caplog.set_level(logging.INFO, logger="mylogger")
+              if {str(use_at_level)}:
+                  with caplog.at_level(logging.DEBUG, logger="other"):
+                      logging.getLogger("other").debug("debug-other")
+              # Force a failure so pytest will include captured logs in the report.
+              assert False
+          '''
+      )
+      return mod
+  
+  def run_and_assert_no_sfx(testdir: Testdir, mod_src: str):
+      testdir.makepyfile(mod_src)
+      result = testdir.runpytest()
+      # Ensure the test did run and produced failure (so report was generated)
+      result.assert_outcomes(failed=1)
+      # The correct behavior: SFX should NOT be present.
+      result.stdout.no_fnmatch_line("*SFX*")
+  
+  def test_restore_order_simple(testdir: Testdir):
+      """Simple scenario: single set_level call should not allow SFX to be captured."""
+      mod = make_sideeffect_module()
+      run_and_assert_no_sfx(testdir, mod)
+  
+  def test_restore_order_with_extra_logging_before_teardown(testdir: Testdir):
+      """Emit extra logs before teardown to ensure no interference."""
+      mod = make_sideeffect_module(extra_setup='logging.getLogger("mylogger").info("during")')
+      run_and_assert_no_sfx(testdir, mod)
+  
+  def test_restore_order_with_at_level_context(testdir: Testdir):
+      """Using at_level context should not cause SFX to be captured."""
+      mod = make_sideeffect_module(use_at_level=True)
+      run_and_assert_no_sfx(testdir, mod)
+  
+  def test_restore_order_multiple_set_levels(testdir: Testdir):
+      """Multiple set_level calls for different loggers in the same test."""
+      extra = textwrap.dedent('''
+          caplog.set_level(logging.WARNING, logger="other")
+          logging.getLogger("other").warning("warn-other")
+      ''')
+      mod = make_sideeffect_module(extra_setup=extra)
+      run_and_assert_no_sfx(testdir, mod)
+  
+  def test_restore_order_repeated_set_level_same_logger(testdir: Testdir):
+      """Repeated set_level calls for the same logger should still not capture SFX."""
+      extra = textwrap.dedent('''
+          caplog.set_level(logging.DEBUG, logger="mylogger")
+          caplog.set_level(logging.INFO, logger="mylogger")
+      ''')
+      mod = make_sideeffect_module(extra_setup=extra)
+      run_and_assert_no_sfx(testdir, mod)
+  
+  def test_restore_order_root_logger(testdir: Testdir):
+      """Setting root logger level should not leak SFX during finalize."""
+      extra = textwrap.dedent('''
+          # Also modify the root logger via logger=None
+          caplog.set_level(logging.CRITICAL, logger=None)
+      ''')
+      mod = make_sideeffect_module(extra_setup=extra)
+      run_and_assert_no_sfx(testdir, mod)
+  
+  def test_restore_order_with_exception_in_test(testdir: Testdir):
+      """Even when the test raises an exception, SFX must not be captured."""
+      # Create a test that raises inside a with to ensure finalization still occurs.
+      mod = textwrap.dedent('''
+          import logging
+          class SideEffectLogger(logging.getLoggerClass()):
+              def setLevel(self, level):
+                  super().setLevel(level)
+                  logging.getLogger("side").info("SFX")
+          logging.setLoggerClass(SideEffectLogger)
+  
+          def test_raises(caplog):
+              caplog.handler.setLevel(logging.WARNING)
+              caplog.set_level(logging.INFO, logger="mylogger")
+              raise RuntimeError("boom")
+      ''')
+      testdir.makepyfile(mod)
+      result = testdir.runpytest()
+      # The test should error; ensure we still don't see the SFX side-effect in output
+      result.assert_outcomes(errors=1)
+      result.stdout.no_fnmatch_line("*SFX*")
+  
+  def test_restore_order_nested_loggers(testdir: Testdir):
+      """Nested loggers set during the test should not cause captured SFX."""
+      extra = textwrap.dedent('''
+          caplog.set_level(logging.DEBUG, logger="nested.one")
+          caplog.set_level(logging.INFO, logger="nested.two")
+      ''')
+      mod = make_sideeffect_module(extra_setup=extra)
+      run_and_assert_no_sfx(testdir, mod)
+  
+  def test_restore_order_after_using_handler_directly(testdir: Testdir):
+      """If the test manipulates the handler directly before set_level, still no SFX."""
+      extra = textwrap.dedent('''
+          # directly change the handler level first
+          caplog.handler.setLevel(logging.ERROR)
+          caplog.set_level(logging.INFO, logger="mylogger")
+      ''')
+      mod = make_sideeffect_module(extra_setup=extra)
+      run_and_assert_no_sfx(testdir, mod)
+  
+  def test_restore_order_many_loggers_combined(testdir: Testdir):
+      """Multiple loggers and contexts combined should not leak SFX."""
+      extra = textwrap.dedent('''
+          caplog.set_level(logging.INFO, logger="a")
+          caplog.set_level(logging.DEBUG, logger="b")
+          with caplog.at_level(logging.WARNING, logger="c"):
+              logging.getLogger("c").warning("c-warn")
+      ''')
+      mod = make_sideeffect_module(extra_setup=extra)
+      run_and_assert_no_sfx(testdir, mod)
+new_imports_code: ""

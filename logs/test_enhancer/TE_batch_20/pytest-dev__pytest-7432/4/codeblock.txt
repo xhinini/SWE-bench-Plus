@@ -1,0 +1,175 @@
+# No new top-level imports required beyond standard pytest and types which are used in the test file.
+import types
+import pytest
+from _pytest.skipping import (
+    pytest_runtest_makereport,
+    skipped_by_mark_key,
+    xfailed_key,
+    unexpectedsuccess_key,
+)
+from _pytest.outcomes import xfail as xfail_module
+
+class FakeReport:
+    def __init__(self, skipped: bool, longrepr, when="call"):
+        # internal outcome string; property .skipped is derived from this
+        self._outcome = "skipped" if skipped else "failed"
+        self.longrepr = longrepr
+        self.when = when
+        self.wasxfail = None
+        self.longreprtext = None  # unused, for compatibility
+
+    @property
+    def skipped(self):
+        return self._outcome == "skipped"
+
+    @property
+    def passed(self):
+        return self._outcome == "passed"
+
+    @property
+    def outcome(self):
+        return self._outcome
+
+    @outcome.setter
+    def outcome(self, val):
+        self._outcome = val
+
+class FakeCall:
+    def __init__(self, excinfo=None, when="call"):
+        self.excinfo = excinfo
+        self.when = when
+
+class FakeExcInfo:
+    def __init__(self, value):
+        self.value = value
+
+class FakeItem:
+    def __init__(self, filename="test_file.py", line=10, store=None, runxfail=False):
+        self._store = store if store is not None else {}
+        self._filename = filename
+        self._line = line
+        # config with nested option.runxfail
+        self.config = types.SimpleNamespace(option=types.SimpleNamespace(runxfail=runxfail))
+    def reportinfo(self):
+        # mimic signature that returns (filename, line, ...). line must be int or None.
+        return (self._filename, self._line, None)
+
+def run_makereport_and_get_report(item, call, rep):
+    """Run the hookwrapper and return the (possibly mutated) report."""
+    gen = pytest_runtest_makereport(item, call)
+    # start the generator
+    next(gen)
+    class Outcome:
+        def get_result(self):
+            return rep
+    try:
+        gen.send(Outcome())
+    except StopIteration:
+        pass
+    return rep
+
+def assert_longrepr_adjusted(rep, item, original_longrepr):
+    # original_longrepr is (fname, lineno, reason)
+    fname, lineno, reason = original_longrepr
+    expected = (str(item.reportinfo()[0]), item.reportinfo()[1] + 1, reason)
+    assert rep.longrepr == expected
+
+def assert_longrepr_unchanged(rep, original_longrepr):
+    assert rep.longrepr == original_longrepr
+
+def make_xfail_exception(msg):
+    exc = xfail_module.Exception(msg)
+    return exc
+
+def test_adjusts_when_initially_skipped_and_longrepr_tuple():
+    # straightforward: rep is already skipped and has tuple longrepr -> adjusted
+    original = ("orig.py", 5, "skipped-by-mark")
+    item = FakeItem(filename="fileA.py", line=20, store={skipped_by_mark_key: True})
+    rep = FakeReport(skipped=True, longrepr=original, when="call")
+    call = FakeCall(excinfo=None, when="call")
+    rep2 = run_makereport_and_get_report(item, call, rep)
+    assert_longrepr_adjusted(rep2, item, original)
+
+def test_adjusts_when_call_excinfo_is_xfail_and_longrepr_tuple_was_not_initially_skipped():
+    # Regression case: rep.skipped is False initially but call.excinfo contains xfail.Exception
+    # so later in makereport rep.outcome is set to "skipped". The final location-correction must run.
+    original = ("orig.py", 5, "skipped-by-mark")
+    store = {skipped_by_mark_key: True}
+    item = FakeItem(filename="fileB.py", line=30, store=store, runxfail=False)
+    # rep.skipped is False initially, but longrepr already tuple (simulate upstream)
+    rep = FakeReport(skipped=False, longrepr=original, when="call")
+    # create call with excinfo.value an xfail exception
+    call = FakeCall(excinfo=FakeExcInfo(make_xfail_exception("hello")), when="call")
+    rep2 = run_makereport_and_get_report(item, call, rep)
+    # Should be adjusted by the final correction block in the gold patch
+    assert_longrepr_adjusted(rep2, item, original)
+
+def test_adjusts_when_xfailed_mark_set_during_collection_and_rep_was_initially_not_skipped():
+    # Another regression: xfailed mark present (item._store[xfailed_key]) and rep.skipped False initially,
+    # makereport's xfailed-handling will set rep.outcome to "skipped" and the location-correction must run.
+    original = ("orig.py", 7, "via-mark")
+    store = {skipped_by_mark_key: True, xfailed_key: types.SimpleNamespace(reason="r", run=True, strict=False, raises=None)}
+    item = FakeItem(filename="fileC.py", line=40, store=store, runxfail=False)
+    rep = FakeReport(skipped=False, longrepr=original, when="call")
+    call = FakeCall(excinfo=None, when="call")
+    rep2 = run_makereport_and_get_report(item, call, rep)
+    assert_longrepr_adjusted(rep2, item, original)
+
+def test_does_not_adjust_when_longrepr_not_tuple_even_if_mark_set_and_later_skipped():
+    # if longrepr is not a tuple, do not change it
+    original = "some traceback text"
+    store = {skipped_by_mark_key: True}
+    item = FakeItem(filename="fileD.py", line=50, store=store, runxfail=False)
+    rep = FakeReport(skipped=False, longrepr=original, when="call")
+    # simulate becoming skipped via xfail.Exception
+    call = FakeCall(excinfo=FakeExcInfo(make_xfail_exception("msg")), when="call")
+    rep2 = run_makereport_and_get_report(item, call, rep)
+    # Should remain unchanged because type(longrepr) is not tuple
+    assert_longrepr_unchanged(rep2, original)
+
+def test_respects_runxfail_option_but_still_adjusts_location():
+    # Even when --runxfail is True, the location-correction should still be applied
+    original = ("orig.py", 2, "skipme")
+    store = {skipped_by_mark_key: True}
+    # config option runxfail True
+    item = FakeItem(filename="fileE.py", line=3, store=store, runxfail=True)
+    rep = FakeReport(skipped=True, longrepr=original, when="call")
+    call = FakeCall(excinfo=None, when="call")
+    rep2 = run_makereport_and_get_report(item, call, rep)
+    assert_longrepr_adjusted(rep2, item, original)
+
+def test_adjusts_when_skipped_set_by_xfailed_branch_with_strict_false():
+    # Simulate case where xfailed mark exists and causes skipping (strict False) and longrepr tuple present.
+    original = ("orig.py", 11, "xfail-reason")
+    xfail_mark = types.SimpleNamespace(reason="xfail-reason", run=True, strict=False, raises=None)
+    store = {skipped_by_mark_key: True, xfailed_key: xfail_mark}
+    item = FakeItem(filename="fileF.py", line=100, store=store, runxfail=False)
+    rep = FakeReport(skipped=False, longrepr=original, when="call")
+    call = FakeCall(excinfo=None, when="call")
+    rep2 = run_makereport_and_get_report(item, call, rep)
+    assert_longrepr_adjusted(rep2, item, original)
+
+def test_no_adjust_when_skipped_by_mark_key_false():
+    # If skipped_by_mark_key is False, no adjustment should happen even if rep.skipped True and longrepr tuple.
+    original = ("orig.py", 20, "something")
+    store = {skipped_by_mark_key: False}
+    item = FakeItem(filename="fileG.py", line=200, store=store, runxfail=False)
+    rep = FakeReport(skipped=True, longrepr=original, when="call")
+    call = FakeCall(excinfo=None, when="call")
+    rep2 = run_makereport_and_get_report(item, call, rep)
+    assert_longrepr_unchanged(rep2, original)
+
+def test_unexpectedsuccess_handling_does_not_trigger_location_adjustment():
+    # If unexpectedsuccess_key present and when == "call", the unexpectedsuccess branch overwrites longrepr
+    # and sets outcome to failed; the location adjustment should not run.
+    original = ("orig.py", 2, "via-decorator")
+    store = {skipped_by_mark_key: True, unexpectedsuccess_key: "reason-text"}
+    item = FakeItem(filename="fileH.py", line=77, store=store, runxfail=False)
+    # Start as skipped True: but unexpectedsuccess branch applies only when rep.when == "call"
+    rep = FakeReport(skipped=True, longrepr=original, when="call")
+    call = FakeCall(excinfo=None, when="call")
+    rep2 = run_makereport_and_get_report(item, call, rep)
+    # unexpectedsuccess processing changes longrepr to a string; location adjust shouldn't produce a tuple.
+    assert not isinstance(rep2.longrepr, tuple)
+    # ensure the longrepr contains 'Unexpected success'
+    assert "Unexpected success" in str(rep2.longrepr)

@@ -1,0 +1,180 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that the DatabaseCache._cull() method does not raise an exception when the SQL used to select keys for culling returns no rows (cursor.fetchone() returns None). The original bug accessed cursor.fetchone()[0] without checking for None, raising a TypeError. Each test patches the database backend's cache_key_culling_sql to return a query that yields no rows, forces a cull by setting _max_entries to 0, and then performs various cache operations (set, add, touch, set_many, etc.). The tests assert that the operations complete without raising and that cache semantics (presence/absence of keys, return values) are as expected.
+test_code: |
+  @override_settings(CACHES=caches_setting_for_tests(
+      BACKEND='django.core.cache.backends.db.DatabaseCache',
+      # Use a unique table name for this test class to avoid collisions.
+      LOCATION='test cache table cull empty'
+  ))
+  class CullingEmptyResultTests(TransactionTestCase):
+      available_apps = ['cache']
+  
+      def setUp(self):
+          super().setUp()
+          management.call_command('createcachetable', verbosity=0)
+  
+      def tearDown(self):
+          # Drop the table created for these tests.
+          with connection.cursor() as cursor:
+              table_name = connection.ops.quote_name('test cache table cull empty')
+              cursor.execute('DROP TABLE %s' % table_name)
+          super().tearDown()
+  
+      def _patch_cull_sql_and_force_cull(self, cache_alias='cull'):
+          """
+          Helper context manager: patches cache_key_culling_sql to return a SQL
+          that produces no rows and forces a cull by setting _max_entries to 0.
+          Yields the cache instance and a cleanup function to restore _max_entries.
+          """
+          cull_cache = caches[cache_alias]
+          db = 'default'
+          ops = connections[db].ops
+          patcher = mock.patch.object(ops, 'cache_key_culling_sql', return_value="SELECT cache_key FROM %s WHERE 1=0")
+          return patcher, cull_cache
+  
+      def test_set_handles_empty_cull_result(self):
+          patcher, cull_cache = self._patch_cull_sql_and_force_cull()
+          with patcher:
+              old_max = cull_cache._max_entries
+              cull_cache._max_entries = 0
+              try:
+                  # Should not raise even if the culling SQL returns no rows.
+                  result = cull_cache.set('ce_set', 'value', timeout=1000)
+              finally:
+                  cull_cache._max_entries = old_max
+          self.assertTrue(result)
+          self.assertTrue(cull_cache.has_key('ce_set'))
+  
+      def test_add_handles_empty_cull_result(self):
+          patcher, cull_cache = self._patch_cull_sql_and_force_cull()
+          with patcher:
+              old_max = cull_cache._max_entries
+              cull_cache._max_entries = 0
+              try:
+                  result = cull_cache.add('ce_add', 'value', timeout=1000)
+              finally:
+                  cull_cache._max_entries = old_max
+          self.assertTrue(result)
+          self.assertTrue(cull_cache.has_key('ce_add'))
+  
+      def test_touch_handles_empty_cull_result(self):
+          patcher, cull_cache = self._patch_cull_sql_and_force_cull()
+          # Ensure key exists first
+          cull_cache.set('ce_touch', 'v', timeout=1000)
+          with patcher:
+              old_max = cull_cache._max_entries
+              cull_cache._max_entries = 0
+              try:
+                  result = cull_cache.touch('ce_touch', timeout=2000)
+              finally:
+                  cull_cache._max_entries = old_max
+          self.assertTrue(result)
+          self.assertTrue(cull_cache.has_key('ce_touch'))
+  
+      def test_set_many_handles_empty_cull_result(self):
+          patcher, cull_cache = self._patch_cull_sql_and_force_cull()
+          with patcher:
+              old_max = cull_cache._max_entries
+              cull_cache._max_entries = 0
+              try:
+                  failing = cull_cache.set_many({'ce_m1': 1, 'ce_m2': 2})
+              finally:
+                  cull_cache._max_entries = old_max
+          # set_many returns an empty list on success
+          self.assertEqual(failing, [])
+          self.assertEqual(cull_cache.get('ce_m1'), 1)
+          self.assertEqual(cull_cache.get('ce_m2'), 2)
+  
+      def test_multiple_consecutive_sets_handle_empty_cull_result(self):
+          patcher, cull_cache = self._patch_cull_sql_and_force_cull()
+          with patcher:
+              old_max = cull_cache._max_entries
+              cull_cache._max_entries = 0
+              try:
+                  for i in range(3):
+                      name = 'ce_seq_%s' % i
+                      self.assertTrue(cull_cache.set(name, i))
+              finally:
+                  cull_cache._max_entries = old_max
+          for i in range(3):
+              self.assertEqual(cull_cache.get('ce_seq_%s' % i), i)
+  
+      def test_set_does_not_delete_other_key_when_cull_result_empty(self):
+          """
+          Ensure that when the culling SQL returns no rows the cull does not
+          crash and existing keys remain present.
+          """
+          patcher, cull_cache = self._patch_cull_sql_and_force_cull()
+          # Put an existing key that should survive the cull.
+          cull_cache.set('ce_keep', 'keep', timeout=1000)
+          with patcher:
+              old_max = cull_cache._max_entries
+              cull_cache._max_entries = 0
+              try:
+                  # Trigger a set that will invoke culling.
+                  self.assertTrue(cull_cache.set('ce_trigger', 't', timeout=1000))
+              finally:
+                  cull_cache._max_entries = old_max
+          # Both keys should still be available (no crash and no unintended delete).
+          self.assertEqual(cull_cache.get('ce_keep'), 'keep')
+          self.assertEqual(cull_cache.get('ce_trigger'), 't')
+  
+      def test_add_after_expired_entry_handles_empty_cull_result(self):
+          patcher, cull_cache = self._patch_cull_sql_and_force_cull()
+          # Add an entry that will expire quickly.
+          cull_cache.set('ce_expire', 'x', timeout=0.01)
+          time.sleep(0.02)
+          with patcher:
+              old_max = cull_cache._max_entries
+              cull_cache._max_entries = 0
+              try:
+                  # Adding a new key should invoke culling but not raise.
+                  self.assertTrue(cull_cache.add('ce_after_expired', 'y', timeout=1000))
+              finally:
+                  cull_cache._max_entries = old_max
+          self.assertTrue(cull_cache.has_key('ce_after_expired'))
+  
+      def test_touch_nonexistent_handles_empty_cull_result(self):
+          """
+          touch() on a nonexistent key should return False, but culling should
+          not cause an exception even if the culling SQL returns no rows.
+          """
+          patcher, cull_cache = self._patch_cull_sql_and_force_cull()
+          with patcher:
+              old_max = cull_cache._max_entries
+              cull_cache._max_entries = 0
+              try:
+                  result = cull_cache.touch('ce_nonexistent', timeout=1000)
+              finally:
+                  cull_cache._max_entries = old_max
+          self.assertFalse(result)
+  
+      def test_set_then_touch_handles_empty_cull_result(self):
+          patcher, cull_cache = self._patch_cull_sql_and_force_cull()
+          # Create a key, then cause another operation to trigger cull.
+          cull_cache.set('ce_seq_touch', 'v', timeout=1000)
+          with patcher:
+              old_max = cull_cache._max_entries
+              cull_cache._max_entries = 0
+              try:
+                  # This set should invoke culling; touch should still work afterwards.
+                  self.assertTrue(cull_cache.set('ce_trigger2', 'v2', timeout=1000))
+                  self.assertTrue(cull_cache.touch('ce_seq_touch', timeout=2000))
+              finally:
+                  cull_cache._max_entries = old_max
+          self.assertTrue(cull_cache.has_key('ce_seq_touch'))
+          self.assertTrue(cull_cache.has_key('ce_trigger2'))
+  
+      def test_set_many_then_get_handles_empty_cull_result(self):
+          patcher, cull_cache = self._patch_cull_sql_and_force_cull()
+          with patcher:
+              old_max = cull_cache._max_entries
+              cull_cache._max_entries = 0
+              try:
+                  cull_cache.set_many({'ce_bulk1': 'a', 'ce_bulk2': 'b'})
+              finally:
+                  cull_cache._max_entries = old_max
+          self.assertEqual(cull_cache.get('ce_bulk1'), 'a')
+          self.assertEqual(cull_cache.get('ce_bulk2'), 'b')
+new_imports_code: ""

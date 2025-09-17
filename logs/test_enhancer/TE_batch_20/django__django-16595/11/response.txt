@@ -1,0 +1,156 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise MigrationOptimizer reductions around AlterField interactions (multiple AlterField ops, interactions with RenameField when db_column is set vs not set, case-insensitive names, interaction with AddField, and iteration count). They are designed to catch regressions where an AlterField isn't properly treated as replacing an earlier AlterField on the same model/field.
+test_code: |
+  from django.db import migrations, models
+  from django.db.migrations.optimizer import MigrationOptimizer
+  from django.test import SimpleTestCase
+  
+  class OptimizerAlterFieldRegressionTests(SimpleTestCase):
+      def optimize(self, operations, app_label="migrations"):
+          optimizer = MigrationOptimizer()
+          return optimizer.optimize(operations, app_label), optimizer._iterations
+  
+      def serialize(self, value):
+          # Simple serializer helper consistent with existing tests in suite.
+          from django.db.migrations.serializer import serializer_factory
+          return serializer_factory(value).serialize()[0]
+  
+      def assertOptimizesTo(self, operations, expected, app_label=None):
+          result, iterations = self.optimize(operations, app_label or "migrations")
+          result = [self.serialize(f) for f in result]
+          expected = [self.serialize(f) for f in expected]
+          self.assertEqual(expected, result)
+  
+      def test_three_alterfields_collapses_to_last(self):
+          # Three AlterField operations on the same field should collapse to the last AlterField.
+          f1 = models.CharField(max_length=256, null=True)
+          f2 = models.CharField(max_length=128, null=True)
+          f3 = models.CharField(max_length=128, null=True, help_text="help")
+          ops = [
+              migrations.AlterField("Book", "title", f1),
+              migrations.AlterField("Book", "title", f2),
+              migrations.AlterField("Book", "title", f3),
+          ]
+          expected = [migrations.AlterField("Book", "title", f3)]
+          self.assertOptimizesTo(ops, expected)
+  
+      def test_optimize_alterfield_only_subsequence(self):
+          # Optimizing a slice containing only AlterField operations should collapse to the last AlterField.
+          f1 = models.CharField(max_length=256, null=True)
+          f2 = models.CharField(max_length=128, null=True)
+          f3 = models.CharField(max_length=128, null=True, help_text="help")
+          # Prepend an unrelated AddField to emulate real sequence and then optimize the sublist
+          ops = [
+              migrations.AddField("Book", "author", models.CharField(max_length=50)),
+              migrations.AlterField("Book", "title", f1),
+              migrations.AlterField("Book", "title", f2),
+              migrations.AlterField("Book", "title", f3),
+          ]
+          # Optimize only the AlterField sub-list (like the reproduce script was doing)
+          optimizer = MigrationOptimizer()
+          optimized = optimizer.optimize(ops[1:], "migrations")
+          # Only the last AlterField should remain in that sub-optimization
+          self.assertEqual(
+              [self.serialize(op) for op in optimized],
+              [self.serialize(migrations.AlterField("Book", "title", f3))],
+          )
+  
+      def test_alterfield_then_removefield_results_in_removefield(self):
+          # An AlterField followed by RemoveField on the same field should result in only RemoveField.
+          ops = [
+              migrations.AlterField("Foo", "age", models.IntegerField()),
+              migrations.RemoveField("Foo", "age"),
+          ]
+          expected = [migrations.RemoveField("Foo", "age")]
+          self.assertOptimizesTo(ops, expected)
+  
+      def test_alterfield_case_insensitive_field_names_collapses(self):
+          # Field names and model names are case-insensitive for reduction.
+          f1 = models.IntegerField()
+          f2 = models.IntegerField(help_text="x")
+          ops = [
+              migrations.AlterField("MyModel", "Count", f1),
+              migrations.AlterField("mymodel", "count", f2),
+          ]
+          expected = [migrations.AlterField("MyModel", "count", f2)]
+          self.assertOptimizesTo(ops, expected)
+  
+      def test_alterfield_then_rename_with_db_column_none_keeps_rename_and_alter(self):
+          # If the field's db_column is None, AlterField followed by RenameField should produce
+          # RenameField + AlterField(new_name).
+          field = models.CharField(max_length=128)  # db_column is None by default
+          ops = [
+              migrations.AlterField("Book", "title", field),
+              migrations.RenameField("Book", "title", "headline"),
+          ]
+          # Optimizer should reorder/rewrite to have the RenameField and an AlterField on the new name.
+          expected = [
+              migrations.RenameField("Book", "title", "headline"),
+              migrations.AlterField("Book", "headline", field),
+          ]
+          self.assertOptimizesTo(ops, expected)
+  
+      def test_alterfield_then_rename_with_db_column_set_keeps_only_rename(self):
+          # If the field has a db_column set, renaming the field should not produce an extra AlterField.
+          field = models.CharField(max_length=128, db_column="title_col")
+          ops = [
+              migrations.AlterField("Book", "title", field),
+              migrations.RenameField("Book", "title", "headline"),
+          ]
+          # With a db_column, the rename should be sufficient (no additional AlterField needed).
+          expected = [migrations.RenameField("Book", "title", "headline")]
+          self.assertOptimizesTo(ops, expected)
+  
+      def test_alterfields_different_models_do_not_collapse(self):
+          # AlterField on the same field name but different models should not collapse.
+          f1 = models.IntegerField()
+          f2 = models.IntegerField(help_text="x")
+          ops = [
+              migrations.AlterField("A", "value", f1),
+              migrations.AlterField("B", "value", f2),
+          ]
+          # Should remain unchanged
+          self.assertOptimizesTo(ops, ops)
+  
+      def test_alterfield_after_addfield_collapses_into_addfield_with_last_state(self):
+          # AddField followed by multiple AlterField on same field should result in a single AddField with final state.
+          f_add = models.CharField(max_length=255)
+          f_alt1 = models.CharField(max_length=100)
+          f_alt2 = models.CharField(max_length=50, help_text="final")
+          ops = [
+              migrations.AddField("Book", "title", f_add),
+              migrations.AlterField("Book", "title", f_alt1),
+              migrations.AlterField("Book", "title", f_alt2),
+          ]
+          expected = [migrations.AddField("Book", "title", f_alt2)]
+          self.assertOptimizesTo(ops, expected)
+  
+      def test_alterfield_preserve_default_false_affects_database_field_in_deconstruct(self):
+          # Ensure preserve_default is respected in the operation deconstruction/serialization path
+          f1 = models.IntegerField(default=1)
+          f2 = models.IntegerField(default=2)
+          ops = [
+              migrations.AlterField("Foo", "num", f1, preserve_default=False),
+              migrations.AlterField("Foo", "num", f2, preserve_default=False),
+          ]
+          expected = [migrations.AlterField("Foo", "num", f2, preserve_default=False)]
+          self.assertOptimizesTo(ops, expected)
+  
+      def test_alterfield_iteration_count_small(self):
+          # Ensure optimizer finishes quickly for a chain of AlterField operations.
+          f1 = models.CharField(max_length=256)
+          f2 = models.CharField(max_length=128)
+          ops = [
+              migrations.AlterField("Big", "col", f1),
+              migrations.AlterField("Big", "col", f2),
+          ]
+          optimizer = MigrationOptimizer()
+          optimized, iterations = optimizer.optimize(ops, "migrations"), optimizer._iterations
+          # Should collapse to single AlterField and take a small number of iterations (sanity check)
+          self.assertEqual(
+              [self.serialize(o) for o in optimized],
+              [self.serialize(migrations.AlterField("Big", "col", f2))],
+          )
+          self.assertLess(iterations, 10)
+new_imports_code: ""

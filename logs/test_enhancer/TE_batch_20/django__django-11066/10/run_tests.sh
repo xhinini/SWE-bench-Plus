@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 contenttypes_tests.test_operations_llm.DisallowMigrateRouter.allow_migrate contenttypes_tests.test_operations_llm.DisallowMigrateRouter.db_for_read contenttypes_tests.test_operations_llm.DisallowMigrateRouter.db_for_write contenttypes_tests.test_operations_llm.ForceDefaultWriteRouter.allow_migrate contenttypes_tests.test_operations_llm.ForceDefaultWriteRouter.db_for_read contenttypes_tests.test_operations_llm.ForceDefaultWriteRouter.db_for_write contenttypes_tests.test_operations_llm.ForceOtherWriteRouter.allow_migrate contenttypes_tests.test_operations_llm.ForceOtherWriteRouter.db_for_read contenttypes_tests.test_operations_llm.ForceOtherWriteRouter.db_for_write contenttypes_tests.test_operations_llm.RenameContentTypeDBTests.setUp contenttypes_tests.test_operations_llm.RenameContentTypeDBTests.test_clear_cache_called_on_successful_rename contenttypes_tests.test_operations_llm.RenameContentTypeDBTests.test_conflict_on_default_db_does_not_prevent_rename_in_other_db contenttypes_tests.test_operations_llm.RenameContentTypeDBTests.test_does_nothing_when_router_disallows_migrate_model contenttypes_tests.test_operations_llm.RenameContentTypeDBTests.test_get_by_natural_key_uses_db_manager_with_given_db contenttypes_tests.test_operations_llm.RenameContentTypeDBTests.test_integrity_error_in_target_db_keeps_old_model contenttypes_tests.test_operations_llm.RenameContentTypeDBTests.test_missing_content_type_does_not_create_in_default_db contenttypes_tests.test_operations_llm.RenameContentTypeDBTests.test_rename_backward_uses_schema_editor_db contenttypes_tests.test_operations_llm.RenameContentTypeDBTests.test_rename_uses_schema_editor_db_despite_router_forcing_default_for_writes contenttypes_tests.test_operations_llm.RenameContentTypeDBTests.test_save_called_with_using_keyword
+coverage json -o coverage.json
+: '>>>>> End Test Output'

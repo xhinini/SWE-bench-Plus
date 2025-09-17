@@ -1,0 +1,217 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests ensure that admindocs uses inspect.cleandoc (and not the legacy trim_docstring) when parsing docstrings in both the utils.parse_docstring path and the ModelDetailView path. They monkeypatch the legacy trim_docstring to raise if called; the gold patch uses cleandoc directly and these tests will pass, while a candidate patch that still calls trim_docstring from those code paths will cause the tests to fail.
+new_imports_code: |
+  from inspect import cleandoc
+  from types import SimpleNamespace
+  from django.contrib.admindocs import utils as adm_utils, views as adm_views
+  from django.utils.translation import gettext as _
+test_code: |
+  import unittest
+
+  from django.contrib.admindocs.utils import (
+      docutils_is_available, parse_docstring, parse_rst,
+  )
+  from django.test.utils import captured_stderr
+
+  from .tests import AdminDocsSimpleTestCase
+
+  @unittest.skipUnless(docutils_is_available, "no docutils installed.")
+  class TestUtilsTrimIntegration(AdminDocsSimpleTestCase):
+      """
+      Additional regression tests to ensure cleandoc is used instead of the
+      legacy trim_docstring in key code paths.
+      """
+
+      def _raise_if_trim_called(self):
+          def bad_trim(doc):
+              raise AssertionError("trim_called")
+          return bad_trim
+
+      # parse_docstring tests (should not call legacy trim_docstring)
+
+      def test_parse_docstring_does_not_call_trim_on_simple_docstring(self):
+          original = adm_utils.trim_docstring
+          adm_utils.trim_docstring = self._raise_if_trim_called()
+          try:
+              title, body, meta = parse_docstring("Title\n\nBody")
+              self.assertEqual(title, "Title")
+              self.assertEqual(body, "Body")
+              self.assertEqual(meta, {})
+          finally:
+              adm_utils.trim_docstring = original
+
+      def test_parse_docstring_does_not_call_trim_with_indented_docstring(self):
+          original = adm_utils.trim_docstring
+          adm_utils.trim_docstring = self._raise_if_trim_called()
+          try:
+              # A docstring with an unindented first line and an indented second
+              doc = "First line\n    second line"
+              title, body, meta = parse_docstring(doc)
+              # The title should be "First line" and body should preserve second line
+              # without being interpreted as a literal block (i.e., cleandoc should
+              # dedent the second line).
+              self.assertEqual(title, "First line")
+              # There is no blank line separating title/body, so body should be ''
+              # (parse_docstring splits on blank lines for title/body separation).
+              # Use parse_rst to confirm cleandoc behavior on the body portion.
+              parsed = parse_rst(cleandoc("    second line"), 'model', 'model:test')
+              # parsed should render a simple paragraph
+              self.assertIn('<p>second line</p>', parsed)
+          finally:
+              adm_utils.trim_docstring = original
+
+      def test_parse_docstring_handles_none_without_calling_trim(self):
+          original = adm_utils.trim_docstring
+          adm_utils.trim_docstring = self._raise_if_trim_called()
+          try:
+              title, body, meta = parse_docstring(None)
+              self.assertEqual(title, '')
+              self.assertEqual(body, '')
+              self.assertEqual(meta, {})
+          finally:
+              adm_utils.trim_docstring = original
+
+      def test_parse_docstring_with_leading_blank_and_indented_block(self):
+          original = adm_utils.trim_docstring
+          adm_utils.trim_docstring = self._raise_if_trim_called()
+          try:
+              # Docstring starts with a blank line, then indented content.
+              doc = "\n    indented content\n\nmeta: value"
+              title, body, meta = parse_docstring(doc)
+              # cleandoc should strip leading common indentation and leading blank line.
+              self.assertIn('indented content', body)
+              self.assertEqual(meta, {'meta': 'value'})
+          finally:
+              adm_utils.trim_docstring = original
+
+      def test_parse_docstring_multiline_metadata_parsing(self):
+          original = adm_utils.trim_docstring
+          adm_utils.trim_docstring = self._raise_if_trim_called()
+          try:
+              doc = "Title\n\nBody text\n\nkey_one: value one\nkey_two: value two"
+              title, body, meta = parse_docstring(doc)
+              self.assertEqual(title, "Title")
+              self.assertIn("Body text", body)
+              self.assertEqual(meta, {'key_one': 'value one', 'key_two': 'value two'})
+          finally:
+              adm_utils.trim_docstring = original
+
+      # ModelDetailView tests (ensure the view path uses cleandoc and not trim_docstring)
+
+      def _make_fake_model_with_property(self, doc):
+          """
+          Construct a fake model class that has:
+            - _meta with required attributes accessed by ModelDetailView
+            - a property whose __doc__ equals the supplied docstring
+          """
+          def make_prop(docstring):
+              def fget(self):
+                  return None
+              fget.__doc__ = docstring
+              return property(fget)
+
+          class FakeMeta:
+              model_name = 'fakemodel'
+              app_label = 'fakeapp'
+              object_name = 'FakeModel'
+              fields = []
+              many_to_many = []
+              related_objects = []
+
+          class FakeModel:
+              __doc__ = "Fake model doc"
+              _meta = FakeMeta()
+              prop = make_prop(doc)
+              # also add an explicit method (non-property) to ensure both paths are covered
+              def method(self):
+                  """Method doc
+                  with indentation
+                  """
+                  return None
+
+          return FakeModel
+
+      def test_model_detail_uses_cleandoc_for_property_docstring(self):
+          # Patch trim_docstring to raise if called; gold patch should avoid calling it
+          original_trim = adm_utils.trim_docstring
+          original_get_app = adm_views.apps.get_app_config
+          original_each_context = adm_views.admin.site.each_context
+          adm_utils.trim_docstring = self._raise_if_trim_called()
+          try:
+              FakeModel = self._make_fake_model_with_property("prop title\n    indented")
+              adm_views.apps.get_app_config = lambda label: SimpleNamespace(get_model=lambda name: FakeModel)
+              # admin.site.each_context is used by BaseAdminDocsView.get_context_data
+              adm_views.admin.site.each_context = lambda request: {}
+              view = adm_views.ModelDetailView()
+              view.request = None
+              view.kwargs = {'app_label': 'fakeapp', 'model_name': 'FakeModel'}
+              context = view.get_context_data()
+              # Find the property entry
+              fields = context['fields']
+              entries = [f for f in fields if f['name'] == 'prop']
+              self.assertTrue(entries, "Expected a 'prop' entry in fields")
+              entry = entries[0]
+              expected = adm_utils.parse_rst(cleandoc("prop title\n    indented"), 'model', _('model:') + FakeModel._meta.model_name)
+              self.assertEqual(entry['verbose'], expected)
+          finally:
+              adm_utils.trim_docstring = original_trim
+              adm_views.apps.get_app_config = original_get_app
+              adm_views.admin.site.each_context = original_each_context
+
+      def test_model_detail_uses_cleandoc_for_method_docstring(self):
+          original_trim = adm_utils.trim_docstring
+          original_get_app = adm_views.apps.get_app_config
+          original_each_context = adm_views.admin.site.each_context
+          adm_utils.trim_docstring = self._raise_if_trim_called()
+          try:
+              FakeModel = self._make_fake_model_with_property("prop title\n    indented")
+              adm_views.apps.get_app_config = lambda label: SimpleNamespace(get_model=lambda name: FakeModel)
+              adm_views.admin.site.each_context = lambda request: {}
+              view = adm_views.ModelDetailView()
+              view.request = None
+              view.kwargs = {'app_label': 'fakeapp', 'model_name': 'FakeModel'}
+              context = view.get_context_data()
+              methods = context['methods']
+              # There should be an entry for 'method' (it has args because of 'self')
+              entries = [m for m in methods if m['name'] == 'method']
+              self.assertTrue(entries, "Expected a 'method' entry in methods")
+              entry = entries[0]
+              expected = adm_utils.parse_rst(cleandoc(FakeModel.method.__doc__), 'model', _('model:') + FakeModel._meta.model_name)
+              self.assertEqual(entry['verbose'], expected)
+          finally:
+              adm_utils.trim_docstring = original_trim
+              adm_views.apps.get_app_config = original_get_app
+              adm_views.admin.site.each_context = original_each_context
+
+      def test_model_detail_property_and_method_together_do_not_call_trim(self):
+          # Combined check to ensure neither path invokes the legacy trim
+          original_trim = adm_utils.trim_docstring
+          original_get_app = adm_views.apps.get_app_config
+          original_each_context = adm_views.admin.site.each_context
+          adm_utils.trim_docstring = self._raise_if_trim_called()
+          try:
+              # Use a docstring with a leading blank and indentation to ensure dedent is necessary
+              FakeModel = self._make_fake_model_with_property("\n    prop title\n    more")
+              adm_views.apps.get_app_config = lambda label: SimpleNamespace(get_model=lambda name: FakeModel)
+              adm_views.admin.site.each_context = lambda request: {}
+              view = adm_views.ModelDetailView()
+              view.request = None
+              view.kwargs = {'app_label': 'fakeapp', 'model_name': 'FakeModel'}
+              context = view.get_context_data()
+              # Validate property
+              fields = context['fields']
+              prop_entries = [f for f in fields if f['name'] == 'prop']
+              self.assertTrue(prop_entries)
+              expected_prop = adm_utils.parse_rst(cleandoc("\n    prop title\n    more"), 'model', _('model:') + FakeModel._meta.model_name)
+              self.assertEqual(prop_entries[0]['verbose'], expected_prop)
+              # Validate method
+              methods = context['methods']
+              method_entries = [m for m in methods if m['name'] == 'method']
+              self.assertTrue(method_entries)
+              expected_method = adm_utils.parse_rst(cleandoc(FakeModel.method.__doc__), 'model', _('model:') + FakeModel._meta.model_name)
+              self.assertEqual(method_entries[0]['verbose'], expected_method)
+          finally:
+              adm_utils.trim_docstring = original_trim
+              adm_views.apps.get_app_config = original_get_app
+              adm_views.admin.site.each_context = original_each_context

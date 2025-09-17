@@ -1,0 +1,250 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that StaticFilesHandlerMixin.get_response_async uses the module-level sync_to_async wrapper to run the synchronous serve and response_for_exception functions in an async-friendly way. They assert that sync_to_async is called with the expected callables, that the returned awaitable resolves to the expected value on success, and that when serve raises Http404 the response_for_exception callable is invoked (via sync_to_async) and its result is returned. The model patch omitted use of sync_to_async; these tests will fail for that incorrect behavior and pass for the correct (gold) implementation.
+test_code: |
+  import asyncio
+  from urllib.parse import urlparse
+  from types import SimpleNamespace
+  from unittest import mock
+  
+  import pytest
+  from django.http import Http404
+  
+  import importlib
+  
+  handlers_mod = importlib.import_module("django.contrib.staticfiles.handlers")
+  StaticFilesHandlerMixin = handlers_mod.StaticFilesHandlerMixin
+  ASGIStaticFilesHandler = handlers_mod.ASGIStaticFilesHandler
+  response_for_exception = handlers_mod.response_for_exception
+  
+  # Helper to create a dummy request object
+  class DummyRequest:
+      def __init__(self, path="/static/test.txt"):
+          self.path = path
+  
+  def make_dummy_handler(serve_impl):
+      """
+      Create an instance of a minimal handler object that uses the mixin and
+      provides a serve() implementation. We set base_url to a known value so
+      file_path/file handling isn't used.
+      """
+      class DummyHandler(StaticFilesHandlerMixin):
+          def __init__(self):
+              # urlparse('/static/') -> path index 2 is '/static/'
+              self.base_url = urlparse('/static/')
+              # Bind the serve implementation (synchronous)
+              self._serve_impl = serve_impl
+          def serve(self, request):
+              return self._serve_impl(request)
+      return DummyHandler()
+  
+  def make_dummy_asgi_handler(serve_impl):
+      """
+      Create a minimal ASGIStaticFilesHandler-like instance that uses the mixin
+      (so get_response_async is inherited). This avoids interacting with Django
+      settings by overriding __init__ behavior.
+      """
+      class DummyASGI(StaticFilesHandlerMixin, ASGIStaticFilesHandler):
+          def __init__(self):
+              # Do not call ASGIStaticFilesHandler.__init__ which reads settings;
+              # instead set base_url manually and provide serve.
+              self.base_url = urlparse('/static/')
+              self._serve_impl = serve_impl
+          def serve(self, request):
+              return self._serve_impl(request)
+      return DummyASGI()
+  
+  def make_fake_sync_to_async(call_records, response_for_exception_obj=None):
+      """
+      Returns a fake sync_to_async implementation that records which functions
+      it was asked to wrap. It returns a wrapper that when called returns a
+      coroutine which calls the original function synchronously and returns its result.
+      If the wrapped function is response_for_exception and response_for_exception_obj
+      is provided, that object will be returned instead (allowing us to control the error response).
+      """
+      def fake(func):
+          call_records.append(func)
+          def wrapper(*args, **kwargs):
+              async def coro():
+                  # If we're wrapping response_for_exception and a custom object was supplied,
+                  # return that directly for deterministic testing.
+                  if func is response_for_exception and response_for_exception_obj is not None:
+                      return response_for_exception_obj
+                  return func(*args, **kwargs)
+              return coro()
+          return wrapper
+      return fake
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_calls_sync_to_async_on_success():
+      calls = []
+      # serve returns a simple sentinel response
+      def serve_impl(request):
+          return "OK"
+      handler = make_dummy_handler(serve_impl)
+      # Patch the module's sync_to_async
+      fake = make_fake_sync_to_async(calls)
+      with mock.patch.object(handlers_mod, "sync_to_async", fake):
+          resp = await handler.get_response_async(DummyRequest())
+      assert resp == "OK"
+      # sync_to_async should have been called once with the serve implementation
+      assert len(calls) == 1
+      assert calls[0] is handler.serve
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_passes_request_argument_to_wrapper():
+      calls = []
+      received_args = {}
+      def serve_impl(request):
+          # record that the serve implementation received the exact object
+          received_args['request_seen'] = request
+          return "OK"
+      handler = make_dummy_handler(serve_impl)
+      fake = make_fake_sync_to_async(calls)
+      with mock.patch.object(handlers_mod, "sync_to_async", fake):
+          req = DummyRequest(path="/static/somefile.txt")
+          resp = await handler.get_response_async(req)
+      assert resp == "OK"
+      assert received_args['request_seen'] is req
+      assert calls and calls[0] is handler.serve
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_called_each_time_for_multiple_calls():
+      calls = []
+      invocation_count = {"times": 0}
+      def serve_impl(request):
+          invocation_count["times"] += 1
+          return f"OK-{invocation_count['times']}"
+      handler = make_dummy_handler(serve_impl)
+      fake = make_fake_sync_to_async(calls)
+      with mock.patch.object(handlers_mod, "sync_to_async", fake):
+          r1 = await handler.get_response_async(DummyRequest())
+          r2 = await handler.get_response_async(DummyRequest())
+      assert r1 == "OK-1"
+      assert r2 == "OK-2"
+      # sync_to_async should have been invoked for both calls
+      assert len(calls) == 2
+      assert all(call is handler.serve for call in calls)
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_uses_sync_to_async_when_serve_raises_http404():
+      calls = []
+      # serve raises Http404
+      def serve_impl(request):
+          raise Http404("not found")
+      # Provide a deterministic response_for_exception result
+      error_obj = object()
+      handler = make_dummy_handler(serve_impl)
+      fake = make_fake_sync_to_async(calls, response_for_exception_obj=error_obj)
+      with mock.patch.object(handlers_mod, "sync_to_async", fake):
+          resp = await handler.get_response_async(DummyRequest())
+      # On Http404, get_response_async should return the object produced by response_for_exception
+      assert resp is error_obj
+      # sync_to_async should have been asked to wrap both serve and response_for_exception
+      assert len(calls) >= 2
+      assert handler.serve in calls
+      assert response_for_exception in calls
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_ensures_response_for_exception_wrapped_via_sync_to_async():
+      calls = []
+      # serve raises Http404
+      def serve_impl(request):
+          raise Http404()
+      # We'll supply a custom sentinel error response when response_for_exception is wrapped
+      sentinel = {"error": True}
+      handler = make_dummy_handler(serve_impl)
+      fake = make_fake_sync_to_async(calls, response_for_exception_obj=sentinel)
+      with mock.patch.object(handlers_mod, "sync_to_async", fake):
+          resp = await handler.get_response_async(DummyRequest())
+      assert resp is sentinel
+      # Ensure response_for_exception was passed to sync_to_async
+      assert response_for_exception in calls
+  
+  @pytest.mark.asyncio
+  async def test_asgi_handler_get_response_async_uses_sync_to_async_on_success():
+      calls = []
+      def serve_impl(request):
+          return "ASGI-OK"
+      handler = make_dummy_asgi_handler(serve_impl)
+      fake = make_fake_sync_to_async(calls)
+      with mock.patch.object(handlers_mod, "sync_to_async", fake):
+          resp = await handler.get_response_async(DummyRequest())
+      assert resp == "ASGI-OK"
+      assert len(calls) == 1
+      assert calls[0] is handler.serve
+  
+  @pytest.mark.asyncio
+  async def test_asgi_handler_get_response_async_uses_sync_to_async_on_exception():
+      calls = []
+      def serve_impl(request):
+          raise Http404()
+      sentinel = "ASGI-ERROR"
+      handler = make_dummy_asgi_handler(serve_impl)
+      fake = make_fake_sync_to_async(calls, response_for_exception_obj=sentinel)
+      with mock.patch.object(handlers_mod, "sync_to_async", fake):
+          resp = await handler.get_response_async(DummyRequest())
+      assert resp == sentinel
+      # Both serve and response_for_exception should have been wrapped
+      assert handler.serve in calls
+      assert response_for_exception in calls
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_respects_order_of_wrapper_calls():
+      """
+      Ensure that sync_to_async is asked to wrap serve first and only if that
+      raises is it asked to wrap response_for_exception. The implementation
+      should call/await the serve wrapper before calling the response wrapper.
+      """
+      call_sequence = []
+      def serve_impl(request):
+          call_sequence.append("serve_called")
+          raise Http404()
+      def fake_response_for_exception(req, exc):
+          call_sequence.append("response_for_exception_called")
+          return "ERR"
+      handler = make_dummy_handler(serve_impl)
+      # Create a fake sync_to_async that wraps and preserves call order
+      def fake(func):
+          # record wrap order
+          call_sequence.append(f"wrapped:{getattr(func, '__name__', repr(func))}")
+          def wrapper(*args, **kwargs):
+              async def coro():
+                  return func(*args, **kwargs)
+              return coro()
+          return wrapper
+      with mock.patch.object(handlers_mod, "sync_to_async", fake):
+          # Also patch the module-level response_for_exception to our fake to record the call
+          with mock.patch.object(handlers_mod, "response_for_exception", fake_response_for_exception):
+              resp = await handler.get_response_async(DummyRequest())
+      assert resp == "ERR"
+      # Expect that wrapping of serve happened before wrapping of response_for_exception
+      wrapped_names = [s for s in call_sequence if s.startswith("wrapped:")]
+      assert any("serve" in s for s in wrapped_names)
+      assert any("response_for_exception" in s for s in wrapped_names)
+      # Ensure serve was actually invoked before response_for_exception
+      assert call_sequence.index("serve_called") < call_sequence.index("response_for_exception_called")
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_with_different_request_objects_calls_sync_to_async():
+      # Validate that different request objects cause separate wrapper calls and are forwarded
+      calls = []
+      seen_requests = []
+      def serve_impl(request):
+          seen_requests.append(request)
+          return f"RESULT-{request.path}"
+      handler = make_dummy_handler(serve_impl)
+      fake = make_fake_sync_to_async(calls)
+      with mock.patch.object(handlers_mod, "sync_to_async", fake):
+          r1 = await handler.get_response_async(DummyRequest(path="/static/a"))
+          r2 = await handler.get_response_async(DummyRequest(path="/static/b"))
+      assert r1 == "RESULT-/static/a"
+      assert r2 == "RESULT-/static/b"
+      assert len(calls) == 2
+      assert seen_requests[0].path.endswith("/a")
+      assert seen_requests[1].path.endswith("/b")
+new_imports_code: |
+  import pytest
+  from django.http import Http404
+  import importlib
+  from urllib.parse import urlparse

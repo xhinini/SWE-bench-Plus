@@ -1,0 +1,192 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise post_process with max_post_process_passes == 0 for HashedFilesMixin and ManifestFilesMixin to ensure no UnboundLocalError occurs and URLs/references are correctly rewritten (including fragments like '#' and '?#', query strings, absolute/static paths, and ignored absolute paths). They will fail on the original buggy code (where "substitutions" is referenced before assignment when max_post_process_passes is 0) and pass with the patched code.
+test_code: |
+  import os
+  import shutil
+  import tempfile
+  import unittest
+  from django.test import override_settings
+  from django.core.files.base import ContentFile
+  
+  from django.contrib.staticfiles.storage import (
+      HashedFilesMixin, ManifestFilesMixin,
+      StaticFilesStorage, ManifestStaticFilesStorage,
+  )
+  
+  @override_settings(STATIC_URL='/static/', DEBUG=False)
+  class TestPostProcessMaxZero(unittest.TestCase):
+      def setUp(self):
+          self.tempdir = tempfile.mkdtemp()
+  
+      def tearDown(self):
+          shutil.rmtree(self.tempdir)
+  
+      def _make_storage(self, mixin_cls):
+          class S(mixin_cls, StaticFilesStorage):
+              # Force zero passes to reproduce the edge case.
+              max_post_process_passes = 0
+          return S(location=self.tempdir, base_url='/static/')
+  
+      def test_simple_css_processed_with_max_zero(self):
+          """
+          Simple CSS referencing an image should be post-processed with
+          max_post_process_passes == 0 without raising.
+          """
+          storage = self._make_storage(HashedFilesMixin)
+          storage._save('img.png', ContentFile(b'data'))
+          storage._save('test.css', ContentFile(b'body { background: url("img.png"); }'))
+  
+          results = list(storage.post_process({'test.css': (storage, 'test.css')}, dry_run=False))
+          # Ensure we have at least one processed result for test.css
+          names = [r[0] for r in results]
+          self.assertIn('test.css', names)
+  
+          # Find the hashed output for test.css
+          hashed = next(r[1] for r in results if r[0] == 'test.css')
+          with storage.open(hashed) as f:
+              content = f.read()
+          self.assertIn(b'img.', content)
+          self.assertIn(b'.png', content)
+  
+      def test_css_with_hash_bang_fragment_preserved(self):
+          """
+          Ensure the special '?#' font-face hack keeps the '?' when processed.
+          """
+          storage = self._make_storage(HashedFilesMixin)
+          storage._save('fonts/font.eot', ContentFile(b'fontdata'))
+          # CSS uses the special fragment syntax
+          storage._save('fonts.css', ContentFile(b'@font-face { src: url("fonts/font.eot?#iefix"); }'))
+  
+          results = list(storage.post_process({'fonts.css': (storage, 'fonts.css')}, dry_run=False))
+          hashed = next(r[1] for r in results if r[0] == 'fonts.css')
+          with storage.open(hashed) as f:
+              content = f.read()
+          # The '?#' should still be present in the transformed URL
+          self.assertIn(b'?#iefix', content)
+  
+      def test_css_with_hash_fragment_preserved(self):
+          """
+          CSS with a '#' fragment (not the '?#' hack) should retain the fragment.
+          """
+          storage = self._make_storage(HashedFilesMixin)
+          storage._save('img.png', ContentFile(b'data2'))
+          storage._save('frag.css', ContentFile(b'body{background:url("img.png#frag")}'))
+  
+          results = list(storage.post_process({'frag.css': (storage, 'frag.css')}, dry_run=False))
+          hashed = next(r[1] for r in results if r[0] == 'frag.css')
+          with storage.open(hashed) as f:
+              content = f.read()
+          # Fragment should be present after processing
+          self.assertIn(b'#frag', content)
+  
+      def test_css_with_querystring_preserved(self):
+          """
+          CSS referencing a resource with a query string should preserve the query.
+          """
+          storage = self._make_storage(HashedFilesMixin)
+          storage._save('img.png', ContentFile(b'data3'))
+          storage._save('q.css', ContentFile(b'body{background:url("img.png?ver=1.2")}'))
+  
+          results = list(storage.post_process({'q.css': (storage, 'q.css')}, dry_run=False))
+          hashed = next(r[1] for r in results if r[0] == 'q.css')
+          with storage.open(hashed) as f:
+              content = f.read()
+          self.assertIn(b'?ver=1.2', content)
+  
+      def test_absolute_static_url_processed(self):
+          """
+          An absolute URL that starts with STATIC_URL should be processed.
+          """
+          storage = self._make_storage(HashedFilesMixin)
+          storage._save('root.png', ContentFile(b'rootdata'))
+          storage._save('abs.css', ContentFile(b'body{background:url("/static/root.png")}'))
+  
+          results = list(storage.post_process({'abs.css': (storage, 'abs.css')}, dry_run=False))
+          hashed = next(r[1] for r in results if r[0] == 'abs.css')
+          with storage.open(hashed) as f:
+              content = f.read()
+          # The static-root absolute reference should be rewritten to hashed name.
+          self.assertIn(b'root.', content)
+          self.assertIn(b'.png', content)
+  
+      def test_absolute_outside_static_ignored(self):
+          """
+          An absolute URL that does not start with STATIC_URL should be ignored
+          (left untouched).
+          """
+          storage = self._make_storage(HashedFilesMixin)
+          storage._save('other.png', ContentFile(b'x'))
+          storage._save('ignore.css', ContentFile(b'body{background:url("/media/other.png")}'))
+  
+          results = list(storage.post_process({'ignore.css': (storage, 'ignore.css')}, dry_run=False))
+          hashed = next(r[1] for r in results if r[0] == 'ignore.css')
+          with storage.open(hashed) as f:
+              content = f.read()
+          # Since the URL doesn't point into STATIC_URL, it should remain un-hashed.
+          self.assertIn(b'/media/other.png', content)
+  
+      def test_manifest_post_process_with_max_zero_saves_manifest(self):
+          """
+          ManifestFilesMixin with max_post_process_passes == 0 should write a manifest
+          and allow stored_name lookups.
+          """
+          class M(ManifestFilesMixin, StaticFilesStorage):
+              max_post_process_passes = 0
+          storage = M(location=self.tempdir, base_url='/static/')
+          # Save a simple file so post_process has something to process.
+          storage._save('mfile.txt', ContentFile(b'hello'))
+          results = list(storage.post_process({'mfile.txt': (storage, 'mfile.txt')}, dry_run=False))
+          # Manifest file should be created on disk
+          manifest_path = os.path.join(self.tempdir, storage.manifest_name)
+          self.assertTrue(os.path.exists(manifest_path))
+          # stored_name should now find an entry (no exception)
+          _ = storage.stored_name('mfile.txt')
+  
+      def test_no_runtime_error_yielded_when_max_zero(self):
+          """
+          Ensure post_process does not yield the 'All' runtime error when
+          max_post_process_passes == 0 (no UnboundLocalError or spurious RuntimeError).
+          """
+          storage = self._make_storage(HashedFilesMixin)
+          storage._save('a.png', ContentFile(b'a'))
+          storage._save('a.css', ContentFile(b'url("a.png")'))
+  
+          results = list(storage.post_process({'a.css': (storage, 'a.css')}, dry_run=False))
+          # No entry named 'All' should be yielded for this normal case.
+          names = [r[0] for r in results]
+          self.assertNotIn('All', names)
+  
+      def test_stored_name_with_max_zero_resolves(self):
+          """
+          stored_name should be able to compute the hashed name even if
+          max_post_process_passes is zero (it performs its own limited loop).
+          """
+          storage = self._make_storage(HashedFilesMixin)
+          storage._save('s.png', ContentFile(b's'))
+          # call stored_name for a non-adjustable name; should not raise.
+          name = storage.stored_name('s.png')
+          # Ensure returned name contains the expected filename with a hash marker (or same name if none)
+          self.assertTrue(name.endswith('.png'))
+  
+      def test_multiple_adjustable_files_with_max_zero(self):
+          """
+          Multiple adjustable files in one run should all be processed without error.
+          """
+          storage = self._make_storage(HashedFilesMixin)
+          storage._save('i1.png', ContentFile(b'1'))
+          storage._save('i2.png', ContentFile(b'22'))
+          storage._save('c1.css', ContentFile(b'url("i1.png")'))
+          storage._save('c2.css', ContentFile(b'url("i2.png")'))
+  
+          paths = {
+              'c1.css': (storage, 'c1.css'),
+              'c2.css': (storage, 'c2.css'),
+          }
+          results = list(storage.post_process(paths, dry_run=False))
+          # Both CSS files should be processed and present in results
+          names = [r[0] for r in results]
+          self.assertIn('c1.css', names)
+          self.assertIn('c2.css', names)
+new_imports_code: |
+  from django.core.files.base import ContentFile

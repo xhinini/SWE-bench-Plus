@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_mutation_of_non_form_errors_for_nonempty_list forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_html_does_not_duplicate_errorlist_token forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_identity_after_is_valid_called forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_multiple_calls_return_same_instance forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_mutation_reflects_internal_errorlist forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_returns_errorlist_instance forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_returns_internal_instance_for_valid_formset forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_with_nonempty_errors_keeps_internal_instance forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_unbound_formset_non_form_errors_identity
+coverage json -o coverage.json
+: '>>>>> End Test Output'

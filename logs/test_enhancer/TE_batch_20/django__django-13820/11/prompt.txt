@@ -1,0 +1,1117 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `django/db/migrations/loader.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 import pkgutil
+2 import sys
+3 from importlib import import_module, reload
+4 
+5 from django.apps import apps
+6 from django.conf import settings
+7 from django.db.migrations.graph import MigrationGraph
+8 from django.db.migrations.recorder import MigrationRecorder
+9 
+10 from .exceptions import (
+11     AmbiguityError, BadMigrationError, InconsistentMigrationHistory,
+12     NodeNotFoundError,
+13 )
+14 
+15 MIGRATIONS_MODULE_NAME = 'migrations'
+16 
+17 
+18 class MigrationLoader:
+19     """
+20     Load migration files from disk and their status from the database.
+21 
+22     Migration files are expected to live in the "migrations" directory of
+23     an app. Their names are entirely unimportant from a code perspective,
+24     but will probably follow the 1234_name.py convention.
+25 
+26     On initialization, this class will scan those directories, and open and
+27     read the Python files, looking for a class called Migration, which should
+28     inherit from django.db.migrations.Migration. See
+29     django.db.migrations.migration for what that looks like.
+30 
+31     Some migrations will be marked as "replacing" another set of migrations.
+32     These are loaded into a separate set of migrations away from the main ones.
+33     If all the migrations they replace are either unapplied or missing from
+34     disk, then they are injected into the main set, replacing the named migrations.
+35     Any dependency pointers to the replaced migrations are re-pointed to the
+36     new migration.
+37 
+38     This does mean that this class MUST also talk to the database as well as
+39     to disk, but this is probably fine. We're already not just operating
+40     in memory.
+41     """
+42 
+43     def __init__(
+44         self, connection, load=True, ignore_no_migrations=False,
+45         replace_migrations=True,
+46     ):
+47         self.connection = connection
+48         self.disk_migrations = None
+49         self.applied_migrations = None
+50         self.ignore_no_migrations = ignore_no_migrations
+51         self.replace_migrations = replace_migrations
+52         if load:
+53             self.build_graph()
+54 
+55     @classmethod
+56     def migrations_module(cls, app_label):
+57         """
+58         Return the path to the migrations module for the specified app_label
+59         and a boolean indicating if the module is specified in
+60         settings.MIGRATION_MODULE.
+61         """
+62         if app_label in settings.MIGRATION_MODULES:
+63             return settings.MIGRATION_MODULES[app_label], True
+64         else:
+65             app_package_name = apps.get_app_config(app_label).name
+66             return '%s.%s' % (app_package_name, MIGRATIONS_MODULE_NAME), False
+67 
+68     def load_disk(self):
+69         """Load the migrations from all INSTALLED_APPS from disk."""
+70         self.disk_migrations = {}
+71         self.unmigrated_apps = set()
+72         self.migrated_apps = set()
+73         for app_config in apps.get_app_configs():
+74             # Get the migrations module directory
+75             module_name, explicit = self.migrations_module(app_config.label)
+76             if module_name is None:
+77                 self.unmigrated_apps.add(app_config.label)
+78                 continue
+79             was_loaded = module_name in sys.modules
+80             try:
+81                 module = import_module(module_name)
+82             except ModuleNotFoundError as e:
+83                 if (
+84                     (explicit and self.ignore_no_migrations) or
+85                     (not explicit and MIGRATIONS_MODULE_NAME in e.name.split('.'))
+86                 ):
+87                     self.unmigrated_apps.add(app_config.label)
+88                     continue
+89                 raise
+90             else:
+91                 # Module is not a package (e.g. migrations.py).
+92                 if not hasattr(module, '__path__'):
+93                     self.unmigrated_apps.add(app_config.label)
+94                     continue
+95                 # Empty directories are namespaces. Namespace packages have no
+96                 # __file__ and don't use a list for __path__. See
+97                 # https://docs.python.org/3/reference/import.html#namespace-packages
+98                 if (
+99                     getattr(module, '__file__', None) is None and
+100                     not isinstance(module.__path__, list)
+101                 ):
+102                     self.unmigrated_apps.add(app_config.label)
+103                     continue
+104                 # Force a reload if it's already loaded (tests need this)
+105                 if was_loaded:
+106                     reload(module)
+107             self.migrated_apps.add(app_config.label)
+108             migration_names = {
+109                 name for _, name, is_pkg in pkgutil.iter_modules(module.__path__)
+110                 if not is_pkg and name[0] not in '_~'
+111             }
+112             # Load migrations
+113             for migration_name in migration_names:
+114                 migration_path = '%s.%s' % (module_name, migration_name)
+115                 try:
+116                     migration_module = import_module(migration_path)
+117                 except ImportError as e:
+118                     if 'bad magic number' in str(e):
+119                         raise ImportError(
+120                             "Couldn't import %r as it appears to be a stale "
+121                             ".pyc file." % migration_path
+122                         ) from e
+123                     else:
+124                         raise
+125                 if not hasattr(migration_module, "Migration"):
+126                     raise BadMigrationError(
+127                         "Migration %s in app %s has no Migration class" % (migration_name, app_config.label)
+128                     )
+129                 self.disk_migrations[app_config.label, migration_name] = migration_module.Migration(
+130                     migration_name,
+131                     app_config.label,
+132                 )
+133 
+134     def get_migration(self, app_label, name_prefix):
+135         """Return the named migration or raise NodeNotFoundError."""
+136         return self.graph.nodes[app_label, name_prefix]
+137 
+138     def get_migration_by_prefix(self, app_label, name_prefix):
+139         """
+140         Return the migration(s) which match the given app label and name_prefix.
+141         """
+142         # Do the search
+143         results = []
+144         for migration_app_label, migration_name in self.disk_migrations:
+145             if migration_app_label == app_label and migration_name.startswith(name_prefix):
+146                 results.append((migration_app_label, migration_name))
+147         if len(results) > 1:
+148             raise AmbiguityError(
+149                 "There is more than one migration for '%s' with the prefix '%s'" % (app_label, name_prefix)
+150             )
+151         elif not results:
+152             raise KeyError("There no migrations for '%s' with the prefix '%s'" % (app_label, name_prefix))
+153         else:
+154             return self.disk_migrations[results[0]]
+155 
+156     def check_key(self, key, current_app):
+157         if (key[1] != "__first__" and key[1] != "__latest__") or key in self.graph:
+158             return key
+159         # Special-case __first__, which means "the first migration" for
+160         # migrated apps, and is ignored for unmigrated apps. It allows
+161         # makemigrations to declare dependencies on apps before they even have
+162         # migrations.
+163         if key[0] == current_app:
+164             # Ignore __first__ references to the same app (#22325)
+165             return
+166         if key[0] in self.unmigrated_apps:
+167             # This app isn't migrated, but something depends on it.
+168             # The models will get auto-added into the state, though
+169             # so we're fine.
+170             return
+171         if key[0] in self.migrated_apps:
+172             try:
+173                 if key[1] == "__first__":
+174                     return self.graph.root_nodes(key[0])[0]
+175                 else:  # "__latest__"
+176                     return self.graph.leaf_nodes(key[0])[0]
+177             except IndexError:
+178                 if self.ignore_no_migrations:
+179                     return None
+180                 else:
+181                     raise ValueError("Dependency on app with no migrations: %s" % key[0])
+182         raise ValueError("Dependency on unknown app: %s" % key[0])
+183 
+184     def add_internal_dependencies(self, key, migration):
+185         """
+186         Internal dependencies need to be added first to ensure `__first__`
+187         dependencies find the correct root node.
+188         """
+189         for parent in migration.dependencies:
+190             # Ignore __first__ references to the same app.
+191             if parent[0] == key[0] and parent[1] != '__first__':
+192                 self.graph.add_dependency(migration, key, parent, skip_validation=True)
+193 
+194     def add_external_dependencies(self, key, migration):
+195         for parent in migration.dependencies:
+196             # Skip internal dependencies
+197             if key[0] == parent[0]:
+198                 continue
+199             parent = self.check_key(parent, key[0])
+200             if parent is not None:
+201                 self.graph.add_dependency(migration, key, parent, skip_validation=True)
+202         for child in migration.run_before:
+203             child = self.check_key(child, key[0])
+204             if child is not None:
+205                 self.graph.add_dependency(migration, child, key, skip_validation=True)
+206 
+207     def build_graph(self):
+208         """
+209         Build a migration dependency graph using both the disk and database.
+210         You'll need to rebuild the graph if you apply migrations. This isn't
+211         usually a problem as generally migration stuff runs in a one-shot process.
+212         """
+213         # Load disk data
+214         self.load_disk()
+215         # Load database data
+216         if self.connection is None:
+217             self.applied_migrations = {}
+218         else:
+219             recorder = MigrationRecorder(self.connection)
+220             self.applied_migrations = recorder.applied_migrations()
+221         # To start, populate the migration graph with nodes for ALL migrations
+222         # and their dependencies. Also make note of replacing migrations at this step.
+223         self.graph = MigrationGraph()
+224         self.replacements = {}
+225         for key, migration in self.disk_migrations.items():
+226             self.graph.add_node(key, migration)
+227             # Replacing migrations.
+228             if migration.replaces:
+229                 self.replacements[key] = migration
+230         for key, migration in self.disk_migrations.items():
+231             # Internal (same app) dependencies.
+232             self.add_internal_dependencies(key, migration)
+233         # Add external dependencies now that the internal ones have been resolved.
+234         for key, migration in self.disk_migrations.items():
+235             self.add_external_dependencies(key, migration)
+236         # Carry out replacements where possible and if enabled.
+237         if self.replace_migrations:
+238             for key, migration in self.replacements.items():
+239                 # Get applied status of each of this migration's replacement
+240                 # targets.
+241                 applied_statuses = [(target in self.applied_migrations) for target in migration.replaces]
+242                 # The replacing migration is only marked as applied if all of
+243                 # its replacement targets are.
+244                 if all(applied_statuses):
+245                     self.applied_migrations[key] = migration
+246                 else:
+247                     self.applied_migrations.pop(key, None)
+248                 # A replacing migration can be used if either all or none of
+249                 # its replacement targets have been applied.
+250                 if all(applied_statuses) or (not any(applied_statuses)):
+251                     self.graph.remove_replaced_nodes(key, migration.replaces)
+252                 else:
+253                     # This replacing migration cannot be used because it is
+254                     # partially applied. Remove it from the graph and remap
+255                     # dependencies to it (#25945).
+256                     self.graph.remove_replacement_node(key, migration.replaces)
+257         # Ensure the graph is consistent.
+258         try:
+259             self.graph.validate_consistency()
+260         except NodeNotFoundError as exc:
+261             # Check if the missing node could have been replaced by any squash
+262             # migration but wasn't because the squash migration was partially
+263             # applied before. In that case raise a more understandable exception
+264             # (#23556).
+265             # Get reverse replacements.
+266             reverse_replacements = {}
+267             for key, migration in self.replacements.items():
+268                 for replaced in migration.replaces:
+269                     reverse_replacements.setdefault(replaced, set()).add(key)
+270             # Try to reraise exception with more detail.
+271             if exc.node in reverse_replacements:
+272                 candidates = reverse_replacements.get(exc.node, set())
+273                 is_replaced = any(candidate in self.graph.nodes for candidate in candidates)
+274                 if not is_replaced:
+275                     tries = ', '.join('%s.%s' % c for c in candidates)
+276                     raise NodeNotFoundError(
+277                         "Migration {0} depends on nonexistent node ('{1}', '{2}'). "
+278                         "Django tried to replace migration {1}.{2} with any of [{3}] "
+279                         "but wasn't able to because some of the replaced migrations "
+280                         "are already applied.".format(
+281                             exc.origin, exc.node[0], exc.node[1], tries
+282                         ),
+283                         exc.node
+284                     ) from exc
+285             raise
+286         self.graph.ensure_not_cyclic()
+287 
+288     def check_consistent_history(self, connection):
+289         """
+290         Raise InconsistentMigrationHistory if any applied migrations have
+291         unapplied dependencies.
+292         """
+293         recorder = MigrationRecorder(connection)
+294         applied = recorder.applied_migrations()
+295         for migration in applied:
+296             # If the migration is unknown, skip it.
+297             if migration not in self.graph.nodes:
+298                 continue
+299             for parent in self.graph.node_map[migration].parents:
+300                 if parent not in applied:
+301                     # Skip unapplied squashed migrations that have all of their
+302                     # `replaces` applied.
+303                     if parent in self.replacements:
+304                         if all(m in applied for m in self.replacements[parent].replaces):
+305                             continue
+306                     raise InconsistentMigrationHistory(
+307                         "Migration {}.{} is applied before its dependency "
+308                         "{}.{} on database '{}'.".format(
+309                             migration[0], migration[1], parent[0], parent[1],
+310                             connection.alias,
+311                         )
+312                     )
+313 
+314     def detect_conflicts(self):
+315         """
+316         Look through the loaded graph and detect any conflicts - apps
+317         with more than one leaf migration. Return a dict of the app labels
+318         that conflict with the migration names that conflict.
+319         """
+320         seen_apps = {}
+321         conflicting_apps = set()
+322         for app_label, migration_name in self.graph.leaf_nodes():
+323             if app_label in seen_apps:
+324                 conflicting_apps.add(app_label)
+325             seen_apps.setdefault(app_label, set()).add(migration_name)
+326         return {app_label: sorted(seen_apps[app_label]) for app_label in conflicting_apps}
+327 
+328     def project_state(self, nodes=None, at_end=True):
+329         """
+330         Return a ProjectState object representing the most recent state
+331         that the loaded migrations represent.
+332 
+333         See graph.make_state() for the meaning of "nodes" and "at_end".
+334         """
+335         return self.graph.make_state(nodes=nodes, at_end=at_end, real_apps=list(self.unmigrated_apps))
+336 
+337     def collect_sql(self, plan):
+338         """
+339         Take a migration plan and return a list of collected SQL statements
+340         that represent the best-efforts version of that plan.
+341         """
+342         statements = []
+343         state = None
+344         for migration, backwards in plan:
+345             with self.connection.schema_editor(collect_sql=True, atomic=migration.atomic) as schema_editor:
+346                 if state is None:
+347                     state = self.project_state((migration.app_label, migration.name), at_end=False)
+348                 if not backwards:
+349                     state = migration.apply(state, schema_editor, collect_sql=True)
+350                 else:
+351                     state = migration.unapply(state, schema_editor, collect_sql=True)
+352             statements.extend(schema_editor.collected_sql)
+353         return statements
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `django/db/migrations/loader.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/django/db/migrations/loader.py b/django/db/migrations/loader.py
+--- a/django/db/migrations/loader.py
++++ b/django/db/migrations/loader.py
+@@ -88,15 +88,19 @@ def load_disk(self):
+                     continue
+                 raise
+             else:
+-                # Empty directories are namespaces.
+-                # getattr() needed on PY36 and older (replace w/attribute access).
+-                if getattr(module, '__file__', None) is None:
+-                    self.unmigrated_apps.add(app_config.label)
+-                    continue
+                 # Module is not a package (e.g. migrations.py).
+                 if not hasattr(module, '__path__'):
+                     self.unmigrated_apps.add(app_config.label)
+                     continue
++                # Empty directories are namespaces. Namespace packages have no
++                # __file__ and don't use a list for __path__. See
++                # https://docs.python.org/3/reference/import.html#namespace-packages
++                if (
++                    getattr(module, '__file__', None) is None and
++                    not isinstance(module.__path__, list)
++                ):
++                    self.unmigrated_apps.add(app_config.label)
++                    continue
+                 # Force a reload if it's already loaded (tests need this)
+                 if was_loaded:
+                     reload(module)
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/django/db/migrations/loader.py b/django/db/migrations/loader.py
+index 95a5062ec9..bab2757c47 100644
+--- a/django/db/migrations/loader.py
++++ b/django/db/migrations/loader.py
+@@ -90,7 +90,8 @@ class MigrationLoader:
+             else:
+                 # Empty directories are namespaces.
+                 # getattr() needed on PY36 and older (replace w/attribute access).
+-                if getattr(module, '__file__', None) is None:
++                # Regular packages have list for __path__, namespace packages use custom iterable type
++                if getattr(module, '__file__', None) is None and not (hasattr(module, '__path__') and isinstance(module.__path__, list)):
+                     self.unmigrated_apps.add(app_config.label)
+                     continue
+                 # Module is not a package (e.g. migrations.py).
+diff --git a/reproduce_issue.py b/reproduce_issue.py
+new file mode 100644
+index 0000000000..a84c7f1688
+--- /dev/null
++++ b/reproduce_issue.py
+@@ -0,0 +1,67 @@
++import sys
++import types
++import os
++
++# Add Django to Python path
++sys.path.insert(0, '/testbed')
++
++# Create a mock module that simulates a non-namespace package without __file__
++mock_module = types.ModuleType('mock_migrations')
++mock_module.__path__ = ['/some/path']  # Regular packages have list for __path__
++
++# Create a mock module that simulates a namespace package
++namespace_module = types.ModuleType('namespace_migrations')
++namespace_module.__path__ = type('_NamespacePath', (), {'_path': ['/some/path']})()  # Namespace packages have custom type
++
++# Create a mock app config
++class MockAppConfig:
++    def __init__(self, label):
++        self.label = label
++        self.name = 'mock_app'
++
++# Import Django's MigrationLoader
++from django.db.migrations.loader import MigrationLoader
++
++# Create a loader instance
++loader = MigrationLoader(None, load=False)
++
++def test_module(module, label="test"):
++    # Mock the import_module to return our test module
++    import builtins
++    original_import = builtins.__import__
++    
++    def mock_import(name, *args, **kwargs):
++        if name == 'mock_app.migrations':
++            return module
++        return original_import(name, *args, **kwargs)
++    
++    builtins.__import__ = mock_import
++    
++    # Test the module
++    try:
++        app_config = MockAppConfig(label)
++        loader.disk_migrations = {}
++        loader.unmigrated_apps = set()
++        loader.migrated_apps = set()
++        
++        # Call the relevant part of load_disk()
++        module_name = 'mock_app.migrations'
++        try:
++            if getattr(module, '__file__', None) is None and not (hasattr(module, '__path__') and isinstance(module.__path__, list)):
++                loader.unmigrated_apps.add(app_config.label)
++                return "Rejected (treated as namespace package)"
++            if not hasattr(module, '__path__'):
++                loader.unmigrated_apps.add(app_config.label)
++                return "Rejected (not a package)"
++            return "Accepted"
++        except Exception as e:
++            return f"Error: {str(e)}"
++    finally:
++        # Restore original import
++        builtins.__import__ = original_import
++
++print("Testing regular package without __file__:")
++print(test_module(mock_module))
++
++print("\nTesting namespace package:")
++print(test_module(namespace_module))
+\ No newline at end of file
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `tests/migrations/test_loader.py` that contains the existing tests.
+-----------------------------------------------------------
+import compileall
+import os
+from importlib import import_module
+
+from django.db import connection, connections
+from django.db.migrations.exceptions import (
+    AmbiguityError, InconsistentMigrationHistory, NodeNotFoundError,
+)
+from django.db.migrations.loader import MigrationLoader
+from django.db.migrations.recorder import MigrationRecorder
+from django.test import TestCase, modify_settings, override_settings
+
+from .test_base import MigrationTestBase
+
+
+class RecorderTests(TestCase):
+    """
+    Tests recording migrations as applied or not.
+    """
+    databases = {'default', 'other'}
+
+    def test_apply(self):
+        """
+        Tests marking migrations as applied/unapplied.
+        """
+        recorder = MigrationRecorder(connection)
+        self.assertEqual(
+            {(x, y) for (x, y) in recorder.applied_migrations() if x == "myapp"},
+            set(),
+        )
+        recorder.record_applied("myapp", "0432_ponies")
+        self.assertEqual(
+            {(x, y) for (x, y) in recorder.applied_migrations() if x == "myapp"},
+            {("myapp", "0432_ponies")},
+        )
+        # That should not affect records of another database
+        recorder_other = MigrationRecorder(connections['other'])
+        self.assertEqual(
+            {(x, y) for (x, y) in recorder_other.applied_migrations() if x == "myapp"},
+            set(),
+        )
+        recorder.record_unapplied("myapp", "0432_ponies")
+        self.assertEqual(
+            {(x, y) for (x, y) in recorder.applied_migrations() if x == "myapp"},
+            set(),
+        )
+
+
+class LoaderTests(TestCase):
+    """
+    Tests the disk and database loader, and running through migrations
+    in memory.
+    """
+
+    @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+    @modify_settings(INSTALLED_APPS={'append': 'basic'})
+    def test_load(self):
+        """
+        Makes sure the loader can load the migrations for the test apps,
+        and then render them out to a new Apps.
+        """
+        # Load and test the plan
+        migration_loader = MigrationLoader(connection)
+        self.assertEqual(
+            migration_loader.graph.forwards_plan(("migrations", "0002_second")),
+            [
+                ("migrations", "0001_initial"),
+                ("migrations", "0002_second"),
+            ],
+        )
+        # Now render it out!
+        project_state = migration_loader.project_state(("migrations", "0002_second"))
+        self.assertEqual(len(project_state.models), 2)
+
+        author_state = project_state.models["migrations", "author"]
+        self.assertEqual(
+            list(author_state.fields),
+            ["id", "name", "slug", "age", "rating"]
+        )
+
+        book_state = project_state.models["migrations", "book"]
+        self.assertEqual(list(book_state.fields), ['id', 'author'])
+
+        # Ensure we've included unmigrated apps in there too
+        self.assertIn("basic", project_state.real_apps)
+
+    @override_settings(MIGRATION_MODULES={
+        'migrations': 'migrations.test_migrations',
+        'migrations2': 'migrations2.test_migrations_2',
+    })
+    @modify_settings(INSTALLED_APPS={'append': 'migrations2'})
+    def test_plan_handles_repeated_migrations(self):
+        """
+        _generate_plan() doesn't readd migrations already in the plan (#29180).
+        """
+        migration_loader = MigrationLoader(connection)
+        nodes = [('migrations', '0002_second'), ('migrations2', '0001_initial')]
+        self.assertEqual(
+            migration_loader.graph._generate_plan(nodes, at_end=True),
+            [('migrations', '0001_initial'), ('migrations', '0002_second'), ('migrations2', '0001_initial')]
+        )
+
+    @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations_unmigdep"})
+    def test_load_unmigrated_dependency(self):
+        """
+        Makes sure the loader can load migrations with a dependency on an unmigrated app.
+        """
+        # Load and test the plan
+        migration_loader = MigrationLoader(connection)
+        self.assertEqual(
+            migration_loader.graph.forwards_plan(("migrations", "0001_initial")),
+            [
+                ('contenttypes', '0001_initial'),
+                ('auth', '0001_initial'),
+                ("migrations", "0001_initial"),
+            ],
+        )
+        # Now render it out!
+        project_state = migration_loader.project_state(("migrations", "0001_initial"))
+        self.assertEqual(len([m for a, m in project_state.models if a == "migrations"]), 1)
+
+        book_state = project_state.models["migrations", "book"]
+        self.assertEqual(list(book_state.fields), ['id', 'user'])
+
+    @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations_run_before"})
+    def test_run_before(self):
+        """
+        Makes sure the loader uses Migration.run_before.
+        """
+        # Load and test the plan
+        migration_loader = MigrationLoader(connection)
+        self.assertEqual(
+            migration_loader.graph.forwards_plan(("migrations", "0002_second")),
+            [
+                ("migrations", "0001_initial"),
+                ("migrations", "0003_third"),
+                ("migrations", "0002_second"),
+            ],
+        )
+
+    @override_settings(MIGRATION_MODULES={
+        "migrations": "migrations.test_migrations_first",
+        "migrations2": "migrations2.test_migrations_2_first",
+    })
+    @modify_settings(INSTALLED_APPS={'append': 'migrations2'})
+    def test_first(self):
+        """
+        Makes sure the '__first__' migrations build correctly.
+        """
+        migration_loader = MigrationLoader(connection)
+        self.assertEqual(
+            migration_loader.graph.forwards_plan(("migrations", "second")),
+            [
+                ("migrations", "thefirst"),
+                ("migrations2", "0001_initial"),
+                ("migrations2", "0002_second"),
+                ("migrations", "second"),
+            ],
+        )
+
+    @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+    def test_name_match(self):
+        "Tests prefix name matching"
+        migration_loader = MigrationLoader(connection)
+        self.assertEqual(
+            migration_loader.get_migration_by_prefix("migrations", "0001").name,
+            "0001_initial",
+        )
+        with self.assertRaises(AmbiguityError):
+            migration_loader.get_migration_by_prefix("migrations", "0")
+        with self.assertRaises(KeyError):
+            migration_loader.get_migration_by_prefix("migrations", "blarg")
+
+    def test_load_import_error(self):
+        with override_settings(MIGRATION_MODULES={"migrations": "import_error_package"}):
+            with self.assertRaises(ImportError):
+                MigrationLoader(connection)
+
+    def test_load_module_file(self):
+        with override_settings(MIGRATION_MODULES={"migrations": "migrations.faulty_migrations.file"}):
+            loader = MigrationLoader(connection)
+            self.assertIn(
+                "migrations", loader.unmigrated_apps,
+                "App with migrations module file not in unmigrated apps."
+            )
+
+    def test_load_empty_dir(self):
+        with override_settings(MIGRATION_MODULES={"migrations": "migrations.faulty_migrations.namespace"}):
+            loader = MigrationLoader(connection)
+            self.assertIn(
+                "migrations", loader.unmigrated_apps,
+                "App missing __init__.py in migrations module not in unmigrated apps."
+            )
+
+    @override_settings(
+        INSTALLED_APPS=['migrations.migrations_test_apps.migrated_app'],
+    )
+    def test_marked_as_migrated(self):
+        """
+        Undefined MIGRATION_MODULES implies default migration module.
+        """
+        migration_loader = MigrationLoader(connection)
+        self.assertEqual(migration_loader.migrated_apps, {'migrated_app'})
+        self.assertEqual(migration_loader.unmigrated_apps, set())
+
+    @override_settings(
+        INSTALLED_APPS=['migrations.migrations_test_apps.migrated_app'],
+        MIGRATION_MODULES={"migrated_app": None},
+    )
+    def test_marked_as_unmigrated(self):
+        """
+        MIGRATION_MODULES allows disabling of migrations for a particular app.
+        """
+        migration_loader = MigrationLoader(connection)
+        self.assertEqual(migration_loader.migrated_apps, set())
+        self.assertEqual(migration_loader.unmigrated_apps, {'migrated_app'})
+
+    @override_settings(
+        INSTALLED_APPS=['migrations.migrations_test_apps.migrated_app'],
+        MIGRATION_MODULES={'migrated_app': 'missing-module'},
+    )
+    def test_explicit_missing_module(self):
+        """
+        If a MIGRATION_MODULES override points to a missing module, the error
+        raised during the importation attempt should be propagated unless
+        `ignore_no_migrations=True`.
+        """
+        with self.assertRaisesMessage(ImportError, 'missing-module'):
+            migration_loader = MigrationLoader(connection)
+        migration_loader = MigrationLoader(connection, ignore_no_migrations=True)
+        self.assertEqual(migration_loader.migrated_apps, set())
+        self.assertEqual(migration_loader.unmigrated_apps, {'migrated_app'})
+
+    @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations_squashed"})
+    def test_loading_squashed(self):
+        "Tests loading a squashed migration"
+        migration_loader = MigrationLoader(connection)
+        recorder = MigrationRecorder(connection)
+        self.addCleanup(recorder.flush)
+        # Loading with nothing applied should just give us the one node
+        self.assertEqual(
+            len([x for x in migration_loader.graph.nodes if x[0] == "migrations"]),
+            1,
+        )
+        # However, fake-apply one migration and it should now use the old two
+        recorder.record_applied("migrations", "0001_initial")
+        migration_loader.build_graph()
+        self.assertEqual(
+            len([x for x in migration_loader.graph.nodes if x[0] == "migrations"]),
+            2,
+        )
+
+    @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations_squashed_complex"})
+    def test_loading_squashed_complex(self):
+        "Tests loading a complex set of squashed migrations"
+
+        loader = MigrationLoader(connection)
+        recorder = MigrationRecorder(connection)
+        self.addCleanup(recorder.flush)
+
+        def num_nodes():
+            plan = set(loader.graph.forwards_plan(('migrations', '7_auto')))
+            return len(plan - loader.applied_migrations.keys())
+
+        # Empty database: use squashed migration
+        loader.build_graph()
+        self.assertEqual(num_nodes(), 5)
+
+        # Starting at 1 or 2 should use the squashed migration too
+        recorder.record_applied("migrations", "1_auto")
+        loader.build_graph()
+        self.assertEqual(num_nodes(), 4)
+
+        recorder.record_applied("migrations", "2_auto")
+        loader.build_graph()
+        self.assertEqual(num_nodes(), 3)
+
+        # However, starting at 3 to 5 cannot use the squashed migration
+        recorder.record_applied("migrations", "3_auto")
+        loader.build_graph()
+        self.assertEqual(num_nodes(), 4)
+
+        recorder.record_applied("migrations", "4_auto")
+        loader.build_graph()
+        self.assertEqual(num_nodes(), 3)
+
+        # Starting at 5 to 7 we are passed the squashed migrations
+        recorder.record_applied("migrations", "5_auto")
+        loader.build_graph()
+        self.assertEqual(num_nodes(), 2)
+
+        recorder.record_applied("migrations", "6_auto")
+        loader.build_graph()
+        self.assertEqual(num_nodes(), 1)
+
+        recorder.record_applied("migrations", "7_auto")
+        loader.build_graph()
+        self.assertEqual(num_nodes(), 0)
+
+    @override_settings(MIGRATION_MODULES={
+        "app1": "migrations.test_migrations_squashed_complex_multi_apps.app1",
+        "app2": "migrations.test_migrations_squashed_complex_multi_apps.app2",
+    })
+    @modify_settings(INSTALLED_APPS={'append': [
+        "migrations.test_migrations_squashed_complex_multi_apps.app1",
+        "migrations.test_migrations_squashed_complex_multi_apps.app2",
+    ]})
+    def test_loading_squashed_complex_multi_apps(self):
+        loader = MigrationLoader(connection)
+        loader.build_graph()
+
+        plan = set(loader.graph.forwards_plan(('app1', '4_auto')))
+        expected_plan = {
+            ('app1', '1_auto'),
+            ('app2', '1_squashed_2'),
+            ('app1', '2_squashed_3'),
+            ('app1', '4_auto'),
+        }
+        self.assertEqual(plan, expected_plan)
+
+    @override_settings(MIGRATION_MODULES={
+        "app1": "migrations.test_migrations_squashed_complex_multi_apps.app1",
+        "app2": "migrations.test_migrations_squashed_complex_multi_apps.app2",
+    })
+    @modify_settings(INSTALLED_APPS={'append': [
+        "migrations.test_migrations_squashed_complex_multi_apps.app1",
+        "migrations.test_migrations_squashed_complex_multi_apps.app2",
+    ]})
+    def test_loading_squashed_complex_multi_apps_partially_applied(self):
+        loader = MigrationLoader(connection)
+        recorder = MigrationRecorder(connection)
+        recorder.record_applied('app1', '1_auto')
+        recorder.record_applied('app1', '2_auto')
+        loader.build_graph()
+
+        plan = set(loader.graph.forwards_plan(('app1', '4_auto')))
+        plan = plan - loader.applied_migrations.keys()
+        expected_plan = {
+            ('app2', '1_squashed_2'),
+            ('app1', '3_auto'),
+            ('app1', '4_auto'),
+        }
+
+        self.assertEqual(plan, expected_plan)
+
+    @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations_squashed_erroneous"})
+    def test_loading_squashed_erroneous(self):
+        "Tests loading a complex but erroneous set of squashed migrations"
+
+        loader = MigrationLoader(connection)
+        recorder = MigrationRecorder(connection)
+        self.addCleanup(recorder.flush)
+
+        def num_nodes():
+            plan = set(loader.graph.forwards_plan(('migrations', '7_auto')))
+            return len(plan - loader.applied_migrations.keys())
+
+        # Empty database: use squashed migration
+        loader.build_graph()
+        self.assertEqual(num_nodes(), 5)
+
+        # Starting at 1 or 2 should use the squashed migration too
+        recorder.record_applied("migrations", "1_auto")
+        loader.build_graph()
+        self.assertEqual(num_nodes(), 4)
+
+        recorder.record_applied("migrations", "2_auto")
+        loader.build_graph()
+        self.assertEqual(num_nodes(), 3)
+
+        # However, starting at 3 or 4, nonexistent migrations would be needed.
+        msg = ("Migration migrations.6_auto depends on nonexistent node ('migrations', '5_auto'). "
+               "Django tried to replace migration migrations.5_auto with any of "
+               "[migrations.3_squashed_5] but wasn't able to because some of the replaced "
+               "migrations are already applied.")
+
+        recorder.record_applied("migrations", "3_auto")
+        with self.assertRaisesMessage(NodeNotFoundError, msg):
+            loader.build_graph()
+
+        recorder.record_applied("migrations", "4_auto")
+        with self.assertRaisesMessage(NodeNotFoundError, msg):
+            loader.build_graph()
+
+        # Starting at 5 to 7 we are passed the squashed migrations
+        recorder.record_applied("migrations", "5_auto")
+        loader.build_graph()
+        self.assertEqual(num_nodes(), 2)
+
+        recorder.record_applied("migrations", "6_auto")
+        loader.build_graph()
+        self.assertEqual(num_nodes(), 1)
+
+        recorder.record_applied("migrations", "7_auto")
+        loader.build_graph()
+        self.assertEqual(num_nodes(), 0)
+
+    @override_settings(
+        MIGRATION_MODULES={'migrations': 'migrations.test_migrations'},
+        INSTALLED_APPS=['migrations'],
+    )
+    def test_check_consistent_history(self):
+        loader = MigrationLoader(connection=None)
+        loader.check_consistent_history(connection)
+        recorder = MigrationRecorder(connection)
+        recorder.record_applied('migrations', '0002_second')
+        msg = (
+            "Migration migrations.0002_second is applied before its dependency "
+            "migrations.0001_initial on database 'default'."
+        )
+        with self.assertRaisesMessage(InconsistentMigrationHistory, msg):
+            loader.check_consistent_history(connection)
+
+    @override_settings(
+        MIGRATION_MODULES={'migrations': 'migrations.test_migrations_squashed_extra'},
+        INSTALLED_APPS=['migrations'],
+    )
+    def test_check_consistent_history_squashed(self):
+        """
+        MigrationLoader.check_consistent_history() should ignore unapplied
+        squashed migrations that have all of their `replaces` applied.
+        """
+        loader = MigrationLoader(connection=None)
+        recorder = MigrationRecorder(connection)
+        recorder.record_applied('migrations', '0001_initial')
+        recorder.record_applied('migrations', '0002_second')
+        loader.check_consistent_history(connection)
+        recorder.record_applied('migrations', '0003_third')
+        loader.check_consistent_history(connection)
+
+    @override_settings(MIGRATION_MODULES={
+        "app1": "migrations.test_migrations_squashed_ref_squashed.app1",
+        "app2": "migrations.test_migrations_squashed_ref_squashed.app2",
+    })
+    @modify_settings(INSTALLED_APPS={'append': [
+        "migrations.test_migrations_squashed_ref_squashed.app1",
+        "migrations.test_migrations_squashed_ref_squashed.app2",
+    ]})
+    def test_loading_squashed_ref_squashed(self):
+        "Tests loading a squashed migration with a new migration referencing it"
+        r"""
+        The sample migrations are structured like this:
+
+        app_1       1 --> 2 ---------------------*--> 3        *--> 4
+                     \                          /             /
+                      *-------------------*----/--> 2_sq_3 --*
+                       \                 /    /
+        =============== \ ============= / == / ======================
+        app_2            *--> 1_sq_2 --*    /
+                          \                /
+                           *--> 1 --> 2 --*
+
+        Where 2_sq_3 is a replacing migration for 2 and 3 in app_1,
+        as 1_sq_2 is a replacing migration for 1 and 2 in app_2.
+        """
+
+        loader = MigrationLoader(connection)
+        recorder = MigrationRecorder(connection)
+        self.addCleanup(recorder.flush)
+
+        # Load with nothing applied: both migrations squashed.
+        loader.build_graph()
+        plan = set(loader.graph.forwards_plan(('app1', '4_auto')))
+        plan = plan - loader.applied_migrations.keys()
+        expected_plan = {
+            ('app1', '1_auto'),
+            ('app2', '1_squashed_2'),
+            ('app1', '2_squashed_3'),
+            ('app1', '4_auto'),
+        }
+        self.assertEqual(plan, expected_plan)
+
+        # Fake-apply a few from app1: unsquashes migration in app1.
+        recorder.record_applied('app1', '1_auto')
+        recorder.record_applied('app1', '2_auto')
+        loader.build_graph()
+        plan = set(loader.graph.forwards_plan(('app1', '4_auto')))
+        plan = plan - loader.applied_migrations.keys()
+        expected_plan = {
+            ('app2', '1_squashed_2'),
+            ('app1', '3_auto'),
+            ('app1', '4_auto'),
+        }
+        self.assertEqual(plan, expected_plan)
+
+        # Fake-apply one from app2: unsquashes migration in app2 too.
+        recorder.record_applied('app2', '1_auto')
+        loader.build_graph()
+        plan = set(loader.graph.forwards_plan(('app1', '4_auto')))
+        plan = plan - loader.applied_migrations.keys()
+        expected_plan = {
+            ('app2', '2_auto'),
+            ('app1', '3_auto'),
+            ('app1', '4_auto'),
+        }
+        self.assertEqual(plan, expected_plan)
+
+    @override_settings(MIGRATION_MODULES={'migrations': 'migrations.test_migrations_private'})
+    def test_ignore_files(self):
+        """Files prefixed with underscore, tilde, or dot aren't loaded."""
+        loader = MigrationLoader(connection)
+        loader.load_disk()
+        migrations = [name for app, name in loader.disk_migrations if app == 'migrations']
+        self.assertEqual(migrations, ['0001_initial'])
+
+    @override_settings(
+        MIGRATION_MODULES={'migrations': 'migrations.test_migrations_namespace_package'},
+    )
+    def test_loading_namespace_package(self):
+        """Migration directories without an __init__.py file are ignored."""
+        loader = MigrationLoader(connection)
+        loader.load_disk()
+        migrations = [name for app, name in loader.disk_migrations if app == 'migrations']
+        self.assertEqual(migrations, [])
+
+    @override_settings(MIGRATION_MODULES={'migrations': 'migrations.test_migrations'})
+    def test_loading_package_without__file__(self):
+        """
+        To support frozen environments, MigrationLoader loads migrations from
+        regular packages with no __file__ attribute.
+        """
+        test_module = import_module('migrations.test_migrations')
+        loader = MigrationLoader(connection)
+        # __file__ == __spec__.origin or the latter is None and former is
+        # undefined.
+        module_file = test_module.__file__
+        module_origin = test_module.__spec__.origin
+        module_has_location = test_module.__spec__.has_location
+        try:
+            del test_module.__file__
+            test_module.__spec__.origin = None
+            test_module.__spec__.has_location = False
+            loader.load_disk()
+            migrations = [
+                name
+                for app, name in loader.disk_migrations
+                if app == 'migrations'
+            ]
+            self.assertCountEqual(migrations, ['0001_initial', '0002_second'])
+        finally:
+            test_module.__file__ = module_file
+            test_module.__spec__.origin = module_origin
+            test_module.__spec__.has_location = module_has_location
+
+
+class PycLoaderTests(MigrationTestBase):
+
+    def test_valid(self):
+        """
+        To support frozen environments, MigrationLoader loads .pyc migrations.
+        """
+        with self.temporary_migration_module(module='migrations.test_migrations') as migration_dir:
+            # Compile .py files to .pyc files and delete .py files.
+            compileall.compile_dir(migration_dir, force=True, quiet=1, legacy=True)
+            for name in os.listdir(migration_dir):
+                if name.endswith('.py'):
+                    os.remove(os.path.join(migration_dir, name))
+            loader = MigrationLoader(connection)
+            self.assertIn(('migrations', '0001_initial'), loader.disk_migrations)
+
+    def test_invalid(self):
+        """
+        MigrationLoader reraises ImportErrors caused by "bad magic number" pyc
+        files with a more helpful message.
+        """
+        with self.temporary_migration_module(module='migrations.test_migrations_bad_pyc') as migration_dir:
+            # The -tpl suffix is to avoid the pyc exclusion in MANIFEST.in.
+            os.rename(
+                os.path.join(migration_dir, '0001_initial.pyc-tpl'),
+                os.path.join(migration_dir, '0001_initial.pyc'),
+            )
+            msg = (
+                r"Couldn't import '\w+.migrations.0001_initial' as it appears "
+                "to be a stale .pyc file."
+            )
+            with self.assertRaisesRegex(ImportError, msg):
+                MigrationLoader(connection)
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""

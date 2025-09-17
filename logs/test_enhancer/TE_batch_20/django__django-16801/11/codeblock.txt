@@ -1,0 +1,119 @@
+# No new imports required. Existing imports in tests/model_fields/test_imagefield.py are sufficient.
+@skipIf(Image is None, "Pillow is required to test ImageField")
+class ImageFieldNoDimensionsAdditionalTests(ImageFieldTestMixin, TestCase):
+    """
+    Additional tests for ImageField without width/height fields that ensure
+    assigning an image calculates and caches dimensions on assignment.
+    """
+
+    PersonModel = Person
+
+    def test_assignment_opens_file_single_field(self):
+        # Assigning to an existing instance should calculate dimensions.
+        p = Person(name="Joe")
+        # Initially, the underlying TestImageFieldFile should not have been opened.
+        self.assertFalse(getattr(p.mugshot, "was_opened", False))
+        p.mugshot = self.file1
+        self.assertTrue(p.mugshot.was_opened)
+        self.assertEqual(p.mugshot.width, 4)
+        self.assertEqual(p.mugshot.height, 8)
+
+    def test_assignment_caches_dimensions_single_field(self):
+        # After assignment, dimensions should be cached on the file object,
+        # so subsequent accesses don't re-open the file.
+        p = Person(name="Joe")
+        p.mugshot = self.file1
+        # Reset the flag and read dimensions again; should not re-open.
+        p.mugshot.was_opened = False
+        self.assertEqual(p.mugshot.width, 4)
+        self.assertEqual(p.mugshot.height, 8)
+        self.assertFalse(p.mugshot.was_opened)
+
+    def test_assignment_after_fetch_triggers_dimension_calculation(self):
+        # When replacing a file on an instance fetched from the DB, the
+        # assignment should calculate dimensions for the new file.
+        p = Person.objects.create(name="Alice", mugshot=self.file1)
+        p = Person.objects.get(name="Alice")
+        # Replace the image - this should trigger dimension calculation.
+        p.mugshot = self.file2
+        self.assertTrue(p.mugshot.was_opened)
+        self.assertEqual(p.mugshot.width, 8)
+        self.assertEqual(p.mugshot.height, 4)
+
+    def test_assignment_after_fetch_caches(self):
+        # After assigning on a fetched instance, the dimensions should be
+        # cached for subsequent access.
+        p = Person.objects.create(name="Bob", mugshot=self.file1)
+        p = Person.objects.get(name="Bob")
+        p.mugshot = self.file2
+        p.mugshot.was_opened = False
+        _ = p.mugshot.width
+        self.assertFalse(p.mugshot.was_opened)
+
+@skipIf(Image is None, "Pillow is required to test ImageField")
+class TwoImageFieldAdditionalTests(ImageFieldTestMixin, TestCase):
+    """
+    Additional tests for models with two ImageFields (no dimension fields)
+    ensuring assignment to each field calculates and caches dimensions.
+    """
+
+    PersonModel = PersonTwoImages
+
+    def test_assignment_opens_each_field(self):
+        p = self.PersonModel()
+        p.mugshot = self.file1
+        self.assertTrue(p.mugshot.was_opened)
+        self.assertEqual(p.mugshot.width, 4)
+        self.assertEqual(p.mugshot.height, 8)
+
+        p.headshot = self.file2
+        self.assertTrue(p.headshot.was_opened)
+        self.assertEqual(p.headshot.width, 8)
+        self.assertEqual(p.headshot.height, 4)
+
+    def test_assignment_caches_each_field(self):
+        p = self.PersonModel()
+        p.mugshot = self.file1
+        p.headshot = self.file2
+        # Reset flags and ensure cached values are returned without re-opening.
+        p.mugshot.was_opened = False
+        p.headshot.was_opened = False
+        self.assertEqual(p.mugshot.width, 4)
+        self.assertEqual(p.mugshot.height, 8)
+        self.assertEqual(p.headshot.width, 8)
+        self.assertEqual(p.headshot.height, 4)
+        self.assertFalse(p.mugshot.was_opened)
+        self.assertFalse(p.headshot.was_opened)
+
+    def test_replace_file_triggers_dimension_calculation_mugshot(self):
+        p = self.PersonModel()
+        p.mugshot = self.file1
+        # Ensure replacing the file triggers recalculation for the new file.
+        p.mugshot.was_opened = False
+        p.mugshot = self.file2
+        self.assertTrue(p.mugshot.was_opened)
+        self.assertEqual(p.mugshot.width, 8)
+        self.assertEqual(p.mugshot.height, 4)
+
+    def test_replace_file_triggers_dimension_calculation_headshot(self):
+        p = self.PersonModel()
+        p.headshot = self.file2
+        p.headshot.was_opened = False
+        p.headshot = self.file1
+        self.assertTrue(p.headshot.was_opened)
+        self.assertEqual(p.headshot.width, 4)
+        self.assertEqual(p.headshot.height, 8)
+
+    def test_clearing_one_does_not_affect_other_cache(self):
+        # Clearing one ImageField shouldn't clear the cached dimensions of the other.
+        p = self.PersonModel()
+        p.mugshot = self.file1
+        p.headshot = self.file2
+        # Clear mugshot
+        p.mugshot = None
+        # Headshot should remain cached and not re-open on subsequent access.
+        self.assertEqual(p.headshot.width, 8)
+        self.assertEqual(p.headshot.height, 4)
+        p.headshot.was_opened = False
+        _ = p.headshot.width
+        self.assertFalse(p.headshot.was_opened)

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_false_for_mixed_with_non_autofield model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_single_element_tuple model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_tuple_of_big_and_small_auto_fields model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_tuple_with_custom_big_and_builtin_small model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_tuple_with_deep_inheritance_levels model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_tuple_with_duplicates model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_tuple_with_nested_small_and_big model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_tuple_with_subclass_and_its_subclass model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_tuple_with_two_user_defined_autofields model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_user_defined_mixed_hierarchy
+coverage json -o coverage.json
+: '>>>>> End Test Output'

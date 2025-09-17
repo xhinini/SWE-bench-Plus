@@ -1,0 +1,192 @@
+from types import MethodType, SimpleNamespace
+from django.db.models.base import NOT_PROVIDED
+from types import SimpleNamespace, MethodType
+import unittest
+from django.test import SimpleTestCase
+from django.db import DatabaseError
+from django.db.models.base import Model, NOT_PROVIDED
+
+class FakeField:
+    def __init__(self, name, attname=None, primary_key=False, default=NOT_PROVIDED, get_pk_value_on_save_return=None):
+        self.name = name
+        self.attname = attname or name
+        self.primary_key = primary_key
+        self.default = default
+        # prepare a bound method on the field instance
+        if get_pk_value_on_save_return is not None:
+            # get_pk_value_on_save(self_field, model_instance)
+            def _get_pk_value_on_save(self_field, model_instance):
+                return get_pk_value_on_save_return
+            self.get_pk_value_on_save = MethodType(_get_pk_value_on_save, self)
+        else:
+            # default behaviour: return None
+            def _get_pk_value_on_save(self_field, model_instance):
+                return None
+            self.get_pk_value_on_save = MethodType(_get_pk_value_on_save, self)
+
+    def is_relation(self):
+        return False
+
+class FakeMeta:
+    def __init__(self, pk_field, other_fields):
+        # local_concrete_fields used in _save_table (and some other lists)
+        self.local_concrete_fields = [pk_field] + list(other_fields)
+        self.local_fields = list(self.local_concrete_fields)
+        self.pk = pk_field
+        self.auto_field = None
+        self.db_returning_fields = []
+        self.order_with_respect_to = None
+
+def make_fake_instance(pk_attname='id', pk_default=object(), pk_get_value=None,
+                       explicit_pk_value=None, other_field_name='other'):
+    """
+    Create a fake 'self' and 'cls' pair suitable for passing to Model._save_table.
+    The fake self will capture calls to _do_insert and _do_update.
+    """
+    # Fake primary key field
+    if pk_default is NOT_PROVIDED:
+        pk_field = FakeField(name=pk_attname, attname=pk_attname, primary_key=True,
+                             default=NOT_PROVIDED, get_pk_value_on_save_return=pk_get_value)
+    else:
+        pk_field = FakeField(name=pk_attname, attname=pk_attname, primary_key=True,
+                             default=pk_default, get_pk_value_on_save_return=pk_get_value)
+    # One non-PK concrete field
+    other_field = FakeField(name=other_field_name, attname=other_field_name, primary_key=False, default=NOT_PROVIDED)
+    meta = FakeMeta(pk_field, [other_field])
+
+    # The cls passed to _save_table uses its _meta
+    cls = SimpleNamespace(_meta=meta, _base_manager=None)
+
+    # The instance needs attributes referenced by _save_table and helpers
+    inst = SimpleNamespace()
+    inst._meta = meta
+    inst._state = SimpleNamespace(adding=True, db=None)
+    # Allow direct attribute access like normal model instance
+    inst.__dict__ = {}
+
+    # If an explicit pk value is requested, set it on the instance before saving
+    if explicit_pk_value is not None:
+        setattr(inst, pk_attname, explicit_pk_value)
+
+    # Provide _get_pk_val used by _save_table. It reads from instance attribute.
+    def _get_pk_val(self_inst, meta_arg=None):
+        # meta_arg is ignored; read the pk attname from the instance's dict
+        return getattr(self_inst, meta.pk.attname, None)
+    inst._get_pk_val = MethodType(_get_pk_val, inst)
+
+    # Flags to record which helper was called
+    inst.insert_called = False
+    inst.update_called = False
+
+    # Provide _do_insert and _do_update that simply flip flags and return expected shapes.
+    def _do_insert(self_inst, manager, using, fields, returning_fields, raw):
+        self_inst.insert_called = True
+        # Return a list of None results matching returning_fields length (mimic real return)
+        return [None for _ in (returning_fields or ())]
+    inst._do_insert = MethodType(_do_insert, inst)
+
+    # _do_update should accept (base_qs, using, pk_val, values, update_fields, forced_update)
+    def _do_update(self_inst, base_qs, using, pk_val, values, update_fields, forced_update):
+        self_inst.update_called = True
+        # By default, simulate that update did not affect rows (return False via 0)
+        # Returning integer > 0 indicates update affected rows; >0 is treated as True.
+        # We'll allow tests to replace this method when needed.
+        return 0
+    inst._do_update = MethodType(_do_update, inst)
+
+    return inst, cls, meta
+
+class SaveTableDecisionTests(SimpleTestCase):
+
+    def test_force_insert_with_default_callable_no_explicit_pk_calls_insert(self):
+        # default present and get_pk_value_on_save returns a value (simulating field supplying a PK)
+        inst, cls, meta = make_fake_instance(pk_attname='id', pk_default=lambda: 1, pk_get_value=42, explicit_pk_value=None)
+        # Call _save_table with update_fields to trigger forced_update semantics if an update is tried.
+        update_fields = frozenset({'other'})
+        # Ensure _do_update will report no rows affected (0) so candidate patch would raise if it attempted update with forced_update=True.
+        # Run - expecting insert to be called (force_insert path).
+        Model._save_table(inst, raw=False, cls=cls, force_insert=False, force_update=False, using='default', update_fields=update_fields)
+        self.assertTrue(inst.insert_called)
+        self.assertFalse(inst.update_called)
+
+    def test_force_insert_with_default_constant_no_explicit_pk_calls_insert(self):
+        inst, cls, meta = make_fake_instance(pk_attname='id', pk_default=1234, pk_get_value=1234, explicit_pk_value=None)
+        update_fields = frozenset({'other'})
+        Model._save_table(inst, raw=False, cls=cls, force_insert=False, force_update=False, using='default', update_fields=update_fields)
+        self.assertTrue(inst.insert_called)
+        self.assertFalse(inst.update_called)
+
+    def test_force_insert_with_default_and_explicit_pk_provided_calls_insert(self):
+        # Even if the user provided a PK explicitly, original/gold logic should still treat this as an insert for new object.
+        inst, cls, meta = make_fake_instance(pk_attname='id', pk_default=lambda: 1, pk_get_value=1, explicit_pk_value=99)
+        update_fields = frozenset({'other'})
+        Model._save_table(inst, raw=False, cls=cls, force_insert=False, force_update=False, using='default', update_fields=update_fields)
+        self.assertTrue(inst.insert_called)
+        self.assertFalse(inst.update_called)
+
+    def test_raw_true_does_not_force_insert_when_default_and_no_explicit_pk_uses_update(self):
+        # For raw=True, the new patch prevents forcing insert; we expect update path to be taken (here we simulate successful update)
+        inst, cls, meta = make_fake_instance(pk_attname='id', pk_default=lambda: 1, pk_get_value=42, explicit_pk_value=None)
+        # Replace _do_update to simulate an update that affected rows (>0).
+        def _do_update_success(self_inst, base_qs, using, pk_val, values, update_fields, forced_update):
+            self_inst.update_called = True
+            return 1
+        inst._do_update = MethodType(_do_update_success, inst)
+        update_fields = frozenset({'other'})
+        Model._save_table(inst, raw=True, cls=cls, force_insert=False, force_update=False, using='default', update_fields=update_fields)
+        self.assertFalse(inst.insert_called)
+        self.assertTrue(inst.update_called)
+
+    def test_raw_true_does_not_force_insert_when_default_and_explicit_pk_uses_update(self):
+        inst, cls, meta = make_fake_instance(pk_attname='id', pk_default=lambda: 1, pk_get_value=42, explicit_pk_value=7)
+        def _do_update_success(self_inst, base_qs, using, pk_val, values, update_fields, forced_update):
+            self_inst.update_called = True
+            return 1
+        inst._do_update = MethodType(_do_update_success, inst)
+        update_fields = frozenset({'other'})
+        Model._save_table(inst, raw=True, cls=cls, force_insert=False, force_update=False, using='default', update_fields=update_fields)
+        self.assertFalse(inst.insert_called)
+        self.assertTrue(inst.update_called)
+
+    def test_no_force_insert_when_default_is_not_provided(self):
+        # When default is NOT_PROVIDED, the skip-update branch should not be entered.
+        inst, cls, meta = make_fake_instance(pk_attname='id', pk_default=NOT_PROVIDED, pk_get_value=None, explicit_pk_value=None)
+        # Simulate successful update if attempted.
+        def _do_update_success(self_inst, base_qs, using, pk_val, values, update_fields, forced_update):
+            self_inst.update_called = True
+            return 1
+        inst._do_update = MethodType(_do_update_success, inst)
+        update_fields = frozenset({'other'})
+        Model._save_table(inst, raw=False, cls=cls, force_insert=False, force_update=False, using='default', update_fields=update_fields)
+        self.assertFalse(inst.insert_called)
+        self.assertTrue(inst.update_called)
+
+    def test_force_insert_with_custom_pk_attname_calls_insert(self):
+        inst, cls, meta = make_fake_instance(pk_attname='custom_id', pk_default=lambda: 'x', pk_get_value='x', explicit_pk_value=None, other_field_name='other')
+        update_fields = frozenset({'other'})
+        Model._save_table(inst, raw=False, cls=cls, force_insert=False, force_update=False, using='default', update_fields=update_fields)
+        self.assertTrue(inst.insert_called)
+        self.assertFalse(inst.update_called)
+
+    def test_force_insert_with_multiple_non_pk_fields_calls_insert(self):
+        # Build meta with two non-PK fields
+        inst, cls, meta = make_fake_instance(pk_attname='id', pk_default=lambda: 1, pk_get_value=1, explicit_pk_value=None)
+        # Add additional non-pk field to local_concrete_fields and local_fields
+        extra_field = FakeField(name='extra', attname='extra', primary_key=False)
+        meta.local_concrete_fields.append(extra_field)
+        meta.local_fields.append(extra_field)
+        update_fields = frozenset({'other', 'extra'})
+        Model._save_table(inst, raw=False, cls=cls, force_insert=False, force_update=False, using='default', update_fields=update_fields)
+        self.assertTrue(inst.insert_called)
+        self.assertFalse(inst.update_called)
+
+    def test_force_insert_with_update_fields_using_attname_and_name_calls_insert(self):
+        inst, cls, meta = make_fake_instance(pk_attname='id', pk_default=lambda: 1, pk_get_value=1, explicit_pk_value=None)
+        # Use attname (same as name in our fake fields) in update_fields
+        update_fields = frozenset({'other'})
+        Model._save_table(inst, raw=False, cls=cls, force_insert=False, force_update=False, using='default', update_fields=update_fields)
+        self.assertTrue(inst.insert_called)
+        self.assertFalse(inst.update_called)
+
+if __name__ == "__main__":
+    unittest.main()

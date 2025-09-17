@@ -1,0 +1,253 @@
+import decimal
+import datetime
+import time
+import uuid
+import pathlib
+from django.conf import SettingsReference, settings
+from django.db import migrations, models
+from django.test import SimpleTestCase
+from django.utils.timezone import utc
+from django.db.migrations.writer import MigrationWriter
+
+
+class ImportOrderingTests(SimpleTestCase):
+    def make_migration_with_ops(self, ops):
+        """
+        Helper to create a Migration type with the provided operations list.
+        """
+        return type("Migration", (migrations.Migration,), {"operations": ops, "dependencies": []})
+
+    def index_of(self, haystack, needle):
+        """
+        Helper to return the index of needle in haystack (string). Fails the test if not found.
+        """
+        idx = haystack.find(needle)
+        self.assertNotEqual(idx, -1, "Expected to find %r in output:\n%s" % (needle, haystack))
+        return idx
+
+    def test_imports_before_from_grouping(self):
+        # Create a custom operation whose module is this test's module so it adds an "import ..." entry.
+        class CustomOp:
+            def __init__(self, value):
+                self.value = value
+
+            def deconstruct(self):
+                return ("CustomOp", [self.value], {})
+
+        # Force the operation to advertise itself as coming from the test module used elsewhere in the suite.
+        CustomOp.__module__ = "migrations.test_writer"
+
+        migration = self.make_migration_with_ops([CustomOp(decimal.Decimal("1.3"))])
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        # "import migrations.test_writer" (from the custom op) should appear before "from decimal import Decimal"
+        idx_import = self.index_of(output, "import migrations.test_writer")
+        idx_from_decimal = self.index_of(output, "from decimal import Decimal")
+        self.assertLess(idx_import, idx_from_decimal)
+
+    def test_builtin_module_import_ordering(self):
+        # Use operations that cause "import datetime" and "import time"
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "mymodel",
+                        "myfield",
+                        models.DateTimeField(
+                            default=datetime.datetime(2012, 1, 1, 1, 1, tzinfo=datetime.timezone.utc)
+                        ),
+                    ),
+                    migrations.AddField(
+                        "mymodel",
+                        "myfield2",
+                        models.FloatField(default=time.time),
+                    ),
+                ]
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        # Ensure datetime and time are imported and appear before the django imports block.
+        expected_block = "import datetime\nimport time\nfrom django.db import migrations, models\n"
+        self.assertIn(expected_block, output)
+
+    def test_from_imports_order_by_module(self):
+        # Ensure "from django.conf import settings" sorts before "from django.db import migrations, models"
+        class Op1:
+            def __init__(self, value):
+                self.value = value
+            def deconstruct(self):
+                return ("Op1", [self.value], {})
+        class Op2:
+            def __init__(self, value):
+                self.value = value
+            def deconstruct(self):
+                return ("Op2", [self.value], {})
+
+        Op1.__module__ = "migrations.test_writer"
+        Op2.__module__ = "migrations.test_writer"
+
+        migration = self.make_migration_with_ops(
+            [
+                Op1(SettingsReference("someapp.model", "AUTH_USER_MODEL")),
+                Op2(models.CharField(max_length=10)),
+            ]
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        idx_conf = self.index_of(output, "from django.conf import settings")
+        idx_db = self.index_of(output, "from django.db import migrations, models")
+        self.assertLess(idx_conf, idx_db)
+
+    def test_import_statements_sorted_lexicographically(self):
+        # Ensure 'import datetime' comes before 'import uuid'
+        class Op:
+            def __init__(self, *values):
+                self.values = values
+            def deconstruct(self):
+                # Return the first value as positional argument, the rest are ignored by the serializer
+                return ("Op", [self.values[0]], {})
+
+        Op.__module__ = "migrations.test_writer"
+
+        migration = self.make_migration_with_ops(
+            [
+                Op(datetime.datetime.now()),
+                Op(uuid.uuid4()),
+            ]
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        idx_dt = self.index_of(output, "import datetime")
+        idx_uuid = self.index_of(output, "import uuid")
+        self.assertLess(idx_dt, idx_uuid)
+
+    def test_mixed_imports_and_froms_overall_ordering(self):
+        # Mix several imports and a from import to ensure final grouping is imports first then froms
+        class Op:
+            def __init__(self, value):
+                self.value = value
+            def deconstruct(self):
+                return ("Op", [self.value], {})
+
+        Op.__module__ = "migrations.test_writer"
+
+        migration = self.make_migration_with_ops(
+            [
+                Op(datetime.datetime.now()),
+                Op(pathlib.PurePosixPath("/path/file.txt")),
+                Op(time.time),
+                Op(uuid.uuid4()),
+                Op(decimal.Decimal("1.23")),  # produces "from decimal import Decimal"
+            ]
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        # All "import <module>" lines should appear before "from decimal import Decimal"
+        idx_from_decimal = self.index_of(output, "from decimal import Decimal")
+        for mod in ("import datetime", "import pathlib", "import time", "import uuid"):
+            self.assertLess(self.index_of(output, mod), idx_from_decimal)
+
+    def test_same_module_from_variants_ordering(self):
+        # Ensure 'from a import x' sorts before 'from a.b import y' for module token ordering.
+        # We can't easily invent arbitrary modules for the serializer, but we can use settings (django.conf)
+        # and a dotted module like 'django.db' (models) to emulate the behavior.
+        class Op:
+            def __init__(self, value):
+                self.value = value
+            def deconstruct(self):
+                return ("Op", [self.value], {})
+
+        Op.__module__ = "migrations.test_writer"
+
+        migration = self.make_migration_with_ops(
+            [
+                Op(SettingsReference("someapp.model", "AUTH_USER_MODEL")),  # from django.conf import settings
+                Op(models.CharField(max_length=1)),  # from django.db import models -> merged to migrations, models
+            ]
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        idx_conf = self.index_of(output, "from django.conf import settings")
+        idx_db = self.index_of(output, "from django.db import migrations, models")
+        self.assertLess(idx_conf, idx_db)
+
+    def test_many_imports_sorting_stability(self):
+        # Add a larger set of modules to ensure consistent ordering (imports first, sorted by module name).
+        class Op:
+            def __init__(self, value):
+                self.value = value
+            def deconstruct(self):
+                return ("Op", [self.value], {})
+
+        Op.__module__ = "migrations.test_writer"
+
+        values = [
+            datetime.datetime.now(),
+            uuid.uuid4(),
+            pathlib.PurePosixPath("/tmp"),
+            time.time,
+        ]
+        migration = self.make_migration_with_ops([Op(v) for v in values])
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        # Check pairwise ordering
+        order_expected = ["import datetime", "import pathlib", "import time", "import uuid"]
+        indices = [self.index_of(output, tok) for tok in order_expected]
+        self.assertEqual(indices, sorted(indices))
+
+    def test_decimal_vs_conf_from_order(self):
+        # Ensure 'from decimal import Decimal' sorts before 'from django.conf import settings'
+        # because 'decimal' < 'django.conf' lexicographically.
+        class Op:
+            def __init__(self, value):
+                self.value = value
+            def deconstruct(self):
+                return ("Op", [self.value], {})
+
+        Op.__module__ = "migrations.test_writer"
+
+        migration = self.make_migration_with_ops(
+            [Op(decimal.Decimal("2.5")), Op(SettingsReference("someapp.model", "AUTH_USER_MODEL"))]
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        idx_decimal = self.index_of(output, "from decimal import Decimal")
+        idx_conf = self.index_of(output, "from django.conf import settings")
+        self.assertLess(idx_decimal, idx_conf)
+
+    def test_imports_and_froms_do_not_interleave(self):
+        # Ensure there is no "from" import appearing before any "import" lines.
+        class Op:
+            def __init__(self, value):
+                self.value = value
+            def deconstruct(self):
+                return ("Op", [self.value], {})
+
+        Op.__module__ = "migrations.test_writer"
+
+        migration = self.make_migration_with_ops([Op(decimal.Decimal("1.1")), Op(time.time)])
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        # Find first "import " and first "from "
+        first_import_idx = output.find("\nimport ")
+        first_from_idx = output.find("\nfrom ")
+        # If either isn't found on a preceding new line, try without leading newline.
+        if first_import_idx == -1:
+            first_import_idx = output.find("import ")
+        if first_from_idx == -1:
+            first_from_idx = output.find("from ")
+        # There should be imports and froms; ensure imports come first.
+        self.assertTrue(first_import_idx != -1 and first_from_idx != -1)
+        self.assertLess(first_import_idx, first_from_idx)

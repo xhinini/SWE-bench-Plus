@@ -1,0 +1,218 @@
+from django.apps import apps
+from django.apps import apps
+from django.test import SimpleTestCase, override_settings
+from django.db import models
+
+
+class ClearCacheSwappableTests(SimpleTestCase):
+    """
+    Regression tests ensuring that clear_cache() clears get_swappable_settings_name's
+    cache even if model _expire_cache() calls get_swappable_settings_name().
+    """
+
+    def _wrap_expire_cache_for_models(self, to_string):
+        """
+        Wrap model._meta._expire_cache for all models returned by apps.get_models(include_auto_created=True)
+        so that calling _expire_cache will also call apps.get_swappable_settings_name(to_string),
+        thereby potentially repopulating that cache during clear_cache().
+        Returns a list of (model, original_method) tuples to allow restoration.
+        """
+        wrapped = []
+        for model in apps.get_models(include_auto_created=True):
+            original = model._meta._expire_cache
+            
+            def make_wrapper(orig):
+                def wrapper():
+                    # Call the original expire cache behavior.
+                    orig()
+                    # Trigger get_swappable_settings_name during expire to simulate repopulation.
+                    try:
+                        apps.get_swappable_settings_name(to_string)
+                    except Exception:
+                        # Swallow any unexpected errors from probing the function;
+                        # the goal is to repopulate the cache if possible.
+                        pass
+                return wrapper
+            
+            wrapper_fn = make_wrapper(original)
+            # Replace the bound method on the _meta instance.
+            setattr(model._meta, "_expire_cache", wrapper_fn)
+            wrapped.append((model, original))
+        return wrapped
+
+    def _restore_wrapped(self, wrapped):
+        for model, original in wrapped:
+            setattr(model._meta, "_expire_cache", original)
+
+    def test_clear_cache_clears_swappable_cache_when_expire_repopulates(self):
+        # Pick a label that get_swappable_settings_name can process (might be None).
+        to_string = "admin.LogEntry"
+        # Ensure initial cache state is empty.
+        apps.get_swappable_settings_name.cache_clear()
+        apps.get_models.cache_clear()
+
+        # Prime the swappable cache.
+        apps.get_swappable_settings_name(to_string)
+        self.assertGreater(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+        # Wrap expire_cache to repopulate the swappable cache during clear_cache().
+        wrapped = self._wrap_expire_cache_for_models(to_string)
+        try:
+            apps.clear_cache()
+            # After clear_cache the swappable cache must be empty.
+            self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        finally:
+            self._restore_wrapped(wrapped)
+
+    def test_clear_cache_after_multiple_repopulations(self):
+        to_string = "admin.LogEntry"
+        apps.get_swappable_settings_name.cache_clear()
+        apps.get_models.cache_clear()
+        apps.get_swappable_settings_name(to_string)
+        self.assertGreater(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+        # Wrap expire_cache multiple times (simulating several models repopulating).
+        wrapped = self._wrap_expire_cache_for_models(to_string)
+        try:
+            # Trigger clear_cache which will iterate all models and call the wrapped _expire_cache.
+            apps.clear_cache()
+            self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        finally:
+            self._restore_wrapped(wrapped)
+
+    def test_clear_cache_with_different_swappable_strings(self):
+        # Try a few representative strings; at least one may map to a swappable setting.
+        for to_string in ("admin.LogEntry", "auth.User", "contenttypes.ContentType"):
+            apps.get_swappable_settings_name.cache_clear()
+            apps.get_models.cache_clear()
+            apps.get_swappable_settings_name(to_string)
+            self.assertGreaterEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+            wrapped = self._wrap_expire_cache_for_models(to_string)
+            try:
+                apps.clear_cache()
+                self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+            finally:
+                self._restore_wrapped(wrapped)
+
+    def test_clear_cache_even_if_no_models_registered(self):
+        # Simulate situation where get_models returns no models by clearing app_configs temporarily.
+        original_app_configs = apps.app_configs
+        try:
+            apps.app_configs = {}
+            apps.get_swappable_settings_name.cache_clear()
+            apps.get_models.cache_clear()
+            apps.get_swappable_settings_name("admin.LogEntry")
+            # No models to wrap; just ensure clear_cache empties the swappable cache.
+            apps.clear_cache()
+            self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        finally:
+            apps.app_configs = original_app_configs
+
+    def test_clear_cache_while_ready_true_invokes_expire_and_clears(self):
+        # Ensure apps.ready is True to force the expire loop.
+        original_ready = apps.ready
+        apps.ready = True
+        try:
+            to_string = "admin.LogEntry"
+            apps.get_swappable_settings_name.cache_clear()
+            apps.get_models.cache_clear()
+            apps.get_swappable_settings_name(to_string)
+            wrapped = self._wrap_expire_cache_for_models(to_string)
+            try:
+                apps.clear_cache()
+                self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+            finally:
+                self._restore_wrapped(wrapped)
+        finally:
+            apps.ready = original_ready
+
+    def test_clear_cache_restores_empty_cache_after_expire_side_effects(self):
+        # Simulate a side-effect during expire that calls get_swappable_settings_name with varying args.
+        to_strings = ["admin.LogEntry", "auth.User", "nonexistent.AppModel"]
+        apps.get_swappable_settings_name.cache_clear()
+        apps.get_models.cache_clear()
+        # Prime with one of the strings
+        apps.get_swappable_settings_name(to_strings[0])
+        wrapped = []
+        # Wrap expire to cycle through several get_swappable_settings_name calls.
+        for model in apps.get_models(include_auto_created=True):
+            original = model._meta._expire_cache
+            def make_wrapper(orig):
+                def wrapper():
+                    orig()
+                    for s in to_strings:
+                        try:
+                            apps.get_swappable_settings_name(s)
+                        except Exception:
+                            pass
+                return wrapper
+            wrapper_fn = make_wrapper(original)
+            setattr(model._meta, "_expire_cache", wrapper_fn)
+            wrapped.append((model, original))
+        try:
+            apps.clear_cache()
+            self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        finally:
+            self._restore_wrapped(wrapped)
+
+    def test_clear_cache_does_not_leave_partial_cache_entries(self):
+        # Ensure partial repopulation during expire does not leave cache entries.
+        to_string = "admin.LogEntry"
+        apps.get_swappable_settings_name.cache_clear()
+        apps.get_models.cache_clear()
+        apps.get_swappable_settings_name(to_string)
+
+        # Wrap only the first model's expire_cache so that only one call repopulates.
+        models_list = list(apps.get_models(include_auto_created=True))
+        if not models_list:
+            self.skipTest("No models available to test expire wrapping.")
+        first_model = models_list[0]
+        original = first_model._meta._expire_cache
+        def wrapper():
+            original()
+            try:
+                apps.get_swappable_settings_name(to_string)
+            except Exception:
+                pass
+        setattr(first_model._meta, "_expire_cache", wrapper)
+        try:
+            apps.clear_cache()
+            self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        finally:
+            setattr(first_model._meta, "_expire_cache", original)
+
+    def test_clear_cache_multiple_times_is_idempotent(self):
+        to_string = "admin.LogEntry"
+        for _ in range(3):
+            apps.get_swappable_settings_name.cache_clear()
+            apps.get_models.cache_clear()
+            apps.get_swappable_settings_name(to_string)
+            wrapped = self._wrap_expire_cache_for_models(to_string)
+            try:
+                apps.clear_cache()
+                self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+            finally:
+                self._restore_wrapped(wrapped)
+
+    def test_clear_cache_with_custom_appconfigs(self):
+        # Create a temporary Apps registry with the same installed app labels to ensure
+        # clear_cache behavior works outside the global registry too.
+        from django.apps.registry import Apps
+        temp_apps = Apps([ac.name for ac in apps.get_app_configs()])
+        try:
+            # Prime and then wrap expire on models in the global apps registry because
+            # temp_apps doesn't have models imported in the same way.
+            to_string = "admin.LogEntry"
+            apps.get_swappable_settings_name.cache_clear()
+            apps.get_models.cache_clear()
+            apps.get_swappable_settings_name(to_string)
+            wrapped = self._wrap_expire_cache_for_models(to_string)
+            try:
+                apps.clear_cache()
+                self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+            finally:
+                self._restore_wrapped(wrapped)
+        finally:
+            # no explicit cleanup required for temp_apps; let GC handle it.
+            pass

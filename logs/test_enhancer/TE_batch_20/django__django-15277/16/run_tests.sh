@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_charfield_formfield_max_length_none expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_charfield_validators_cached_and_single_maxlength expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_charfield_with_custom_validators_preserved_and_no_maxlength_added expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_charfield_with_max_length_has_maxlength_validator expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_charfield_without_max_length_no_maxlength_validator expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_filepathfield_deconstruct_omits_default_max_length expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_filepathfield_default_max_length_has_maxlength_validator expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_slugfield_deconstruct_omits_default_max_length expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_slugfield_default_max_length_has_maxlength_validator expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_textfield_without_max_length_no_maxlength_validator
+coverage json -o coverage.json
+: '>>>>> End Test Output'

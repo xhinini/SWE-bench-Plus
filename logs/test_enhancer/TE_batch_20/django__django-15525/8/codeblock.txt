@@ -1,0 +1,267 @@
+# No additional imports required beyond those used in test_code.
+import unittest
+from types import SimpleNamespace
+
+from django.core.serializers.base import build_instance
+
+
+class FakePK:
+    def __init__(self, attname="id"):
+        self.attname = attname
+
+    def to_python(self, value):
+        return value
+
+
+class DoesNotExist(Exception):
+    pass
+
+
+class FakeManager:
+    """
+    Fake manager that supports db_manager(db).get_by_natural_key(*args).
+    It is configurable to return different pk objects depending on the
+    natural_key value provided. It records how it was called.
+    """
+
+    def __init__(self, responses=None, raise_on=None):
+        # responses: dict mapping tuple(natural_key) -> returned object with pk attribute
+        self._responses = responses or {}
+        self._raise_on = raise_on or set()
+        self.last_db = None
+        self.calls = []
+
+    def db_manager(self, db):
+        # Return a lightweight proxy that knows which DB was requested.
+        proxy = SimpleNamespace()
+
+        def get_by_natural_key(*args):
+            self.last_db = db
+            self.calls.append((db, args))
+            if args in self._raise_on:
+                raise DoesNotExist()
+            if args in self._responses:
+                return SimpleNamespace(pk=self._responses[args])
+            # Default: raise DoesNotExist to mimic typical behavior
+            raise DoesNotExist()
+
+        proxy.get_by_natural_key = get_by_natural_key
+        return proxy
+
+
+class FakeMeta:
+    def __init__(self, manager, pk_attname="id"):
+        self.default_manager = manager
+        self.pk = FakePK(attname=pk_attname)
+
+
+class FakeModelBase:
+    """
+    Base class for fake models used in tests. Subclasses should set:
+    - _meta: FakeMeta instance
+    - natural_key: method (optional)
+    - DoesNotExist: exception class
+    """
+
+    DoesNotExist = DoesNotExist
+
+    def __init__(self, **data):
+        # Django sets _state on model instances; emulate that.
+        self._state = SimpleNamespace(db=None)
+        # Set provided data as attributes
+        for k, v in data.items():
+            setattr(self, k, v)
+
+    def __repr__(self):
+        return "<FakeModel pk=%r>" % getattr(self, "id", None)
+
+
+class BuildInstanceTests(unittest.TestCase):
+    def test_sets_db_on_obj_before_natural_key(self):
+        """
+        When natural_key depends on the instance _state.db, build_instance must
+        set _state.db to the provided db so the correct natural_key is generated
+        and the manager is queried with that natural_key.
+        """
+        # natural_key returns tuple containing the db name
+        class M(FakeModelBase):
+            def natural_key(self):
+                return (self._state.db,)
+
+        # manager returns pk 42 when natural_key=(expected_db,)
+        expected_db = "other_db"
+        manager = FakeManager(responses={(expected_db,): 42})
+        M._meta = FakeMeta(manager)
+
+        data = {}
+        inst = build_instance(M, data, expected_db)
+        # build_instance returns a new instance built from the (possibly modified) data
+        self.assertEqual(inst.id, 42)
+        # ensure manager was asked using the DB we passed
+        self.assertEqual(manager.last_db, expected_db)
+
+    def test_skips_natural_key_when_pk_present(self):
+        """
+        If the data includes the primary key value, natural_key should not be used.
+        """
+        class M(FakeModelBase):
+            def natural_key(self):
+                # If called, would return something that would trigger an error
+                raise RuntimeError("natural_key should not be called when pk present")
+
+        manager = FakeManager()
+        M._meta = FakeMeta(manager)
+
+        data = {"id": 99}
+        inst = build_instance(M, data, "irrelevant_db")
+        self.assertEqual(inst.id, 99)
+        # manager.get_by_natural_key should not have been called
+        self.assertEqual(manager.calls, [])
+
+    def test_no_get_by_natural_key_attribute(self):
+        """
+        If the default manager does not provide get_by_natural_key, build_instance
+        should not attempt to use natural keys and should return an instance.
+        """
+        class M(FakeModelBase):
+            def natural_key(self):
+                # depends on _state.db, but default_manager doesn't have get_by_natural_key
+                return (self._state.db,)
+
+        # Provide a manager object without get_by_natural_key attribute
+        class SimpleManager:
+            def db_manager(self, db):
+                return SimpleNamespace()
+
+        manager = SimpleManager()
+        M._meta = FakeMeta(manager)
+
+        data = {}
+        inst = build_instance(M, data, "dbX")
+        # no pk available so id attribute should not be set
+        self.assertFalse(hasattr(inst, "id"))
+
+    def test_handles_does_not_exist_from_get_by_natural_key(self):
+        """
+        If get_by_natural_key raises DoesNotExist, build_instance should ignore it
+        and return an instance without setting the pk.
+        """
+        class M(FakeModelBase):
+            def natural_key(self):
+                return (self._state.db,)
+
+        manager = FakeManager(raise_on={(None,)})
+        M._meta = FakeMeta(manager)
+
+        data = {}
+        inst = build_instance(M, data, None)
+        self.assertFalse(hasattr(inst, "id"))
+
+    def test_natural_key_call_avoids_attribute_error_with_db_set(self):
+        """
+        natural_key may perform operations that assume _state.db is a string.
+        If build_instance does not set _state.db prior to calling natural_key(),
+        AttributeError would be raised. The patched behavior avoids this.
+        """
+        class M(FakeModelBase):
+            def natural_key(self):
+                # If _state.db is None, calling upper() would raise AttributeError.
+                return (self._state.db.upper(),)
+
+        expected_db = "dbname"
+        manager = FakeManager(responses={(expected_db.upper(),): 7})
+        M._meta = FakeMeta(manager)
+
+        data = {}
+        inst = build_instance(M, data, expected_db)
+        self.assertEqual(inst.id, 7)
+
+    def test_db_none_is_supported(self):
+        """
+        When db is None, build_instance should set _state.db to None and natural_key
+        implementations that return (None,) should work (manager called with db=None).
+        """
+        class M(FakeModelBase):
+            def natural_key(self):
+                return (self._state.db,)
+
+        manager = FakeManager(responses={(None,): 123})
+        M._meta = FakeMeta(manager)
+
+        data = {}
+        inst = build_instance(M, data, None)
+        self.assertEqual(inst.id, 123)
+        self.assertEqual(manager.last_db, None)
+
+    def test_natural_key_based_on_other_field(self):
+        """
+        natural_key that returns a tuple built from other fields in data must
+        still work. This verifies build_instance does not clobber unrelated fields.
+        """
+        class M(FakeModelBase):
+            def natural_key(self):
+                # natural key is based on 'name' attribute (set from data)
+                return (getattr(self, "name", None),)
+
+        manager = FakeManager(responses={("alice",): 55})
+        M._meta = FakeMeta(manager)
+
+        data = {"name": "alice"}
+        inst = build_instance(M, data, "some_db")
+        self.assertEqual(inst.id, 55)
+        self.assertEqual(inst.name, "alice")
+
+    def test_returns_model_instance_with_preserved_fields(self):
+        """
+        The final returned object must be an instance of the provided Model and
+        have the data fields preserved.
+        """
+        class M(FakeModelBase):
+            def natural_key(self):
+                return ("x",)
+
+        manager = FakeManager(responses={("x",): 11})
+        M._meta = FakeMeta(manager)
+
+        data = {"name": "bob"}
+        inst = build_instance(M, data, "db1")
+        self.assertIsInstance(inst, M)
+        self.assertEqual(inst.name, "bob")
+        self.assertEqual(inst.id, 11)
+
+    def test_multiple_calls_with_different_db_values(self):
+        """
+        Repeated calls with different db values must consult the manager with the
+        correct DB context (i.e., obj._state.db must reflect the db argument).
+        """
+        class M(FakeModelBase):
+            def natural_key(self):
+                return (self._state.db,)
+
+        manager = FakeManager(responses={("a",): 1, ("b",): 2})
+        M._meta = FakeMeta(manager)
+
+        inst1 = build_instance(M, {}, "a")
+        self.assertEqual(inst1.id, 1)
+        inst2 = build_instance(M, {}, "b")
+        self.assertEqual(inst2.id, 2)
+
+    def test_missing_natural_key_attribute_skips_behavior(self):
+        """
+        If the Model has no natural_key attribute, build_instance should not
+        attempt to call it even if the manager offers get_by_natural_key.
+        """
+        class M(FakeModelBase):
+            pass  # no natural_key attribute
+
+        manager = FakeManager(responses={("irrelevant",): 7})
+        M._meta = FakeMeta(manager)
+
+        data = {}
+        inst = build_instance(M, data, "dbX")
+        # No pk was provided; since natural_key isn't present, pk should not be set.
+        self.assertFalse(hasattr(inst, "id"))
+
+
+if __name__ == "__main__":
+    unittest.main()

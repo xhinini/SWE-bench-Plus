@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_after_add_then_race_returns_false cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_called_with_correct_filename_when_race_occurs cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_does_not_create_file_when_open_fails cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_does_not_mask_other_file_operations cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_does_not_swallow_non_filenotfound_errors cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_handles_open_filenotfound_even_if_exists_true cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_handles_unicode_key_race cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_open_called_once_when_race cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_retries_subsequent_calls_if_file_appears cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_with_version_handles_open_filenotfound
+coverage json -o coverage.json
+: '>>>>> End Test Output'

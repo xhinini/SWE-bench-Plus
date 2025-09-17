@@ -1,0 +1,129 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that objects assigned a custom "expression-like" Python object (i.e. an object that implements resolve_expression but is not an instance of Django's Expression class) are treated as expressions by bulk_update. They would have failed with the original implementation that used isinstance(attr, Expression) (which would wrap such objects in Value and thus treat them as literal values), but pass after the fix that checks for the presence of resolve_expression. The tests cover text, integer, boolean, FK (via tag_id), custom DB column, JSON field and batching/duplicate scenarios.
+test_code: |
+  from django.test import TestCase
+  from django.db.models import F, Value
+  from django.test import skipUnlessDBFeature
+
+  # Models imported earlier in the test module:
+  # Note, Number, Individual, Tag, CustomDbColumn, JSONFieldNullable
+  # are available in the test module namespace.
+
+  class FakeExpr:
+      """
+      A minimal "expression-like" object that is NOT a subclass of Django's
+      Expression, but exposes resolve_expression so it should be treated as an
+      expression by bulk_update after the patch.
+      """
+      def __init__(self, expr):
+          # expr is an actual Expression instance (e.g., F(...), Value(...), Lower(...))
+          self._expr = expr
+
+      def resolve_expression(self, *args, **kwargs):
+          # Return the wrapped real expression when asked to resolve.
+          return self._expr
+
+  class BulkUpdateExpressionLikeObjectTests(TestCase):
+      @classmethod
+      def setUpTestData(cls):
+          # Create small sets of objects used by the tests.
+          cls.notes = [
+              Note.objects.create(note=f'test_note_{i}', misc='initial')
+              for i in range(5)
+          ]
+          cls.numbers = [Number.objects.create(num=0) for _ in range(5)]
+          cls.individuals = [Individual.objects.create(alive=False) for _ in range(5)]
+          cls.tags = [Tag.objects.create(name=f'tag_{i}') for i in range(2)]
+          cls.customs = [CustomDbColumn.objects.create(custom_column=1, ip_address='0.0.0.0') for _ in range(5)]
+
+      def test_custom_expr_text_field(self):
+          # Assign a FakeExpr that resolves to F('note') to the misc field.
+          for obj in self.notes:
+              obj.misc = FakeExpr(F('note'))
+          Note.objects.bulk_update(self.notes, ['misc'])
+          # Verify that misc equals note for each row.
+          for obj in self.notes:
+              obj.refresh_from_db()
+              self.assertEqual(obj.misc, obj.note)
+
+      def test_custom_expr_text_field_batch_size_one(self):
+          for obj in self.notes:
+              obj.misc = FakeExpr(F('note'))
+          # Ensure batching does not break recognition of expression-like objects.
+          Note.objects.bulk_update(self.notes, ['misc'], batch_size=1)
+          for obj in self.notes:
+              obj.refresh_from_db()
+              self.assertEqual(obj.misc, obj.note)
+
+      def test_custom_expr_integer_increment(self):
+          for obj in self.numbers:
+              # increment num by 1 using an expression wrapped by FakeExpr
+              obj.num = FakeExpr(F('num') + 1)
+          Number.objects.bulk_update(self.numbers, ['num'])
+          self.assertCountEqual(Number.objects.filter(num=1), self.numbers)
+
+      def test_custom_expr_integer_duplicates_and_batches(self):
+          # Duplicate the same object twice to force duplicate handling across batches.
+          n = Number.objects.create(num=0)
+          objs = [n, n]
+          for obj in objs:
+              obj.num = FakeExpr(F('num') + 1)
+          # Use batch_size=1 to force multiple batches and duplicate handling.
+          rows = Number.objects.bulk_update(objs, ['num'], batch_size=1)
+          # Two updates: duplicate in two batches leads to two rows reported.
+          self.assertEqual(rows, 2)
+          n.refresh_from_db()
+          self.assertEqual(n.num, 2)
+
+      def test_custom_expr_boolean_field(self):
+          for ind in self.individuals:
+              ind.alive = FakeExpr(Value(True))
+          Individual.objects.bulk_update(self.individuals, ['alive'])
+          self.assertCountEqual(Individual.objects.filter(alive=True), self.individuals)
+
+      def test_custom_expr_function_lower(self):
+          # Test with function expression (Lower) wrapped by FakeExpr.
+          for obj in self.notes:
+              obj.note = FakeExpr(Lower('note'))
+          Note.objects.bulk_update(self.notes, ['note'])
+          # All notes should be lower-cased (they already start with 'test_note_', but we assert round-trip).
+          for obj in self.notes:
+              obj.refresh_from_db()
+              self.assertEqual(obj.note, obj.note.lower())
+
+      def test_custom_expr_fk_field_via_tag_id(self):
+          # Set tag_id using a FakeExpr that resolves to a literal pk for tags[0].
+          for obj in self.notes:
+              # assign to tag_id directly so bulk_update reads the attribute corresponding to the FK column.
+              obj.tag_id = FakeExpr(Value(self.tags[0].pk))
+          Note.objects.bulk_update(self.notes, ['tag'])
+          self.assertCountEqual(Note.objects.filter(tag=self.tags[0]), self.notes)
+
+      def test_custom_expr_nullable_set_null_for_fk(self):
+          # Set tag_id to NULL via a FakeExpr returning Value(None).
+          for obj in self.notes:
+              obj.tag_id = FakeExpr(Value(None))
+          Note.objects.bulk_update(self.notes, ['tag'])
+          self.assertCountEqual(Note.objects.filter(tag__isnull=True), self.notes)
+
+      def test_custom_expr_custom_db_column_increment(self):
+          for obj in self.customs:
+              obj.custom_column = FakeExpr(F('custom_column') + 2)
+          CustomDbColumn.objects.bulk_update(self.customs, ['custom_column'])
+          self.assertCountEqual(CustomDbColumn.objects.filter(custom_column=3), self.customs)
+
+      @skipUnlessDBFeature('supports_json_field')
+      def test_custom_expr_json_field(self):
+          # JSONFieldNullable may require DB feature checks; this test is skipped if not supported.
+          JSONFieldNullable.objects.bulk_create([JSONFieldNullable(json_field={'a': i}) for i in range(3)])
+          objs = list(JSONFieldNullable.objects.all())
+          for o in objs:
+              # Use FakeExpr to produce a JSON value expression.
+              o.json_field = FakeExpr(Value({'c': o.json_field['a'] + 1}))
+          JSONFieldNullable.objects.bulk_update(objs, ['json_field'])
+          self.assertCountEqual(JSONFieldNullable.objects.filter(json_field__has_key='c'), objs)
+new_imports_code: |
+  # Additional imports required for the new tests
+  from django.db.models import Value
+  from django.db.models.functions import Lower

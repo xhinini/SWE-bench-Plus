@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.EmptyFormDeleteFieldTests.test_add_fields_direct_call_does_not_raise forms_tests.tests.test_formsets_llm.EmptyFormDeleteFieldTests.test_empty_form_as_ul_does_not_contain_delete forms_tests.tests.test_formsets_llm.EmptyFormDeleteFieldTests.test_empty_form_delete_widget_custom_with_can_delete_extra_true forms_tests.tests.test_formsets_llm.EmptyFormDeleteFieldTests.test_empty_form_includes_delete_when_can_delete_extra_true forms_tests.tests.test_formsets_llm.EmptyFormDeleteFieldTests.test_empty_form_no_delete_when_can_delete_extra_false forms_tests.tests.test_formsets_llm.EmptyFormDeleteFieldTests.test_empty_form_no_delete_with_initial_present forms_tests.tests.test_formsets_llm.EmptyFormDeleteFieldTests.test_empty_form_rendering_no_error_when_can_delete_extra_false forms_tests.tests.test_formsets_llm.EmptyFormDeleteFieldTests.test_empty_form_str_no_error_when_can_delete_extra_false forms_tests.tests.test_formsets_llm.EmptyFormDeleteFieldTests.test_is_multipart_uses_empty_form_no_error forms_tests.tests.test_formsets_llm.EmptyFormDeleteFieldTests.test_media_access_uses_empty_form
+coverage json -o coverage.json
+: '>>>>> End Test Output'

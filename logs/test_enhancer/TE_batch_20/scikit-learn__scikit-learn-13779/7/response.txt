@@ -1,0 +1,204 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests assert that VotingClassifier and VotingRegressor correctly handle estimators set to None when a sample_weight is provided, that they skip None estimators during sample_weight validation, and that transform/predict/proba produce correct shapes and outputs. They also verify that a ValueError is raised when a non-None estimator does not support sample_weight. The tests would have failed on the original buggy implementation which attempted to call has_fit_parameter on None; they pass with the patched implementation. The tests are implemented using small mock estimators to avoid heavy dependencies and to deterministically check behavior.
+test_code: |
+  import numpy as np
+  import pytest
+  from sklearn.base import BaseEstimator, ClassifierMixin, RegressorMixin
+  from sklearn.ensemble import VotingClassifier, VotingRegressor
+  from sklearn.utils.validation import has_fit_parameter
+
+  class MockClfSupportsSW(BaseEstimator, ClassifierMixin):
+      """Classifier that supports sample_weight in fit."""
+      def __init__(self, label=0, n_classes=2):
+          self.label = label
+          self.n_classes = n_classes
+          self.fitted_ = False
+          self.received_sample_weight = None
+
+      def fit(self, X, y, sample_weight=None):
+          # accept sample_weight as kwarg
+          self.received_sample_weight = sample_weight
+          self.fitted_ = True
+          return self
+
+      def predict(self, X):
+          # return the same label for all samples
+          return np.full(shape=(X.shape[0],), fill_value=self.label, dtype=int)
+
+      def predict_proba(self, X):
+          # return deterministic probabilities across n_classes
+          probs = np.zeros((X.shape[0], self.n_classes))
+          probs[:, self.label] = 1.0
+          return probs
+
+  class MockClfNoSW(BaseEstimator, ClassifierMixin):
+      """Classifier that does NOT support sample_weight in fit signature."""
+      def __init__(self, label=0, n_classes=2):
+          self.label = label
+          self.n_classes = n_classes
+          self.fitted_ = False
+
+      # intentionally define fit without sample_weight parameter
+      def fit(self, X, y):
+          self.fitted_ = True
+          return self
+
+      def predict(self, X):
+          return np.full(shape=(X.shape[0],), fill_value=self.label, dtype=int)
+
+      def predict_proba(self, X):
+          probs = np.zeros((X.shape[0], self.n_classes))
+          probs[:, self.label] = 1.0
+          return probs
+
+  class MockRegSupportsSW(BaseEstimator, RegressorMixin):
+      """Regressor that supports sample_weight in fit."""
+      def __init__(self, value=0.0):
+          self.value = value
+          self.fitted_ = False
+          self.received_sample_weight = None
+
+      def fit(self, X, y, sample_weight=None):
+          self.received_sample_weight = sample_weight
+          self.fitted_ = True
+          return self
+
+      def predict(self, X):
+          return np.full(shape=(X.shape[0],), fill_value=self.value, dtype=float)
+
+  def _make_simple_data(n_samples=5, n_features=2):
+      rng = np.random.RandomState(0)
+      X = rng.randn(n_samples, n_features)
+      y = rng.randint(0, 2, size=(n_samples,))
+      return X, y
+
+  def test_fit_with_sample_weight_and_none_estimator_classifier():
+      """Ensure fit accepts sample_weight when some estimators are None."""
+      X, y = _make_simple_data()
+      # two real classifiers that support sample_weight and one None in middle
+      clf1 = MockClfSupportsSW(label=0, n_classes=2)
+      clf2 = None
+      clf3 = MockClfSupportsSW(label=1, n_classes=2)
+      eclf = VotingClassifier(estimators=[('a', clf1), ('b', clf2), ('c', clf3)],
+                              voting='soft')
+      sw = np.ones(len(y))
+      # Should not raise and should fit the non-None estimators only
+      eclf.fit(X, y, sample_weight=sw)
+      assert hasattr(eclf, 'estimators_')
+      # estimators_ length should be number of non-None estimators
+      assert len(eclf.estimators_) == 2
+      # the mock classifiers should have received the sample_weight
+      assert eclf.named_estimators_.a.received_sample_weight is not None
+      assert eclf.named_estimators_.c.received_sample_weight is not None
+
+  def test_set_params_none_and_fit_with_sample_weight_regressor():
+      """VotingRegressor should handle estimators set to None with sample_weight."""
+      X, y = _make_simple_data()
+      # two regressors, make one of them set to None via set_params
+      r1 = MockRegSupportsSW(value=1.0)
+      r2 = MockRegSupportsSW(value=2.0)
+      ereg = VotingRegressor(estimators=[('r1', r1), ('r2', r2)])
+      sw = np.arange(len(y), dtype=float) + 1.0
+      # initial fit works
+      ereg.fit(X, y, sample_weight=sw)
+      # now remove one estimator and fit again with sample_weight
+      ereg.set_params(r1=None)
+      # Should not raise
+      ereg.fit(X, y, sample_weight=sw)
+      # predictions shape must match y
+      y_pred = ereg.predict(X)
+      assert y_pred.shape == y.shape
+
+  def test_weights_not_none_property_with_none_estimators():
+      """_weights_not_none returns weights only for non-None estimators."""
+      clf1 = MockClfSupportsSW(label=0)
+      clf2 = None
+      clf3 = MockClfSupportsSW(label=1)
+      weights = [1.0, 2.0, 3.0]
+      eclf = VotingClassifier(estimators=[('a', clf1), ('b', clf2), ('c', clf3)],
+                              weights=weights)
+      # _weights_not_none should reference only weights for non-None estimators (a and c)
+      # Access property before fit (it uses self.weights and self.estimators)
+      wn = eclf._weights_not_none
+      assert wn == [1.0, 3.0]
+
+  def test_transform_soft_with_none_and_flatten_true_shapes():
+      """transform (soft, flatten) should skip None estimators and hstack probas."""
+      X, y = _make_simple_data(n_samples=4)
+      # two classifiers, one None
+      clf1 = MockClfSupportsSW(label=0, n_classes=3)
+      clf2 = None
+      eclf = VotingClassifier(estimators=[('a', clf1), ('b', clf2)],
+                              voting='soft', flatten_transform=True)
+      eclf.fit(X, y)
+      proba = eclf.transform(X)
+      # Only one estimator contributes -> shape is (n_samples, n_classes)
+      assert proba.shape == (X.shape[0], 3)
+
+  def test_transform_soft_with_none_and_flatten_false_shapes():
+      """transform (soft, no flatten) should return per-estimator probas for present estimators."""
+      X, y = _make_simple_data(n_samples=3)
+      clf1 = MockClfSupportsSW(label=0, n_classes=2)
+      clf2 = MockClfSupportsSW(label=1, n_classes=2)
+      clf3 = None
+      eclf = VotingClassifier(estimators=[('a', clf1), ('b', clf2), ('c', clf3)],
+                              voting='soft', flatten_transform=False)
+      eclf.fit(X, y)
+      proba = eclf.transform(X)
+      # Should be (n_estimators_present, n_samples, n_classes)
+      assert proba.shape == (2, X.shape[0], 2)
+
+  def test_predict_hard_with_none_estimators_weights():
+      """Hard voting should work when some estimators are None and weights applied."""
+      X, y = _make_simple_data(n_samples=6)
+      # two classifiers present: one predicts 0 for all, another predicts 1 for all
+      clf0 = MockClfSupportsSW(label=0, n_classes=2)
+      clf1 = MockClfSupportsSW(label=1, n_classes=2)
+      clf_none = None
+      eclf = VotingClassifier(estimators=[('z0', clf0), ('nz', clf_none), ('z1', clf1)],
+                              voting='hard', weights=[1.0, 10.0, 2.0])
+      eclf.fit(X, y)
+      # since clf1 has larger weight (2.0) than clf0 (1.0), final prediction should be 1
+      preds = eclf.predict(X)
+      assert np.all(preds == 1)
+
+  def test_error_when_non_supporting_estimator_and_sample_weight():
+      """If a non-None estimator does not accept sample_weight, ValueError is raised."""
+      X, y = _make_simple_data()
+      clf1 = MockClfSupportsSW(label=0)
+      clf2 = MockClfNoSW(label=1)  # does not accept sample_weight
+      eclf = VotingClassifier(estimators=[('a', clf1), ('b', clf2)],
+                              voting='soft')
+      # sample_weight provided -> should raise about sample weight support
+      with pytest.raises(ValueError, match="does not support sample weights"):
+          eclf.fit(X, y, sample_weight=np.ones(len(y)))
+
+  def test_parallel_fit_with_none_estimators_and_sample_weight():
+      """fit with n_jobs > 1 should accept sample_weight and skip None estimators."""
+      X, y = _make_simple_data(n_samples=8)
+      clf1 = MockClfSupportsSW(label=0)
+      clf2 = None
+      clf3 = MockClfSupportsSW(label=1)
+      eclf = VotingClassifier(estimators=[('a', clf1), ('b', clf2), ('c', clf3)],
+                              voting='soft', n_jobs=2)
+      # Should run without raising
+      eclf.fit(X, y, sample_weight=np.arange(len(y), dtype=float) + 1.0)
+      # Ensure only non-none estimators were fitted
+      assert hasattr(eclf, 'estimators_')
+      assert len(eclf.estimators_) == 2
+
+  def test_set_params_removing_all_estimators_raises():
+      """Setting all estimators to None should cause a ValueError on fit."""
+      X, y = _make_simple_data()
+      clf1 = MockClfSupportsSW(label=0)
+      clf2 = MockClfSupportsSW(label=1)
+      eclf = VotingClassifier(estimators=[('a', clf1), ('b', clf2)], voting='soft')
+      # set both to None via set_params and ensure fit raises
+      eclf.set_params(a=None, b=None)
+      with pytest.raises(ValueError, match="All estimators are None. At least one is required!"):
+          eclf.fit(X, y, sample_weight=np.ones(len(y)))
+new_imports_code: |
+  # No new top-level imports required beyond those already present in the
+  # test file; helper classes import BaseEstimator, ClassifierMixin and RegressorMixin
+  # from sklearn.base which is already available in the test environment.

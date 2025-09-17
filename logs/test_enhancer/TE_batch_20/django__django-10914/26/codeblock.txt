@@ -1,0 +1,183 @@
+import os
+import stat
+import tempfile
+from contextlib import closing
+from django.conf import settings
+from django.core.files.storage import FileSystemStorage, default_storage
+from django.core.files.uploadedfile import SimpleUploadedFile, TemporaryUploadedFile
+from django.test import SimpleTestCase, override_settings
+
+class _Umask:
+    """
+    Context manager to temporarily set the process umask in a RAII style.
+    Returns the previous umask on enter.
+    """
+    def __init__(self, mask):
+        self.mask = mask
+        self.old = None
+
+    def __enter__(self):
+        # os.umask returns the previous umask
+        self.old = os.umask(self.mask)
+        return self.old
+
+    def __exit__(self, exc_type, exc, tb):
+        os.umask(self.old)
+
+class FileUploadPermissionsTests(SimpleTestCase):
+    def _get_mode(self, path):
+        return os.stat(path).st_mode & 0o777
+
+    def test_default_filesystemstorage_applies_default_permissions(self):
+        """
+        With umask 0, a freshly saved file should have been chmod'ed to the
+        default FILE_UPLOAD_PERMISSIONS (0o644).
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = FileSystemStorage(location=tmpdir)
+            # Ensure deterministic creation permissions
+            with _Umask(0):
+                uploaded = SimpleUploadedFile('f1.txt', b'content')
+                name = storage.save('f1.txt', uploaded)
+                path = storage.path(name)
+                self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+                self.assertEqual(self._get_mode(path), 0o644)
+
+    @override_settings(FILE_UPLOAD_PERMISSIONS=None)
+    def test_override_settings_none_disables_chmod(self):
+        """
+        When FILE_UPLOAD_PERMISSIONS is explicitly None, storage instances
+        should not chmod files after save. With umask 0, newly-created files
+        will be 0o666 (typical create mode) if no chmod is applied.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = FileSystemStorage(location=tmpdir)
+            with _Umask(0):
+                uploaded = SimpleUploadedFile('f2.txt', b'xyz')
+                name = storage.save('f2.txt', uploaded)
+                path = storage.path(name)
+                self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+                # Expect 0o666 because no chmod should be applied
+                self.assertEqual(self._get_mode(path), 0o666)
+
+    @override_settings(FILE_UPLOAD_PERMISSIONS=0o600)
+    def test_override_settings_custom_permissions_applied(self):
+        """
+        When FILE_UPLOAD_PERMISSIONS is overridden to a specific value, it
+        should be applied to saved files.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = FileSystemStorage(location=tmpdir)
+            with _Umask(0):
+                uploaded = SimpleUploadedFile('f3.txt', b'data')
+                name = storage.save('f3.txt', uploaded)
+                path = storage.path(name)
+                self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+                self.assertEqual(self._get_mode(path), 0o600)
+
+    def test_init_parameter_none_disables_chmod(self):
+        """
+        Passing file_permissions_mode=None to FileSystemStorage should disable
+        chmod (i.e., leave file mode as created under current umask).
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = FileSystemStorage(location=tmpdir, file_permissions_mode=None)
+            with _Umask(0):
+                uploaded = SimpleUploadedFile('f4.txt', b'hello')
+                name = storage.save('f4.txt', uploaded)
+                path = storage.path(name)
+                self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+                self.assertEqual(self._get_mode(path), 0o666)
+
+    def test_init_parameter_value_is_respected(self):
+        """
+        Passing an explicit file_permissions_mode to FileSystemStorage
+        should be applied regardless of global settings.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = FileSystemStorage(location=tmpdir, file_permissions_mode=0o640)
+            with _Umask(0):
+                uploaded = SimpleUploadedFile('f5.txt', b'bytes')
+                name = storage.save('f5.txt', uploaded)
+                path = storage.path(name)
+                self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+                self.assertEqual(self._get_mode(path), 0o640)
+
+    def test_temporaryuploadedfile_saved_with_default_permissions(self):
+        """
+        Ensure a TemporaryUploadedFile (simulating a large upload) receives
+        the same file permission handling as SimpleUploadedFile.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = FileSystemStorage(location=tmpdir)
+            # TemporaryUploadedFile wants an approximate size; we'll write to it.
+            temp_file = TemporaryUploadedFile('large.txt', 'text/plain', 0, 'utf-8')
+            try:
+                temp_file.write(b'large content')
+                temp_file.seek(0)
+                with _Umask(0):
+                    name = storage.save('large.txt', temp_file)
+                    path = storage.path(name)
+                    self.addCleanup(lambda: os.path.exists(path) and os.remove(path))
+                    self.assertEqual(self._get_mode(path), 0o644)
+            finally:
+                try:
+                    temp_file.close()
+                except Exception:
+                    pass
+
+    def test_multiple_files_get_consistent_permissions(self):
+        """
+        Saving multiple files in the same storage instance should consistently
+        apply the configured file permissions.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = FileSystemStorage(location=tmpdir)
+            with _Umask(0):
+                names = []
+                for i in range(3):
+                    uploaded = SimpleUploadedFile(f'm{i}.txt', b'x')
+                    name = storage.save(f'm{i}.txt', uploaded)
+                    names.append(storage.path(name))
+                for p in names:
+                    self.addCleanup(lambda p=p: os.path.exists(p) and os.remove(p))
+                    self.assertEqual(self._get_mode(p), 0o644)
+
+    @override_settings(FILE_UPLOAD_DIRECTORY_PERMISSIONS=0o700)
+    def test_directory_permissions_applied_when_creating_subdirectories(self):
+        """
+        When saving to a subdirectory that doesn't exist, the created
+        directory should have the FILE_UPLOAD_DIRECTORY_PERMISSIONS when set.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            storage = FileSystemStorage(location=tmpdir)
+            subpath = 'subdir1/subdir2/test.txt'
+            with _Umask(0):
+                uploaded = SimpleUploadedFile('test.txt', b'c')
+                name = storage.save(subpath, uploaded)
+                file_path = storage.path(name)
+                self.addCleanup(lambda: os.path.exists(file_path) and os.remove(file_path))
+                # Check both levels of directories exist and check the top-level created directory mode
+                dir1 = os.path.join(tmpdir, 'subdir1')
+                dir2 = os.path.join(dir1, 'subdir2')
+                self.addCleanup(lambda: os.path.isdir(dir2) and os.rmdir(dir2))
+                self.addCleanup(lambda: os.path.isdir(dir1) and os.rmdir(dir1))
+                # Directory creation should have applied 0o700
+                self.assertEqual(os.stat(dir1).st_mode & 0o777, 0o700)
+
+    def test_new_storage_reflects_changed_settings(self):
+        """
+        Changing settings.FILE_UPLOAD_PERMISSIONS should be reflected in
+        newly-created FileSystemStorage instances (but not affect already
+        created instances).
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Default instance - reflect current settings
+            s1 = FileSystemStorage(location=tmpdir)
+            original_mode = s1.file_permissions_mode
+            # Create a new instance after changing setting
+            with override_settings(FILE_UPLOAD_PERMISSIONS=0o606):
+                s2 = FileSystemStorage(location=tmpdir)
+                self.assertEqual(s2.file_permissions_mode, 0o606)
+            # s1 shouldn't have been mutated by the context manager
+            self.assertEqual(s1.file_permissions_mode, original_mode)

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_views.test_templatetags_llm.ShowSaveAsNewTests.test_add_permission_without_change_permission_shows_save_as_new admin_views.test_templatetags_llm.ShowSaveAsNewTests.test_add_true_but_change_flag_false_hides_save_as_new admin_views.test_templatetags_llm.ShowSaveAsNewTests.test_both_add_and_change_permissions_shows_save_as_new admin_views.test_templatetags_llm.ShowSaveAsNewTests.test_change_flag_false_hides_save_as_new_even_with_add admin_views.test_templatetags_llm.ShowSaveAsNewTests.test_change_permission_without_add_permission_hides_save_as_new admin_views.test_templatetags_llm.ShowSaveAsNewTests.test_combination_add_true_change_permission_false_with_other_flags admin_views.test_templatetags_llm.ShowSaveAsNewTests.test_has_view_permission_irrelevant_for_save_as_new admin_views.test_templatetags_llm.ShowSaveAsNewTests.test_is_popup_hides_save_as_new_even_with_add admin_views.test_templatetags_llm.ShowSaveAsNewTests.test_save_as_flag_false_hides_save_as_new_even_with_add admin_views.test_templatetags_llm.ShowSaveAsNewTests.test_show_save_override_does_not_affect_show_save_as_new admin_views.test_templatetags_llm._base_context
+coverage json -o coverage.json
+: '>>>>> End Test Output'

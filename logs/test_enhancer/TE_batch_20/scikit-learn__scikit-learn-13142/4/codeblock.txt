@@ -1,0 +1,169 @@
+from sklearn.mixture.base import BaseMixture
+from sklearn.utils.testing import assert_array_equal
+import numpy as np
+from sklearn.mixture.base import BaseMixture
+from sklearn.utils.testing import assert_array_equal
+import pytest
+
+class DummyMixture(BaseMixture):
+    """
+    Deterministic Dummy mixture to expose the fit_predict final E-step ordering bug.
+
+    Behavior:
+    - _initialize_parameters sets self.means_ differently on each initialization
+      (based on an internal _init_count) so different inits produce different
+      current parameters.
+    - _compute_lower_bound is designed so that the first initialization always
+      produces the highest lower_bound (so best_params should come from init 1),
+      while the loop still ends with the model parameters from the last init.
+    This combination reproduces the condition where a final E-step done before
+    _set_parameters would produce labels inconsistent with the ultimately set
+    best parameters.
+    """
+    def __init__(self, n_components=2, n_features=1,
+                 tol=1e-3, reg_covar=1e-6, max_iter=1, n_init=2,
+                 init_params='random', random_state=0, warm_start=False,
+                 verbose=0, verbose_interval=1):
+        super().__init__(n_components=n_components, tol=tol,
+                         reg_covar=reg_covar, max_iter=max_iter,
+                         n_init=n_init, init_params=init_params,
+                         random_state=random_state, warm_start=warm_start,
+                         verbose=verbose, verbose_interval=verbose_interval)
+        self.n_features = n_features
+        self._init_count = 0
+
+    def _check_parameters(self, X):
+        # no checks necessary for the dummy
+        return
+
+    def _initialize_parameters(self, X, random_state):
+        # Override BaseMixture._initialize_parameters to deterministically
+        # produce differing parameters for each initialization.
+        self._init_count += 1
+        # Create means that depend on the init count so each init is distinct.
+        # shape = (n_components, n_features)
+        base = float(self._init_count - 1) * 10.0
+        self.means_ = np.array([[base + float(k)] * self.n_features
+                                for k in range(self.n_components)])
+        # simple diagonal covariances (stored as vector for 'diag' type)
+        self.covariances_ = np.ones((self.n_components, self.n_features))
+        # equal weights
+        self.weights_ = np.ones(self.n_components) / float(self.n_components)
+        self.covariance_type = 'diag'
+
+    def _m_step(self, X, log_resp):
+        # No-op for deterministic behavior
+        return
+
+    def _e_step(self, X):
+        # Produce log responsibilities based on negative absolute distance
+        X = np.asarray(X)
+        # Ensure X is 2D
+        if X.ndim == 1:
+            X = X[:, None]
+        # use first feature only for simplicity
+        xcol = X[:, 0][:, None]  # shape (n_samples, 1)
+        means_col = self.means_[:, 0][None, :]  # shape (1, n_components)
+        scores = -np.abs(xcol - means_col)  # higher is better
+        # log_prob_norm per sample
+        # To avoid numerical issues, use log-sum-exp manually
+        max_scores = np.max(scores, axis=1, keepdims=True)
+        log_prob_norm = (np.log(np.sum(np.exp(scores - max_scores), axis=1))
+                         + max_scores.ravel())
+        log_resp = scores - log_prob_norm[:, None]
+        return np.mean(log_prob_norm), log_resp
+
+    def _check_is_fitted(self):
+        if not hasattr(self, "means_"):
+            raise ValueError("This DummyMixture instance is not fitted yet.")
+
+    def _get_parameters(self):
+        # Return a copy of current parameters as a dict
+        return {
+            'means': self.means_.copy(),
+            'covariances': self.covariances_.copy(),
+            'weights': self.weights_.copy(),
+            'covariance_type': self.covariance_type
+        }
+
+    def _set_parameters(self, params):
+        self.means_ = params['means'].copy()
+        self.covariances_ = params['covariances'].copy()
+        self.weights_ = params['weights'].copy()
+        self.covariance_type = params['covariance_type']
+
+    def _estimate_log_weights(self):
+        return np.log(self.weights_)
+
+    def _estimate_log_prob(self, X):
+        # Same scoring as _e_step but without normalization
+        X = np.asarray(X)
+        if X.ndim == 1:
+            X = X[:, None]
+        xcol = X[:, 0][:, None]
+        means_col = self.means_[:, 0][None, :]
+        return -np.abs(xcol - means_col)
+
+    def _compute_lower_bound(self, log_resp, log_prob_norm):
+        # Make earlier inits strictly better; the first init (when
+        # _init_count == 1) will have the highest lower bound.
+        return 1000.0 - float(self._init_count)
+
+# Tests:
+def _run_consistency_test(n_init, n_components=2, warm_start=False, n_samples=5):
+    rng = np.random.RandomState(0)
+    # Create simple 1D data that will be assigned differently depending on means
+    # Values chosen around small magnitudes so early init means (base 0) differ
+    # strongly from later inits (base 10, 20, ...)
+    X = np.asarray([0.0, 1.0, 2.0, 11.0, 12.0])[:n_samples].reshape(-1, 1)
+    gm = DummyMixture(n_components=n_components, n_init=n_init,
+                      random_state=0, warm_start=warm_start)
+    y_fit_predict = gm.fit_predict(X)
+    y_predict = gm.predict(X)
+    # fit_predict must be consistent with predict (which uses the finally set
+    # best parameters). This should fail on the buggy ordering.
+    assert_array_equal(y_fit_predict, y_predict)
+    # Also check equivalence with calling fit then predict
+    gm2 = DummyMixture(n_components=n_components, n_init=n_init,
+                       random_state=0, warm_start=warm_start)
+    gm2.fit(X)
+    assert_array_equal(gm2.predict(X), gm2.fit_predict(X))
+
+def test_fit_predict_consistency_n_init_2():
+    _run_consistency_test(n_init=2, n_components=2, n_samples=5)
+
+def test_fit_predict_consistency_n_init_3():
+    _run_consistency_test(n_init=3, n_components=2, n_samples=5)
+
+def test_fit_predict_consistency_n_init_4():
+    _run_consistency_test(n_init=4, n_components=2, n_samples=5)
+
+def test_fit_predict_consistency_n_init_5():
+    _run_consistency_test(n_init=5, n_components=2, n_samples=5)
+
+def test_fit_predict_consistency_three_components_n_init_3():
+    _run_consistency_test(n_init=3, n_components=3, n_samples=5)
+
+def test_fit_predict_consistency_many_samples():
+    _run_consistency_test(n_init=3, n_components=2, n_samples=5)
+
+def test_fit_predict_with_warm_start_first_call():
+    # warm_start True but first call behaves same way as warm_start False
+    _run_consistency_test(n_init=3, n_components=2, warm_start=True, n_samples=5)
+
+def test_fit_predict_with_warm_start_second_call():
+    # Ensure second call (with warm_start) that skips re-initialization still
+    # returns labels consistent with predict.
+    X = np.asarray([0.0, 1.0, 2.0, 11.0, 12.0]).reshape(-1, 1)
+    gm = DummyMixture(n_components=2, n_init=3, random_state=0, warm_start=True)
+    y1 = gm.fit_predict(X)
+    # Second call: do_init should be False (warm_start and hasattr(converged_))
+    y2 = gm.fit_predict(X)
+    assert_array_equal(y2, gm.predict(X))
+    # Ensure the first call was also consistent
+    assert_array_equal(y1, gm.predict(X))
+
+def test_fit_predict_consistency_various_inits_repeated():
+    # Run several repetitions with different n_init values to catch regressions
+    for n_init in (2, 3, 4, 5):
+        _run_consistency_test(n_init=n_init, n_components=2, n_samples=5)

@@ -1,0 +1,205 @@
+import types
+from unittest import mock
+from requests.exceptions import HTTPError
+import pytest
+import types
+from unittest import mock
+from requests.exceptions import HTTPError
+import pytest
+from sphinx.builders.linkcheck import CheckExternalLinksBuilder
+
+# Helper factory to create a Response-like object used by the builder
+class MockResponse:
+    def __init__(self, url, status_code=200, headers=None, chunks=None, history=None, request_method='GET'):
+        self.url = url
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._chunks = chunks or []
+        self.history = history or []
+        # simple object to mimic requests Response.request.method
+        self.request = types.SimpleNamespace(method=request_method)
+
+    def iter_content(self, chunk_size=4096, decode_unicode=False):
+        for c in self._chunks:
+            # mimic requests behavior: when decode_unicode=True, yield str; otherwise bytes
+            yield c
+
+    def raise_for_status(self):
+        if 400 <= self.status_code < 600:
+            # attach self as the response attribute like requests.HTTPError does
+            raise HTTPError(f"{self.status_code} Client Error: Error for url: {self.url}", response=self)
+
+def enqueue_and_get_result(app, uri, mock_get, mock_head, timeout=5.0):
+    """
+    Put a single uri into the builder's work queue and return the rqueue result tuple.
+    """
+    # patch requests.get and requests.head for the duration while the worker threads run
+    with mock.patch.multiple('sphinx.builders.linkcheck.requests',
+                            get=mock_get, head=mock_head):
+        # ensure no leftover state
+        # put the uri; docname and lineno are arbitrary for these tests
+        app.builder.wqueue.put((uri, 'testdoc', 1), False)
+        # wait for a result from rqueue
+        result = app.builder.rqueue.get(timeout=timeout)
+        return result
+
+@pytest.mark.sphinx('linkcheck', freshenv=True, testroot='linkcheck')
+def test_anchor_html_found(app):
+    """HTML content contains the anchor -> working"""
+    url = 'https://example.com/page.html'
+    uri_with_anchor = url + '#found'
+    #Mock GET returns HTML that contains id="found"
+    resp = MockResponse(url, status_code=200,
+                        headers={'content-type': 'text/html'},
+                        chunks=['<html><body><div id="found">x</div></body></html>'])
+    def mg(u, **kwargs):
+        return resp
+    def mh(u, **kwargs):
+        return resp
+    uri, docname, lineno, status, info, code = enqueue_and_get_result(app, uri_with_anchor, mg, mh)
+    assert uri == uri_with_anchor
+    assert status == 'working'
+    assert info == ''
+
+@pytest.mark.sphinx('linkcheck', freshenv=True, testroot='linkcheck')
+def test_anchor_html_missing(app):
+    """HTML content does not contain anchor -> broken with Anchor not found"""
+    url = 'https://example.com/page2.html'
+    uri_with_anchor = url + '#missing'
+    resp = MockResponse(url, status_code=200,
+                        headers={'content-type': 'text/html'},
+                        chunks=['<html><body><div id="other">x</div></body></html>'])
+    def mg(u, **kwargs):
+        return resp
+    def mh(u, **kwargs):
+        return resp
+    uri, docname, lineno, status, info, code = enqueue_and_get_result(app, uri_with_anchor, mg, mh)
+    assert status == 'broken'
+    assert "Anchor 'missing' not found" in info
+
+@pytest.mark.sphinx('linkcheck', freshenv=True, testroot='linkcheck')
+def test_anchor_pdf_missing_should_be_broken(app):
+    """Non-HTML (PDF) without anchor must be treated like missing anchor (broken).
+    The candidate patch mistakenly treats non-HTML as 'working' for anchor checks.
+    """
+    url = 'https://example.com/file.pdf'
+    uri_with_anchor = url + '#a1'
+    # PDF-like non-html content, no anchor present
+    resp = MockResponse(url, status_code=200,
+                        headers={'content-type': 'application/pdf'},
+                        chunks=[b'%PDF-1.4 binarycontent'])
+    def mg(u, **kwargs):
+        return resp
+    def mh(u, **kwargs):
+        # model patch may try HEAD first; emulate HEAD returning 200
+        head_resp = MockResponse(url, status_code=200, headers={'content-type': 'application/pdf'}, chunks=[])
+        # indicate that this was a HEAD request
+        head_resp.request = types.SimpleNamespace(method='HEAD')
+        return head_resp
+    uri, docname, lineno, status, info, code = enqueue_and_get_result(app, uri_with_anchor, mg, mh)
+    # Gold patch: should search the body and report anchor not found (broken)
+    assert status == 'broken'
+    assert "Anchor 'a1' not found" in info
+
+@pytest.mark.sphinx('linkcheck', freshenv=True, testroot='linkcheck')
+def test_anchor_missing_content_type_should_be_broken(app):
+    """Missing Content-Type header should NOT cause the builder to skip anchor checks."""
+    url = 'https://example.com/unknown'
+    uri_with_anchor = url + '#x'
+    resp = MockResponse(url, status_code=200,
+                        headers={},  # no content-type
+                        chunks=['<html><body>No anchor here</body></html>'])
+    def mg(u, **kwargs):
+        return resp
+    def mh(u, **kwargs):
+        return resp
+    uri, docname, lineno, status, info, code = enqueue_and_get_result(app, uri_with_anchor, mg, mh)
+    assert status == 'broken'
+    assert "Anchor 'x' not found" in info
+
+@pytest.mark.sphinx('linkcheck', freshenv=True, testroot='linkcheck')
+def test_anchor_image_missing_should_be_broken(app):
+    """Image content-type should not be treated as automatically working when an anchor is present."""
+    url = 'https://example.com/logo.png'
+    uri_with_anchor = url + '#imganchor'
+    resp = MockResponse(url, status_code=200,
+                        headers={'content-type': 'image/png'},
+                        chunks=[b'\x89PNG\r\n\x1a\nbinary'])
+    def mg(u, **kwargs):
+        return resp
+    def mh(u, **kwargs):
+        return resp
+    uri, docname, lineno, status, info, code = enqueue_and_get_result(app, uri_with_anchor, mg, mh)
+    assert status == 'broken'
+    assert "Anchor 'imganchor' not found" in info
+
+@pytest.mark.sphinx('linkcheck', freshenv=True, testroot='linkcheck')
+def test_anchor_pdf_with_anchor_in_body_marked_working(app):
+    """If even non-HTML content (binary) happens to contain the anchor string, it should be found."""
+    url = 'https://example.com/report.pdf'
+    uri_with_anchor = url + '#foundhere'
+    # simulate binary content that nevertheless contains the anchor text in decoded chunks
+    resp = MockResponse(url, status_code=200,
+                        headers={'content-type': 'application/pdf'},
+                        chunks=['... id="foundhere" ...'])
+    def mg(u, **kwargs):
+        return resp
+    def mh(u, **kwargs):
+        return resp
+    uri, docname, lineno, status, info, code = enqueue_and_get_result(app, uri_with_anchor, mg, mh)
+    # both gold and candidate will be working in this case
+    assert status == 'working'
+    assert info == ''
+
+@pytest.mark.sphinx('linkcheck', freshenv=True, testroot='linkcheck')
+def test_anchor_text_plain_missing_should_be_broken(app):
+    """text/plain content-type should not be skipped for anchor checking."""
+    url = 'https://example.com/readme.txt'
+    uri_with_anchor = url + '#section'
+    resp = MockResponse(url, status_code=200,
+                        headers={'content-type': 'text/plain'},
+                        chunks=['No anchor here in plain text'])
+    def mg(u, **kwargs):
+        return resp
+    def mh(u, **kwargs):
+        return resp
+    uri, docname, lineno, status, info, code = enqueue_and_get_result(app, uri_with_anchor, mg, mh)
+    assert status == 'broken'
+    assert "Anchor 'section' not found" in info
+
+@pytest.mark.sphinx('linkcheck', freshenv=True, testroot='linkcheck')
+def test_anchor_content_type_with_charset_html_behavior(app):
+    """Content-Type 'text/html; charset=utf-8' should be treated as HTML (i.e., not skipped),
+    and anchor missing should be reported as broken."""
+    url = 'https://example.com/withcharset'
+    uri_with_anchor = url + '#alpha'
+    resp = MockResponse(url, status_code=200,
+                        headers={'content-type': 'text/html; charset=utf-8'},
+                        chunks=['<html><body><div id="other">x</div></body></html>'])
+    def mg(u, **kwargs):
+        return resp
+    def mh(u, **kwargs):
+        return resp
+    uri, docname, lineno, status, info, code = enqueue_and_get_result(app, uri_with_anchor, mg, mh)
+    assert status == 'broken'
+    assert "Anchor 'alpha' not found" in info
+
+@pytest.mark.sphinx('linkcheck', freshenv=True, testroot='linkcheck')
+def test_anchor_head_ok_get_404_results_in_http_error(app):
+    """When a HEAD may be accepted but the subsequent GET returns 404, the builder must surface the HTTP error."""
+    url = 'https://example.com/moved'
+    uri_with_anchor = url + '#anchor'
+    head_resp = MockResponse(url, status_code=200, headers={'content-type': 'text/html'}, chunks=[])
+    # GET returns 404, which should lead to HTTPError raised by raise_for_status()
+    get_resp = MockResponse(url, status_code=404, headers={'content-type': 'text/html'},
+                            chunks=['Not found page'])
+    def mg(u, **kwargs):
+        return get_resp
+    def mh(u, **kwargs):
+        # simulate HEAD success initially
+        head_resp.request = types.SimpleNamespace(method='HEAD')
+        return head_resp
+    uri, docname, lineno, status, info, code = enqueue_and_get_result(app, uri_with_anchor, mg, mh)
+    # Because GET returned 404, builder should return broken with HTTPError message
+    assert status == 'broken'
+    assert '404 Client Error' in info

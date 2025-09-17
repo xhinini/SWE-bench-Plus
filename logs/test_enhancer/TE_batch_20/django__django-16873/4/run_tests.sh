@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_arg_returns_original_empty_list template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_arg_returns_original_generator template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_arg_returns_original_list_autoescape_on template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_arg_returns_original_list_nested template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_arg_returns_original_list_with_mixed_types template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_arg_returns_original_list_with_object_elements template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_arg_returns_original_list_with_safe_elements template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_arg_returns_original_list_with_unicode template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_arg_returns_original_single_element_list template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_arg_returns_original_tuple
+coverage json -o coverage.json
+: '>>>>> End Test Output'

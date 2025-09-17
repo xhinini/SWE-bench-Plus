@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 validators.tests_llm.URLValidatorUnsafeCharsTests.test_caret_rejected_when_configured validators.tests_llm.URLValidatorUnsafeCharsTests.test_changing_class_attribute_affects_all_instances validators.tests_llm.URLValidatorUnsafeCharsTests.test_class_override_rejects_pipe_in_fragment validators.tests_llm.URLValidatorUnsafeCharsTests.test_class_override_rejects_pipe_in_path validators.tests_llm.URLValidatorUnsafeCharsTests.test_class_override_rejects_pipe_in_query validators.tests_llm.URLValidatorUnsafeCharsTests.test_class_override_rejects_pipe_in_userinfo validators.tests_llm.URLValidatorUnsafeCharsTests.test_instance_override_rejects_pipe_in_path validators.tests_llm.URLValidatorUnsafeCharsTests.test_multiple_unsafe_chars_rejected validators.tests_llm.URLValidatorUnsafeCharsTests.test_mutated_instance_unsafe_chars_after_init validators.tests_llm.URLValidatorUnsafeCharsTests.test_underscore_rejected_when_configured
+coverage json -o coverage.json
+: '>>>>> End Test Output'

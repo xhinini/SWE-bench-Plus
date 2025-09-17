@@ -1,0 +1,144 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests validate that BaseManager.from_queryset/_get_queryset_methods correctly copy public QuerySet methods to the Manager class, preserve metadata (name, docstring, signature, and __wrapped__), respect the queryset_only attribute and underscore-name rules, do not override existing Manager methods, and ensure that get_queryset() is called with the manager's db and hints. They are written to fail against a faulty implementation that doesn't apply functools.wraps correctly (losing __name__/__doc__/signature/__wrapped__) or mishandles method copying, but pass with the provided gold patch.
+test_code: |
+  from unittest import mock
+  import inspect
+  
+  from django.test import SimpleTestCase
+  
+  from django.db.models.manager import BaseManager
+  
+  
+  class DummyModel:
+      # Minimal _meta placeholder so `get_queryset` callers that access it won't break.
+      class _meta:
+          label = "app.DummyModel"
+          object_name = "DummyModel"
+  
+  
+  class FakeQuerySet:
+      def __init__(self, model=None, using=None, hints=None):
+          self.model = model
+          self.using = using
+          self.hints = hints
+          # For proxying tests
+          self._last_called = None
+          self._last_args = None
+          self._last_kwargs = None
+  
+      def public_method(self, x, y=2):
+          "Public method doc"
+          return ("public", x, y)
+  
+      def method_with_varargs(self, a, *args, **kwargs):
+          "Varargs doc"
+          return ("varargs", a, args, kwargs)
+  
+      def _private(self):
+          "Private doc"
+          return "private"
+  
+      def all(self):
+          "QuerySet all doc"
+          # Not used for DB; just to detect copy behavior
+          return "qs_all"
+  
+      def proxy_call(self, *args, **kwargs):
+          # Record the call and return a sentinel
+          self._last_called = True
+          self._last_args = args
+          self._last_kwargs = kwargs
+          return ("proxied", args, kwargs)
+  
+  # Adjust attributes to simulate queryset_only semantics
+  FakeQuerySet._private.queryset_only = None  # default; should be skipped due to leading underscore
+  FakeQuerySet.public_method.queryset_only = None
+  FakeQuerySet.method_with_varargs.queryset_only = None
+  FakeQuerySet.proxy_call.queryset_only = None
+  FakeQuerySet.all.queryset_only = None
+  
+  # Create another QuerySet for testing queryset_only=False on underscored method
+  class QSWithExplicitUnderscore:
+      def __init__(self, model=None, using=None, hints=None):
+          pass
+  
+      def _exposed_private(self):
+          "explicitly exposed"
+          return "exposed"
+  
+  QSWithExplicitUnderscore._exposed_private.queryset_only = False
+  
+  
+  class ManagerFromFakeQSTests(SimpleTestCase):
+      def setUp(self):
+          # Build a Manager subclass from FakeQuerySet
+          self.ManagerClass = BaseManager.from_queryset(FakeQuerySet, class_name="MgrFromFakeQS")
+          self.manager = self.ManagerClass()
+          self.manager.model = DummyModel
+  
+      def test__get_queryset_methods_skips_private_names(self):
+          methods = BaseManager._get_queryset_methods(FakeQuerySet)
+          # _private should be skipped because it starts with '_' and queryset_only is None
+          self.assertNotIn("_private", methods)
+          # public_method should be present
+          self.assertIn("public_method", methods)
+  
+      def test_query_only_false_allows_private_copy(self):
+          methods = BaseManager._get_queryset_methods(QSWithExplicitUnderscore)
+          # _exposed_private has queryset_only=False so it should be copied
+          self.assertIn("_exposed_private", methods)
+  
+      def test_copied_method_has_name_and_doc_preserved(self):
+          # The manager class should have public_method on it
+          self.assertTrue(hasattr(self.ManagerClass, "public_method"))
+          mgr_func = getattr(self.ManagerClass, "public_method")
+          qs_func = FakeQuerySet.public_method
+          # __name__ and __doc__ should match the original queryset function
+          self.assertEqual(mgr_func.__name__, qs_func.__name__)
+          self.assertEqual(mgr_func.__doc__, qs_func.__doc__)
+  
+      def test_copied_method_has___wrapped___pointing_to_original(self):
+          mgr_func = getattr(self.ManagerClass, "public_method")
+          # The wrapper created by wraps() should expose __wrapped__ as the original function
+          self.assertIs(getattr(mgr_func, "__wrapped__", None), FakeQuerySet.public_method)
+  
+      def test_signature_preserved(self):
+          mgr_func = getattr(self.ManagerClass, "method_with_varargs")
+          sig_mgr = inspect.signature(mgr_func)
+          sig_qs = inspect.signature(FakeQuerySet.method_with_varargs)
+          self.assertEqual(str(sig_mgr), str(sig_qs))
+  
+      def test_manager_method_proxies_to_queryset_and_forwards_args(self):
+          # Use the proxy_call to verify that args/kwargs are forwarded
+          # Call via manager instance (this triggers the wrapper which calls get_queryset())
+          result = self.manager.proxy_call(1, 2, a=3)
+          self.assertEqual(result[0], "proxied")
+          self.assertEqual(result[1], (1, 2))
+          self.assertEqual(result[2], {"a": 3})
+  
+      def test_from_queryset_sets__queryset_class(self):
+          self.assertIs(self.ManagerClass._queryset_class, FakeQuerySet)
+  
+      def test_manager_does_not_override_existing_manager_methods(self):
+          # QuerySet defines 'all'; Manager already defines 'all'. Ensure we did not copy/override it.
+          # The ManagerClass.all should be BaseManager.all (function defined on manager), not FakeQuerySet.all.
+          self.assertNotEqual(getattr(self.ManagerClass, "all").__doc__, FakeQuerySet.all.__doc__)
+  
+      def test_db_manager_sets_db_and_hints_and_get_queryset_uses_them(self):
+          m2 = self.manager.db_manager(using="the_db", hints={"k": "v"})
+          qs = m2.get_queryset()
+          # Our FakeQuerySet stores using and hints on initialization
+          self.assertEqual(qs.using, "the_db")
+          self.assertEqual(qs.hints, {"k": "v"})
+  
+      def test_methods_not_copied_if_queryset_only_true(self):
+          class QS2:
+              def hidden(self):
+                  return "hidden"
+  
+          QS2.hidden.queryset_only = True
+          methods = BaseManager._get_queryset_methods(QS2)
+          self.assertNotIn("hidden", methods)
+new_imports_code: |
+  # No additional project-wide imports required. The tests import what they need.

@@ -1,0 +1,165 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests register a temporary serializer that emits controlled import lines, then create a migration with an operation that uses a value of that serialized type. The MigrationWriter collects imports from operation serialization; the tests assert that the generated migration string contains the imports in the expected grouped-and-sorted order (all "import ..." lines first, sorted by module, then all "from ... import ..." lines, sorted by module). Additional tests cover the special merging of "from django.db import models" into "from django.db import migrations, models", removal of migration-file imports that should be converted into a comment, and handling of duplicates.
+test_code: |
+  from django.db import migrations
+  from django.db.migrations.writer import MigrationWriter
+  from django.db.migrations.serializer import BaseSerializer
+  from django.test import SimpleTestCase
+  from django.db import migrations
+  from django.db.migrations.writer import MigrationWriter
+  from django.db.migrations.serializer import BaseSerializer
+
+  # Small helper classes used in tests.
+  class ImportMarker:
+      """Marker class instances are serialized by the tests to emit controlled imports."""
+
+  class OpWithValue:
+      """A very small operation-like object used only for serialization by OperationWriter."""
+      def __init__(self, value):
+          self.value = value
+
+      def deconstruct(self):
+          # Name doesn't exist on django.db.migrations, so OperationWriter will import the
+          # operation module (this class lives in the test module).
+          return ("OpWithValue", [self.value], {})
+
+  class TestImportSorting(SimpleTestCase):
+      def _register_serializer(self, imports_set):
+          """
+          Register a serializer for ImportMarker that returns a dummy string and the
+          provided imports_set. Returns the serializer class so it can be unregistered.
+          """
+          class DummySerializer(BaseSerializer):
+              def serialize(self):
+                  # Return a trivial expression and the imports_set
+                  return ("ImportMarker()", set(imports_set))
+
+          MigrationWriter.register_serializer(ImportMarker, DummySerializer)
+          return DummySerializer
+
+      def _build_migration_and_output(self, imports_set):
+          # Register serializer
+          DummySerializer = self._register_serializer(imports_set)
+          try:
+              migration = type(
+                  "Migration",
+                  (migrations.Migration,),
+                  {
+                      "operations": [OpWithValue(ImportMarker())],
+                      "dependencies": [],
+                  },
+              )
+              writer = MigrationWriter(migration)
+              output = writer.as_string()
+          finally:
+              # Cleanup
+              MigrationWriter.unregister_serializer(ImportMarker)
+          return output
+
+      def test_group_imports_and_from_statements_order_basic(self):
+          imports = {"import zebra", "from alpha import x", "import alpha"}
+          output = self._build_migration_and_output(imports)
+          expected = "import alpha\nimport zebra\nfrom alpha import x\n"
+          # Check that the grouped-and-sorted import block is present
+          self.assertIn(expected, output)
+
+      def test_sorting_imports_by_module_name(self):
+          imports = {"import zed", "import aaa", "from mmm import x"}
+          output = self._build_migration_and_output(imports)
+          expected = "import aaa\nimport zed\nfrom mmm import x\n"
+          self.assertIn(expected, output)
+
+      def test_subpackage_sorting(self):
+          # Mix imports and froms referring to the same base package and subpackages.
+          imports = {"import a.b", "from a import c", "from a.b import d"}
+          output = self._build_migration_and_output(imports)
+          # Expect import lines first (sorted by module), then from lines (sorted by module)
+          expected = "import a.b\nfrom a import c\nfrom a.b import d\n"
+          self.assertIn(expected, output)
+
+      def test_complex_mixture_of_many_imports(self):
+          imports = {
+              "import zebra",
+              "import apple",
+              "from banana import x",
+              "from alpha import y",
+              "import mango.pulp",
+              "from mango import skin",
+          }
+          output = self._build_migration_and_output(imports)
+          expected = (
+              "import apple\n"
+              "import mango.pulp\n"
+              "import zebra\n"
+              "from alpha import y\n"
+              "from banana import x\n"
+              "from mango import skin\n"
+          )
+          self.assertIn(expected, output)
+
+      def test_models_merge_and_order(self):
+          # If "from django.db import models" is present it should be merged with
+          # the migrations import into "from django.db import migrations, models"
+          imports = {"from django.db import models", "import datetime"}
+          output = self._build_migration_and_output(imports)
+          expected = "import datetime\nfrom django.db import migrations, models\n"
+          self.assertIn(expected, output)
+
+      def test_migration_imports_become_comment(self):
+          # An import that looks like it imports a migration module (has a .<digits> fragment)
+          # should be removed from the imports block and added to the functions-to-copy comment.
+          imports = {"import somepackage.subpackage.0001_migration", "import datetime"}
+          output = self._build_migration_and_output(imports)
+          # The migration-like import must not appear in the import block.
+          self.assertIn("import datetime\n", output)
+          self.assertNotIn("import somepackage.subpackage.0001_migration\n", output)
+          # Instead, there should be a comment telling the developer to copy functions from that module.
+          self.assertIn(
+              "# Functions from the following migrations need manual copying.",
+              output,
+          )
+          # The reported module name should be present in the comment (without the leading "import")
+          self.assertIn("somepackage.subpackage.0001_migration", output)
+
+      def test_duplicate_imports_and_deduplication(self):
+          # Duplicates in the provided set shouldn't result in duplicate import lines.
+          imports = {"import apl", "import apl", "from apl import x", "from apl import x"}
+          output = self._build_migration_and_output(imports)
+          # Only one import apl line and one from line should be in the block.
+          self.assertIn("import apl\n", output)
+          # Count occurrences
+          self.assertEqual(output.count("import apl\n"), 1)
+          self.assertEqual(output.count("from apl import x\n"), 1)
+
+      def test_imports_with_multiple_names_in_from(self):
+          imports = {"from package import a, b", "from package.sub import c"}
+          output = self._build_migration_and_output(imports)
+          expected = "from package import a, b\nfrom package.sub import c\n"
+          self.assertIn(expected, output)
+
+      def test_long_module_names_ordering(self):
+          imports = {
+              "import beta2",
+              "import beta1",
+              "from alpha2 import x",
+              "from alpha1 import y",
+          }
+          output = self._build_migration_and_output(imports)
+          expected = (
+              "import beta1\n"
+              "import beta2\n"
+              "from alpha1 import y\n"
+              "from alpha2 import x\n"
+          )
+          self.assertIn(expected, output)
+
+      def test_mixed_case_sorting_behavior(self):
+          # Sorting is by the module name token; case affects ASCII ordering and should be deterministic.
+          imports = {"import apple", "import Zebra", "from alpha import x"}
+          output = self._build_migration_and_output(imports)
+          # ASCII ordering places 'Zebra' before 'apple' (uppercase before lowercase).
+          expected = "import Zebra\nimport apple\nfrom alpha import x\n"
+          self.assertIn(expected, output)
+new_imports_code: |-
+  # No additional top-level imports required; the tests reuse imports from the existing test module.

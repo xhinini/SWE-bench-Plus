@@ -1,0 +1,213 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that RegisterLookupMixin._unregister_lookup clears the cached lookups for the class it is called on and for all its subclasses. They would fail if _unregister_lookup removed the lookup from the class but did not clear the lru_cache() for subclasses (i.e., the subclasses would still return the stale lookup from their cached get_lookups()). The tests also cover unregistering by explicit lookup_name, overriding lookups in subclasses, deep inheritance chains, and that unregistering raises KeyError when the lookup is not registered.
+test_code: |
+  from django.test import SimpleTestCase
+  from django.db import models
+  from django.core.exceptions import FieldError
+  
+  class TempLookup(models.Lookup):
+      lookup_name = "temp_lookup"
+  
+      def as_sql(self, compiler, connection):
+          # Minimal implementation for registration purposes.
+          lhs, params = self.process_lhs(compiler, connection)
+          rhs, rhs_params = self.process_rhs(compiler, connection)
+          params.extend(rhs_params)
+          return "%s = %s" % (lhs, rhs), params
+  
+  class TempLookup2(models.Lookup):
+      lookup_name = "temp_keep"
+  
+      def as_sql(self, compiler, connection):
+          lhs, params = self.process_lhs(compiler, connection)
+          rhs, rhs_params = self.process_rhs(compiler, connection)
+          params.extend(rhs_params)
+          return "%s = %s" % (lhs, rhs), params
+  
+  class UnregisterLookupCacheTests(SimpleTestCase):
+      def tearDown(self):
+          # Ensure no leftover registrations on real Django classes.
+          for cls in (models.Field, models.CharField, models.IntegerField, models.ForeignObject):
+              # Remove class_lookups entries if present and clear caches.
+              if "class_lookups" in cls.__dict__:
+                  cls.class_lookups.pop(TempLookup.lookup_name, None)
+                  cls.class_lookups.pop(TempLookup2.lookup_name, None)
+              try:
+                  cls.get_lookups.cache_clear()
+              except Exception:
+                  pass
+  
+      def test_unregister_clears_cache_on_direct_subclass(self):
+          # Register on the base Field, warm the CharField cache, then unregister.
+          models.Field.register_lookup(TempLookup)
+          try:
+              # Warm subclass cache.
+              _ = models.CharField.get_lookups()
+              # Now unregister from base class.
+              models.Field._unregister_lookup(TempLookup)
+              # The subclass cache must reflect the unregistration immediately.
+              self.assertNotIn("temp_lookup", models.CharField.get_lookups())
+          finally:
+              # Cleanup in case of failure.
+              if "class_lookups" in models.Field.__dict__:
+                  models.Field.class_lookups.pop("temp_lookup", None)
+              models.Field.get_lookups.cache_clear()
+              models.CharField.get_lookups.cache_clear()
+  
+      def test_unregister_with_lookup_name_param(self):
+          # Register under an alias and unregister using explicit lookup_name param.
+          models.Field.register_lookup(TempLookup, lookup_name="temp_alias")
+          try:
+              _ = models.IntegerField.get_lookups()
+              models.Field._unregister_lookup(TempLookup, lookup_name="temp_alias")
+              self.assertNotIn("temp_alias", models.IntegerField.get_lookups())
+          finally:
+              if "class_lookups" in models.Field.__dict__:
+                  models.Field.class_lookups.pop("temp_alias", None)
+              models.Field.get_lookups.cache_clear()
+              models.IntegerField.get_lookups.cache_clear()
+  
+      def test_unregister_clears_multiple_subclass_caches(self):
+          # Register on base, warm multiple subclass caches, unregister, assert both cleared.
+          models.Field.register_lookup(TempLookup)
+          try:
+              _ = models.CharField.get_lookups()
+              _ = models.IntegerField.get_lookups()
+              models.Field._unregister_lookup(TempLookup)
+              self.assertNotIn("temp_lookup", models.CharField.get_lookups())
+              self.assertNotIn("temp_lookup", models.IntegerField.get_lookups())
+          finally:
+              if "class_lookups" in models.Field.__dict__:
+                  models.Field.class_lookups.pop("temp_lookup", None)
+              models.Field.get_lookups.cache_clear()
+              models.CharField.get_lookups.cache_clear()
+              models.IntegerField.get_lookups.cache_clear()
+  
+      def test_unregister_preserves_other_lookups(self):
+          # Register two lookups, remove one and ensure the other remains.
+          models.Field.register_lookup(TempLookup)
+          models.Field.register_lookup(TempLookup2)
+          try:
+              _ = models.CharField.get_lookups()
+              models.Field._unregister_lookup(TempLookup)
+              lookups = models.CharField.get_lookups()
+              self.assertNotIn("temp_lookup", lookups)
+              self.assertIn("temp_keep", lookups)
+          finally:
+              if "class_lookups" in models.Field.__dict__:
+                  models.Field.class_lookups.pop("temp_lookup", None)
+                  models.Field.class_lookups.pop("temp_keep", None)
+              models.Field.get_lookups.cache_clear()
+              models.CharField.get_lookups.cache_clear()
+  
+      def test_unregister_subclass_override_behavior(self):
+          # Parent provides 'foo', subclass overrides it. Unregistering subclass
+          # override should let the parent implementation be visible again.
+          class ParentLookup(models.Lookup):
+              lookup_name = "foo"
+              def as_sql(self, compiler, connection):
+                  return "1=1", []
+  
+          class SubLookup(models.Lookup):
+              lookup_name = "foo"
+              def as_sql(self, compiler, connection):
+                  return "1=1", []
+  
+          # Register parent on Field and subclass override on CharField.
+          models.Field.register_lookup(ParentLookup)
+          models.CharField.register_lookup(SubLookup)
+          try:
+              # Warm CharField cache so it picks up the override.
+              _ = models.CharField.get_lookups()
+              # Remove the override from the subclass only.
+              models.CharField._unregister_lookup(SubLookup)
+              # After removing subclass override, CharField.get_lookups() should
+              # expose the parent's lookup again.
+              lookups = models.CharField.get_lookups()
+              self.assertIn("foo", lookups)
+              # The remaining mapping should be the ParentLookup (the parent's impl).
+              self.assertIs(lookups["foo"], ParentLookup)
+          finally:
+              # Cleanup both registrations.
+              if "class_lookups" in models.CharField.__dict__:
+                  models.CharField.class_lookups.pop("foo", None)
+              if "class_lookups" in models.Field.__dict__:
+                  models.Field.class_lookups.pop("foo", None)
+              models.Field.get_lookups.cache_clear()
+              models.CharField.get_lookups.cache_clear()
+  
+      def test_unregister_clears_cache_for_deep_subclasses(self):
+          # Create a deep custom inheritance chain and check cache clearing bubbles down.
+          class BaseCustom(models.Field):
+              pass
+  
+          class SubCustom(BaseCustom):
+              pass
+  
+          class SubSubCustom(SubCustom):
+              pass
+  
+          # Register on the base custom class.
+          BaseCustom.register_lookup(TempLookup)
+          try:
+              # Warm the deepest subclass cache.
+              _ = SubSubCustom.get_lookups()
+              # Unregister on the base custom class.
+              BaseCustom._unregister_lookup(TempLookup)
+              # Deep subclass should not have the lookup anymore.
+              self.assertNotIn("temp_lookup", SubSubCustom.get_lookups())
+          finally:
+              if "class_lookups" in BaseCustom.__dict__:
+                  BaseCustom.class_lookups.pop("temp_lookup", None)
+              try:
+                  BaseCustom.get_lookups.cache_clear()
+                  SubCustom.get_lookups.cache_clear()
+                  SubSubCustom.get_lookups.cache_clear()
+              except Exception:
+                  pass
+  
+      def test_unregister_with_name_string_only(self):
+          # Register and then unregister using only the explicit lookup_name string.
+          models.Field.register_lookup(TempLookup, lookup_name="alias_only")
+          try:
+              _ = models.CharField.get_lookups()
+              # Call _unregister_lookup supplying the lookup class and the explicit name.
+              models.Field._unregister_lookup(TempLookup, lookup_name="alias_only")
+              self.assertNotIn("alias_only", models.CharField.get_lookups())
+          finally:
+              if "class_lookups" in models.Field.__dict__:
+                  models.Field.class_lookups.pop("alias_only", None)
+              models.Field.get_lookups.cache_clear()
+              models.CharField.get_lookups.cache_clear()
+  
+      def test_unregister_on_subclass_only_clears_its_cache_not_parent(self):
+          # Register only on CharField; unregister and ensure Field is unaffected.
+          models.CharField.register_lookup(TempLookup)
+          try:
+              _ = models.CharField.get_lookups()
+              models.CharField._unregister_lookup(TempLookup)
+              self.assertNotIn("temp_lookup", models.CharField.get_lookups())
+              # Parent Field should not suddenly gain the lookup (it never had it).
+              self.assertNotIn("temp_lookup", models.Field.get_lookups())
+          finally:
+              if "class_lookups" in models.CharField.__dict__:
+                  models.CharField.class_lookups.pop("temp_lookup", None)
+              models.CharField.get_lookups.cache_clear()
+              models.Field.get_lookups.cache_clear()
+  
+      def test_unregister_nonexistent_raises_keyerror(self):
+          # Trying to unregister a lookup that was never registered should raise KeyError.
+          class NotRegisteredLookup(models.Lookup):
+              lookup_name = "i_dont_exist"
+              def as_sql(self, compiler, connection):
+                  return "1=1", []
+  
+          with self.assertRaises(KeyError):
+              # Ensure the class has no such entry to start with.
+              if "class_lookups" in models.Field.__dict__:
+                  models.Field.class_lookups.pop("i_dont_exist", None)
+              # Attempt to remove a non-registered lookup by name.
+              models.Field._unregister_lookup(NotRegisteredLookup)
+new_imports_code: |
+  from django.db import models

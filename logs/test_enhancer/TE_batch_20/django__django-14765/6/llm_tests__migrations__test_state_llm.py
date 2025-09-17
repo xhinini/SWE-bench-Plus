@@ -1,0 +1,86 @@
+from django.test import SimpleTestCase
+from django.db.migrations.state import ProjectState
+import types
+
+class RealAppsInitTests(SimpleTestCase):
+
+    def test_real_apps_rejects_list_without_message(self):
+        with self.assertRaises(AssertionError) as cm:
+            ProjectState(real_apps=['contenttypes'])
+        self.assertEqual(cm.exception.args, ())
+
+    def test_real_apps_rejects_empty_list_without_message(self):
+        with self.assertRaises(AssertionError) as cm:
+            ProjectState(real_apps=[])
+        self.assertEqual(cm.exception.args, ())
+
+    def test_real_apps_rejects_tuple_without_message(self):
+        with self.assertRaises(AssertionError) as cm:
+            ProjectState(real_apps=('contenttypes',))
+        self.assertEqual(cm.exception.args, ())
+
+    def test_real_apps_rejects_empty_tuple_without_message(self):
+        with self.assertRaises(AssertionError) as cm:
+            ProjectState(real_apps=())
+        self.assertEqual(cm.exception.args, ())
+
+    def test_real_apps_rejects_generator_without_message(self):
+        gen = (x for x in ('contenttypes',))
+        with self.assertRaises(AssertionError) as cm:
+            ProjectState(real_apps=gen)
+        self.assertEqual(cm.exception.args, ())
+
+    def test_real_apps_rejects_frozenset_without_message(self):
+        with self.assertRaises(AssertionError) as cm:
+            ProjectState(real_apps=frozenset({'contenttypes'}))
+        self.assertEqual(cm.exception.args, ())
+
+    def test_real_apps_rejects_string_without_message(self):
+        with self.assertRaises(AssertionError) as cm:
+            ProjectState(real_apps='contenttypes')
+        self.assertEqual(cm.exception.args, ())
+
+    def test_real_apps_rejects_range_without_message(self):
+        with self.assertRaises(AssertionError) as cm:
+            ProjectState(real_apps=range(1))
+        self.assertEqual(cm.exception.args, ())
+
+from django.test import SimpleTestCase
+from django.db.migrations.state import ProjectState
+
+class ProjectStateRealAppsMessageTests(SimpleTestCase):
+
+    def test_real_apps_list_has_empty_assertion_message(self):
+        self._assert_assertion_message_empty(['contenttypes'])
+
+    def test_real_apps_tuple_has_empty_assertion_message(self):
+        self._assert_assertion_message_empty(('contenttypes',))
+
+    def test_real_apps_frozenset_has_empty_assertion_message(self):
+        self._assert_assertion_message_empty(frozenset({'contenttypes'}))
+
+    def test_real_apps_generator_has_empty_assertion_message(self):
+        self._assert_assertion_message_empty((x for x in ['contenttypes']))
+
+    def test_real_apps_map_has_empty_assertion_message(self):
+        self._assert_assertion_message_empty(map(lambda x: x, ['contenttypes']))
+
+    def test_real_apps_custom_iterable_has_empty_assertion_message(self):
+
+        class CustomIter:
+
+            def __iter__(self):
+                yield 'contenttypes'
+        self._assert_assertion_message_empty(CustomIter())
+
+    def test_real_apps_empty_list_has_empty_assertion_message(self):
+        self._assert_assertion_message_empty([])
+
+    def test_real_apps_empty_tuple_has_empty_assertion_message(self):
+        self._assert_assertion_message_empty(())
+
+    def test_real_apps_string_has_empty_assertion_message(self):
+        self._assert_assertion_message_empty('contenttypes')
+
+    def test_real_apps_int_has_empty_assertion_message(self):
+        self._assert_assertion_message_empty(1)

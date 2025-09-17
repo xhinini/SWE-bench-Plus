@@ -1,0 +1,178 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests validate that when KBinsDiscretizer uses the 'kmeans' strategy, cluster centers are properly handled even when the underlying KMeans returns centers in an unsorted order. The tests monkeypatch sklearn.cluster.KMeans to return intentionally unsorted centers and assert that KBinsDiscretizer sorts them (making bin_edges_ monotonic), that transform/inverse_transform are consistent with the sorted centers, that clipping/out-of-range behavior is correct, and that the KMeans init passed by KBinsDiscretizer matches the expected uniform initialization. These tests would have failed if the implementation did not sort the centers before computing bin edges.
+test_code: |
+  import numpy as np
+  import pytest
+  import sklearn.cluster as cluster
+  from sklearn.preprocessing import KBinsDiscretizer
+  from sklearn.utils.testing import assert_array_equal
+  from numpy.testing import assert_allclose
+  import scipy.sparse as sp
+  
+  class FakeKMeans:
+      """
+      Fake KMeans that returns descending (unsorted) cluster centers
+      regardless of the input. This simulates a KMeans implementation
+      that returns centers out of order.
+      """
+      def __init__(self, n_clusters, init=None, n_init=None):
+          self.n_clusters = n_clusters
+          self.init = init
+          self.n_init = n_init
+          # Create descending centers to force "unsorted" situation
+          centers = np.arange(n_clusters, 0, -1).astype(float)
+          # store as column vector like real cluster_centers_
+          self._centers = centers[:, None]
+  
+      def fit(self, X):
+          # Ignore X; pretend the fitted cluster centers are descending
+          self.cluster_centers_ = self._centers
+          return self
+  
+  class SpyKMeans(FakeKMeans):
+      # Keep a reference to the last instance so tests can inspect init
+      last_instance = None
+      def __init__(self, n_clusters, init=None, n_init=None):
+          super().__init__(n_clusters, init=init, n_init=n_init)
+          SpyKMeans.last_instance = self
+  
+  def _manual_bin_edges_for_fake_centers(n_clusters, col_min, col_max):
+      # FakeKMeans would produce descending centers: n, n-1, ..., 1
+      centers = np.arange(n_clusters, 0, -1).astype(float)
+      # Sorting is required to get proper binning
+      centers_sorted = np.sort(centers)
+      # midpoints between consecutive centers
+      midpoints = (centers_sorted[1:] + centers_sorted[:-1]) * 0.5
+      # full bin edges include col_min and col_max as endpoints
+      return np.r_[col_min, midpoints, col_max], centers_sorted
+  
+  def _digitize_with_eps(X_col, edges, n_bins):
+      # replicate the eps logic from KBinsDiscretizer.transform
+      rtol = 1.e-5
+      atol = 1.e-8
+      eps = atol + rtol * np.abs(X_col)
+      # np.digitize with edges[1:] in code but here edges represent
+      # full edges (including first and last), so pass edges[1:-1+1]? The code
+      # uses bin_edges[jj][1:] which are upper bounds excluding first -inf,
+      # but our edges here are r_[col_min, midpoints, col_max] so passing edges[1:]
+      # matches the code behavior.
+      return np.digitize(X_col + eps, edges[1:])
+  
+  def test_kmeans_bin_edges_monotonic(monkeypatch):
+      # Ensure that bin_edges_ is monotonic even when KMeans returns unsorted centers
+      monkeypatch.setattr(cluster, "KMeans", FakeKMeans)
+      X = np.linspace(0.0, 10.0, 11).reshape(-1, 1)
+      est = KBinsDiscretizer(n_bins=4, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      bin_edges = est.bin_edges_[0]
+      # bin edges must strictly increase
+      assert np.all(np.diff(bin_edges) > 0)
+  
+  def test_kmeans_transform_matches_manual_digitize(monkeypatch):
+      monkeypatch.setattr(cluster, "KMeans", FakeKMeans)
+      X = np.array([0.0, 1.0, 2.0, 3.0, 4.0]).reshape(-1, 1)
+      n_bins = 4
+      est = KBinsDiscretizer(n_bins=n_bins, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      # compute expected bin edges from the fake centers (sorted)
+      expected_edges, centers_sorted = _manual_bin_edges_for_fake_centers(
+          n_bins, X.min(), X.max())
+      # compute expected transform using same eps logic as transform
+      expected = _digitize_with_eps(X.ravel(), expected_edges, n_bins)
+      Xt = est.transform(X).ravel()
+      assert_array_equal(expected, Xt)
+  
+  def test_kmeans_inverse_transform_returns_bin_centers(monkeypatch):
+      monkeypatch.setattr(cluster, "KMeans", FakeKMeans)
+      X = np.array([0.0, 1.0, 2.0, 10.0]).reshape(-1, 1)
+      n_bins = 3
+      est = KBinsDiscretizer(n_bins=n_bins, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      Xt = est.transform(X)
+      Xinv = est.inverse_transform(Xt)
+      # compute expected bin edges/centers
+      expected_edges, centers_sorted = _manual_bin_edges_for_fake_centers(
+          n_bins, X.min(), X.max())
+      expected_bin_centers = (expected_edges[1:] + expected_edges[:-1]) * 0.5
+      # Xinv should map each ordinal bin to the corresponding center
+      assert_allclose(Xinv.ravel(), expected_bin_centers[Xt.ravel().astype(int)])
+  
+  def test_kmeans_multiple_features_sorting_per_feature(monkeypatch):
+      # Ensure sorting is applied independently per feature
+      monkeypatch.setattr(cluster, "KMeans", FakeKMeans)
+      X = np.vstack([
+          np.linspace(0, 8, 9),
+          np.linspace(-5, 5, 9)
+      ]).T  # shape (9, 2)
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      # each feature's bin_edges must be monotonically increasing
+      for edges in est.bin_edges_:
+          assert np.all(np.diff(edges) > 0)
+  
+  def test_kmeans_onehot_encode_and_inverse_transform(monkeypatch):
+      monkeypatch.setattr(cluster, "KMeans", FakeKMeans)
+      X = np.array([0.0, 2.0, 4.0, 6.0]).reshape(-1, 1)
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='onehot')
+      Xt = est.fit_transform(X)
+      # should be sparse when encode='onehot'
+      assert sp.issparse(Xt)
+      # inverse_transform should accept the sparse matrix and produce expected shape
+      Xinv = est.inverse_transform(Xt)
+      assert Xinv.shape == X.shape
+      # transform(inverse_transform(Xt)) should reproduce the same ordinal labels
+      Xt2 = est.transform(Xinv)
+      if sp.issparse(Xt2):
+          assert_array_equal(Xt.toarray(), Xt2.toarray())
+      else:
+          assert_array_equal(Xt.toarray(), Xt2)
+  
+  def test_kmeans_clip_out_of_bounds(monkeypatch):
+      # Values outside the fit range should be clipped to [0, n_bins-1]
+      monkeypatch.setattr(cluster, "KMeans", FakeKMeans)
+      X_fit = np.array([0.0, 1.0, 2.0, 3.0]).reshape(-1, 1)
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      est.fit(X_fit)
+      X_out = np.array([-100.0, 1000.0]).reshape(-1, 1)
+      Xt = est.transform(X_out)
+      assert_array_equal(Xt.min(axis=0), np.array([0.]))
+      assert_array_equal(Xt.max(axis=0) + 1, est.n_bins_)
+  
+  def test_kmeans_init_passed_uniform_midpoints(monkeypatch):
+      # Verify that KBinsDiscretizer passes the expected uniform initialization to KMeans
+      monkeypatch.setattr(cluster, "KMeans", SpyKMeans)
+      X = np.linspace(0.0, 10.0, 11).reshape(-1, 1)
+      n_bins = 4
+      est = KBinsDiscretizer(n_bins=n_bins, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      spy = SpyKMeans.last_instance
+      # The init passed by KBinsDiscretizer should be the midpoints of the uniform edges
+      uniform_edges = np.linspace(X.min(), X.max(), n_bins + 1)
+      expected_init = ((uniform_edges[1:] + uniform_edges[:-1]) * 0.5)[:, None]
+      assert_allclose(spy.init, expected_init)
+  
+  def test_kmeans_large_n_bins_handles_sorting(monkeypatch):
+      # ensure sorting logic works for a larger number of bins
+      monkeypatch.setattr(cluster, "KMeans", FakeKMeans)
+      X = np.linspace(0.0, 50.0, 51).reshape(-1, 1)
+      n_bins = 10
+      est = KBinsDiscretizer(n_bins=n_bins, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      edges = est.bin_edges_[0]
+      assert edges.shape[0] == n_bins + 1
+      assert np.all(np.diff(edges) > 0)
+  
+  def test_kmeans_roundtrip_transform_inverse_transform_consistent(monkeypatch):
+      # Fit -> transform -> inverse_transform -> transform should be consistent
+      monkeypatch.setattr(cluster, "KMeans", FakeKMeans)
+      rng = np.random.RandomState(42)
+      X = rng.uniform(-10, 10, size=(100, 2))
+      est = KBinsDiscretizer(n_bins=4, strategy='kmeans', encode='ordinal')
+      Xt = est.fit_transform(X)
+      Xinv = est.inverse_transform(Xt)
+      Xt2 = est.transform(Xinv)
+      # If encode='ordinal' we get dense arrays
+      assert_array_equal(Xt, Xt2)
+new_imports_code: |
+  # No additional imports required beyond what's in test_code.

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.ManageRunserverSkipChecksTests.setUp admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_skip_checks_calls_check_migrations_call_command admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_skip_checks_calls_check_migrations_run_from_argv_order1 admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_skip_checks_calls_check_migrations_run_from_argv_order2 admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_skip_checks_calls_check_migrations_with_addrport_run_from_argv admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_skip_checks_check_migrations_called_with_addrport_call_command admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_skip_checks_check_not_called_but_migrations_called admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_skip_checks_does_not_print_skipping_message_on_call_command admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_skip_checks_flags_order_with_addrport_call_command admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_skip_checks_inner_run_calls_check_migrations
+coverage json -o coverage.json
+: '>>>>> End Test Output'

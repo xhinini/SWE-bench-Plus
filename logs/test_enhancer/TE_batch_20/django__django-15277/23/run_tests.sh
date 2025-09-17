@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_clone_via_deconstruct_reconstruction expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_custom_and_max_length_validators_together expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_custom_validators_preserved_when_no_max_length expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_db_collation_preserved_in_deconstruct expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_deconstruct_includes_max_length_when_set expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_deconstruct_omits_max_length_when_none expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_deepcopy_preserves_validators_without_max_length expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_formfield_max_length_none expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_no_max_length_validator_absent expressions.tests_llm.CharFieldMaxLengthValidatorTests.test_with_max_length_validator_present
+coverage json -o coverage.json
+: '>>>>> End Test Output'

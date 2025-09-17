@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 cache.tests_llm.FileBasedCacheRaceAdditionalTests.setUp cache.tests_llm.FileBasedCacheRaceAdditionalTests.tearDown cache.tests_llm.FileBasedCacheRaceAdditionalTests.test_has_key_handles_race_even_if_exists_false_but_open_raises cache.tests_llm.FileBasedCacheRaceAdditionalTests.test_has_key_open_called_exactly_once_on_race cache.tests_llm.FileBasedCacheRaceAdditionalTests.test_has_key_propagates_permission_error cache.tests_llm.FileBasedCacheRaceAdditionalTests.test_has_key_race_with_exists_then_open_filenotfound cache.tests_llm.FileBasedCacheRaceAdditionalTests.test_has_key_race_with_long_key cache.tests_llm.FileBasedCacheRaceAdditionalTests.test_has_key_race_with_unicode_and_version cache.tests_llm.FileBasedCacheRaceAdditionalTests.test_has_key_race_with_unicode_key cache.tests_llm.FileBasedCacheRaceAdditionalTests.test_has_key_race_with_version_integer cache.tests_llm.FileBasedCacheRaceAdditionalTests.test_has_key_race_with_version_string cache.tests_llm.FileBasedCacheRaceAdditionalTests.test_has_key_returns_false_if_file_deleted_between_checks
+coverage json -o coverage.json
+: '>>>>> End Test Output'

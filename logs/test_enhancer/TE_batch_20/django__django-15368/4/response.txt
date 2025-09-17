@@ -1,0 +1,149 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise bulk_update() behavior when model attribute values are (a) plain Python values, (b) Value() expressions, (c) Case/When-based expressions, (d) Cast/F-based expressions, and (e) custom "expression-like" objects that implement a resolve_expression(...) method but do not subclass Django's Expression class. The regressions target the logic that decides whether an attribute should be wrapped in Value(...) or treated as an expression as-is. The gold patch uses duck-typing (hasattr(attr, "resolve_expression")) to accept expression-like objects; an implementation that still relied on isinstance(attr, Expression) would not treat these custom objects as expressions and produce incorrect results. Each test asserts that the database was updated to the intended values after bulk_update().
+test_code: |
+  from django.test import TestCase, skipUnlessDBFeature
+  from django.db.models import F, Value, Case, When, Cast, IntegerField, Lower
+  from .models import Note, Number, Individual, Article, JSONFieldNullable, CustomDbColumn
+
+  class BulkUpdateRegressionTests(TestCase):
+      def create_notes(self, n=6):
+          return [Note.objects.create(note=str(i), misc=str(i)) for i in range(n)]
+
+      def test_custom_expression_like_object_assigns_to_charfield(self):
+          # A custom object that implements resolve_expression should be treated
+          # as an expression and not wrapped in Value(...).
+          class CustomExpr:
+              def __init__(self, template_field):
+                  self.template_field = template_field
+              def resolve_expression(self, *args, **kwargs):
+                  # Resolve to an F-expression that references another field.
+                  return F(self.template_field)
+
+          notes = self.create_notes(5)
+          for note in notes:
+              # Set misc to a custom expression pointing to note field.
+              note.misc = CustomExpr('note')
+          Note.objects.bulk_update(notes, ['misc'])
+          # After bulk_update, misc should equal the value of note for each row.
+          self.assertCountEqual(
+              Note.objects.values_list('misc', flat=True),
+              [n.note for n in notes]
+          )
+
+      def test_custom_expression_like_returns_value_wrapped_correctly(self):
+          class CustomExprValue:
+              def __init__(self, val):
+                  self.val = val
+              def resolve_expression(self, *args, **kwargs):
+                  # Return a Value expression so it becomes SQL literal.
+                  return Value(self.val)
+
+          notes = self.create_notes(4)
+          for i, note in enumerate(notes):
+              note.misc = CustomExprValue('custom-%d' % i)
+          Note.objects.bulk_update(notes, ['misc'])
+          self.assertCountEqual(
+              Note.objects.values_list('misc', flat=True),
+              ['custom-%d' % i for i in range(len(notes))]
+          )
+
+      def test_case_expression_assignments(self):
+          # Verify that different Values per instance produce expected results
+          notes = self.create_notes(6)
+          for idx, note in enumerate(notes):
+              note.misc = Value('A') if idx % 2 == 0 else Value('B')
+          Note.objects.bulk_update(notes, ['misc'])
+          self.assertCountEqual(
+              Note.objects.filter(misc='A'),
+              [notes[i] for i in range(len(notes)) if i % 2 == 0]
+          )
+          self.assertCountEqual(
+              Note.objects.filter(misc='B'),
+              [notes[i] for i in range(len(notes)) if i % 2 == 1]
+          )
+
+      def test_value_instances_are_preserved(self):
+          notes = self.create_notes(3)
+          for note in notes:
+              note.misc = Value('val-preserved')
+          Note.objects.bulk_update(notes, ['misc'])
+          self.assertTrue(all(n == 'val-preserved' for n in Note.objects.values_list('misc', flat=True)))
+
+      def test_plain_python_values_are_wrapped(self):
+          notes = self.create_notes(3)
+          for i, note in enumerate(notes):
+              note.misc = 'plain-%d' % i
+          Note.objects.bulk_update(notes, ['misc'])
+          self.assertCountEqual(
+              Note.objects.values_list('misc', flat=True),
+              ['plain-%d' % i for i in range(len(notes))]
+          )
+
+      def test_boolean_expression_like_assign(self):
+          # Use a custom expression-like that resolves to a Value(True).
+          class BoolExpr:
+              def resolve_expression(self, *a, **kw):
+                  return Value(True)
+          individuals = [Individual.objects.create(alive=False) for _ in range(4)]
+          for ind in individuals:
+              ind.alive = BoolExpr()
+          Individual.objects.bulk_update(individuals, ['alive'])
+          self.assertCountEqual(Individual.objects.filter(alive=True), individuals)
+
+      def test_mixed_expressions_and_plain_values(self):
+          notes = self.create_notes(5)
+          for i, note in enumerate(notes):
+              if i % 2:
+                  note.misc = Value('EXPR')
+              else:
+                  note.misc = 'PLAIN-%d' % i
+          Note.objects.bulk_update(notes, ['misc'])
+          self.assertCountEqual(
+              Note.objects.filter(misc='EXPR'),
+              [notes[i] for i in range(len(notes)) if i % 2 == 1]
+          )
+          self.assertCountEqual(
+              Note.objects.filter(misc__startswith='PLAIN-'),
+              [notes[i] for i in range(len(notes)) if i % 2 == 0]
+          )
+
+      def test_nested_expression_that_returns_expression(self):
+          # Custom expression that returns a Lower(...) expression on resolve.
+          class LoweringExpr:
+              def __init__(self, field_name):
+                  self.field_name = field_name
+              def resolve_expression(self, *a, **kw):
+                  return Lower(self.field_name)
+          notes = [Note.objects.create(note='UPPER', misc='x') for _ in range(3)]
+          for n in notes:
+              n.misc = LoweringExpr('note')
+          Note.objects.bulk_update(notes, ['misc'])
+          self.assertCountEqual(Note.objects.filter(misc='upper'), notes)
+
+      def test_cast_expression_bulk_update(self):
+          # Use Cast(F('num') + 2) to ensure cast expressions are accepted.
+          nums = [Number.objects.create(num=0) for _ in range(5)]
+          for n in nums:
+              n.num = Cast(F('num') + 2, output_field=IntegerField())
+          Number.objects.bulk_update(nums, ['num'])
+          self.assertCountEqual(Number.objects.filter(num=2), nums)
+
+      def test_custom_expression_like_from_callable_property(self):
+          # A class that exposes a bound method resolve_expression via attribute.
+          class CallableExpr:
+              def __init__(self, field):
+                  self.field = field
+              def resolve_expression(self, *a, **kw):
+                  return F(self.field)
+          notes = self.create_notes(4)
+          for n in notes:
+              # Use callable instance; hasattr should detect resolve_expression.
+              n.misc = CallableExpr('note')
+          Note.objects.bulk_update(notes, ['misc'])
+          self.assertCountEqual(
+              Note.objects.values_list('misc', flat=True),
+              [n.note for n in notes]
+          )
+new_imports_code: |
+  # No new imports needed; all required classes are imported within the test module above.

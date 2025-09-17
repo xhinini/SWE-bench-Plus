@@ -1,0 +1,202 @@
+import tempfile
+import os
+import re
+import shutil
+from django.core.files.storage import FileSystemStorage
+from django.contrib.staticfiles.storage import HashedFilesMixin, ManifestFilesMixin
+import os
+import re
+import tempfile
+import unittest
+from pathlib import Path
+from io import BytesIO
+
+from django.core.files.storage import FileSystemStorage
+from django.contrib.staticfiles.storage import HashedFilesMixin, ManifestFilesMixin
+from django.conf import settings
+
+# Helper: create a storage class mixing the desired mixin and FileSystemStorage.
+def make_storage_class(mixin_cls, max_post_process_passes=0, **attrs):
+    attrs = dict(attrs)
+    attrs.setdefault('max_post_process_passes', max_post_process_passes)
+    return type(
+        "TmpStorage_{}".format(mixin_cls.__name__),
+        (mixin_cls, FileSystemStorage),
+        attrs
+    )
+
+class ZeroPassPostProcessTests(unittest.TestCase):
+    def _write_files(self, base_dir, files):
+        """
+        files: dict of relative path -> bytes content
+        """
+        for relpath, content in files.items():
+            full = os.path.join(base_dir, relpath)
+            os.makedirs(os.path.dirname(full), exist_ok=True)
+            with open(full, 'wb') as f:
+                f.write(content)
+
+    def _run_post_process(self, storage_cls, files):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            # Write files to disk under tmpdir
+            self._write_files(tmpdir, files)
+
+            # The storage instance under test
+            storage = storage_cls(location=tmpdir, base_url='/static/')
+
+            # The original file storage used by the collector (open by _post_process)
+            origin_storage = FileSystemStorage(location=tmpdir)
+
+            # Build paths mapping expected by post_process:
+            # name -> (storage, path)
+            paths = {}
+            for rel in files.keys():
+                paths[rel.replace('\\', '/')] = (origin_storage, rel.replace('\\', '/'))
+
+            # Run post_process and collect results; ensure no UnboundLocalError / NameError
+            results = list(storage.post_process(paths, dry_run=False))
+
+            return storage, results, tmpdir
+        finally:
+            # leave files for inspection by the tests; caller cleans up
+            pass
+
+    def test_zero_pass_hashed_css_rewrites_urls(self):
+        storage_cls = make_storage_class(HashedFilesMixin, max_post_process_passes=0)
+        files = {
+            'css/test.css': b'body { background: url("img/pic.png"); }',
+            'css/img/pic.png': b'PNGDATA',
+        }
+        storage, results, tmpdir = self._run_post_process(storage_cls, files)
+        # Ensure hashed_files cache populated for the css file
+        key = 'css/test.css'
+        self.assertIn(key, storage.hashed_files)
+        # Open the processed hashed CSS and assert the image reference contains a 12-hex hash
+        hashed_css = storage.hashed_files[key]
+        with storage.open(hashed_css) as f:
+            content = f.read()
+        self.assertRegex(content, rb'\.[0-9a-f]{12}\.png')
+
+        # cleanup
+        import shutil
+        shutil.rmtree(tmpdir)
+
+    def test_zero_pass_manifest_css_rewrites_urls_and_saves_manifest(self):
+        storage_cls = make_storage_class(ManifestFilesMixin, max_post_process_passes=0)
+        files = {
+            'styles/main.css': b'@import "parts/part.css";',
+            'styles/parts/part.css': b'body { background: url("../img/x.png"); }',
+            'styles/img/x.png': b'data',
+        }
+        storage, results, tmpdir = self._run_post_process(storage_cls, files)
+        key = 'styles/parts/part.css'
+        self.assertIn(key, storage.hashed_files)
+        # Manifest file should have been written to storage.manifest_name
+        manifest_path = storage.manifest_name
+        self.assertTrue(storage.exists(manifest_path))
+
+        # cleanup
+        import shutil
+        shutil.rmtree(tmpdir)
+
+    def test_zero_pass_with_fragment_preserves_question_fragment(self):
+        # Test the special font eot?#iefix hack handling
+        storage_cls = make_storage_class(HashedFilesMixin, max_post_process_passes=0)
+        files = {
+            'css/fonttest.css': b'@font-face { src: url("fonts/font.eot?#iefix"); }',
+            'css/fonts/font.eot': b'FONTDATA',
+        }
+        storage, results, tmpdir = self._run_post_process(storage_cls, files)
+        key = 'css/fonttest.css'
+        self.assertIn(key, storage.hashed_files)
+        hashed_css = storage.hashed_files[key]
+        with storage.open(hashed_css) as f:
+            content = f.read()
+        # There should be a '?' preserved directly after the filename in the rewritten url
+        self.assertIn(b'.eot?', content)
+
+        import shutil
+        shutil.rmtree(tmpdir)
+
+    def test_zero_pass_non_adjustable_file_not_modified(self):
+        storage_cls = make_storage_class(HashedFilesMixin, max_post_process_passes=0)
+        files = {
+            'docs/readme.txt': b'just text',
+        }
+        storage, results, tmpdir = self._run_post_process(storage_cls, files)
+        key = 'docs/readme.txt'
+        # Non-adjustable files are still processed (copied) and should have an entry
+        self.assertIn(key, storage.hashed_files)
+        # The saved file name should end with .txt (no hash for non-hashed storages would keep same)
+        saved = storage.hashed_files[key]
+        self.assertTrue(saved.endswith('.txt'))
+
+        import shutil
+        shutil.rmtree(tmpdir)
+
+    def test_zero_pass_keep_intermediate_files_false(self):
+        # Explicitly set keep_intermediate_files False on HashedFilesMixin subclass
+        storage_cls = make_storage_class(HashedFilesMixin, max_post_process_passes=0, keep_intermediate_files=False)
+        files = {
+            'a/style.css': b'body { background: url("b/pic.png"); }',
+            'a/b/pic.png': b'PNG',
+        }
+        storage, results, tmpdir = self._run_post_process(storage_cls, files)
+        key = 'a/style.css'
+        self.assertIn(key, storage.hashed_files)
+        # Even with keep_intermediate_files=False, post_process should complete.
+        import shutil
+        shutil.rmtree(tmpdir)
+
+    def test_zero_pass_manifest_strict_false_allows_missing_manifest_entries(self):
+        storage_cls = make_storage_class(ManifestFilesMixin, max_post_process_passes=0, manifest_strict=False)
+        files = {
+            'm/style.css': b'body { background: url("img/y.png"); }',
+            'm/img/y.png': b'123',
+        }
+        storage, results, tmpdir = self._run_post_process(storage_cls, files)
+        self.assertIn('m/style.css', storage.hashed_files)
+        import shutil
+        shutil.rmtree(tmpdir)
+
+    def test_zero_pass_nested_paths(self):
+        storage_cls = make_storage_class(HashedFilesMixin, max_post_process_passes=0)
+        files = {
+            'nested/dir/css/my.css': b'url("../img/foo.png")',
+            'nested/dir/css/img/foo.png': b'X',
+        }
+        storage, results, tmpdir = self._run_post_process(storage_cls, files)
+        self.assertIn('nested/dir/css/my.css', storage.hashed_files)
+        import shutil
+        shutil.rmtree(tmpdir)
+
+    def test_zero_pass_absolute_staticurl_reference(self):
+        storage_cls = make_storage_class(HashedFilesMixin, max_post_process_passes=0)
+        files = {
+            'css/rooted.css': b'background: url("/static/css/absolute.png");',
+            'css/absolute.png': b'PNGABS',
+        }
+        storage, results, tmpdir = self._run_post_process(storage_cls, files)
+        # The css that referenced the absolute STATIC_URL should have been resolved and processed
+        self.assertIn('css/rooted.css', storage.hashed_files)
+        import shutil
+        shutil.rmtree(tmpdir)
+
+    def test_zero_pass_multiple_files_interdependent(self):
+        # Two css files referencing each other's images; ensure no crash with 0 passes
+        storage_cls = make_storage_class(HashedFilesMixin, max_post_process_passes=0)
+        files = {
+            'css/one.css': b'url("img/a.png")',
+            'css/two.css': b'url("img/b.png")',
+            'css/img/a.png': b'A',
+            'css/img/b.png': b'B',
+        }
+        storage, results, tmpdir = self._run_post_process(storage_cls, files)
+        self.assertIn('css/one.css', storage.hashed_files)
+        self.assertIn('css/two.css', storage.hashed_files)
+        import shutil
+        shutil.rmtree(tmpdir)
+
+# Add tests to module-level so test discovery picks them up when this file is imported.
+globals().update({name: getattr(ZeroPassPostProcessTests, name) for name in dir(ZeroPassPostProcessTests) if name.startswith('test_')})

@@ -1,0 +1,198 @@
+from unittest import mock
+import types
+from unittest import mock
+
+from django.test import TestCase
+from django.db.migrations.loader import MigrationLoader
+from django.db.migrations.exceptions import BadMigrationError
+from django.db.migrations.recorder import MigrationRecorder
+
+class FakeAppConfig:
+    def __init__(self, label, name=None):
+        self.label = label
+        self.name = name or label
+
+class LoaderModuleShapeTests(TestCase):
+    def setUp(self):
+        # We'll create a loader instance with no DB connection; tests will
+        # call load_disk() directly after monkeypatching import and apps.
+        self.loader = MigrationLoader(connection=None, load=False)
+
+    def _make_pkg(self, file_attr, path_obj):
+        mod = types.ModuleType('fakepkg.migrations')
+        # set __file__ only if file_attr is not None
+        if file_attr is not None:
+            mod.__file__ = file_attr
+        # assign __path__ attribute as given (could be list, tuple, object, subclass)
+        mod.__path__ = path_obj
+        # spec attributes sometimes are used elsewhere; set a minimal spec
+        mod.__spec__ = mock.MagicMock()
+        mod.__spec__.origin = file_attr
+        mod.__spec__.has_location = file_attr is not None
+        return mod
+
+    def _make_migration_mod(self, has_migration_class=True):
+        mmod = types.ModuleType('fakepkg.migrations.0001_initial')
+        if has_migration_class:
+            class DummyMigration:
+                def __init__(self, name, app_label):
+                    self.name = name
+                    self.app_label = app_label
+                    self.dependencies = []
+                    self.run_before = []
+                    self.replaces = []
+                    self.atomic = False
+                def apply(self, state, schema_editor, collect_sql=False):
+                    return state
+                def unapply(self, state, schema_editor, collect_sql=False):
+                    return state
+            mmod.Migration = DummyMigration
+        return mmod
+
+    def _setup_app_and_pkg(self, module_obj, migration_names=('0001_initial',), migration_mods=None):
+        """
+        Prepare mocks:
+          - apps.get_app_configs -> a single FakeAppConfig('fakepkg')
+          - import_module -> returns our package module for 'fakepkg.migrations' and
+            migration modules for 'fakepkg.migrations.<name>'
+          - pkgutil.iter_modules -> yields the provided migration_names as non-packages
+        migration_mods: dict mapping migration_name -> module object (or exception to raise)
+        """
+        migration_mods = migration_mods or {}
+        app = FakeAppConfig('fakepkg', 'fakepkg')
+        # Patch apps.get_app_configs used in loader module
+        patch_apps = mock.patch('django.db.migrations.loader.apps.get_app_configs', return_value=[app])
+        patch_import = mock.patch('django.db.migrations.loader.import_module')
+        patch_iter = mock.patch('django.db.migrations.loader.pkgutil.iter_modules')
+
+        p_apps = patch_apps.start()
+        p_import = patch_import.start()
+        p_iter = patch_iter.start()
+
+        # pkgutil.iter_modules should iterate module.__path__
+        p_iter.return_value = [
+            (None, name, False) for name in migration_names
+        ]
+
+        def import_side_effect(name, *args, **kwargs):
+            # Return the package module
+            if name == 'fakepkg.migrations':
+                return module_obj
+            # Return migration modules or raise per mapping
+            for mn in migration_names:
+                if name == f'fakepkg.migrations.{mn}':
+                    val = migration_mods.get(mn)
+                    if isinstance(val, Exception):
+                        raise val
+                    if val is None:
+                        return self._make_migration_mod(has_migration_class=True)
+                    return val
+            # Fallback to real import for anything else
+            return __import__(name)
+        p_import.side_effect = import_side_effect
+
+        # Save patches for teardown
+        self._patches = (patch_apps, patch_import, patch_iter)
+        return p_apps, p_import, p_iter
+
+    def tearDown(self):
+        # Stop any started patches
+        for p in getattr(self, '_patches', ()):
+            try:
+                p.stop()
+            except Exception:
+                pass
+
+    def test_regular_package_no_file_but_list_path_is_migrated(self):
+        # __file__ missing (None), but __path__ is a real list -> treated as a regular package
+        pkg = self._make_pkg(file_attr=None, path_obj=['/fake/path'])
+        self._setup_app_and_pkg(pkg)
+        self.loader.load_disk()
+        self.assertIn('fakepkg', self.loader.migrated_apps)
+        self.assertNotIn('fakepkg', self.loader.unmigrated_apps)
+        # Disk migrations should contain our migration
+        self.assertIn(('fakepkg', '0001_initial'), self.loader.disk_migrations)
+
+    def test_regular_package_with_file_and_custom_path_obj_is_migrated(self):
+        # __file__ present and __path__ is a custom object (should still be accepted because __file__ exists)
+        class CustomPath(object):
+            pass
+        pkg = self._make_pkg(file_attr='/some/file', path_obj=CustomPath())
+        self._setup_app_and_pkg(pkg)
+        self.loader.load_disk()
+        self.assertIn('fakepkg', self.loader.migrated_apps)
+        self.assertNotIn('fakepkg', self.loader.unmigrated_apps)
+        self.assertIn(('fakepkg', '0001_initial'), self.loader.disk_migrations)
+
+    def test_namespace_package_no_file_and_non_list_path_is_unmigrated(self):
+        # __file__ None and __path__ not a list -> namespace package -> unmigrated
+        class NamespacePath:
+            pass
+        pkg = self._make_pkg(file_attr=None, path_obj=NamespacePath())
+        self._setup_app_and_pkg(pkg)
+        self.loader.load_disk()
+        self.assertIn('fakepkg', self.loader.unmigrated_apps)
+        self.assertNotIn('fakepkg', self.loader.migrated_apps)
+
+    def test_module_file_without_path_is_unmigrated(self):
+        # Migrations module implemented as a single file (no __path__)
+        mod = types.ModuleType('fakepkg.migrations')
+        # Do NOT set __path__
+        self._setup_app_and_pkg(mod)
+        self.loader.load_disk()
+        self.assertIn('fakepkg', self.loader.unmigrated_apps)
+        self.assertNotIn('fakepkg', self.loader.migrated_apps)
+
+    def test_list_subclass_path_with_no_file_is_migrated(self):
+        # A subclass of list should be treated as a list -> migrated even if __file__ is None
+        class MyList(list):
+            pass
+        pkg = self._make_pkg(file_attr=None, path_obj=MyList(['/fake/path']))
+        self._setup_app_and_pkg(pkg)
+        self.loader.load_disk()
+        self.assertIn('fakepkg', self.loader.migrated_apps)
+        self.assertNotIn('fakepkg', self.loader.unmigrated_apps)
+
+    def test_custom_iterable_path_with_file_missing_but_file_present_migrated(self):
+        # If __file__ is present, even a non-list __path__ should not be treated as namespace
+        class PathLike:
+            pass
+        pkg = self._make_pkg(file_attr='/some/file', path_obj=PathLike())
+        self._setup_app_and_pkg(pkg)
+        self.loader.load_disk()
+        self.assertIn('fakepkg', self.loader.migrated_apps)
+        self.assertNotIn('fakepkg', self.loader.unmigrated_apps)
+
+    def test_ignored_filenames_are_skipped(self):
+        # Ensure names starting with _ or ~ are ignored by loader
+        pkg = self._make_pkg(file_attr='/some/file', path_obj=['/fake/path'])
+        # Provide several migration names including an ignored one
+        migration_names = ('_private', '0001_initial', '~temp', '.dotfile', '0002_second')
+        # Provide both migration modules
+        migration_mods = {
+            '0001_initial': self._make_migration_mod(True),
+            '0002_second': self._make_migration_mod(True),
+        }
+        self._setup_app_and_pkg(pkg, migration_names=migration_names, migration_mods=migration_mods)
+        self.loader.load_disk()
+        migrations = sorted([name for app, name in self.loader.disk_migrations if app == 'fakepkg'])
+        # Only non-ignored names loaded
+        self.assertEqual(migrations, ['0001_initial', '0002_second'])
+
+    def test_bad_pyc_import_raises_helpful_error(self):
+        # If import_module for a migration raises ImportError('bad magic number'),
+        # loader should reraise with the more helpful message.
+        pkg = self._make_pkg(file_attr='/some/file', path_obj=['/fake/path'])
+        bad_import = ImportError('bad magic number')
+        migration_mods = {'0001_initial': bad_import}
+        self._setup_app_and_pkg(pkg, migration_names=('0001_initial',), migration_mods=migration_mods)
+        with self.assertRaisesRegex(ImportError, r"stale \.pyc file"):
+            self.loader.load_disk()
+
+    def test_missing_migration_class_raises_BadMigrationError(self):
+        # If migration module doesn't have Migration, a BadMigrationError should be raised.
+        pkg = self._make_pkg(file_attr='/some/file', path_obj=['/fake/path'])
+        migration_mods = {'0001_initial': self._make_migration_mod(has_migration_class=False)}
+        self._setup_app_and_pkg(pkg, migration_names=('0001_initial',), migration_mods=migration_mods)
+        with self.assertRaises(BadMigrationError):
+            self.loader.load_disk()

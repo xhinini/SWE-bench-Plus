@@ -1,0 +1,150 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests ensure that ValueError raised while resolving filesystem paths (for example due to embedded null bytes or other ValueError messages) are ignored by iter_modules_and_files() and sys_path_directories(). The gold patch swallows any ValueError raised by Path.resolve() and continues; the candidate (model) patch re-raises many ValueError variants and will fail these tests. Each test patches pathlib.Path.resolve to raise ValueError for specially crafted "bad" paths while allowing normal resolution for other paths, verifying that bad entries are ignored and good entries are still returned without exceptions.
+test_code: |
+  from pathlib import Path
+  import sys
+  import tempfile
+  import shutil
+  from types import ModuleType
+  from unittest import mock
+
+  from django.test import SimpleTestCase
+  from django.test.utils import extend_sys_path
+  from django.utils import autoreload
+
+  class ResolveValueErrorTests(SimpleTestCase):
+      def setUp(self):
+          # Create a temporary directory with one good file to resolve.
+          self._td = tempfile.mkdtemp()
+          self.addCleanup(shutil.rmtree, self._td)
+          self.tempdir = Path(self._td).resolve().absolute()
+          self.good_file = (self.tempdir / 'good.py')
+          self.good_file.touch()
+          # Ensure caches are cleared between tests.
+          autoreload.iter_modules_and_files.cache_clear()
+
+      def fake_resolve_factory(self, orig_resolve, bad_mark, message):
+          """
+          Return a fake resolve method that raises ValueError(message) for paths
+          containing bad_mark, otherwise delegates to orig_resolve.
+          """
+          def fake_resolve(self, strict=True):
+              if bad_mark in str(self):
+                  raise ValueError(message)
+              return orig_resolve(self, strict=strict)
+          return fake_resolve
+
+      def test_iter_modules_and_files_ignores_value_error_with_arbitrary_message(self):
+          # extra_files contains a bad path. Path.resolve will raise ValueError with a non-standard message.
+          bad_path = '/some/bad1/path.py'
+          orig_resolve = Path.resolve
+          fake = self.fake_resolve_factory(orig_resolve, 'bad1', 'some arbitrary error')
+          with mock.patch.object(Path, 'resolve', new=fake):
+              # Should not raise and should return an empty frozenset (bad path ignored).
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+          self.assertEqual(result, frozenset())
+
+      def test_iter_modules_and_files_ignores_value_error_with_embedded_null_variation(self):
+          # Message similar to embedded null byte but not exactly the same string used by model patch.
+          bad_path = '/some/bad2/path.py'
+          orig_resolve = Path.resolve
+          fake = self.fake_resolve_factory(orig_resolve, 'bad2', 'embedded null byte in path')
+          with mock.patch.object(Path, 'resolve', new=fake):
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+          self.assertEqual(result, frozenset())
+
+      def test_iter_modules_and_files_ignores_value_error_for_module_origin_arbitrary_message(self):
+          # A module with __spec__.origin that triggers ValueError on resolve.
+          bad_origin = '/origin/bad3.py'
+          module = ModuleType('testmod_bad3')
+          spec = type('S', (), {})()
+          spec.has_location = True
+          spec.origin = bad_origin
+          spec.loader = object()
+          module.__spec__ = spec
+          orig_resolve = Path.resolve
+          fake = self.fake_resolve_factory(orig_resolve, 'bad3', 'another message')
+          with mock.patch.object(Path, 'resolve', new=fake):
+              result = autoreload.iter_modules_and_files((module,), frozenset())
+          self.assertEqual(result, frozenset())
+
+      def test_iter_modules_and_files_ignores_multiple_value_errors_and_returns_good_files(self):
+          # extra_files contains both a bad path and a good file. Bad should be ignored, good should be returned.
+          bad_path = '/bad4/file.py'
+          orig_resolve = Path.resolve
+          fake = self.fake_resolve_factory(orig_resolve, 'bad4', 'bad message 4')
+          with mock.patch.object(Path, 'resolve', new=fake):
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path, str(self.good_file)]))
+          # The good file should be present (resolved), bad file ignored.
+          self.assertIn(self.good_file.resolve(), result)
+
+      def test_sys_path_directories_ignores_value_error_with_arbitrary_message(self):
+          # Add a bad entry to sys.path that will trigger ValueError during resolve.
+          bad_path = '/sys/bad1'
+          orig_resolve = Path.resolve
+          fake = self.fake_resolve_factory(orig_resolve, 'bad1', 'sys path error')
+          self.addCleanup(lambda: sys.path.remove(bad_path) if bad_path in sys.path else None)
+          sys.path.append(bad_path)
+          with mock.patch.object(Path, 'resolve', new=fake):
+              # Should not raise; bad entry ignored.
+              dirs = list(autoreload.sys_path_directories())
+          # The good tempdir is not added to sys.path here; just assert no exception was raised and result is a list.
+          self.assertIsInstance(dirs, list)
+
+      def test_sys_path_directories_ignores_value_error_embedded_variation(self):
+          # Variant message similar to embedded null byte but not exact.
+          bad_path = '/sys/bad2'
+          orig_resolve = Path.resolve
+          fake = self.fake_resolve_factory(orig_resolve, 'bad2', 'embedded null byte in path')
+          self.addCleanup(lambda: sys.path.remove(bad_path) if bad_path in sys.path else None)
+          sys.path.append(bad_path)
+          with mock.patch.object(Path, 'resolve', new=fake):
+              dirs = list(autoreload.sys_path_directories())
+          self.assertIsInstance(dirs, list)
+
+      def test_iter_modules_and_files_handles_multiple_bad_paths(self):
+          # multiple bad extra_files entries should all be ignored.
+          bad1 = '/multi/badA.py'
+          bad2 = '/multi/badB.py'
+          orig_resolve = Path.resolve
+          # Both bad markers will trigger different ValueError messages.
+          def fake_resolve(self, strict=True):
+              s = str(self)
+              if 'badA' in s:
+                  raise ValueError('first bad')
+              if 'badB' in s:
+                  raise ValueError('second bad')
+              return orig_resolve(self, strict=strict)
+          with mock.patch.object(Path, 'resolve', new=fake_resolve):
+              result = autoreload.iter_modules_and_files((), frozenset([bad1, bad2]))
+          self.assertEqual(result, frozenset())
+
+      def test_sys_path_directories_returns_other_paths_when_some_entries_fail(self):
+          # Place both a good directory and a bad entry on sys.path. The good directory should be returned.
+          good_dir = str(self.tempdir)
+          bad_path = '/sys/multi_bad'
+          self.addCleanup(lambda: sys.path.remove(bad_path) if bad_path in sys.path else None)
+          sys.path.extend([bad_path, good_dir])
+          orig_resolve = Path.resolve
+          fake = self.fake_resolve_factory(orig_resolve, 'multi_bad', 'multi bad message')
+          with mock.patch.object(Path, 'resolve', new=fake):
+              dirs = list(autoreload.sys_path_directories())
+          # Ensure the good dir is present in returned directories.
+          self.assertIn(self.tempdir.resolve(), dirs)
+
+      def test_iter_modules_and_files_ignores_value_error_when_path_object_passed(self):
+          # Pass a Path object in extra_files that will raise ValueError on resolve.
+          bad_path_obj = Path('/pathobj/bad5.py')
+          orig_resolve = Path.resolve
+          fake = self.fake_resolve_factory(orig_resolve, 'bad5', 'pathobj error')
+          with mock.patch.object(Path, 'resolve', new=fake):
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path_obj]))
+          self.assertEqual(result, frozenset())
+
+  # If run as a script, run tests via unittest (this block is safe in test discovery).
+  if __name__ == '__main__':
+      import unittest
+      unittest.main()
+new_imports_code: |
+  # No additional top-level imports required; tests include their own imports.

@@ -1,0 +1,271 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise MigrationLoader.load_disk() behavior around detection of namespace packages vs regular packages when module.__file__ is missing and various types of module.__path__ values are present (list, list subclass, tuple, custom iterable, missing __path__). They also check reload() invocation when module was already loaded and ensure private/ignored migration files are not imported. The tests will fail on the candidate patch that mishandles some combinations of __file__ and __path__ and will pass on the fixed (gold) version.
+test_code: |
+  from importlib import import_module, reload
+  import importlib
+  import types
+  import sys
+  import os
+  import tempfile
+  import textwrap
+  from django.test import TestCase, override_settings
+  from django.db.migrations.loader import MigrationLoader
+  from .test_base import MigrationTestBase
+  
+  
+  class LoaderEdgeCaseTests(MigrationTestBase, TestCase):
+      """
+      Additional tests for migration loader edge cases around module.__file__
+      and module.__path__ handling (regular packages vs namespace packages).
+      """
+  
+      def _backup_module_attrs(self, module, *attrs):
+          """Return a dict of existing attribute values for restoration."""
+          backup = {}
+          for a in attrs:
+              backup[a] = getattr(module, a, AttributeError)
+          return backup
+  
+      def _restore_module_attrs(self, module, backup):
+          """Restore previously backed-up attributes on module."""
+          for a, val in backup.items():
+              if val is AttributeError:
+                  if hasattr(module, a):
+                      delattr(module, a)
+              else:
+                  setattr(module, a, val)
+  
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_regular_package_with_no_file_and_list_path_is_accepted(self):
+          """
+          Regular packages that have no __file__ but have a list for __path__
+          should be treated as migrated (i.e., migrations loaded).
+          """
+          mod = import_module('migrations.test_migrations')
+          backup = self._backup_module_attrs(mod, '__file__', '__spec__', '__path__')
+          try:
+              # Simulate frozen environment: remove __file__ and mark spec as no location.
+              if hasattr(mod, '__file__'):
+                  del mod.__file__
+              if hasattr(mod, '__spec__'):
+                  mod.__spec__.origin = None
+                  mod.__spec__.has_location = False
+              # Ensure __path__ is a list (regular package)
+              mod.__path__ = list(mod.__path__)
+              loader = MigrationLoader(connection=None, load=False)
+              # Call only load_disk to avoid DB interactions
+              loader.load_disk()
+              # Should be considered migrated (the test_migrations package contains migrations)
+              self.assertIn('migrations', loader.migrated_apps)
+              self.assertNotIn('migrations', loader.unmigrated_apps)
+              # And it should have discovered migrations from disk (names listed)
+              migrations = [name for app, name in loader.disk_migrations if app == 'migrations']
+              self.assertCountEqual(migrations, ['0001_initial', '0002_second'])
+          finally:
+              self._restore_module_attrs(mod, backup)
+  
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_namespace_package_like_path_object_with_no_file_is_ignored(self):
+          """
+          If __file__ is None and __path__ is a custom non-list iterable (namespace
+          package), it should be treated as unmigrated.
+          """
+          mod = import_module('migrations.test_migrations')
+          backup = self._backup_module_attrs(mod, '__file__', '__spec__', '__path__')
+          class CustomPath:
+              def __init__(self, seq):
+                  self._seq = list(seq)
+              def __iter__(self):
+                  return iter(self._seq)
+              def __repr__(self):
+                  return "<CustomPath %r>" % (self._seq,)
+          try:
+              if hasattr(mod, '__file__'):
+                  del mod.__file__
+              mod.__spec__.origin = None
+              mod.__spec__.has_location = False
+              # Use a custom path-like object (not a list)
+              mod.__path__ = CustomPath(mod.__path__)
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              # Should be ignored as unmigrated app
+              self.assertIn('migrations', loader.unmigrated_apps)
+              self.assertNotIn('migrations', loader.migrated_apps)
+              # No disk migrations discovered for this app
+              migrations = [name for app, name in loader.disk_migrations if app == 'migrations']
+              self.assertEqual(migrations, [])
+          finally:
+              self._restore_module_attrs(mod, backup)
+  
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_list_subclass_path_with_no_file_is_accepted(self):
+          """
+          If __path__ is a list subclass and __file__ is missing, it should still
+          be treated as a regular package and accepted.
+          """
+          mod = import_module('migrations.test_migrations')
+          backup = self._backup_module_attrs(mod, '__file__', '__spec__', '__path__')
+          class ListSub(list):
+              pass
+          try:
+              if hasattr(mod, '__file__'):
+                  del mod.__file__
+              mod.__spec__.origin = None
+              mod.__spec__.has_location = False
+              mod.__path__ = ListSub(mod.__path__)
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              self.assertIn('migrations', loader.migrated_apps)
+              self.assertNotIn('migrations', loader.unmigrated_apps)
+              migrations = [name for app, name in loader.disk_migrations if app == 'migrations']
+              self.assertCountEqual(migrations, ['0001_initial', '0002_second'])
+          finally:
+              self._restore_module_attrs(mod, backup)
+  
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_tuple_path_with_no_file_is_treated_as_namespace_and_ignored(self):
+          """
+          If __path__ is a tuple (not a list) and __file__ is missing, treat as
+          namespace package and ignore.
+          """
+          mod = import_module('migrations.test_migrations')
+          backup = self._backup_module_attrs(mod, '__file__', '__spec__', '__path__')
+          try:
+              if hasattr(mod, '__file__'):
+                  del mod.__file__
+              mod.__spec__.origin = None
+              mod.__spec__.has_location = False
+              mod.__path__ = tuple(mod.__path__)
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              self.assertIn('migrations', loader.unmigrated_apps)
+              self.assertNotIn('migrations', loader.migrated_apps)
+              migrations = [name for app, name in loader.disk_migrations if app == 'migrations']
+              self.assertEqual(migrations, [])
+          finally:
+              self._restore_module_attrs(mod, backup)
+  
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_no_path_attribute_marks_module_as_unmigrated(self):
+          """
+          If the module is not a package (no __path__), it's considered unmigrated.
+          """
+          mod = import_module('migrations.test_migrations')
+          backup = self._backup_module_attrs(mod, '__path__')
+          try:
+              if hasattr(mod, '__path__'):
+                  del mod.__path__
+              loader = MigrationLoader(connection=None, load=False)
+              # load_disk should not raise even if __path__ missing, and the app is unmigrated
+              loader.load_disk()
+              self.assertIn('migrations', loader.unmigrated_apps)
+              self.assertNotIn('migrations', loader.migrated_apps)
+              self.assertEqual([name for app, name in loader.disk_migrations if app == 'migrations'], [])
+          finally:
+              self._restore_module_attrs(mod, backup)
+  
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_reload_called_when_module_was_loaded(self):
+          """
+          If the migrations module was already loaded in sys.modules, MigrationLoader
+          should call importlib.reload() to refresh it.
+          """
+          # Ensure module is loaded
+          module_name = 'migrations.test_migrations'
+          mod = import_module(module_name)
+          # Place a sentinel in sys.modules to mark it as loaded (it is).
+          self.assertIn(module_name, sys.modules)
+          called = {'reloaded': False}
+          original_reload = importlib.reload
+          try:
+              def fake_reload(m):
+                  # Confirm we're being asked to reload the same module
+                  self.assertIs(m, mod)
+                  called['reloaded'] = True
+                  return original_reload(m)
+              importlib.reload = fake_reload
+              loader = MigrationLoader(connection=None, load=False)
+              # Force a situation where migrations_module returns our module and it
+              # is in sys.modules; load_disk should then call reload()
+              # Use settings to point to existing module
+              loader.load_disk()
+              self.assertTrue(called['reloaded'])
+          finally:
+              importlib.reload = original_reload
+  
+      def test_private_files_are_ignored_when_listing_migrations(self):
+          """
+          Files prefixed with underscore or tilde shouldn't be considered migration
+          modules when scanning package path.
+          """
+          # Use the helper to create a temporary migrations module on disk
+          with self.temporary_migration_module(module='migrations.temp_ignore') as migration_dir:
+              # Create files: a normal migration and a private-prefixed one
+              good = os.path.join(migration_dir, '0001_initial.py')
+              private = os.path.join(migration_dir, '_0002_private.py')
+              with open(good, 'w') as f:
+                  f.write(textwrap.dedent("""
+                      from django.db.migrations import Migration
+                      class Migration(Migration):
+                          operations = []
+                  """))
+              with open(private, 'w') as f:
+                  f.write(textwrap.dedent("""
+                      # Private migration file that should be ignored.
+                  """))
+              # Ensure package is importable
+              # The temporary_migration_module already ensures package path and name
+              loader = MigrationLoader(connection=None, load=False)
+              # Manually set migrations_module to our temp package
+              # The temporary_migration_module context sets up 'migrations.temp_ignore' as package,
+              # but MigrationLoader by default will scan all installed apps; to be explicit:
+              # We'll import the package and call load_disk relying on its __path__ pointing to migration_dir.
+              pkg = import_module('migrations.temp_ignore')
+              # Sanity
+              self.assertTrue(hasattr(pkg, '__path__'))
+              loader.load_disk()
+              # We should have found 0001_initial but not the private file
+              migrations = [name for app, name in loader.disk_migrations if app == 'migrations']
+              self.assertIn('0001_initial', migrations)
+              for name in migrations:
+                  self.assertFalse(name.startswith('_'))
+  
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_custom_iterable_path_but_with_file_present_is_accepted(self):
+          """
+          If __path__ is a custom iterable but __file__ is present (normal package),
+          it should be treated as migrated since presence of __file__ indicates a
+          non-namespace package.
+          """
+          mod = import_module('migrations.test_migrations')
+          backup = self._backup_module_attrs(mod, '__file__', '__path__', '__spec__')
+          class CustomIterable:
+              def __init__(self, seq):
+                  self._seq = list(seq)
+              def __iter__(self):
+                  return iter(self._seq)
+              def __repr__(self):
+                  return "<CustomIterable %r>" % (self._seq,)
+          try:
+              # Ensure __file__ set (normal package)
+              mod.__file__ = mod.__file__ if hasattr(mod, '__file__') else 'dummy'
+              mod.__path__ = CustomIterable(mod.__path__)
+              # Restore spec info indicating location
+              if hasattr(mod, '__spec__'):
+                  mod.__spec__.origin = mod.__file__
+                  mod.__spec__.has_location = True
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              # With __file__ present it should be treated as migrated even though __path__ isn't a list
+              self.assertIn('migrations', loader.migrated_apps)
+              self.assertNotIn('migrations', loader.unmigrated_apps)
+              migrations = [name for app, name in loader.disk_migrations if app == 'migrations']
+              self.assertCountEqual(migrations, ['0001_initial', '0002_second'])
+          finally:
+              self._restore_module_attrs(mod, backup)
+new_imports_code: |
+  import importlib
+  import importlib.util
+  import tempfile
+  import textwrap

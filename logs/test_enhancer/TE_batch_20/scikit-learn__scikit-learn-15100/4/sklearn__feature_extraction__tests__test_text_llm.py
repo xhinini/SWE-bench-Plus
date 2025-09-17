@@ -1,0 +1,3 @@
+import unicodedata
+from sklearn.feature_extraction.text import strip_accents_unicode
+import pytest

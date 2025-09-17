@@ -1,0 +1,152 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that bulk_update correctly recognizes objects that implement a resolve_expression method (i.e., expression-like objects) and treats them as expressions rather than wrapping them in Value. They cover integer, string, boolean fields, batching, mixing with F() expressions, duplicate rows, falsey PKs, multi-field updates, and the fallback behavior for objects without resolve_expression.
+test_code: |
+  from django.test import TestCase
+  from django.db.models import F
+  from django.core.exceptions import FieldDoesNotExist
+
+  from .models import (
+      Number, Note, Individual, Order,
+  )
+
+  class BulkUpdateExprLikeTests(TestCase):
+      def setUp(self):
+          # Create a small set of model instances for use in tests.
+          self.numbers = [Number.objects.create(num=0) for _ in range(6)]
+          self.notes = [Note.objects.create(note='orig', misc='orig') for _ in range(4)]
+          self.individuals = [Individual.objects.create(alive=False) for _ in range(3)]
+          # A fresh order with a falsey pk for the pk=0 case.
+          self.order = Order.objects.create(pk=0, name='start')
+
+      class ExprLike:
+          """
+          A simple object that isn't a subclass of django Expression but
+          provides resolve_expression(). The resolve_expression returns a
+          Value that the ORM can use during compilation.
+          """
+          def __init__(self, val, output_field):
+              self.val = val
+              self._output_field = output_field
+
+          def resolve_expression(self, *args, **kwargs):
+              from django.db.models import Value
+              return Value(self.val, output_field=self._output_field)
+
+      class ExprLikeToF:
+          """
+          resolve_expression returns an actual F() based expression.
+          """
+          def __init__(self, offset):
+              self.offset = offset
+
+          def resolve_expression(self, *args, **kwargs):
+              return F('num') + self.offset
+
+      def test_exprlike_updates_integer_field(self):
+          # Each Number.num is set to a different ExprLike which resolves to a Value.
+          for i, obj in enumerate(self.numbers):
+              obj.num = self.ExprLike(i + 10, Number._meta.get_field('num'))
+          Number.objects.bulk_update(self.numbers, ['num'])
+          self.assertCountEqual(
+              Number.objects.values_list('num', flat=True),
+              [i + 10 for i in range(len(self.numbers))]
+          )
+
+      def test_exprlike_mixed_with_f_expression(self):
+          # First half set to ExprLike(100), second half to F('num') + 2
+          half = len(self.numbers) // 2
+          for obj in self.numbers[:half]:
+              obj.num = self.ExprLike(100, Number._meta.get_field('num'))
+          for obj in self.numbers[half:]:
+              obj.num = F('num') + 2
+          Number.objects.bulk_update(self.numbers, ['num'])
+          nums = list(Number.objects.order_by('pk').values_list('num', flat=True))
+          # first half -> 100, second half -> original 0 + 2 == 2
+          expected = [100] * half + [2] * (len(self.numbers) - half)
+          self.assertEqual(nums, expected)
+
+      def test_exprlike_with_batch_size(self):
+          # Ensure batching doesn't break the resolve_expression handling.
+          for i, obj in enumerate(self.numbers):
+              obj.num = self.ExprLike(i + 20, Number._meta.get_field('num'))
+          Number.objects.bulk_update(self.numbers, ['num'], batch_size=1)
+          self.assertCountEqual(
+              Number.objects.values_list('num', flat=True),
+              [i + 20 for i in range(len(self.numbers))]
+          )
+
+      def test_exprlike_on_char_field(self):
+          # Use Note.note (a CharField) with expression-like objects resolving to strings.
+          for i, note in enumerate(self.notes):
+              note.note = self.ExprLike('n-%d' % i, Note._meta.get_field('note'))
+          Note.objects.bulk_update(self.notes, ['note'])
+          self.assertCountEqual(
+              Note.objects.values_list('note', flat=True),
+              ['n-%d' % i for i in range(len(self.notes))]
+          )
+
+      def test_exprlike_duplicate_objects(self):
+          # Passing the same object twice should still result in a single update
+          # for that primary key in a single batch.
+          obj = Number.objects.create(num=0)
+          obj.num = self.ExprLike(77, Number._meta.get_field('num'))
+          rows_updated = Number.objects.bulk_update([obj, obj], ['num'])
+          # Two entries (same pk) in same batch -> 1 row changed
+          self.assertEqual(rows_updated, 1)
+          self.assertEqual(Number.objects.get(pk=obj.pk).num, 77)
+
+      def test_exprlike_falsey_pk_value(self):
+          # Ensure falsey primary key (0) is handled correctly with ExprLike.
+          self.order.name = self.ExprLike('updated', Order._meta.get_field('name'))
+          Order.objects.bulk_update([self.order], ['name'])
+          self.order.refresh_from_db()
+          self.assertEqual(self.order.name, 'updated')
+
+      def test_exprlike_booleanfield(self):
+          for obj in self.individuals:
+              obj.alive = self.ExprLike(True, Individual._meta.get_field('alive'))
+          Individual.objects.bulk_update(self.individuals, ['alive'])
+          self.assertCountEqual(Individual.objects.filter(alive=True), self.individuals)
+
+      def test_exprlike_multiple_fields(self):
+          # Ensure multi-field updates also accept expression-like objects.
+          for i, note in enumerate(self.notes):
+              note.note = self.ExprLike('multi-%d' % i, Note._meta.get_field('note'))
+              note.misc = self.ExprLike('misc-%d' % i, Note._meta.get_field('misc'))
+          Note.objects.bulk_update(self.notes, ['note', 'misc'])
+          self.assertCountEqual(
+              Note.objects.values_list('note', flat=True),
+              ['multi-%d' % i for i in range(len(self.notes))]
+          )
+          self.assertCountEqual(
+              Note.objects.values_list('misc', flat=True),
+              ['misc-%d' % i for i in range(len(self.notes))]
+          )
+
+      def test_exprlike_resolves_to_f_expression(self):
+          # expr-like that resolves to an F() expression (increment)
+          objs = [Number.objects.create(num=0) for _ in range(3)]
+          for obj in objs:
+              obj.num = self.ExprLikeToF(5)
+          Number.objects.bulk_update(objs, ['num'])
+          self.assertCountEqual(Number.objects.filter(num=5), objs)
+
+      def test_object_without_resolve_is_wrapped_and_saved(self):
+          # Objects without resolve_expression should be wrapped as Value and saved.
+          class Plain:
+              def __init__(self, v):
+                  self.v = v
+              def __str__(self):
+                  return str(self.v)
+          obj = Number.objects.create(num=0)
+          obj.num = Plain(123)
+          # This should not error; the plain object will be coerced to DB value.
+          Number.objects.bulk_update([obj], ['num'])
+          # The database will attempt to store the string/int representation; ensure a value exists.
+          refreshed = Number.objects.get(pk=obj.pk)
+          # Try conversion to int; if DB stored '123' or 123, both are acceptable.
+          self.assertIn(int(refreshed.num), (123,))
+
+new_imports_code: |
+  from django.db.models import Value, F

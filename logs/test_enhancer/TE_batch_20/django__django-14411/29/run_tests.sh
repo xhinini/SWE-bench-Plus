@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.ReadOnlyPasswordHashAdditionalTests.test_bound_field_label_no_for_with_explicit_label auth_tests.test_forms_llm.ReadOnlyPasswordHashAdditionalTests.test_id_for_label_direct auth_tests.test_forms_llm.ReadOnlyPasswordHashAdditionalTests.test_label_empty_string_renders_empty_label_tag auth_tests.test_forms_llm.ReadOnlyPasswordHashAdditionalTests.test_readonly_field_disabled_and_has_changed_behavior auth_tests.test_forms_llm.ReadOnlyPasswordHashAdditionalTests.test_render_preserves_container_id auth_tests.test_forms_llm.ReadOnlyPasswordHashAdditionalTests.test_render_valid_pbkdf2_contains_algorithm_and_salt_summary auth_tests.test_forms_llm.ReadOnlyPasswordHashAdditionalTests.test_render_with_invalid_format_shows_invalid_message auth_tests.test_forms_llm.ReadOnlyPasswordHashAdditionalTests.test_render_with_none_value_contains_no_password_set_message auth_tests.test_forms_llm.ReadOnlyPasswordHashAdditionalTests.test_render_with_unusable_password_prefix_shows_no_password_set
+coverage json -o coverage.json
+: '>>>>> End Test Output'

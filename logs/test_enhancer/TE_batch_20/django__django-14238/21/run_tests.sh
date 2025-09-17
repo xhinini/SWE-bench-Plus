@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_issubclass_tuple_direct_classes_mixed model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_issubclass_tuple_duplicates model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_issubclass_tuple_mixed_two_level_subclasses model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_issubclass_tuple_nested_subclasses_mixed model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_issubclass_tuple_one_element model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_issubclass_tuple_order_irrelevant model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_issubclass_tuple_subclasses_mixed model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_issubclass_tuple_various_combinations model_fields.test_autofield_llm.AutoFieldMetaTupleSubclassTests.test_issubclass_tuple_with_nested_and_direct
+coverage json -o coverage.json
+: '>>>>> End Test Output'

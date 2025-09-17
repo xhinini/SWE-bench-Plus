@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 check_framework.test_translation_llm.TranslationImportResilienceTests._block_trans_real_imports check_framework.test_translation_llm.TranslationImportResilienceTests.test_inconsistent_language_region_with_trans_real_blocked check_framework.test_translation_llm.TranslationImportResilienceTests.test_inconsistent_language_simple_with_trans_real_blocked check_framework.test_translation_llm.TranslationImportResilienceTests.test_inconsistent_when_no_languages_listed_with_trans_real_blocked check_framework.test_translation_llm.TranslationImportResilienceTests.test_supported_complex_tag_with_trans_real_blocked check_framework.test_translation_llm.TranslationImportResilienceTests.test_supported_language_exact_match_with_trans_real_blocked check_framework.test_translation_llm.TranslationImportResilienceTests.test_supported_language_fallback_base_language_with_trans_real_blocked check_framework.test_translation_llm.TranslationImportResilienceTests.test_supported_language_normalization_with_trans_real_blocked check_framework.test_translation_llm.TranslationImportResilienceTests.test_supported_language_region_match_with_trans_real_blocked check_framework.test_translation_llm.TranslationImportResilienceTests.test_supported_script_tag_with_trans_real_blocked check_framework.test_translation_llm.TranslationImportResilienceTests.test_supported_when_multiple_languages_present_with_trans_real_blocked
+coverage json -o coverage.json
+: '>>>>> End Test Output'

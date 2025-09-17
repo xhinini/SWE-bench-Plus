@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 xor_lookups.tests_llm.XorWhereNodeRegressionTests._compile_where_sql xor_lookups.tests_llm.XorWhereNodeRegressionTests.setUpTestData xor_lookups.tests_llm.XorWhereNodeRegressionTests.test_four_operand_xor_uses_mod xor_lookups.tests_llm.XorWhereNodeRegressionTests.test_negated_three_operand_xor_uses_mod_and_has_not xor_lookups.tests_llm.XorWhereNodeRegressionTests.test_nested_xor_uses_mod_for_multi_operand_group xor_lookups.tests_llm.XorWhereNodeRegressionTests.test_three_operand_xor_results_match_python_xor xor_lookups.tests_llm.XorWhereNodeRegressionTests.test_three_operand_xor_sql_contains_equal_one_on_rhs xor_lookups.tests_llm.XorWhereNodeRegressionTests.test_three_operand_xor_uses_mod xor_lookups.tests_llm.XorWhereNodeRegressionTests.test_two_operand_xor_does_not_use_mod xor_lookups.tests_llm.XorWhereNodeRegressionTests.test_two_operand_xor_results_match_python_xor xor_lookups.tests_llm.XorWhereNodeRegressionTests.test_xor_with_empty_in_and_extra_operand_uses_mod
+coverage json -o coverage.json
+: '>>>>> End Test Output'

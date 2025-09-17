@@ -1,0 +1,26 @@
+from sympy.testing.pytest import raises
+from sympy.tensor.array.dense_ndim_array import ImmutableDenseNDimArray, MutableDenseNDimArray
+from sympy.tensor.array.sparse_ndim_array import ImmutableSparseNDimArray, MutableSparseNDimArray
+from sympy.testing.pytest import raises
+from sympy.tensor.array.dense_ndim_array import ImmutableDenseNDimArray, MutableDenseNDimArray
+from sympy.tensor.array.sparse_ndim_array import ImmutableSparseNDimArray, MutableSparseNDimArray
+
+def test_parse_index_integer_in_bounds_immutable_dense_1d():
+    a = ImmutableDenseNDimArray([1, 2, 3])
+    assert a._parse_index(1) == 1
+
+def test_parse_index_integer_in_bounds_mutable_dense_1d():
+    a = MutableDenseNDimArray([1, 2, 3])
+    assert a._parse_index(2) == 2
+
+def test_parse_index_integer_in_bounds_immutable_dense_2d():
+    a = ImmutableDenseNDimArray([[1, 2, 3], [4, 5, 6]])
+    assert a._parse_index(4) == 4
+
+def test_parse_index_integer_in_bounds_mutable_sparse_1d():
+    a = MutableSparseNDimArray([10, 20, 30])
+    assert a._parse_index(0) == 0
+
+def test_parse_index_negative_integer_dense_returns_negative():
+    a = ImmutableDenseNDimArray([1, 2, 3])
+    assert a._parse_index(-1) == -1

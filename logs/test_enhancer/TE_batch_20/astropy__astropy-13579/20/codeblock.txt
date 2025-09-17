@@ -1,0 +1,154 @@
+# No new imports required; tests reuse imports at top of module (numpy, assert_allclose, etc.).
+def _expected_world_to_pixel_from_underlying(sliced_wcs, *world_inputs):
+    """
+    Construct the expected pixel output by:
+    - computing the world values for the dropped world dimensions via
+      sliced_wcs._pixel_to_world_values_all with zeros for the kept pixel axes,
+    - inserting those values into the provided kept-world inputs to form the full
+      world_inputs expected by the underlying WCS,
+    - calling the underlying wcs.world_to_pixel_values,
+    - applying the slice start offsets for pixel axes that were sliced with a start,
+    - returning only the pixel values corresponding to the sliced_wcs pixel_keep axes.
+    """
+    wcs = sliced_wcs._wcs
+    # Value for dropped world coordinates
+    sliced_out_world_coords = sliced_wcs._pixel_to_world_values_all(*[0] * len(sliced_wcs._pixel_keep))
+    world_inputs = tuple(map(np.asanyarray, world_inputs))
+    full_world = []
+    iworld_curr = 0
+    for iworld in range(wcs.world_n_dim):
+        if iworld in sliced_wcs._world_keep:
+            full_world.append(world_inputs[iworld_curr])
+            iworld_curr += 1
+        else:
+            full_world.append(sliced_out_world_coords[iworld])
+    full_world = np.broadcast_arrays(*full_world)
+    pixel_arrays = list(wcs.world_to_pixel_values(*full_world))
+    # Apply pixel slice starts
+    for ipixel in range(wcs.pixel_n_dim):
+        s = sliced_wcs._slices_pixel[ipixel]
+        if isinstance(s, slice) and s.start is not None:
+            pixel_arrays[ipixel] -= s.start
+    pixel = tuple(pixel_arrays[ip] for ip in sliced_wcs._pixel_keep)
+    if sliced_wcs.pixel_n_dim == 1 and wcs.pixel_n_dim > 1:
+        return pixel[0]
+    return pixel
+
+
+def test_regression_world_to_pixel_uses_sliced_values_spectral_slice():
+    sl = SlicedLowLevelWCS(WCS_SPECTRAL_CUBE, [slice(None), 10])
+    # kept world dims are Latitude and Longitude in this slice
+    res = sl.world_to_pixel_values(10, 25)
+    expected = _expected_world_to_pixel_from_underlying(sl, 10, 25)
+    assert_allclose(res, expected)
+
+
+def test_regression_world_to_pixel_broadcasting_spectral_slice():
+    sl = SlicedLowLevelWCS(WCS_SPECTRAL_CUBE, [slice(None), 10])
+    wlat = np.array([10.0, 11.0])
+    wlon = np.array([25.0, 26.0])
+    res = sl.world_to_pixel_values(wlat, wlon)
+    expected = _expected_world_to_pixel_from_underlying(sl, wlat, wlon)
+    # shapes should match and values should be equal
+    assert_allclose(res[0], expected[0])
+    assert_allclose(res[1], expected[1])
+
+
+def test_regression_world_to_pixel_negative_index_slice():
+    # Use the coupled WCS where dropping one pixel axis should still use the
+    # proper dropped world coordinate value (not a fixed 1.0 or other default).
+    fits_wcs = WCS(header=COUPLED_WCS_HEADER)
+    sl = SlicedLowLevelWCS(fits_wcs, -1)
+    # Provide the kept world values (two values expected since one pixel was dropped)
+    # We'll pick a representative world coordinate pair (center-ish)
+    world_vals = (0.0, 0.0)
+    res = sl.world_to_pixel_values(*world_vals)
+    expected = _expected_world_to_pixel_from_underlying(sl, *world_vals)
+    assert_allclose(res, expected)
+
+
+def test_regression_world_to_pixel_with_quantities():
+    # Ensure Quantity inputs are handled consistently and produce same result
+    sl = SlicedLowLevelWCS(WCS_SPECTRAL_CUBE, [slice(None), 10])
+    import astropy.units as u
+    wlat = 10.0 * u.deg
+    wlon = 25.0 * u.deg
+    res = sl.world_to_pixel_values(wlat, wlon)
+    expected = _expected_world_to_pixel_from_underlying(sl, wlat.to_value(u.deg), wlon.to_value(u.deg))
+    # world_to_pixel_values on the underlying WCS expects plain numbers; compare floats
+    assert_allclose(np.asarray(res), np.asarray(expected))
+
+
+def test_regression_nested_slicing_world_to_pixel_equivalence():
+    # nested slicing scenario: should be equivalent to a single final slice
+    wcs = WCS_SPECTRAL_CUBE
+    nested = SlicedLowLevelWCS(SlicedLowLevelWCS(wcs, [slice(None), slice(1, 10), slice(None)]),
+                               [3, slice(2, None)])
+    final = wcs[3, 3:10, 2:8]
+    # pick a world coordinate appropriate for the final sliced WCS (2 kept dims)
+    # Use the final wrapper's world_to_pixel_values and compare with nested wrapper
+    # Evaluate a random test world coordinate pair by mapping through both wrappers
+    wvals = (10.0, 25.0)
+    res_nested = nested.world_to_pixel_values(*wvals)
+    res_final = final.world_to_pixel_values(*wvals)
+    assert_allclose(res_nested, res_final)
+
+
+def test_regression_world_to_pixel_shape_and_broadcasting():
+    # Check output shapes and broadcasting properties for array inputs
+    sl = SlicedLowLevelWCS(WCS_SPECTRAL_CUBE, [slice(None), 10])
+    wlat = np.linspace(10, 12, 5)
+    wlon = 25.0  # scalar should broadcast
+    res = sl.world_to_pixel_values(wlat, wlon)
+    expected = _expected_world_to_pixel_from_underlying(sl, wlat, np.broadcast_to(wlon, wlat.shape))
+    # Result is a tuple of arrays for multi-dim world; ensure shapes match
+    assert np.shape(res[0]) == np.shape(expected[0])
+    assert np.shape(res[1]) == np.shape(expected[1])
+    assert_allclose(res[0], expected[0])
+    assert_allclose(res[1], expected[1])
+
+
+def test_regression_world_to_pixel_multiple_dropped_dimensions():
+    # Drop two pixel axes leaving a single pixel axis and ensure the mapping is correct
+    sl = SlicedLowLevelWCS(WCS_SPECTRAL_CUBE, np.s_[0, :, 0])
+    # After dropping two pixel axes, the resulting WCS should still accept the
+    # kept world coordinates in the proper order. Determine how many kept world
+    # axes there are and create test inputs accordingly.
+    n_kept_world = sl.world_n_dim
+    # Construct a simple input filled with the CRVAL-derived central values for kept dims
+    # Use sl._pixel_to_world_values_all to get the full-world baseline and pick kept ones
+    full_world_at_zero = sl._pixel_to_world_values_all(*[0] * len(sl._pixel_keep))
+    world_inputs = []
+    for iworld in range(sl._wcs.world_n_dim):
+        if iworld in sl._world_keep:
+            world_inputs.append(full_world_at_zero[iworld])
+    res = sl.world_to_pixel_values(*world_inputs)
+    expected = _expected_world_to_pixel_from_underlying(sl, *world_inputs)
+    assert_allclose(res, expected)
+
+
+def test_regression_world_to_pixel_with_broadcasting_and_quantities():
+    # Combine quantities and broadcasting to ensure behavior matches underlying WCS.
+    sl = SlicedLowLevelWCS(WCS_SPECTRAL_CUBE, [slice(None), 10])
+    import astropy.units as u
+    wlat = (np.array([10.0, 11.0]) * u.deg)
+    wlon = (25.0 * u.deg)  # scalar quantity should broadcast
+    res = sl.world_to_pixel_values(wlat, wlon)
+    expected = _expected_world_to_pixel_from_underlying(sl, wlat.to_value(u.deg), np.broadcast_to(wlon.to_value(u.deg), wlat.shape))
+    # Compare numeric arrays
+    assert_allclose(np.asarray(res[0]), np.asarray(expected[0]))
+    assert_allclose(np.asarray(res[1]), np.asarray(expected[1]))
+
+
+def test_regression_coupled_wcs_world_to_pixel_matches_underlying():
+    # For the coupled WCS header, make sure world_to_pixel_values on the sliced WCS
+    # returns the same numerical pixel positions as the underlying WCS when the missing
+    # world dims are filled using the slice-fixed world values.
+    fits_wcs = WCS(header=COUPLED_WCS_HEADER)
+    sl = SlicedLowLevelWCS(fits_wcs, 0)
+    world_vals = sl._pixel_to_world_values_all(*[0] * len(sl._pixel_keep))
+    # Build inputs only for kept world dims
+    kept_inputs = tuple(world_vals[i] for i in sl._world_keep)
+    res = sl.world_to_pixel_values(*kept_inputs)
+    expected = _expected_world_to_pixel_from_underlying(sl, *kept_inputs)
+    assert_allclose(res, expected)

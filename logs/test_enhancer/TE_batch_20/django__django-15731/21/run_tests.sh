@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 basic.tests_llm.ManagerMethodGenerationTests.test_core_method_signatures_preserved basic.tests_llm.ManagerMethodGenerationTests.test_doc_and_name_preserved basic.tests_llm.ManagerMethodGenerationTests.test_existing_manager_methods_are_not_overwritten basic.tests_llm.ManagerMethodGenerationTests.test_from_queryset_with_custom_method_preserves_signature_and_doc basic.tests_llm.ManagerMethodGenerationTests.test_get_queryset_methods_returns_expected_keys_for_custom_queryset basic.tests_llm.ManagerMethodGenerationTests.test_manager_method_calls_underlying_queryset basic.tests_llm.ManagerMethodGenerationTests.test_method_skipped_when_queryset_only_true basic.tests_llm.ManagerMethodGenerationTests.test_private_method_copied_when_queryset_only_false basic.tests_llm.ManagerMethodGenerationTests.test_signature_preserved_for_private_method basic.tests_llm.ManagerMethodGenerationTests.test_wrapped_attribute_points_to_queryset_function
+coverage json -o coverage.json
+: '>>>>> End Test Output'

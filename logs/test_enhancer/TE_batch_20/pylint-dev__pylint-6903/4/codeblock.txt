@@ -1,0 +1,136 @@
+# No new top-level imports required beyond those inside the test module.
+# new test module for regressions related to _query_cpu/_cpu_count
+import pytest
+from unittest.mock import patch, mock_open, MagicMock
+import os
+
+from pylint.lint import run
+
+
+def _make_open_map(mapping):
+    """Return an open replacement that serves different content per path."""
+    def _mock_open(path, *args, **kwargs):
+        # Accept Path objects converted to str as well
+        key = path
+        if isinstance(path, os.PathLike):
+            key = str(path)
+        # If the file is in mapping, return a file-like mock
+        if key in mapping:
+            return mock_open(read_data=mapping[key])()
+        # otherwise raise as real open would for a missing file
+        raise FileNotFoundError(key)
+    return _mock_open
+
+
+def _make_path_factory(existing_paths):
+    """Return a callable to patch run.Path so that is_file() matches existing_paths."""
+    def _mock_path(path):
+        # path argument may be a string or Path; convert to str for comparison
+        key = path
+        if isinstance(path, os.PathLike):
+            key = str(path)
+        return MagicMock(is_file=lambda: key in existing_paths)
+    return _mock_path
+
+
+def test_query_cpu_negative_shares_returns_negative():
+    # cpu.shares = -1024 -> int(-1024/1024) == -1, expect -1 (do not clamp to 1)
+    files = {
+        "/sys/fs/cgroup/cpu/cpu.shares": "-1024\n",
+    }
+    with patch("builtins.open", _make_open_map(files)):
+        with patch("pylint.lint.run.Path", _make_path_factory(set(files.keys()))):
+            assert run._query_cpu() == -1
+
+
+def test_query_cpu_negative_shares_larger_negative_value():
+    # cpu.shares = -2048 -> int(-2048/1024) == -2
+    files = {
+        "/sys/fs/cgroup/cpu/cpu.shares": "-2048\n",
+    }
+    with patch("builtins.open", _make_open_map(files)):
+        with patch("pylint.lint.run.Path", _make_path_factory(set(files.keys()))):
+            assert run._query_cpu() == -2
+
+
+def test_query_cpu_negative_shares_with_quota_ignored():
+    # cpu.cfs_quota_us == -1 (ignored), cpu.shares negative -> negative preserved
+    files = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",
+        "/sys/fs/cgroup/cpu/cpu.shares": "-1024\n",
+    }
+    with patch("builtins.open", _make_open_map(files)):
+        with patch("pylint.lint.run.Path", _make_path_factory(set(files.keys()))):
+            assert run._query_cpu() == -1
+
+
+def test_query_cpu_small_negative_shares_rounds_to_zero_then_one():
+    # cpu.shares = -512 -> int(-512/1024) == 0 -> corrected to 1
+    files = {
+        "/sys/fs/cgroup/cpu/cpu.shares": "-512\n",
+    }
+    with patch("builtins.open", _make_open_map(files)):
+        with patch("pylint.lint.run.Path", _make_path_factory(set(files.keys()))):
+            assert run._query_cpu() == 1
+
+
+def test_query_cpu_zero_shares_returns_one():
+    # cpu.shares = 0 -> int(0/1024) == 0 -> corrected to 1
+    files = {
+        "/sys/fs/cgroup/cpu/cpu.shares": "0\n",
+    }
+    with patch("builtins.open", _make_open_map(files)):
+        with patch("pylint.lint.run.Path", _make_path_factory(set(files.keys()))):
+            assert run._query_cpu() == 1
+
+
+def test_query_cpu_fractional_quota_returns_one():
+    # quota/period yields fractional <1 -> int() gives 0 -> corrected to 1
+    files = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "50000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    with patch("builtins.open", _make_open_map(files)):
+        with patch("pylint.lint.run.Path", _make_path_factory(set(files.keys()))):
+            assert run._query_cpu() == 1
+
+
+def test_query_cpu_quota_and_period_return_integer():
+    # quota/period yields exact integer
+    files = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "200000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    with patch("builtins.open", _make_open_map(files)):
+        with patch("pylint.lint.run.Path", _make_path_factory(set(files.keys()))):
+            assert run._query_cpu() == 2
+
+
+def test_query_cpu_no_cgroup_files_returns_none():
+    # No relevant files -> None
+    with patch("pylint.lint.run.Path", _make_path_factory(set())):
+        # builtins.open should not be called, but ensure any call fails
+        with patch("builtins.open", side_effect=FileNotFoundError()):
+            assert run._query_cpu() is None
+
+
+def test_cpu_count_uses_sched_getaffinity_and_min_with_cpu_share():
+    # When sched_getaffinity is available and _query_cpu returns 2,
+    # cpu_count must be min(cpu_share, len(sched_affinity))
+    with patch("pylint.lint.run._query_cpu", return_value=2):
+        with patch("pylint.lint.run.os.sched_getaffinity", lambda x: {0, 1, 2, 3}):
+            assert run._cpu_count() == 2
+
+
+def test_cpu_count_with_negative_shares_returns_negative_min():
+    # When underlying files indicate negative cpu.shares (e.g. -2048 -> -2),
+    # _cpu_count should return min(cpu_share, affinity_count) which will be negative.
+    files = {
+        "/sys/fs/cgroup/cpu/cpu.shares": "-2048\n",
+    }
+    with patch("builtins.open", _make_open_map(files)):
+        with patch("pylint.lint.run.Path", _make_path_factory(set(files.keys()))):
+            with patch("pylint.lint.run.os.sched_getaffinity", lambda x: {0, 1, 2, 3}):
+                # Expect min(-2, 4) -> -2. The candidate model patch that clamps
+                # negative values to 1 would produce 1 and thus fail this test.
+                assert run._cpu_count() == -2

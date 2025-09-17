@@ -1,0 +1,265 @@
+from __future__ import annotations
+
+import types
+from typing import Set, Tuple
+
+from django.test import SimpleTestCase
+from django.db import migrations
+from django.db.migrations.writer import MigrationWriter
+from django.db.migrations.serializer import BaseSerializer
+
+# A tiny helper serializer class to inject custom import lines during serialization.
+class _InjectingSerializer(BaseSerializer):
+    def __init__(self, value):
+        super().__init__(value)
+    def serialize(self) -> Tuple[str, Set[str]]:
+        # value is expected to be a tuple (repr_string, set_of_import_lines)
+        return self.value[0], set(self.value[1])
+
+class MigrationWriterImportsTests(SimpleTestCase):
+    def tearDown(self):
+        # Ensure no leftover serializer registrations perturb other tests.
+        try:
+            MigrationWriter.unregister_serializer(tuple)
+        except Exception:
+            # ignore if not registered
+            pass
+
+    def _make_migration_with_custom_arg(self, injected_value):
+        """
+        Create a Migration instance which has one custom Operation that accepts
+        a single argument. The argument will be serialized using our registered
+        serializer for `tuple` (used as a sentinel type here).
+        """
+        # Define a tiny Operation class local to the test so OperationWriter will
+        # add an import for it (simulating a custom operation).
+        class TestOp(migrations.Operation):
+            def __init__(self, arg):
+                self.arg = arg
+            def deconstruct(self):
+                return ("TestOp", [self.arg], {})
+        # Build a migration type dynamically.
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {"operations": [TestOp(injected_value)], "dependencies": []},
+        )
+        return migration
+
+    def test_imports_grouping_imports_before_froms(self):
+        """
+        Ensure that import statements are listed before from-import statements.
+        Injected imports include both types.
+        """
+        # Prepare an injected serializer that will produce a mix of imports.
+        injected_imports = {
+            "import zzz.module",
+            "from aaa import something",
+            "from bbb import other",
+        }
+        injected_value = ("Custom()", injected_imports)
+        MigrationWriter.register_serializer(tuple, _InjectingSerializer)
+
+        migration = self._make_migration_with_custom_arg(injected_value)
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        # Extract the imports block (between header and blank line before class)
+        # Simpler assertion: ensure 'import zzz.module' occurs before first 'from ' line.
+        imports_section = output.splitlines()
+        import_lines = [l for l in imports_section if l.strip().startswith(("import ", "from "))]
+        # There should be at least one import and one from import.
+        self.assertTrue(any(l.strip().startswith("import zzz.module") for l in import_lines))
+        # The first 'import ' line index should be less than any 'from ' line index.
+        first_import_index = next(i for i, l in enumerate(import_lines) if l.strip().startswith("import "))
+        first_from_index = next(i for i, l in enumerate(import_lines) if l.strip().startswith("from "))
+        self.assertLess(first_import_index, first_from_index)
+
+        MigrationWriter.unregister_serializer(tuple)
+
+    def test_merge_models_with_migrations(self):
+        """
+        If from django.db import models exists, it should be merged with
+        migrations into 'from django.db import migrations, models'.
+        """
+        injected_imports = {"from django.db import models"}
+        injected_value = ("Custom()", injected_imports)
+        MigrationWriter.register_serializer(tuple, _InjectingSerializer)
+
+        migration = self._make_migration_with_custom_arg(injected_value)
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        # Ensure the merged import line is present.
+        self.assertIn("from django.db import migrations, models", output)
+
+        MigrationWriter.unregister_serializer(tuple)
+
+    def test_migration_imports_comment_appended(self):
+        """
+        Imports that match the migration-import pattern (import <module>.<digit>...)
+        should be removed from the import list and recorded in the manual
+        porting comment block.
+        """
+        # Use an import that matches the regex pattern in writer:
+        # r"^import (.*)\.\d+[^\s]*$"
+        # e.g. import somepackage.0001_migrations.funcs
+        injected_imports = {"import somepackage.0001_migrations_funcs"}
+        injected_value = ("Custom()", injected_imports)
+        MigrationWriter.register_serializer(tuple, _InjectingSerializer)
+
+        migration = self._make_migration_with_custom_arg(injected_value)
+        writer = MigrationWriter(migration)
+        writer_output = writer.as_string()
+
+        # The import should not appear as a normal import.
+        self.assertNotIn("import somepackage.0001_migrations_funcs", writer_output)
+        # Instead, the manual copying comment block should reference the module name
+        self.assertIn("# Functions from the following migrations need manual copying.", writer_output)
+        # And should include the module portion (after 'import ')
+        self.assertIn("somepackage.0001_migrations_funcs", writer_output)
+
+        MigrationWriter.unregister_serializer(tuple)
+
+    def test_sorting_by_module_name_with_multiple_imports(self):
+        """
+        When multiple 'import' statements exist, they should be sorted by the module
+        name (i.e., the token after 'import ').
+        """
+        injected_imports = {
+            "import zzz",
+            "import aaa.module",
+            "import mmm",
+        }
+        injected_value = ("Custom()", injected_imports)
+        MigrationWriter.register_serializer(tuple, _InjectingSerializer)
+
+        migration = self._make_migration_with_custom_arg(injected_value)
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        # Collect import lines
+        import_lines = [l.strip() for l in output.splitlines() if l.strip().startswith("import ")]
+        # They should be sorted by the module part: 'aaa.module', 'mmm', 'zzz'
+        self.assertEqual(import_lines, ["import aaa.module", "import mmm", "import zzz"])
+
+        MigrationWriter.unregister_serializer(tuple)
+
+    def test_serializer_provided_from_imports_sorted_after_imports(self):
+        """
+        Ensure that serializer-provided 'from ' imports are placed after 'import ' ones
+        and that multiple from-imports appear (order among them is deterministic in this test).
+        """
+        injected_imports = {
+            "import keep.first",
+            "from xpack import beta",
+            "from xpack import alpha",
+        }
+        injected_value = ("Custom()", injected_imports)
+        MigrationWriter.register_serializer(tuple, _InjectingSerializer)
+
+        migration = self._make_migration_with_custom_arg(injected_value)
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        lines = [l.strip() for l in output.splitlines() if l.strip().startswith(("import ", "from "))]
+        # First line should be the import line we injected.
+        self.assertTrue(lines[0].startswith("import keep.first"))
+        # All subsequent lines should start with 'from ' (i.e., from-imports)
+        self.assertTrue(all(l.startswith("from ") for l in lines[1:]))
+
+        MigrationWriter.unregister_serializer(tuple)
+
+    def test_operation_writer_adds_import_for_custom_operation(self):
+        """
+        OperationWriter should add an import for an operation class defined outside
+        django.db.migrations (i.e., a custom operation).
+        """
+        # We will use tuple serializer to inject a benign import so that the
+        # OperationWriter still has at least one serializer-driven import.
+        injected_imports = {"import example.mod"}
+        injected_value = ("Custom()", injected_imports)
+        MigrationWriter.register_serializer(tuple, _InjectingSerializer)
+
+        migration = self._make_migration_with_custom_arg(injected_value)
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        # The operation class defined in this test module should be imported by module path.
+        # Since TestOp is local to the test function, OperationWriter will add an import
+        # like "import tests..." or similar. We assert that our serializer import is present too.
+        self.assertIn("import example.mod", output)
+
+        MigrationWriter.unregister_serializer(tuple)
+
+    def test_no_models_import_when_unused(self):
+        """
+        If serializers provide no django models import, ensure migrations import still
+        exists (the writer always adds 'from django.db import migrations').
+        """
+        injected_imports = {"import abc"}
+        injected_value = ("Custom()", injected_imports)
+        MigrationWriter.register_serializer(tuple, _InjectingSerializer)
+
+        migration = self._make_migration_with_custom_arg(injected_value)
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        self.assertIn("from django.db import migrations", output)
+
+        MigrationWriter.unregister_serializer(tuple)
+
+    def test_multiple_mixed_imports_full_integration(self):
+        """
+        A mixed set of imports injected should produce a properly grouped and sorted
+        imports block, and include the migration header/class scaffolding.
+        """
+        injected_imports = {
+            "import zlib",
+            "from django.conf import settings",
+            "import datetime",
+            "from django.db import models",
+            "import time",
+        }
+        injected_value = ("Custom()", injected_imports)
+        MigrationWriter.register_serializer(tuple, _InjectingSerializer)
+
+        migration = self._make_migration_with_custom_arg(injected_value)
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+
+        # Ensure imports block contains expected merged django.db line
+        self.assertIn("from django.db import migrations, models", output)
+        # Ensure datetime and time import lines exist and are before the from django... lines
+        imports_block = [l for l in output.splitlines() if l.strip().startswith(("import ", "from "))]
+        # Identify index of first 'from django' line
+        from_django_idx = next(i for i, l in enumerate(imports_block) if "django" in l)
+        # All import lines before that index should be 'import ' lines
+        for l in imports_block[:from_django_idx]:
+            self.assertTrue(l.strip().startswith("import "))
+
+        MigrationWriter.unregister_serializer(tuple)
+
+    def test_unregister_serializer_cleans_up(self):
+        """
+        Ensure registering and unregistering a serializer works and that after
+        unregistering, serialization falls back (and may raise for unknown types).
+        """
+        injected_imports = {"import somepkg"}
+        injected_value = ("Custom()", injected_imports)
+        MigrationWriter.register_serializer(tuple, _InjectingSerializer)
+
+        # After registering, serialization should succeed (i.e., as_string runs).
+        migration = self._make_migration_with_custom_arg(injected_value)
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        self.assertIn("import somepkg", output)
+
+        MigrationWriter.unregister_serializer(tuple)
+
+        # After unregistering, attempting to call as_string for the same migration
+        # will attempt to serialize the tuple type and should raise ValueError.
+        with self.assertRaises(ValueError):
+            # The serializer for tuple is gone; MigrationWriter.serialize will error
+            # when encountering the tuple sentinel value.
+            MigrationWriter.serialize(injected_value)

@@ -1,0 +1,133 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests simulate various cgroup CPU quota/period and cpu.shares file contents by patching Path.is_file and builtins.open in the pylint.lint.run module. They assert that _query_cpu() never returns 0 for fractional/very small allotments (it should normalize a 0 available-CPU result to 1). They also test that _cpu_count() returns at least 1 in these scenarios, and that Run with --jobs=0 does not crash when quota/period would otherwise compute 0 CPUs.
+test_code: |
+  # tests/test_query_cpu_patch.py
+  # -*- coding: utf-8 -*-
+  from __future__ import annotations
+  import os
+  from unittest.mock import MagicMock, mock_open, patch
+  import pytest
+
+  from pylint.lint import run as run_mod
+  from pylint.testutils import GenericTestReporter as Reporter
+
+  def _make_path_mock(existing_files):
+      """Return a callable to patch pylint.lint.run.Path which responds to is_file()."""
+      def _mock_path(path):
+          # path can be passed as a string argument
+          return MagicMock(is_file=lambda: str(path) in existing_files)
+      return _mock_path
+
+  def _make_open_mock(mapping):
+      """Return a callable to patch builtins.open to return mapping[path] as file content."""
+      builtin_open = open
+      def _open(path, *args, **kwargs):
+          key = str(path)
+          if key in mapping:
+              # mock_open returns a callable that should be called to produce the file handle
+              return mock_open(read_data=str(mapping[key]))()
+          return builtin_open(path, *args, **kwargs)
+      return _open
+
+  @pytest.mark.parametrize(
+      "quota,period",
+      [
+          ("1", "1000000"),
+          ("500000", "1000000"),
+          ("0", "1000000"),
+          ("1023", "1000000"),
+      ],
+  )
+  def test_query_cpu_quota_period_fractional_results_in_at_least_one(quota, period):
+      """When quota/period computes < 1 cpu (==0), _query_cpu must return 1."""
+      mapping = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": quota,
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": period,
+      }
+      path_mock = _make_path_mock(set(mapping.keys()))
+      open_mock = _make_open_mock(mapping)
+      with patch("pylint.lint.run.Path", new=path_mock):
+          with patch("builtins.open", new=open_mock):
+              assert run_mod._query_cpu() == 1
+
+  @pytest.mark.parametrize("shares", ["1", "2", "1023"])
+  def test_query_cpu_shares_small_values_return_one(shares):
+      """Very small cpu.shares values that would compute to 0 must be normalized to 1."""
+      mapping = {
+          "/sys/fs/cgroup/cpu/cpu.shares": shares,
+      }
+      path_mock = _make_path_mock(set(mapping.keys()))
+      open_mock = _make_open_mock(mapping)
+      with patch("pylint.lint.run.Path", new=path_mock):
+          with patch("builtins.open", new=open_mock):
+              assert run_mod._query_cpu() == 1
+
+  def test_cpu_count_with_sched_getaffinity_and_fractional_quota_returns_at_least_one():
+      """If sched_getaffinity reports 2 CPUs but quota/period would yield 0, _cpu_count returns 1."""
+      mapping = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "1",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "1000000",
+      }
+      path_mock = _make_path_mock(set(mapping.keys()))
+      open_mock = _make_open_mock(mapping)
+      # Force sched_getaffinity to exist and report 2 CPUs.
+      with patch("pylint.lint.run.Path", new=path_mock):
+          with patch("builtins.open", new=open_mock):
+              with patch.object(os, "sched_getaffinity", new=lambda pid: {0, 1}):
+                  assert run_mod._cpu_count() >= 1
+
+  def test_cpu_count_with_multiprocessing_and_fractional_quota_returns_at_least_one():
+      """If multiprocessing reports multiple CPUs but quota/period yields 0, _cpu_count returns 1."""
+      mapping = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "500000",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "1000000",
+      }
+      path_mock = _make_path_mock(set(mapping.keys()))
+      open_mock = _make_open_mock(mapping)
+      fake_mp = MagicMock()
+      fake_mp.cpu_count.return_value = 4
+      # Ensure os.sched_getaffinity is absent in this test
+      with patch("pylint.lint.run.Path", new=path_mock):
+          with patch("builtins.open", new=open_mock):
+              with patch.object(os, "sched_getaffinity", new=None):
+                  with patch("pylint.lint.run.multiprocessing", new=fake_mp):
+                      assert run_mod._cpu_count() >= 1
+
+  def test_query_cpu_quota_that_yields_two_returns_two():
+      """Sanity check: when quota/period yields >1, the value is returned unchanged."""
+      mapping = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "2000000",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "1000000",
+      }
+      path_mock = _make_path_mock(set(mapping.keys()))
+      open_mock = _make_open_mock(mapping)
+      with patch("pylint.lint.run.Path", new=path_mock):
+          with patch("builtins.open", new=open_mock):
+              assert run_mod._query_cpu() == 2
+
+  def test_pylint_run_jobs_equal_zero_with_quota_fraction_does_not_crash(tmp_path):
+      """Run(...) with --jobs=0 should not crash when quota/period would compute 0 CPUs."""
+      # Use a small python package path to lint (file path argument required by Run)
+      pkg_file = str(tmp_path / "module.py")
+      pkg_file_path = pkg_file
+      # create a dummy module file
+      with open(pkg_file_path, "w", encoding="utf-8") as fh:
+          fh.write("x = 1\n")
+      mapping = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "1",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "1000000",
+      }
+      path_mock = _make_path_mock(set(mapping.keys()))
+      open_mock = _make_open_mock(mapping)
+      # Run with args [filepath, "--jobs=0"]
+      args = [pkg_file_path, "--jobs=0"]
+      with patch("pylint.lint.run.Path", new=path_mock):
+          with patch("builtins.open", new=open_mock):
+              with pytest.raises(SystemExit) as exc:
+                  run_mod.Run(args, reporter=Reporter())
+              # Expect a zero exit code (successful run)
+              assert exc.value.code == 0
+new_imports_code: |
+  from pylint.lint import run as run_mod
+  from pylint.testutils import GenericTestReporter as Reporter

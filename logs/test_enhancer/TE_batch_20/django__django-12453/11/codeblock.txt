@@ -1,0 +1,161 @@
+import copy
+from unittest import mock
+from django.db import connections, DEFAULT_DB_ALIAS, connection
+from django.test import SimpleTestCase
+from ..models import Object, ObjectReference
+import contextlib
+
+def get_connection_copy():
+    # Duplicate the default connection like the tests in this module do.
+    test_connection = copy.copy(connections[DEFAULT_DB_ALIAS])
+    test_connection.settings_dict = copy.deepcopy(
+        connections[DEFAULT_DB_ALIAS].settings_dict
+    )
+    return test_connection
+
+
+class TestDeserializeConstraintChecks(SimpleTestCase):
+    databases = {'default'}
+
+    SAMPLE_CIRCULAR_DATA = """
+    [
+        {
+            "model": "backends.object",
+            "pk": 1,
+            "fields": {"obj_ref": 1, "related_objects": []}
+        },
+        {
+            "model": "backends.objectreference",
+            "pk": 1,
+            "fields": {"obj": 1}
+        }
+    ]
+    """
+
+    def test_constraint_checks_disabled_used_default_connection(self):
+        entered = []
+
+        class CM:
+            def __enter__(self_inner):
+                entered.append('enter')
+            def __exit__(self_inner, exc_type, exc, tb):
+                entered.append('exit')
+
+        with mock.patch.object(connection, 'constraint_checks_disabled', new=lambda: CM()):
+            with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                # Should not raise
+                connection.creation.deserialize_db_from_string(self.SAMPLE_CIRCULAR_DATA)
+                # Ensure the context manager was entered and exited
+                self.assertEqual(entered, ['enter', 'exit'])
+                mocked_check.assert_called_once()
+
+    def test_check_constraints_called_default_connection(self):
+        with mock.patch.object(connection, 'constraint_checks_disabled', new=contextlib.nullcontext):
+            with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                connection.creation.deserialize_db_from_string('[]')
+                mocked_check.assert_called_once()
+
+    def test_constraint_checks_disabled_used_nondefault_connection(self):
+        test_conn = get_connection_copy()
+        entered = []
+
+        class CM:
+            def __enter__(self_inner):
+                entered.append('enter')
+            def __exit__(self_inner, exc_type, exc, tb):
+                entered.append('exit')
+
+        with mock.patch.object(test_conn, 'constraint_checks_disabled', new=lambda: CM()):
+            with mock.patch.object(test_conn, 'check_constraints') as mocked_check:
+                # Use the creation tied to the copied connection
+                test_conn.creation.deserialize_db_from_string(self.SAMPLE_CIRCULAR_DATA)
+                self.assertEqual(entered, ['enter', 'exit'])
+                mocked_check.assert_called_once()
+
+    def test_check_constraints_called_nondefault_connection(self):
+        test_conn = get_connection_copy()
+        with mock.patch.object(test_conn, 'constraint_checks_disabled', new=contextlib.nullcontext):
+            with mock.patch.object(test_conn, 'check_constraints') as mocked_check:
+                test_conn.creation.deserialize_db_from_string('[]')
+                mocked_check.assert_called_once()
+
+    def test_deserialize_calls_constraint_checks_with_circular_data(self):
+        with mock.patch.object(connection, 'constraint_checks_disabled', new=contextlib.nullcontext):
+            with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                connection.creation.deserialize_db_from_string(self.SAMPLE_CIRCULAR_DATA)
+                mocked_check.assert_called_once()
+
+    def test_deserialize_calls_constraint_checks_with_multiple_objects(self):
+        data = """
+        [
+            {"model": "backends.objectreference", "pk": 2, "fields": {"obj": 2}},
+            {"model": "backends.object", "pk": 2, "fields": {"obj_ref": 2, "related_objects": []}}
+        ]
+        """
+        with mock.patch.object(connection, 'constraint_checks_disabled', new=contextlib.nullcontext):
+            with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                connection.creation.deserialize_db_from_string(data)
+                mocked_check.assert_called_once()
+
+    def test_serialize_deserialize_roundtrip_triggers_check_constraints(self):
+        # Create a couple of objects, serialize and then deserialize into a fresh DB state
+        obj = Object.objects.create()  # create one object
+        obj_ref = ObjectReference.objects.create(obj=obj)
+
+        serialized = connection.creation.serialize_db_to_string()
+        # Clear DB to ensure deserialization is doing the work
+        Object.objects.all().delete()
+        ObjectReference.objects.all().delete()
+
+        with mock.patch.object(connection, 'constraint_checks_disabled', new=contextlib.nullcontext):
+            with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                connection.creation.deserialize_db_from_string(serialized)
+                mocked_check.assert_called_once()
+                # Ensure objects were restored
+                self.assertEqual(Object.objects.count(), 1)
+                self.assertEqual(ObjectReference.objects.count(), 1)
+
+    def test_check_constraints_called_exactly_once(self):
+        with mock.patch.object(connection, 'constraint_checks_disabled', new=contextlib.nullcontext):
+            with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                connection.creation.deserialize_db_from_string(self.SAMPLE_CIRCULAR_DATA)
+                mocked_check.assert_called_once()
+
+    def test_constraint_checks_disabled_entered_before_any_model_save(self):
+        events = []
+
+        # Wrap the original save methods to record the order of saves
+        orig_obj_save = Object.save
+        orig_objref_save = ObjectReference.save
+
+        def obj_save(self, *args, **kwargs):
+            events.append('save:Object')
+            return orig_obj_save(self, *args, **kwargs)
+
+        def objref_save(self, *args, **kwargs):
+            events.append('save:ObjectReference')
+            return orig_objref_save(self, *args, **kwargs)
+
+        class CM:
+            def __enter__(self_inner):
+                events.append('enter_constraint_cm')
+            def __exit__(self_inner, exc_type, exc, tb):
+                events.append('exit_constraint_cm')
+
+        with mock.patch.object(Object, 'save', new=obj_save), \
+             mock.patch.object(ObjectReference, 'save', new=objref_save), \
+             mock.patch.object(connection, 'constraint_checks_disabled', new=lambda: CM()), \
+             mock.patch.object(connection, 'check_constraints') as mocked_check:
+            connection.creation.deserialize_db_from_string(self.SAMPLE_CIRCULAR_DATA)
+
+        # Ensure the constraint CM enter happened before saves
+        self.assertTrue(events.index('enter_constraint_cm') < events.index('save:Object'))
+        self.assertTrue(events.index('enter_constraint_cm') < events.index('save:ObjectReference'))
+        mocked_check.assert_called_once()
+
+    def test_empty_payload_still_calls_check_constraints(self):
+        # Even with no objects, we should call check_constraints after deserialization
+        with mock.patch.object(connection, 'constraint_checks_disabled', new=contextlib.nullcontext):
+            with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                connection.creation.deserialize_db_from_string('[]')
+                mocked_check.assert_called_once()

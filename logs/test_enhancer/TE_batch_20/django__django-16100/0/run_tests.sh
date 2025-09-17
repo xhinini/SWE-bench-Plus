@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.tests_llm.ChangelistAtomicUsageTests._atomic_cm admin_changelist.tests_llm.ChangelistAtomicUsageTests._changelist_url admin_changelist.tests_llm.ChangelistAtomicUsageTests._setup_swallow_objs admin_changelist.tests_llm.ChangelistAtomicUsageTests.test_atomic_called_with_using_even_if_no_changecount admin_changelist.tests_llm.ChangelistAtomicUsageTests.test_atomic_called_with_using_multiple_forms_changed admin_changelist.tests_llm.ChangelistAtomicUsageTests.test_atomic_called_with_using_on_changes admin_changelist.tests_llm.ChangelistAtomicUsageTests.test_atomic_called_with_using_on_mixed_validity admin_changelist.tests_llm.ChangelistAtomicUsageTests.test_atomic_called_with_using_single_change admin_changelist.tests_llm.ChangelistAtomicUsageTests.test_atomic_called_with_using_when_index_and_action_present admin_changelist.tests_llm.ChangelistAtomicUsageTests.test_atomic_called_with_using_when_log_change_raises admin_changelist.tests_llm.ChangelistAtomicUsageTests.test_atomic_called_with_using_when_no_changes admin_changelist.tests_llm.ChangelistAtomicUsageTests.test_atomic_called_with_using_when_save_related_raises
+coverage json -o coverage.json
+: '>>>>> End Test Output'

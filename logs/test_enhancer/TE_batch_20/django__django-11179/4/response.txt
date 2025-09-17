@@ -1,0 +1,151 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests assert that when a single model instance is fast-deleted (the optimized single-object path in Collector.delete),
+the in-memory instance's primary key attribute is set to None. They cover various scenarios: Model.delete(), using Collector directly,
+models with non-integer/custom primary keys created dynamically, deletion when signals are connected (to force the non-fast path),
+deletion of related objects (Avatar/User relationship), and using Collector.collect/delete directly. The tests would fail if the special-case
+single-object fast-delete path does not clear the instance's primary key.
+test_code: |
+  from django.db import connection, models
+  from django.db.models.deletion import Collector
+  from django.db import transaction, connections
+  from django.test import TestCase
+  from django.db import models as dj_models
+  
+  # Reuse existing models from the tests package when available.
+  try:
+      from .models import User, Avatar
+  except Exception:
+      # If the local models import path isn't available in this context,
+      # import from the test app registry used by the project's tests.
+      from tests.delete.models import User, Avatar
+  
+  
+  class DeletionRegressionTests(TestCase):
+      def test_model_delete_single_instance_sets_pk_to_none(self):
+          u = User.objects.create()
+          # Ensure the instance is fast-deletable and that Model.delete clears pk.
+          self.assertTrue(u.pk is not None)
+          u.delete()
+          self.assertIsNone(u.pk)
+  
+      def test_model_delete_single_instance_with_signal_listeners_still_sets_pk_none(self):
+          # Attach a pre_delete listener so fast-delete is not possible and the
+          # non-fast path is exercised. The instance's pk should still be set to None.
+          calls = []
+  
+          def noop(sender, **kwargs):
+              calls.append(sender)
+  
+          models.signals.pre_delete.connect(noop, sender=User)
+          try:
+              u = User.objects.create()
+              u.delete()
+              self.assertIsNone(u.pk)
+              self.assertTrue(calls)  # ensure listener was invoked
+          finally:
+              models.signals.pre_delete.disconnect(noop, sender=User)
+  
+      def test_queryset_delete_single_object_sets_pk_none_when_using_collector_directly(self):
+          u = User.objects.create()
+          coll = Collector(using='default')
+          # Collector.collect expects an iterable of model instances.
+          coll.collect([u])
+          # Now delete via collector (triggers the optimized single-object path).
+          deleted_count, deleted_dict = coll.delete()
+          self.assertEqual(deleted_count, 1)
+          # After deletion, the in-memory instance should have pk set to None.
+          self.assertIsNone(u.pk)
+          label = u._meta.label
+          self.assertIn(label, deleted_dict)
+  
+      def test_fast_delete_related_avatar_user_clears_avatar_pk(self):
+          a = Avatar.objects.create(desc='x')
+          # Ensure at least one user references the avatar so the avatar delete cascades/fast-deletes users.
+          User.objects.create(avatar=a)
+          a.delete()
+          # The avatar instance used to call delete() should have its pk set to None.
+          self.assertIsNone(a.pk)
+  
+      def test_dynamic_model_with_custom_char_primary_key_has_pk_cleared_on_delete(self):
+          # Create a dynamic model with a CharField primary key and ensure its pk is cleared.
+          attrs = {
+              '__module__': __name__,
+              'code': dj_models.CharField(max_length=36, primary_key=True),
+              'name': dj_models.CharField(max_length=30, blank=True),
+              'Meta': type('Meta', (), {'app_label': 'tests', 'managed': True}),
+          }
+          Custom = type('CustomPKModel', (dj_models.Model,), attrs)
+          # Create the db table for the dynamic model.
+          with connection.schema_editor() as schema_editor:
+              schema_editor.create_model(Custom)
+          try:
+              inst = Custom.objects.create(code='pk1', name='n')
+              self.assertIsNotNone(inst.pk)
+              inst.delete()
+              self.assertIsNone(inst.pk)
+          finally:
+              # Clean up the table to avoid side effects on other tests.
+              with connection.schema_editor() as schema_editor:
+                  schema_editor.delete_model(Custom)
+  
+      def test_collector_collect_then_delete_single_instance_clears_pk(self):
+          # Another direct Collector path: collect a single instance as an iterable (not via Model.delete())
+          u = User.objects.create()
+          coll = Collector(using='default')
+          # collect() can accept a homogeneous iterable of model instances
+          coll.collect([u])
+          # delete should use optimized path and clear pk
+          deleted_count, deleted_dict = coll.delete()
+          self.assertEqual(deleted_count, 1)
+          self.assertIsNone(u.pk)
+  
+      def test_delete_return_value_and_pk_cleared_for_single_instance(self):
+          # Ensure delete() returns correct tuple and clears the instance pk.
+          a = Avatar.objects.create(desc='y')
+          deleted, detail = a.delete()
+          # For a single avatar with no extra related rows, deleted >= 1
+          self.assertGreaterEqual(deleted, 1)
+          self.assertIsNone(a.pk)
+          self.assertIn(Avatar._meta.label, detail)
+  
+      def test_multiple_deletes_do_not_leave_inmemory_pk_for_single_instance_optimised_path(self):
+          # Ensure that when only a single instance is present in the collector data,
+          # the optimized path both deletes and clears the pk.
+          u = User.objects.create()
+          # Simulate the internal collector state as if Model.delete would.
+          collector = Collector(using='default')
+          collector.collect([u])
+          deleted_count, deleted_dict = collector.delete()
+          self.assertEqual(deleted_count, 1)
+          self.assertIsNone(u.pk)
+  
+      def test_delete_on_instance_with_non_integer_pk_field_is_cleared(self):
+          # Create a dynamic model with a UUID-like char pk to ensure generic pk handling.
+          attrs = {
+              '__module__': __name__,
+              'uid': dj_models.CharField(max_length=64, primary_key=True),
+              'Meta': type('Meta', (), {'app_label': 'tests', 'managed': True}),
+          }
+          Dyn = type('DynPKModel', (dj_models.Model,), attrs)
+          with connection.schema_editor() as schema_editor:
+              schema_editor.create_model(Dyn)
+          try:
+              inst = Dyn.objects.create(uid='u-1')
+              inst.delete()
+              self.assertIsNone(inst.pk)
+          finally:
+              with connection.schema_editor() as schema_editor:
+                  schema_editor.delete_model(Dyn)
+  
+      def test_model_delete_clears_pk_when_only_one_row_exists_even_with_multiple_tables(self):
+          # Use Avatar which may have related fast-deletes; ensure that calling delete()
+          # on a single instance clears its pk after operation completes.
+          a = Avatar.objects.create(desc='multi')
+          # Create a referencing user to exercise related fast-delete resolution.
+          User.objects.create(avatar=a)
+          a.delete()
+          self.assertIsNone(a.pk)
+new_imports_code: |
+  from django.db import connection, models as dj_models, models
+  from django.db.models.deletion import Collector

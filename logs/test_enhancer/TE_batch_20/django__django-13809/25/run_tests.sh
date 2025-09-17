@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.RunserverSkipChecksTests.setUp admin_scripts.tests_llm.RunserverSkipChecksTests.test_multiple_invocations_consistent_behavior admin_scripts.tests_llm.RunserverSkipChecksTests.test_no_unwanted_skip_message_even_when_migrations_pending admin_scripts.tests_llm.RunserverSkipChecksTests.test_skip_checks_calls_check_migrations admin_scripts.tests_llm.RunserverSkipChecksTests.test_skip_checks_does_not_print_skipping_message admin_scripts.tests_llm.RunserverSkipChecksTests.test_skip_checks_false_calls_both_check_and_check_migrations admin_scripts.tests_llm.RunserverSkipChecksTests.test_skip_checks_false_prints_performing_system_checks admin_scripts.tests_llm.RunserverSkipChecksTests.test_skip_checks_true_prevents_check_but_still_calls_check_migrations admin_scripts.tests_llm.RunserverSkipChecksTests.test_skip_checks_true_shows_migration_message_when_pending admin_scripts.tests_llm.RunserverSkipChecksTests.test_skip_checks_with_threading_true_still_calls_check_migrations
+coverage json -o coverage.json
+: '>>>>> End Test Output'

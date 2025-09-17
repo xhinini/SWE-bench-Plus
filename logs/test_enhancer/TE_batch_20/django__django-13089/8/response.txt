@@ -1,0 +1,228 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise DatabaseCache._cull() handling of the case where the cursor.fetchone() call (used to obtain the "last cache key" after running the culling SQL) returns None. The original buggy implementation unconditionally indexed cursor.fetchone()[0] and raised an exception when None was returned. The tests verify that no exception is raised and that no DELETE by cache_key < ... is attempted when the culling query returns no row. They also check the complementary case where a last cache key is returned and a deletion is performed, plus a few related edge cases.
+test_code: |
+  from django.core import management
+  from django.core.cache import caches
+  from django.db import router, connections
+  from django.test import TransactionTestCase, override_settings
+  from django.utils import timezone
+  
+  # Reuse the same settings used by DBCacheTests in the original test module.
+  @override_settings(CACHES={
+      'default': {
+          'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
+          # Spaces are used in the table name to ensure quoting/escaping is working
+          'LOCATION': 'test cache table'
+      },
+      # include the 'cull' cache to match the helper settings used elsewhere
+      'cull': {'BACKEND': 'django.core.cache.backends.db.DatabaseCache', 'LOCATION': 'test cache table',
+               'OPTIONS': {'MAX_ENTRIES': 30}},
+  })
+  class CullRegressionTests(TransactionTestCase):
+      available_apps = ['cache']
+  
+      def setUp(self):
+          super().setUp()
+          management.call_command('createcachetable', verbosity=0)
+  
+      def tearDown(self):
+          # Drop the table created for the tests.
+          table_name = connections['default'].ops.quote_name('test cache table')
+          with connections['default'].cursor() as cursor:
+              cursor.execute('DROP TABLE %s' % table_name)
+          super().tearDown()
+  
+      class MockCursor:
+          def __init__(self, fetchone_results):
+              # fetchone_results: list of values to be returned by subsequent fetchone() calls
+              self._fetchone_results = list(fetchone_results)
+              self.calls = []
+              self.rowcount = 0
+  
+          def execute(self, sql, params=None):
+              # Record the SQL and params for assertions.
+              self.calls.append((sql, params))
+              # If a delete is executed, simulate rowcount metadata.
+              if sql.strip().upper().startswith('DELETE'):
+                  # simulate that the delete ran but deleted zero or more rows
+                  self.rowcount = 1
+  
+          def fetchone(self):
+              if self._fetchone_results:
+                  return self._fetchone_results.pop(0)
+              return None
+  
+          def fetchall(self):
+              return []
+  
+      def _get_cull_cache(self):
+          # Return the cache configured for culling tests.
+          return caches['cull']
+  
+      def test__cull_no_last_cache_key_does_not_crash(self):
+          """
+          When the culling SQL returns no row (fetchone() -> None), _cull must not raise.
+          """
+          cull_cache = self._get_cull_cache()
+          db = router.db_for_write(cull_cache.cache_model_class)
+          # Force _cull logic to consider culling by setting a small max entries.
+          cull_cache._max_entries = 1
+          # Simulate: SELECT COUNT(*) -> (5,), cache_key_culling_sql -> None
+          mock_cursor = self.MockCursor([(5,), None])
+          now = timezone.now().replace(microsecond=0)
+          # Should not raise
+          cull_cache._cull(db, mock_cursor, now)
+          # Ensure no 'cache_key <' DELETE was attempted since there was no last_cache_key.
+          self.assertFalse(any('cache_key <' in sql for sql, params in mock_cursor.calls))
+  
+      def test__cull_no_last_cache_key_no_delete_called(self):
+          """
+          Ensure that when the culling SQL returns nothing, no final DELETE with
+          cache_key < ... is executed.
+          """
+          cull_cache = self._get_cull_cache()
+          db = router.db_for_write(cull_cache.cache_model_class)
+          cull_cache._max_entries = 2
+          mock_cursor = self.MockCursor([(10,), None])
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          # There should be at least the "DELETE FROM ... WHERE expires < %s" and the "SELECT COUNT(*) ..." calls,
+          # but NOT the "DELETE FROM ... WHERE cache_key < %s" call.
+          has_cull_delete = any('WHERE cache_key <' in (sql or '') for sql, params in mock_cursor.calls)
+          self.assertFalse(has_cull_delete)
+  
+      def test__cull_with_last_cache_key_executes_delete(self):
+          """
+          When the culling SQL yields a last cache key, a DELETE with 'cache_key < ...'
+          must be executed.
+          """
+          cull_cache = self._get_cull_cache()
+          db = router.db_for_write(cull_cache.cache_model_class)
+          cull_cache._max_entries = 1
+          mock_cursor = self.MockCursor([(5,), ('last-key',)])
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          # Find the delete-by-cache-key SQL and assert the parameter was passed.
+          found = False
+          for sql, params in mock_cursor.calls:
+              if sql and 'WHERE cache_key <' in sql:
+                  found = True
+                  # params should contain the last key returned by the culling SQL.
+                  self.assertEqual(params, ['last-key'])
+          self.assertTrue(found, "Expected a DELETE ... WHERE cache_key < ... to be executed")
+  
+      def test__cull_handles_cull_num_zero_without_deletion(self):
+          """
+          If the computed cull_num is zero and the culling SQL returns no row,
+          no deletion should be attempted and no exception occurs.
+          """
+          cull_cache = self._get_cull_cache()
+          db = router.db_for_write(cull_cache.cache_model_class)
+          # Set a large cull frequency so cull_num = num // cull_frequency == 0
+          cull_cache._cull_frequency = 1000
+          cull_cache._max_entries = 1
+          mock_cursor = self.MockCursor([(5,), None])
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          self.assertFalse(any('WHERE cache_key <' in (sql or '') for sql, params in mock_cursor.calls))
+  
+      def test__cull_deletes_with_none_element_in_last_cache_key_tuple(self):
+          """
+          If fetchone() returns a tuple where the first element is None (e.g. (None,)),
+          the code should still attempt the deletion with None as parameter (the DB
+          will behave accordingly). This ensures we only guard against fetchone() == None.
+          """
+          cull_cache = self._get_cull_cache()
+          db = router.db_for_write(cull_cache.cache_model_class)
+          cull_cache._max_entries = 1
+          # Last cache key is a tuple with None as its element.
+          mock_cursor = self.MockCursor([(5,), (None,)])
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          # The delete-by-cache-key should have been attempted with [None].
+          found = False
+          for sql, params in mock_cursor.calls:
+              if sql and 'WHERE cache_key <' in sql:
+                  found = True
+                  self.assertEqual(params, [None])
+          self.assertTrue(found)
+  
+      def test__cull_calls_culling_sql_with_proper_cull_num(self):
+          """
+          The culling SQL must be called with the correctly computed cull_num value.
+          """
+          cull_cache = self._get_cull_cache()
+          db = router.db_for_write(cull_cache.cache_model_class)
+          # Ensure num > _max_entries so culling is attempted
+          cull_cache._max_entries = 1
+          cull_cache._cull_frequency = 10
+          # num -> 100 so cull_num = 100 // 10 == 10
+          mock_cursor = self.MockCursor([(100,), ('last',)])
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          # Find the culling SQL call and ensure the parameter is 10.
+          found = False
+          for sql, params in mock_cursor.calls:
+              if sql and 'cache_key_culling' not in sql:  # some backends may not include this literal
+                  # We can't rely on the exact SQL string, so find the call with a single integer param.
+                  if params and isinstance(params[0], int) and params[0] == 10:
+                      found = True
+          self.assertTrue(found, "Expected the culling SQL to be called with cull_num == 10")
+  
+      def test__cull_does_nothing_if_count_below_threshold(self):
+          """
+          If the SELECT COUNT(*) result indicates the store is not over the max entries,
+          no culling SQL should be called.
+          """
+          cull_cache = self._get_cull_cache()
+          db = router.db_for_write(cull_cache.cache_model_class)
+          cull_cache._max_entries = 100
+          mock_cursor = self.MockCursor([(1,), ])  # count == 1, below _max_entries
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          # Only the expires delete and the count select should have been executed.
+          # Ensure no call attempted to run the culling SQL nor the final cache_key < delete.
+          self.assertEqual(len(mock_cursor.calls), 2)
+          self.assertFalse(any('WHERE cache_key <' in (sql or '') for sql, params in mock_cursor.calls))
+  
+      def test__cull_uses_quoted_table_name_in_count_sql(self):
+          """
+          The SELECT COUNT(*) SQL should include the properly quoted table name.
+          """
+          cull_cache = self._get_cull_cache()
+          db = router.db_for_write(cull_cache.cache_model_class)
+          mock_cursor = self.MockCursor([(0,), None])
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          # The second call is expected to be the SELECT COUNT(*) FROM <table>
+          # Validate the quoted table name is present in that SQL.
+          quoted_table = connections[db].ops.quote_name(cull_cache._table)
+          # Find the SELECT COUNT(*) call
+          count_call = None
+          for sql, params in mock_cursor.calls:
+              if sql and sql.strip().upper().startswith('SELECT COUNT(*)'):
+                  count_call = sql
+                  break
+          self.assertIsNotNone(count_call)
+          self.assertIn(quoted_table, count_call)
+  
+      def test__cull_calls_clear_when_cull_frequency_zero(self):
+          """
+          If _cull_frequency is zero, _cull should call clear() instead of performing
+          culling SQL operations.
+          """
+          cull_cache = self._get_cull_cache()
+          db = router.db_for_write(cull_cache.cache_model_class)
+          cull_cache._cull_frequency = 0
+          # Patch clear to observe calls
+          called = {'v': False}
+  
+          def fake_clear():
+              called['v'] = True
+          cull_cache.clear = fake_clear
+          # Use a cursor that would otherwise report many rows.
+          mock_cursor = self.MockCursor([(100,), ])
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          self.assertTrue(called['v'])

@@ -1,0 +1,1 @@
+from sympy import Symbol, symbols, coth, tanh, I, pi

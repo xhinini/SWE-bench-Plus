@@ -1,0 +1,241 @@
+from contextlib import contextmanager
+from django.db import router
+
+@override_settings(ROOT_URLCONF="admin_changelist.urls")
+class TransactionAtomicUsingTests(TestCase):
+    """
+    Tests that ensure changelist list_editable saving uses transaction.atomic()
+    with the correct 'using' argument (router.db_for_write(self.model)).
+    These tests capture calls to transaction.atomic and assert the expected
+    'using' kwarg was supplied.
+    """
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.superuser = User.objects.create_superuser(
+            username="txn_super", email="txn@tests", password="xxx"
+        )
+
+    def _build_swallow_post_data(self, a, b, change_form_indexes=("0", "1"), change_values=None, extra=None, follow_ordering=None):
+        """
+        Helper to build POST payload for Swallow changelist list_editable.
+        change_values is a list of tuples (load, speed) for the forms in order.
+        """
+        if change_values is None:
+            change_values = [(str(a.load), str(a.speed)), (str(b.load), str(b.speed))]
+        data = {
+            "form-TOTAL_FORMS": "2",
+            "form-INITIAL_FORMS": "2",
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "form-0-uuid": str(a.pk),
+            "form-1-uuid": str(b.pk),
+            "_save": "Save",
+        }
+        # populate provided change_values
+        data["form-0-load"], data["form-0-speed"] = change_values[0]
+        data["form-1-load"], data["form-1-speed"] = change_values[1]
+        if extra:
+            data.update(extra)
+        return data
+
+    def _capture_atomic_calls(self, perform_request_callable):
+        """
+        Patch transaction.atomic to capture kwargs from calls, then perform the request.
+        Returns the list of captured kwargs dicts.
+        """
+        calls = []
+
+        def fake_atomic(*args, **kwargs):
+            # record kwargs observed
+            calls.append(kwargs)
+            @contextmanager
+            def cm():
+                yield
+            return cm()
+
+        with mock.patch("django.db.transaction.atomic", fake_atomic):
+            perform_request_callable()
+
+        return calls
+
+    def test_atomic_called_with_using_on_changelist_save(self):
+        a = Swallow.objects.create(origin="Swallow A", load=4, speed=1)
+        b = Swallow.objects.create(origin="Swallow B", load=2, speed=2)
+        self.client.force_login(self.superuser)
+        changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+        data = self._build_swallow_post_data(a, b, change_values=[("9.0", "3.0"), ("5.0", "1.0")])
+
+        def do_post():
+            # Perform the POST without expecting exceptions.
+            response = self.client.post(changelist_url, data)
+            # Expect 200 or redirect depending on follow settings; avoid treating it as failure.
+            self.assertIn(response.status_code, (200, 302))
+
+        calls = self._capture_atomic_calls(do_post)
+        expected_using = router.db_for_write(Swallow)
+        # Assert that at least one atomic call included the expected 'using' kwarg.
+        self.assertTrue(any(c.get("using") == expected_using for c in calls),
+                        msg="transaction.atomic was not called with using=%r; calls=%r" % (expected_using, calls))
+
+    def test_atomic_called_with_using_when_log_change_raises(self):
+        a = Swallow.objects.create(origin="Swallow A", load=4, speed=1)
+        b = Swallow.objects.create(origin="Swallow B", load=2, speed=2)
+        self.client.force_login(self.superuser)
+        changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+        data = self._build_swallow_post_data(a, b, change_values=[("9.0", "3.0"), ("5.0", "1.0")])
+
+        def do_post_raising():
+            # Patch log_change to raise an error during save to force rollback path.
+            with mock.patch("django.contrib.admin.ModelAdmin.log_change", side_effect=DatabaseError):
+                # We expect DatabaseError to bubble out.
+                with self.assertRaises(DatabaseError):
+                    self.client.post(changelist_url, data)
+
+        calls = self._capture_atomic_calls(do_post_raising)
+        expected_using = router.db_for_write(Swallow)
+        self.assertTrue(any(c.get("using") == expected_using for c in calls),
+                        msg="transaction.atomic was not called with using=%r during exception; calls=%r" % (expected_using, calls))
+
+    def test_atomic_called_with_using_when_only_one_form_changed(self):
+        a = Swallow.objects.create(origin="Swallow A", load=4, speed=1)
+        b = Swallow.objects.create(origin="Swallow B", load=2, speed=2)
+        self.client.force_login(self.superuser)
+        changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+        # Only change first form
+        data = self._build_swallow_post_data(a, b, change_values=[("9.0", "3.0"), (str(b.load), str(b.speed))])
+
+        def do_post():
+            response = self.client.post(changelist_url, data)
+            self.assertIn(response.status_code, (200, 302))
+
+        calls = self._capture_atomic_calls(do_post)
+        expected_using = router.db_for_write(Swallow)
+        self.assertTrue(any(c.get("using") == expected_using for c in calls),
+                        msg="transaction.atomic was not called with using=%r when only one form changed; calls=%r" % (expected_using, calls))
+
+    def test_atomic_called_with_using_when_no_form_changed(self):
+        """
+        If no forms are changed but formset.is_valid() is True, the atomic
+        block should still be entered (the code opens the atomic context
+        before the loop).
+        """
+        a = Swallow.objects.create(origin="Swallow A", load=4, speed=1)
+        b = Swallow.objects.create(origin="Swallow B", load=2, speed=2)
+        self.client.force_login(self.superuser)
+        changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+        # No changes from current DB values
+        data = self._build_swallow_post_data(a, b, change_values=[(str(a.load), str(a.speed)), (str(b.load), str(b.speed))])
+
+        def do_post():
+            response = self.client.post(changelist_url, data)
+            self.assertIn(response.status_code, (200, 302))
+
+        calls = self._capture_atomic_calls(do_post)
+        expected_using = router.db_for_write(Swallow)
+        self.assertTrue(any(c.get("using") == expected_using for c in calls),
+                        msg="transaction.atomic was not called with using=%r when no form changed; calls=%r" % (expected_using, calls))
+
+    def test_atomic_called_with_using_for_multiple_changed_forms(self):
+        a = Swallow.objects.create(origin="Swallow A", load=4, speed=1)
+        b = Swallow.objects.create(origin="Swallow B", load=2, speed=2)
+        c = Swallow.objects.create(origin="Swallow C", load=5, speed=5)
+        # Increase the form count to simulate more changed forms
+        self.client.force_login(self.superuser)
+        changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+        data = {
+            "form-TOTAL_FORMS": "3",
+            "form-INITIAL_FORMS": "3",
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "form-0-uuid": str(a.pk),
+            "form-1-uuid": str(b.pk),
+            "form-2-uuid": str(c.pk),
+            "form-0-load": "9.0",
+            "form-0-speed": "3.0",
+            "form-1-load": "5.0",
+            "form-1-speed": "1.0",
+            "form-2-load": "7.0",
+            "form-2-speed": "6.0",
+            "_save": "Save",
+        }
+
+        def do_post():
+            response = self.client.post(changelist_url, data)
+            self.assertIn(response.status_code, (200, 302))
+
+        calls = self._capture_atomic_calls(do_post)
+        expected_using = router.db_for_write(Swallow)
+        self.assertTrue(any(c.get("using") == expected_using for c in calls),
+                        msg="transaction.atomic was not called with using=%r for multiple changed forms; calls=%r" % (expected_using, calls))
+
+    def test_atomic_called_with_using_when_log_change_raises_on_second_form(self):
+        """
+        Simulate log_change succeeding for the first form and raising for the second
+        (like the existing atomicity test). Ensure transaction.atomic was called with
+        the correct 'using' in that failure scenario.
+        """
+        a = Swallow.objects.create(origin="Swallow A", load=4, speed=1)
+        b = Swallow.objects.create(origin="Swallow B", load=2, speed=2)
+        self.client.force_login(self.superuser)
+        changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+        data = self._build_swallow_post_data(a, b, change_values=[("9.0", "3.0"), ("5.0", "1.0")])
+
+        def do_post_raising_second():
+            # log_change will succeed once and then raise
+            with mock.patch(
+                "django.contrib.admin.ModelAdmin.log_change",
+                side_effect=[None, DatabaseError],
+            ):
+                with self.assertRaises(DatabaseError):
+                    self.client.post(changelist_url, data)
+
+        calls = self._capture_atomic_calls(do_post_raising_second)
+        expected_using = router.db_for_write(Swallow)
+        self.assertTrue(any(c.get("using") == expected_using for c in calls),
+                        msg="transaction.atomic was not called with using=%r when second log_change raised; calls=%r" % (expected_using, calls))
+
+    def test_atomic_called_with_using_with_ordering_param(self):
+        """
+        Ensure atomic is called with correct using even when the request
+        includes ordering GET params (the view handles 'o' in the response).
+        """
+        a = Swallow.objects.create(origin="Swallow A", load=4, speed=1)
+        b = Swallow.objects.create(origin="Swallow B", load=2, speed=2)
+        self.client.force_login(self.superuser)
+        changelist_url = reverse("admin:admin_changelist_swallow_changelist") + "?o=-2"
+        data = self._build_swallow_post_data(a, b, change_values=[("9.0", "3.0"), ("5.0", "1.0")])
+
+        def do_post():
+            response = self.client.post(changelist_url, data, follow=True)
+            self.assertIn(response.status_code, (200, 302))
+
+        calls = self._capture_atomic_calls(do_post)
+        expected_using = router.db_for_write(Swallow)
+        self.assertTrue(any(c.get("using") == expected_using for c in calls),
+                        msg="transaction.atomic was not called with using=%r when ordering param present; calls=%r" % (expected_using, calls))
+
+    def test_atomic_called_with_using_when_action_selected_but_save_pressed(self):
+        """
+        If an action is selected but the Save button is pressed, the view warns.
+        However, the list_editable save handling still performs atomic calls on save.
+        """
+        Parent.objects.create(name="parent")  # ensure at least one parent exists
+        # Use Swallow changelist to test atomic invocation as that is where bulk-edit saving is handled
+        a = Swallow.objects.create(origin="Swallow A", load=4, speed=1)
+        b = Swallow.objects.create(origin="Swallow B", load=2, speed=2)
+        self.client.force_login(self.superuser)
+        changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+        data = self._build_swallow_post_data(a, b, change_values=[("9.0", "3.0"), ("5.0", "1.0")])
+        # Simulate an action being selected but Save being pressed instead of Go.
+        data.update({"action": "delete_selected"})
+
+        def do_post():
+            response = self.client.post(changelist_url, data)
+            # The view may present a warning and return 200
+            self.assertIn(response.status_code, (200, 302))
+
+        calls = self._capture_atomic_calls(do_post)
+        expected_using = router.db_for_write(Swallow)
+        self.assertTrue(any(c.get("using") == expected_using for c in calls),
+                        msg="transaction.atomic was not called with using=%r when action selected and save pressed; calls=%r" % (expected_using, calls))

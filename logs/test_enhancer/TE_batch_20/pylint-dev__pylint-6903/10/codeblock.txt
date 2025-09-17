@@ -1,0 +1,223 @@
+# No additional top-level imports required beyond those included in the test file.
+# Licensed under the GPL: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+# For details: https://github.com/PyCQA/pylint/blob/main/LICENSE
+# Copyright (c) https://github.com/PyCQA/pylint/blob/main/CONTRIBUTORS.txt
+# pylint: disable=missing-module-docstring, missing-function-docstring, redefined-outer-name
+
+from __future__ import annotations
+
+import os
+import pathlib
+import sys
+from collections.abc import Callable
+from unittest.mock import MagicMock, mock_open, patch
+
+import pytest
+from py._path.local import LocalPath  # type: ignore[import]
+
+from pylint.lint import Run
+from pylint.lint.run import _query_cpu
+from pylint.testutils import GenericTestReporter as Reporter
+
+
+def _make_path_mock(true_paths: set[str]):
+    """Return a Path factory that reports is_file True for entries in true_paths."""
+    real_path = pathlib.Path
+
+    def _mock_path(arg, *args, **kwargs):
+        if arg in true_paths:
+            return MagicMock(is_file=lambda: True)
+        return real_path(arg, *args, **kwargs)
+
+    return _mock_path
+
+
+def _open_factory(contents: dict[str, str]):
+    """Return an open replacement that serves provided file contents."""
+    real_open = open
+
+    def _mock_open(*args, **kwargs):
+        filename = args[0]
+        if filename in contents:
+            return mock_open(read_data=contents[filename])(*args, **kwargs)
+        return real_open(*args, **kwargs)
+
+    return _mock_open
+
+
+@pytest.mark.parametrize("cpu_quota,cpu_period", [("50000", "100000"), ("0", "100000")])
+def test_jobs_zero_with_quota_fractional_cpu(tmpdir: LocalPath, cpu_quota: str, cpu_period: str) -> None:
+    """
+    When cfs_quota_us / cfs_period_us yields 0 (fractional CPU), _query_cpu should
+    normalize to at least 1 CPU and Run(..., --jobs=0) must not crash. This
+    catches the case where only the quota/period branch produced avail_cpu == 0.
+    """
+    contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": cpu_quota + "\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": cpu_period + "\n",
+    }
+    with tmpdir.as_cwd():
+        with patch("builtins.open", _open_factory(contents)):
+            with patch("pylint.lint.run.Path", _make_path_mock(set(contents.keys()))):
+                # Ensure multiprocessing.cpu_count is available and >0
+                fake_mp = MagicMock()
+                fake_mp.cpu_count.return_value = 4
+                with patch("pylint.lint.run.multiprocessing", fake_mp):
+                    testargs = [os.path.abspath(__file__), "--jobs=0"]
+                    with pytest.raises(SystemExit) as err:
+                        Run(testargs, reporter=Reporter())
+                    assert err.value.code == 0
+
+
+def test_jobs_zero_quota_wins_over_shares(tmpdir: LocalPath) -> None:
+    """
+    If both quota/period and shares present, quota branch must be used and
+    any zero result must be normalized to 1 CPU.
+    """
+    contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "50000\n",  # fractional -> 0
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+        "/sys/fs/cgroup/cpu/cpu.shares": "2\n",  # would also produce 0
+    }
+    with tmpdir.as_cwd():
+        with patch("builtins.open", _open_factory(contents)):
+            with patch("pylint.lint.run.Path", _make_path_mock(set(contents.keys()))):
+                fake_mp = MagicMock()
+                fake_mp.cpu_count.return_value = 8
+                with patch("pylint.lint.run.multiprocessing", fake_mp):
+                    testargs = [os.path.abspath(__file__), "--jobs=0"]
+                    with pytest.raises(SystemExit) as err:
+                        Run(testargs, reporter=Reporter())
+                    assert err.value.code == 0
+
+
+def test_jobs_zero_with_shares_fractional_cpu(tmpdir: LocalPath) -> None:
+    """
+    If cpu.shares yields a fractional CPU (small shares), must be normalized to 1.
+    This is similar to an existing test, included for completeness.
+    """
+    contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",  # invalid, so ignore quota branch
+        "/sys/fs/cgroup/cpu/cpu.shares": "2\n",  # 2/1024 -> 0 => should normalize to 1
+    }
+    with tmpdir.as_cwd():
+        with patch("builtins.open", _open_factory(contents)):
+            with patch("pylint.lint.run.Path", _make_path_mock(set(contents.keys()))):
+                fake_mp = MagicMock()
+                fake_mp.cpu_count.return_value = 4
+                with patch("pylint.lint.run.multiprocessing", fake_mp):
+                    testargs = [os.path.abspath(__file__), "--jobs=0"]
+                    with pytest.raises(SystemExit) as err:
+                        Run(testargs, reporter=Reporter())
+                    assert err.value.code == 0
+
+
+def test_query_cpu_directly_normalizes_zero_from_quota_and_period() -> None:
+    """
+    Call _query_cpu directly to ensure that a zero computed from quota/period
+    is normalized to 1 (this is the targeted bugfix).
+    """
+    contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "12345\n",  # < period
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    with patch("builtins.open", _open_factory(contents)):
+        with patch("pylint.lint.run.Path", _make_path_mock(set(contents.keys()))):
+            # No multiprocessing needed; _query_cpu should return 1
+            assert _query_cpu() == 1
+
+
+def test_query_cpu_prefers_quota_over_shares(tmpdir: LocalPath) -> None:
+    """
+    If quota is present (and not -1) and period is present, it must be used
+    even if cpu.shares is also present.
+    """
+    contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "250000\n",  # 2.5 -> int() -> 2
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+        "/sys/fs/cgroup/cpu/cpu.shares": "1\n",
+    }
+    with patch("builtins.open", _open_factory(contents)):
+        with patch("pylint.lint.run.Path", _make_path_mock(set(contents.keys()))):
+            assert _query_cpu() == 2
+
+
+def test_behavior_without_any_cgroup_files_uses_sched_affinity(tmpdir: LocalPath) -> None:
+    """
+    If no cgroup files are present, _cpu_count should rely on os.sched_getaffinity
+    if available. Here we patch sched_getaffinity to simulate 3 CPUs.
+    """
+    # No cgroup files present -> Path.is_file should be False for them
+    with tmpdir.as_cwd():
+        with patch("pylint.lint.run.Path", pathlib.Path):
+            # Patch sched_getaffinity to simulate 3 CPUs
+            with patch.object(os, "sched_getaffinity", lambda _: {0, 1, 2}):
+                fake_mp = MagicMock()
+                fake_mp.cpu_count.return_value = 99  # should not be used
+                with patch("pylint.lint.run.multiprocessing", fake_mp):
+                    testargs = [os.path.abspath(__file__), "--jobs=0"]
+                    with pytest.raises(SystemExit) as err:
+                        Run(testargs, reporter=Reporter())
+                    assert err.value.code == 0
+
+
+def test_behavior_without_sched_uses_multiprocessing_cpu_count(tmpdir: LocalPath) -> None:
+    """
+    If sched_getaffinity not available, fallback to multiprocessing.cpu_count().
+    """
+    with tmpdir.as_cwd():
+        with patch("pylint.lint.run.Path", pathlib.Path):
+            # Remove sched_getaffinity if present
+            if hasattr(os, "sched_getaffinity"):
+                with patch.object(os, "sched_getaffinity", None):
+                    fake_mp = MagicMock()
+                    fake_mp.cpu_count.return_value = 2
+                    with patch("pylint.lint.run.multiprocessing", fake_mp):
+                        testargs = [os.path.abspath(__file__), "--jobs=0"]
+                        with pytest.raises(SystemExit) as err:
+                            Run(testargs, reporter=Reporter())
+                        assert err.value.code == 0
+            else:
+                # If not present on the platform already, just ensure multiprocessing is used
+                fake_mp = MagicMock()
+                fake_mp.cpu_count.return_value = 2
+                with patch("pylint.lint.run.multiprocessing", fake_mp):
+                    testargs = [os.path.abspath(__file__), "--jobs=0"]
+                    with pytest.raises(SystemExit) as err:
+                        Run(testargs, reporter=Reporter())
+                    assert err.value.code == 0
+
+
+def test_cpu_shares_with_whitespace_and_newlines_are_parsed(tmpdir: LocalPath) -> None:
+    """
+    Ensure files with surrounding whitespace/newlines are parsed correctly and
+    normalized when they produce zero.
+    """
+    contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "  -1  \n",
+        "/sys/fs/cgroup/cpu/cpu.shares": "   2   \n",
+    }
+    with tmpdir.as_cwd():
+        with patch("builtins.open", _open_factory(contents)):
+            with patch("pylint.lint.run.Path", _make_path_mock(set(contents.keys()))):
+                fake_mp = MagicMock()
+                fake_mp.cpu_count.return_value = 3
+                with patch("pylint.lint.run.multiprocessing", fake_mp):
+                    testargs = [os.path.abspath(__file__), "--jobs=0"]
+                    with pytest.raises(SystemExit) as err:
+                        Run(testargs, reporter=Reporter())
+                    assert err.value.code == 0
+
+
+def test_query_cpu_zero_from_quota_normalized_to_one_directly() -> None:
+    """
+    Another direct check ensuring a zero computed from quota/period is normalized to 1.
+    This specifically asserts the module-level _query_cpu behavior.
+    """
+    contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "1\n",  # much smaller than period
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    with patch("builtins.open", _open_factory(contents)):
+        with patch("pylint.lint.run.Path", _make_path_mock(set(contents.keys()))):
+            assert _query_cpu() == 1

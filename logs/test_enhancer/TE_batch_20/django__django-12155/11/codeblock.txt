@@ -1,0 +1,207 @@
+from inspect import cleandoc
+from django.apps import apps
+from django.test import RequestFactory
+from django.test.utils import captured_stderr
+from django.contrib.admindocs import utils
+from django.contrib.admindocs.views import ModelDetailView
+from django.contrib.admindocs.utils import (
+    docutils_is_available, parse_docstring, parse_rst,
+)
+from django.db import models
+import unittest
+from inspect import cleandoc
+
+from django.apps import apps
+from django.test import RequestFactory
+from django.test.utils import captured_stderr
+
+from django.contrib.admindocs import utils
+from django.contrib.admindocs.views import ModelDetailView
+from django.contrib.admindocs.utils import (
+    docutils_is_available, parse_docstring, parse_rst,
+)
+from django.db import models
+
+from .tests import AdminDocsSimpleTestCase
+
+@unittest.skipUnless(docutils_is_available, "no docutils installed.")
+class TestAdmindocsParsingAndModelDetail(AdminDocsSimpleTestCase):
+    def setUp(self):
+        self.rf = RequestFactory()
+        # Keep track of registered models to cleanup after tests
+        self._registered = []
+
+    def tearDown(self):
+        # Attempt to clean up any dynamically registered models.
+        # apps.all_models is keyed by app_label then model_name (lowercase).
+        for app_label, model_name in self._registered:
+            app_models = apps.all_models.get(app_label, {})
+            if model_name in app_models:
+                del app_models[model_name]
+
+    def _register_model(self, model_name, methods):
+        """
+        Dynamically create and register a model under the 'admindocs' app.
+        `methods` is a dict name->(callable or property, docstring)
+        """
+        attrs = {'__module__': __name__}
+        # Add methods/properties
+        for name, doc in methods.items():
+            # create a simple function object with the requested docstring
+            def make_func(n, d):
+                def _f(self, *a, **kw):
+                    # simple placeholder
+                    return None
+                _f.__doc__ = d
+                _f.__name__ = n
+                return _f
+            attrs[name] = make_func(name, doc)
+
+        # Meta inline class
+        class Meta:
+            app_label = 'admindocs'
+            managed = False
+
+        attrs['Meta'] = Meta
+        # Create model class
+        Model = type(model_name, (models.Model,), attrs)
+        # Register the model
+        apps.register_model('admindocs', Model)
+        # Record registration
+        self._registered.append(('admindocs', Model._meta.model_name))
+        return Model
+
+    def _get_model_fields_verbose(self, model_name):
+        view = ModelDetailView()
+        view.request = self.rf.get('/')
+        view.kwargs = {'app_label': 'admindocs', 'model_name': model_name}
+        context = view.get_context_data()
+        return context['fields']
+
+    def test_parse_docstring_none_returns_empty(self):
+        title, body, meta = parse_docstring(None)
+        self.assertEqual(title, '')
+        self.assertEqual(body, '')
+        self.assertEqual(meta, {})
+
+    def test_parse_docstring_empty_string_returns_empty(self):
+        title, body, meta = parse_docstring('')
+        self.assertEqual(title, '')
+        self.assertEqual(body, '')
+        self.assertEqual(meta, {})
+
+    def test_parse_docstring_whitespace_only_returns_empty(self):
+        title, body, meta = parse_docstring('   \n   ')
+        self.assertEqual(title, '')
+        self.assertEqual(body, '')
+        self.assertEqual(meta, {})
+
+    def test_parse_docstring_dedents_correctly(self):
+        raw = """First line
+
+            second line
+            third line
+        """
+        # parse_docstring should dedent the docstring (as inspect.cleandoc does)
+        title, body, meta = parse_docstring(raw)
+        # Title must equal the first non-blank line dedented
+        self.assertEqual(title, 'First line')
+        # Body should not include leading spaces on the second line
+        self.assertIn('second line', body)
+        self.assertNotIn('\n    second line', body)
+
+    def test_parse_docstring_metadata_parsing(self):
+        doc = """Title
+
+        some_meta: value
+        another_meta: another
+        """
+        title, body, meta = parse_docstring(doc)
+        self.assertEqual(title, 'Title')
+        self.assertEqual(meta['some_meta'], 'value')
+        self.assertEqual(meta['another_meta'], 'another')
+
+    def test_model_method_docstring_is_dedented_and_rendered(self):
+        """Method docstrings that are indented inside class should be dedented and rendered."""
+        doc = """
+            Summary line.
+
+                More details on new line.
+        """
+        Model = self._register_model('DedentModelA', {'dedented_method': doc})
+        fields = self._get_model_fields_verbose('DedentModelA')
+        # find the field entry for our method (it should have been included in fields)
+        found = [f for f in fields if f['name'] == 'dedented_method']
+        self.assertTrue(found, "dedented_method not found in fields: %r" % fields)
+        verbose_html = found[0]['verbose']
+        # The dedented summary line should be rendered as a paragraph
+        self.assertIn('<p>Summary line.', verbose_html)
+        # No leading indentation should be present in the rendered HTML
+        self.assertNotIn('    Summary line', verbose_html)
+
+    def test_model_property_docstring_dedented_and_rendered(self):
+        prop_doc = """
+            Property title
+
+            Property description line.
+        """
+        # create a property-like function (python property can't be simply added via register_model)
+        # we simulate by adding a method that will be treated as a property by isinstance check
+        # in the code (the code checks isinstance(func, property) - to simulate, we add a real
+        # property object)
+        def make_model_with_property(name, doc):
+            attrs = {'__module__': __name__}
+            def _p(self):
+                return None
+            p = property(_p)
+            p.fget.__doc__ = doc
+            attrs['myprop'] = p
+            class Meta:
+                app_label = 'admindocs'
+                managed = False
+            attrs['Meta'] = Meta
+            Model = type(name, (models.Model,), attrs)
+            apps.register_model('admindocs', Model)
+            self._registered.append(('admindocs', Model._meta.model_name))
+            return Model
+        Model = make_model_with_property('PropModelA', prop_doc)
+        fields = self._get_model_fields_verbose('PropModelA')
+        found = [f for f in fields if f['name'] == 'myprop']
+        self.assertTrue(found, "myprop not found in fields: %r" % fields)
+        verbose_html = found[0]['verbose']
+        self.assertIn('Property title', verbose_html)
+        self.assertIn('Property description line.', verbose_html)
+
+    def test_model_method_with_leading_newline_docstring(self):
+        doc = """
+
+            Leading newline summary.
+
+            details line.
+        """
+        Model = self._register_model('LeadNewlineModelA', {'lead_method': doc})
+        fields = self._get_model_fields_verbose('LeadNewlineModelA')
+        found = [f for f in fields if f['name'] == 'lead_method']
+        self.assertTrue(found, "lead_method not found in fields: %r" % fields)
+        verbose_html = found[0]['verbose']
+        # Leading blank line should be stripped and first content line used as summary
+        self.assertIn('Leading newline summary.', verbose_html)
+        self.assertNotIn('<p></p>', verbose_html)
+
+    def test_multiple_methods_various_doc_indent(self):
+        doc1 = """Single line doc."""
+        doc2 = """
+            Multi line
+            with indent
+        """
+        Model = self._register_model('MultiMethodModelA', {'one': doc1, 'two': doc2})
+        fields = self._get_model_fields_verbose('MultiMethodModelA')
+        f_one = [f for f in fields if f['name'] == 'one'][0]
+        f_two = [f for f in fields if f['name'] == 'two'][0]
+        self.assertIn('Single line doc.', f_one['verbose'])
+        self.assertIn('Multi line', f_two['verbose'])
+        # Ensure no leading 4-space fragments remain in rendered HTML
+        self.assertNotIn('    Multi line', f_two['verbose'])
+
+if __name__ == "__main__":
+    unittest.main()

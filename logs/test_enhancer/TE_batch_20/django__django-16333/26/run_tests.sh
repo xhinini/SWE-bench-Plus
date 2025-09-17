@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.UserCreationSaveGuardTests.test_m2m_save_attribute_removed_before_save_does_not_raise auth_tests.test_forms_llm.UserCreationSaveGuardTests.test_m2m_save_when_present_saves_many_to_many auth_tests.test_forms_llm.UserCreationSaveGuardTests.test_save_after_commit_false_then_save_on_user_without_m2m_does_not_raise auth_tests.test_forms_llm.UserCreationSaveGuardTests.test_save_twice_on_default_user_does_not_raise auth_tests.test_forms_llm.UserCreationSaveGuardTests.test_save_without_m2m_field_does_not_raise auth_tests.test_forms_llm.UserCreationSaveGuardTests.test_save_without_m2m_on_custom_email_field_user_does_not_raise auth_tests.test_forms_llm.UserCreationSaveGuardTests.test_save_without_m2m_on_custom_user_without_is_active_field_does_not_raise auth_tests.test_forms_llm.UserCreationSaveGuardTests.test_save_without_m2m_on_extension_user_does_not_raise auth_tests.test_forms_llm.UserCreationSaveGuardTests.test_save_without_m2m_on_integer_username_user_does_not_raise
+coverage json -o coverage.json
+: '>>>>> End Test Output'

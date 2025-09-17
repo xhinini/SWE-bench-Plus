@@ -1,0 +1,236 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests verify that BaseDatabaseCreation.deserialize_db_from_string:
+  - Uses the connection.constraint_checks_disabled() context manager while deserializing,
+  - Calls connection.check_constraints() once after deserialization completes,
+  - Ensures the constraint-checks-disabled context is entered before any object's save() is called and exited afterward.
+
+  The candidate patch omitted using constraint_checks_disabled() and omitted calling check_constraints(), so these tests would fail against that patch but pass with the provided gold patch.
+test_code: |
+  from unittest import mock
+
+  from django.test import SimpleTestCase
+  from django.db import connection
+  from django.db.backends.base.creation import BaseDatabaseCreation
+
+  # Re-use helper from existing test module if present; otherwise create a minimal one.
+  try:
+      get_connection_copy  # noqa: F821
+  except NameError:
+      import copy
+      from django.db import connections, DEFAULT_DB_ALIAS
+      def get_connection_copy():
+          test_connection = copy.copy(connections[DEFAULT_DB_ALIAS])
+          test_connection.settings_dict = copy.deepcopy(
+              connections[DEFAULT_DB_ALIAS].settings_dict
+          )
+          return test_connection
+
+  class TestDeserializeConstraintHandling(SimpleTestCase):
+      databases = {'default'}
+
+      def test_uses_constraint_checks_disabled_and_calls_check_constraints_on_default_connection(self):
+          entered = []
+          class CM:
+              def __enter__(self):
+                  entered.append('enter')
+                  return self
+              def __exit__(self, exc_type, exc, tb):
+                  entered.append('exit')
+
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=CM()) as mocked_cm, \
+               mock.patch.object(connection, 'check_constraints') as mocked_check, \
+               mock.patch('django.db.backends.base.creation.serializers.deserialize', return_value=iter([])) as mocked_deser:
+              # Should enter constraint-disabled context and call check_constraints
+              connection.creation.deserialize_db_from_string('[]')
+
+          self.assertIn('enter', entered)
+          self.assertIn('exit', entered)
+          mocked_check.assert_called_once()
+          mocked_deser.assert_called()
+
+      def test_uses_constraint_checks_disabled_and_calls_check_constraints_on_custom_connection(self):
+          test_conn = get_connection_copy()
+          entered = []
+          class CM:
+              def __enter__(self):
+                  entered.append('enter')
+                  return self
+              def __exit__(self, exc_type, exc, tb):
+                  entered.append('exit')
+
+          # Create a BaseDatabaseCreation bound to the copied connection
+          creation = BaseDatabaseCreation(test_conn)
+          with mock.patch.object(test_conn, 'constraint_checks_disabled', return_value=CM()) as mocked_cm, \
+               mock.patch.object(test_conn, 'check_constraints') as mocked_check, \
+               mock.patch('django.db.backends.base.creation.serializers.deserialize', return_value=iter([])) as mocked_deser:
+              creation.deserialize_db_from_string('[]')
+
+          self.assertIn('enter', entered)
+          self.assertIn('exit', entered)
+          mocked_check.assert_called_once()
+          mocked_deser.assert_called()
+
+      def test_check_constraints_called_even_with_multiple_objects(self):
+          saved = []
+          class Obj:
+              def __init__(self, name):
+                  self.name = name
+              def save(self):
+                  saved.append(self.name)
+
+          # Have deserialize yield multiple objects
+          def fake_deserialize(stream, **kwargs):
+              return iter([Obj('a'), Obj('b'), Obj('c')])
+
+          entered = []
+          class CM:
+              def __enter__(self):
+                  entered.append('enter')
+                  return self
+              def __exit__(self, exc_type, exc, tb):
+                  entered.append('exit')
+
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=CM()), \
+               mock.patch.object(connection, 'check_constraints') as mocked_check, \
+               mock.patch('django.db.backends.base.creation.serializers.deserialize', fake_deserialize):
+              connection.creation.deserialize_db_from_string('[]')
+
+          # All objects should be saved
+          self.assertEqual(saved, ['a', 'b', 'c'])
+          mocked_check.assert_called_once()
+          self.assertEqual(entered, ['enter', 'exit'])
+
+      def test_constraint_context_entered_before_any_save_called(self):
+          call_order = []
+          class Obj:
+              def save(self):
+                  call_order.append('save_called')
+
+          class CM:
+              def __enter__(self):
+                  call_order.append('entered_cm')
+                  return self
+              def __exit__(self, exc_type, exc, tb):
+                  call_order.append('exited_cm')
+
+          def fake_deserialize(stream, **kwargs):
+              # The deserializer yields objects lazily; ensure save is called after __enter__
+              yield Obj()
+
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=CM()), \
+               mock.patch.object(connection, 'check_constraints') as mocked_check, \
+               mock.patch('django.db.backends.base.creation.serializers.deserialize', fake_deserialize):
+              connection.creation.deserialize_db_from_string('[]')
+
+          # Ensure the CM enter came before any save, and exit after
+          self.assertEqual(call_order, ['entered_cm', 'save_called', 'exited_cm'])
+          mocked_check.assert_called_once()
+
+      def test_constraint_context_exited_after_saves_called(self):
+          call_order = []
+          class Obj:
+              def __init__(self, id):
+                  self.id = id
+              def save(self):
+                  call_order.append(f'save_{self.id}')
+
+          class CM:
+              def __enter__(self):
+                  call_order.append('enter_cm')
+                  return self
+              def __exit__(self, exc_type, exc, tb):
+                  call_order.append('exit_cm')
+
+          def fake_deserialize(stream, **kwargs):
+              for i in range(3):
+                  yield Obj(i)
+
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=CM()), \
+               mock.patch.object(connection, 'check_constraints') as mocked_check, \
+               mock.patch('django.db.backends.base.creation.serializers.deserialize', fake_deserialize):
+              connection.creation.deserialize_db_from_string('[]')
+
+          # Ensure saves happen between enter and exit
+          self.assertEqual(call_order[0], 'enter_cm')
+          self.assertEqual(call_order[-1], 'exit_cm')
+          self.assertTrue(all(item.startswith('save_') for item in call_order[1:-1]))
+          mocked_check.assert_called_once()
+
+      def test_check_constraints_called_once_with_generator_deserialize(self):
+          saved = []
+          class Obj:
+              def save(self):
+                  saved.append(True)
+
+          def fake_deserialize(stream, **kwargs):
+              # generator form
+              for _ in range(5):
+                  yield Obj()
+
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=mock.DEFAULT()) as mocked_cm, \
+               mock.patch.object(connection, 'check_constraints') as mocked_check, \
+               mock.patch('django.db.backends.base.creation.serializers.deserialize', fake_deserialize):
+              connection.creation.deserialize_db_from_string('[]')
+
+          # All objects saved and check_constraints called exactly once
+          self.assertEqual(len(saved), 5)
+          mocked_check.assert_called_once()
+
+      def test_constraint_checks_disabled_called_on_creation_instance(self):
+          test_conn = get_connection_copy()
+          creation = BaseDatabaseCreation(test_conn)
+
+          entered = []
+          class CM:
+              def __enter__(self):
+                  entered.append(True)
+                  return self
+              def __exit__(self, exc_type, exc, tb):
+                  entered.append(False)
+
+          with mock.patch.object(test_conn, 'constraint_checks_disabled', return_value=CM()), \
+               mock.patch.object(test_conn, 'check_constraints') as mocked_check, \
+               mock.patch('django.db.backends.base.creation.serializers.deserialize', return_value=iter([])):
+              creation.deserialize_db_from_string('[]')
+
+          # Enter and exit should have been recorded
+          self.assertEqual(entered, [True, False])
+          mocked_check.assert_called_once()
+
+      def test_deserialize_works_when_no_objects_and_still_checks_constraints(self):
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=mock.DEFAULT()) as mocked_cm, \
+               mock.patch.object(connection, 'check_constraints') as mocked_check, \
+               mock.patch('django.db.backends.base.creation.serializers.deserialize', return_value=iter([])):
+              connection.creation.deserialize_db_from_string('[]')
+
+          mocked_check.assert_called_once()
+
+      def test_constraint_checks_disabled_present_when_deserialize_is_lazy_iterator(self):
+          call_log = []
+          class Obj:
+              def save(self):
+                  call_log.append('saved')
+
+          class CM:
+              def __enter__(self):
+                  call_log.append('enter')
+                  return self
+              def __exit__(self, exc_type, exc, tb):
+                  call_log.append('exit')
+
+          def lazy_deserialize(stream, **kwargs):
+              for _ in range(2):
+                  yield Obj()
+
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=CM()), \
+               mock.patch.object(connection, 'check_constraints') as mocked_check, \
+               mock.patch('django.db.backends.base.creation.serializers.deserialize', lazy_deserialize):
+              connection.creation.deserialize_db_from_string('[]')
+
+          # Ensure enter -> saves -> exit ordering and check_constraints called
+          self.assertEqual(call_log, ['enter', 'saved', 'saved', 'exit'])
+          mocked_check.assert_called_once()
+new_imports_code: |
+  from unittest import mock

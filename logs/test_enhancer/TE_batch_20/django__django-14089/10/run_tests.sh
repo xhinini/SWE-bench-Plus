@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_add_raises utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_clear_raises utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_del_key_raises utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_direct_assignment_raises utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_discard_existing_raises utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_multiple_iterators_all_raise_on_change utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_partial_consumption_then_mutation_raises utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_pop_key_raises utils_tests.test_datastructures_llm.OrderedSetMutationTests.test_reversed_remove_raises
+coverage json -o coverage.json
+: '>>>>> End Test Output'

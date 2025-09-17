@@ -1,0 +1,175 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify MigrationLoader.load_disk() correctly classifies apps as migrated or unmigrated based on combinations of module.__file__ and module.__path__ attributes (regular package, namespace package, module file, and various edge __path__ types). They assert behavior matching the gold patch: regular packages with a list __path__ are treated as migrated even if __file__ is None; namespace packages (no __file__ and a non-list __path__) are treated as unmigrated; plain module files (no __path__) are treated as unmigrated. The tests patch import_module, pkgutil.iter_modules and apps.get_app_configs to simulate different module shapes without touching the filesystem.
+test_code: |
+  from types import ModuleType
+  from unittest.mock import patch, Mock
+  from django.test import TestCase
+  from django.db.migrations.loader import MigrationLoader
+  import pkgutil
+  
+  class MigrationLoaderModuleShapeTests(TestCase):
+      def _make_app_config(self, label, name=None):
+          mock = Mock()
+          mock.label = label
+          mock.name = name or label
+          return mock
+  
+      def _run_with_module(self, module_name, module_obj):
+          """
+          Helper to run load_disk() with a provided fake module object returned
+          by import_module(module_name). Returns (migrated_apps, unmigrated_apps).
+          """
+          loader = MigrationLoader(connection=None, load=False)
+          app_config = self._make_app_config('testapp', name='testapp')
+          # Ensure pkgutil.iter_modules doesn't attempt to read FS; return empty.
+          with patch('django.db.migrations.loader.pkgutil.iter_modules', return_value=[]) as mock_iter:
+              with patch('django.db.migrations.loader.import_module') as import_mod:
+                  # import_module may be called for module and for submodules; return our module
+                  def _import(name, *args, **kwargs):
+                      if name == module_name:
+                          return module_obj
+                      # Any other import used internally (unlikely here) fallback to real
+                      raise ImportError("Unexpected import: %s" % name)
+                  import_mod.side_effect = _import
+                  with patch('django.apps.apps.get_app_configs', return_value=[app_config]):
+                      # Force migrations_module to return our module_name
+                      with patch.object(MigrationLoader, 'migrations_module', lambda self, label: (module_name, False)):
+                          loader.load_disk()
+          return loader.migrated_apps, loader.unmigrated_apps
+  
+      def test_regular_package_with_file_and_path_list_is_migrated(self):
+          m = ModuleType('fake.migrations')
+          # Regular package: __path__ is a list and __file__ present
+          m.__path__ = ['/some/path']
+          m.__file__ = '/some/path/__init__.py'
+          migrated, unmigrated = self._run_with_module('fake.migrations', m)
+          self.assertIn('testapp', migrated)
+          self.assertNotIn('testapp', unmigrated)
+  
+      def test_regular_package_without_file_but_path_list_is_migrated(self):
+          m = ModuleType('fake.migrations')
+          # Regular package in frozen env: __file__ missing/None, but __path__ is a list
+          m.__path__ = ['/some/path']
+          if hasattr(m, '__file__'):
+              delattr(m, '__file__')
+          # Ensure attribute not present
+          try:
+              del m.__file
+          except Exception:
+              pass
+          migrated, unmigrated = self._run_with_module('fake.migrations', m)
+          self.assertIn('testapp', migrated)
+          self.assertNotIn('testapp', unmigrated)
+  
+      def test_namespace_package_no_file_and_nonlist_path_is_unmigrated(self):
+          m = ModuleType('fake.migrations')
+          # Namespace package: __file__ is None and __path__ is NOT a list
+          # Simulate a non-list __path__ (custom iterable)
+          class NonListPath:
+              def __iter__(self):
+                  yield '/some/path'
+          m.__path__ = NonListPath()
+          # ensure __file__ is None
+          m.__file__ = None
+          migrated, unmigrated = self._run_with_module('fake.migrations', m)
+          self.assertIn('testapp', unmigrated)
+          self.assertNotIn('testapp', migrated)
+  
+      def test_module_file_without_path_is_unmigrated(self):
+          m = ModuleType('fake.migrations')
+          # Not a package: no __path__ attribute, but has __file__
+          m.__file__ = '/some/path/migrations.py'
+          # Ensure __path__ doesn't exist
+          if hasattr(m, '__path__'):
+              del m.__path__
+          migrated, unmigrated = self._run_with_module('fake.migrations', m)
+          self.assertIn('testapp', unmigrated)
+          self.assertNotIn('testapp', migrated)
+  
+      def test_package_with_nonlist_path_but_with_file_is_migrated(self):
+          m = ModuleType('fake.migrations')
+          # __path__ is non-list but __file__ is present -> should be treated as package (migrated)
+          class NonListPath:
+              def __iter__(self):
+                  yield '/some/path'
+          m.__path__ = NonListPath()
+          m.__file__ = '/some/path/__init__.py'
+          migrated, unmigrated = self._run_with_module('fake.migrations', m)
+          # Because __file__ is present, it should be treated as a package (migrated)
+          self.assertIn('testapp', migrated)
+          self.assertNotIn('testapp', unmigrated)
+  
+      def test_package_with_path_tuple_and_no_file_is_unmigrated(self):
+          m = ModuleType('fake.migrations')
+          # __path__ is a tuple (not list) and __file__ is None -> namespace -> unmigrated
+          m.__path__ = ('/some/path',)
+          m.__file__ = None
+          migrated, unmigrated = self._run_with_module('fake.migrations', m)
+          self.assertIn('testapp', unmigrated)
+          self.assertNotIn('testapp', migrated)
+  
+      def test_package_with_list_subclass_path_and_no_file_is_migrated(self):
+          m = ModuleType('fake.migrations')
+          # __path__ is a list subclass and __file__ is None -> still a regular package -> migrated
+          class MyList(list):
+              pass
+          m.__path__ = MyList(['/some/path'])
+          m.__file__ = None
+          migrated, unmigrated = self._run_with_module('fake.migrations', m)
+          # isinstance(module.__path__, list) should be True for subclasses, so treated as migrated
+          self.assertIn('testapp', migrated)
+          self.assertNotIn('testapp', unmigrated)
+  
+      def test_package_with_custom_iterable_path_and_no_file_is_unmigrated(self):
+          m = ModuleType('fake.migrations')
+          # Custom iterable (not list) and __file__ None => namespace => unmigrated
+          class CustomIter:
+              def __iter__(self):
+                  yield '/some/path'
+          m.__path__ = CustomIter()
+          m.__file__ = None
+          migrated, unmigrated = self._run_with_module('fake.migrations', m)
+          self.assertIn('testapp', unmigrated)
+          self.assertNotIn('testapp', migrated)
+  
+      def test_package_with_path_list_and_spec_has_location_false_but_no_file_is_migrated(self):
+          # Similar to existing frozen env test but using mocked module object
+          m = ModuleType('fake.migrations')
+          m.__path__ = ['/some/path']
+          # Remove __file__ entirely
+          if hasattr(m, '__file__'):
+              del m.__file__
+          # Simulate a __spec__ with origin None and has_location False
+          class Spec:
+              origin = None
+              has_location = False
+          m.__spec__ = Spec()
+          migrated, unmigrated = self._run_with_module('fake.migrations', m)
+          # Should still be treated as migrated because __path__ is a list
+          self.assertIn('testapp', migrated)
+          self.assertNotIn('testapp', unmigrated)
+  
+      def test_package_with_path_property_returning_list_and_no_file_is_migrated(self):
+          # __path__ as a property that returns a list instance
+          class M(ModuleType):
+              @property
+              def __path__(self):
+                  return ['/some/path']
+          m = M('fake.migrations')
+          # Remove __file__ explicitly
+          if hasattr(m, '__file__'):
+              try:
+                  del m.__file
+              except Exception:
+                  pass
+          # Should be treated as migrated because __path__ returns a list
+          migrated, unmigrated = self._run_with_module('fake.migrations', m)
+          self.assertIn('testapp', migrated)
+          self.assertNotIn('testapp', unmigrated)
+new_imports_code: |
+  from types import ModuleType
+  from unittest.mock import patch, Mock
+  from django.test import TestCase
+  from django.db.migrations.loader import MigrationLoader
+  import pkgutil

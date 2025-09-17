@@ -1,0 +1,160 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These tests verify that the sqlmigrate management command shows or hides
+  the transaction BEGIN/COMMIT wrappers depending both on the migration's
+  atomic flag and the database connection's ability to rollback DDL
+  (connection.features.can_rollback_ddl). They exercise the behavior for the
+  default and a second ('other') database, for forwards and backwards SQL,
+  for atomic and non-atomic migrations, and when the connection's ops provide
+  custom start/end SQL or no start SQL at all.
+test_code: |
+  from unittest import mock
+  import io
+
+  from django.core.management import call_command
+  from django.test import override_settings
+
+  from .test_base import MigrationTestBase
+  from django.db import connections, connection
+
+  class SQLMigrateTransactionTests(MigrationTestBase):
+      """
+      Tests to ensure sqlmigrate respects both migration.atomic and
+      connection.features.can_rollback_ddl when deciding whether to show
+      transaction wrappers around SQL output.
+      """
+      databases = {'default', 'other'}
+
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_database_flag_respects_can_rollback_ddl_for_forwards(self):
+          out = io.StringIO()
+          # Simulate a database that does not support transactional DDL.
+          with mock.patch.object(connections['other'].features, 'can_rollback_ddl', False):
+              call_command('sqlmigrate', 'migrations', '0001', stdout=out, database='other')
+          output = out.getvalue().lower()
+          start_sql = connections['other'].ops.start_transaction_sql()
+          # If the backend provides a start SQL, it should NOT be present.
+          if start_sql:
+              self.assertNotIn(start_sql.lower(), output)
+          self.assertNotIn(connections['other'].ops.end_transaction_sql().lower(), output)
+
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_database_flag_respects_can_rollback_ddl_for_backwards(self):
+          # Ensure the migration has been applied on the other DB so backwards SQL can be generated.
+          call_command('migrate', 'migrations', verbosity=0, database='other')
+          out = io.StringIO()
+          with mock.patch.object(connections['other'].features, 'can_rollback_ddl', False):
+              call_command('sqlmigrate', 'migrations', '0001', stdout=out, database='other', backwards=True)
+          output = out.getvalue().lower()
+          start_sql = connections['other'].ops.start_transaction_sql()
+          if start_sql:
+              self.assertNotIn(start_sql.lower(), output)
+          self.assertNotIn(connections['other'].ops.end_transaction_sql().lower(), output)
+          # Cleanup applied migration
+          call_command('migrate', 'migrations', 'zero', verbosity=0, database='other')
+
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_default_db_shows_transaction_for_atomic_migration_when_supported(self):
+          out = io.StringIO()
+          # Force the default connection to report support for transactional DDL.
+          with mock.patch.object(connection.features, 'can_rollback_ddl', True):
+              call_command('sqlmigrate', 'migrations', '0001', stdout=out)
+          output = out.getvalue().lower()
+          start_sql = connection.ops.start_transaction_sql()
+          # If the backend provides a start SQL, it should be present when both
+          # migration.atomic and can_rollback_ddl are True.
+          if start_sql:
+              self.assertIn(start_sql.lower(), output)
+              self.assertIn(connection.ops.end_transaction_sql().lower(), output)
+
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations_non_atomic"})
+      def test_non_atomic_migration_no_transaction_even_if_db_supports(self):
+          out = io.StringIO()
+          # Even if DB supports transactional DDL, non-atomic migrations should not be wrapped.
+          with mock.patch.object(connection.features, 'can_rollback_ddl', True):
+              call_command('sqlmigrate', 'migrations', '0001', stdout=out)
+          output = out.getvalue().lower()
+          start_sql = connection.ops.start_transaction_sql()
+          if start_sql:
+              self.assertNotIn(start_sql.lower(), output)
+          self.assertNotIn(connection.ops.end_transaction_sql().lower(), output)
+
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_default_and_other_database_behaviour(self):
+          out_default = io.StringIO()
+          out_other = io.StringIO()
+          # default supports transactional DDL, other does not
+          with mock.patch.object(connection.features, 'can_rollback_ddl', True):
+              call_command('sqlmigrate', 'migrations', '0001', stdout=out_default)
+          with mock.patch.object(connections['other'].features, 'can_rollback_ddl', False):
+              call_command('sqlmigrate', 'migrations', '0001', stdout=out_other, database='other')
+          default_out = out_default.getvalue().lower()
+          other_out = out_other.getvalue().lower()
+          start_default = connection.ops.start_transaction_sql()
+          if start_default:
+              self.assertIn(start_default.lower(), default_out)
+          start_other = connections['other'].ops.start_transaction_sql()
+          if start_other:
+              self.assertNotIn(start_other.lower(), other_out)
+
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_start_before_operations_when_transactions_enabled_forwards(self):
+          out = io.StringIO()
+          with mock.patch.object(connection.features, 'can_rollback_ddl', True):
+              call_command('sqlmigrate', 'migrations', '0001', stdout=out)
+          output = out.getvalue().lower()
+          start_sql = connection.ops.start_transaction_sql()
+          idx_start = output.find(start_sql.lower()) if start_sql else -1
+          idx_op_desc_author = output.find('-- create model author')
+          # If start SQL exists, it should be before the first operation description.
+          if start_sql:
+              self.assertGreater(idx_start, -1)
+              self.assertGreater(idx_op_desc_author, idx_start)
+
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_backwards_orders_when_transactions_enabled(self):
+          # Apply migration so we can generate reverse SQL.
+          call_command('migrate', 'migrations', verbosity=0)
+          out = io.StringIO()
+          with mock.patch.object(connection.features, 'can_rollback_ddl', True):
+              call_command('sqlmigrate', 'migrations', '0001', stdout=out, backwards=True)
+          output = out.getvalue().lower()
+          start_sql = connection.ops.start_transaction_sql()
+          idx_start = output.find(start_sql.lower()) if start_sql else -1
+          idx_op_desc_unique = output.find('-- alter unique_together')
+          # If start SQL exists it should be before the operations.
+          if start_sql:
+              self.assertGreater(idx_start, -1)
+              self.assertGreater(idx_op_desc_unique, idx_start)
+          # Cleanup
+          call_command('migrate', 'migrations', 'zero', verbosity=0)
+
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_no_begin_when_start_transaction_sql_missing(self):
+          out = io.StringIO()
+          # Ensure DB supports transactional DDL but start_transaction_sql returns an empty value.
+          with mock.patch.object(connection.features, 'can_rollback_ddl', True), \
+               mock.patch.object(connection.ops, 'start_transaction_sql', return_value=''):
+              call_command('sqlmigrate', 'migrations', '0001', stdout=out)
+          output = out.getvalue().lower()
+          # start_transaction_sql() returned empty, so nothing should be present.
+          start_sql = connection.ops.start_transaction_sql()
+          if start_sql:
+              self.assertNotIn(start_sql.lower(), output)
+          self.assertNotIn(connection.ops.end_transaction_sql().lower(), output)
+
+      @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+      def test_custom_ops_start_end_sql_shown_for_respective_connection(self):
+          out = io.StringIO()
+          # Provide custom start/end SQL on the 'other' connection and enable DDL transactions.
+          with mock.patch.object(connections['other'].features, 'can_rollback_ddl', True), \
+               mock.patch.object(connections['other'].ops, 'start_transaction_sql', return_value='-- OTHER BEGIN --'), \
+               mock.patch.object(connections['other'].ops, 'end_transaction_sql', return_value='-- OTHER END --'):
+              call_command('sqlmigrate', 'migrations', '0001', stdout=out, database='other')
+          output = out.getvalue()
+          self.assertIn('-- OTHER BEGIN --', output)
+          self.assertIn('-- OTHER END --', output)
+new_imports_code: |
+  import io
+  from unittest import mock

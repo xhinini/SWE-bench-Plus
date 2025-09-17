@@ -1,0 +1,213 @@
+from unittest import mock
+from django.core import management
+from django.db import connections, connection
+from django.core.cache import caches
+from django.test import TransactionTestCase, override_settings
+from django.conf import settings
+
+@override_settings(CACHES=caches_setting_for_tests(
+    BACKEND='django.core.cache.backends.db.DatabaseCache',
+    LOCATION='test cache table',
+))
+class DBCullRegressionTests(TransactionTestCase):
+    """
+    Regression tests for DatabaseCache._cull to ensure it doesn't raise
+    when cursor.fetchone() returns None and that culling behaves correctly.
+    """
+    available_apps = ['cache']
+
+    def setUp(self):
+        super().setUp()
+        management.call_command('createcachetable', verbosity=0)
+        self.cache = caches['cull']
+        # Ensure deterministic behavior for tests:
+        self.orig_max_entries = self.cache._max_entries
+        self.orig_cull_frequency = self.cache._cull_frequency
+
+    def tearDown(self):
+        # Restore internals and drop table
+        self.cache._max_entries = self.orig_max_entries
+        self.cache._cull_frequency = self.orig_cull_frequency
+        with connection.cursor() as cursor:
+            table_name = connection.ops.quote_name('test cache table')
+            cursor.execute('DROP TABLE %s' % table_name)
+        super().tearDown()
+
+    def _row_count(self):
+        with connection.cursor() as cursor:
+            table_name = connection.ops.quote_name('test cache table')
+            cursor.execute('SELECT COUNT(*) FROM %s' % table_name)
+            return cursor.fetchone()[0]
+
+    def test_cull_handles_fetchone_none_during_culling(self):
+        """
+        If the culling SQL returns no rows (fetchone() is None), _cull should
+        not raise an exception. This simulates the case where cull_num is 0
+        and the culling SELECT yields no boundary key.
+        """
+        # Force small max entries so culling will be attempted
+        self.cache._max_entries = 5
+        # Force a very large cull frequency so cull_num == 0 (num // freq == 0)
+        self.cache._cull_frequency = 10000
+
+        # Insert > _max_entries entries to trigger _cull on subsequent sets
+        for i in range(7):
+            self.cache.set('k{}'.format(i), 'v', timeout=1000)
+
+        # After inserts, ensure no exception was raised and table exists
+        self.assertGreaterEqual(self._row_count(), 7)
+
+    def test_cull_deletes_keys_up_to_last_cache_key(self):
+        """
+        When the culling SELECT returns a last_cache_key, keys strictly less
+        than that key should be deleted.
+        """
+        self.cache._max_entries = 5
+        # Use small cull frequency to ensure cull_num > 0
+        self.cache._cull_frequency = 2
+
+        # Insert sequential keys 'k1'..'k12'
+        for i in range(1, 13):
+            self.cache.set('cullk{:02d}'.format(i), 'v', timeout=1000)
+
+        total_before = self._row_count()
+        self.assertGreater(total_before, self.cache._max_entries)
+
+        # Add another key to trigger a cull run
+        self.cache.set('trigger', 'v', timeout=1000)
+        total_after = self._row_count()
+        # After culling, number of rows should be reduced (some keys deleted)
+        self.assertLess(total_after, total_before)
+
+    def test_cull_does_nothing_when_not_over_max(self):
+        """
+        If the number of rows is not greater than _max_entries, _cull should
+        not delete anything.
+        """
+        self.cache._max_entries = 1000
+        self.cache._cull_frequency = 3
+        # Populate fewer than _max_entries
+        for i in range(10):
+            self.cache.set('nokull{}'.format(i), 'v', timeout=1000)
+        before = self._row_count()
+        # Trigger set that would normally call _cull path but num <= _max_entries
+        self.cache.set('another', 'v', timeout=1000)
+        after = self._row_count()
+        self.assertEqual(before + 1, after)
+
+    def test_cull_with_cull_frequency_zero_calls_clear(self):
+        """
+        If _cull_frequency == 0, _cull should call clear() and empty the table.
+        """
+        self.cache._max_entries = 1
+        self.cache._cull_frequency = 0
+        # Insert multiple entries so num > _max_entries
+        for i in range(5):
+            self.cache.set('zero{}'.format(i), 'v', timeout=1000)
+        # Insert one more to trigger cull (which should clear)
+        self.cache.set('zero-trigger', 'v', timeout=1000)
+        # After cull with frequency 0, table should be empty
+        self.assertEqual(self._row_count(), 0)
+
+    def test_cull_does_not_raise_on_empty_table(self):
+        """
+        Calling _cull on an empty table should not raise and should leave it empty.
+        We call _cull directly to exercise the empty-table path.
+        """
+        # Ensure table empty
+        self.cache.clear()
+        with connection.cursor() as cursor:
+            now = connection.ops.adapt_datetimefield_value(self.cache._now() if hasattr(self.cache, '_now') else __import__('datetime').datetime.now())
+            # Call _cull directly; provides a real cursor for the method
+            # Using router to determine DB alias like the implementation
+            db = router_db = getattr(self.cache.cache_model_class, '_meta', None)
+            # Invoke internal method
+            # Find db alias for write
+            db_alias = __import__('django.db.router').router.db_for_write(self.cache.cache_model_class)
+            # Use self.cache._cull with the live cursor
+            # Prepare a cursor to pass to _cull
+            with connections[db_alias].cursor() as cur:
+                # now is a naive datetime here; _cull expects a datetime
+                # The call should simply not raise
+                self.cache._cull(db_alias, cur, __import__('datetime').datetime.now())
+        self.assertEqual(self._row_count(), 0)
+
+    def test_cull_handles_fetchone_returning_none_via_monkeypatch(self):
+        """
+        Monkeypatch the cursor so that when the cache_key_culling_sql is
+        executed, fetchone() returns None. Ensure _cull handles this.
+        """
+        self.cache._max_entries = 3
+        self.cache._cull_frequency = 2
+        # Insert entries to get into culling scenario
+        for i in range(6):
+            self.cache.set('mp{}'.format(i), 'v', timeout=1000)
+
+        # Patch the cursor class to record last executed SQL and return None
+        with connections['default'].cursor() as real_cursor:
+            cursor_cls = type(real_cursor)
+
+        original_execute = cursor_cls.execute
+        original_fetchone = cursor_cls.fetchone
+
+        def tracking_execute(self, sql, params=None):
+            # store last executed SQL for inspection by fetchone
+            setattr(self, '_last_executed_sql', sql)
+            return original_execute(self, sql, params)
+
+        def fake_fetchone(self):
+            last = getattr(self, '_last_executed_sql', '') or ''
+            # If this is the cache_key_culling_sql invocation, return None
+            if 'cull' in last or 'ORDER BY' in last or 'LIMIT' in last:
+                return None
+            return original_fetchone(self)
+
+        with mock.patch.object(cursor_cls, 'execute', tracking_execute, create=True):
+            with mock.patch.object(cursor_cls, 'fetchone', fake_fetchone, create=True):
+                # Trigger a set that will run _cull with the patched cursor
+                self.cache.set('mp-trigger', 'v', timeout=1000)
+        # Ensure no exception and table still exists with rows
+        self.assertGreaterEqual(self._row_count(), 1)
+
+    def test_cull_reduces_count_consistently_on_repeated_triggers(self):
+        """
+        Repeated culling runs should eventually reduce counts below _max_entries.
+        """
+        self.cache._max_entries = 5
+        self.cache._cull_frequency = 2
+        # Add many keys to force multiple cull actions on subsequent sets
+        for i in range(25):
+            self.cache.set('many{}'.format(i), 'v', timeout=1000)
+        # After multiple operations, the count should be <= _max_entries
+        final = self._row_count()
+        self.assertLessEqual(final, self.cache._max_entries)
+
+    def test_cull_handles_non_ascii_keys(self):
+        """
+        Ensure culling logic handles keys with non-ascii characters and
+        doesn't raise when choosing culling boundary.
+        """
+        self.cache._max_entries = 3
+        self.cache._cull_frequency = 2
+        keys = ['unicé-{}'.format(i) for i in range(8)]
+        for k in keys:
+            self.cache.set(k, 'v', timeout=1000)
+        # Trigger cull
+        self.cache.set('unic-trigger', 'v', timeout=1000)
+        # Ensure no exception and at least one key remains (the recent ones)
+        self.assertGreaterEqual(self._row_count(), 1)
+
+    def test_multiple_cull_calls_are_idempotent(self):
+        """
+        Calling cull multiple times in succession should be safe and not raise.
+        """
+        self.cache._max_entries = 4
+        self.cache._cull_frequency = 2
+        for i in range(10):
+            self.cache.set('idemp{}'.format(i), 'v', timeout=1000)
+        # Manually call cull a few times using live cursor
+        db_alias = __import__('django.db.router').router.db_for_write(self.cache.cache_model_class)
+        with connections[db_alias].cursor() as cur:
+            for _ in range(3):
+                # Should not raise
+                self.cache._cull(db_alias, cur, __import__('datetime').datetime.now())

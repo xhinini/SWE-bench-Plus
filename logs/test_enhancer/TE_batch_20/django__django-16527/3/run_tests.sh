@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.base_context admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_basic_add_permission_without_change_permission admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_context_object_passed_instead_of_dict admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_with_add_and_change_flags_both_true admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_with_add_flag_true admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_with_delete_permission_and_show_delete_true admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_with_editable_inlines_true admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_with_show_save_and_add_another_false admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_with_show_save_and_continue_false admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_with_show_save_false admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_with_view_permission_false
+coverage json -o coverage.json
+: '>>>>> End Test Output'

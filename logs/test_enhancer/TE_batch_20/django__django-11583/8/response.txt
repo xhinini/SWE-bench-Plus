@@ -1,0 +1,164 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests verify that iter_modules_and_files() and sys_path_directories() tolerate
+  Path.resolve() raising ValueError (with arbitrary error messages) when resolving
+  problematic paths, and that such errors are logged and ignored (the functions continue
+  rather than re-raising). The model-generated patch re-raises ValueError unless the
+  message exactly equals "embedded null byte", which these tests would detect by
+  producing ValueError instances with different messages. The tests also ensure that
+  valid entries are still returned when one of multiple entries raises ValueError.
+test_code: |
+  from pathlib import Path
+  import sys
+  import tempfile
+  import os
+  from unittest import mock
+
+  from django.test import SimpleTestCase
+  from django.utils import autoreload
+
+  class ValueErrorHandlingTests(SimpleTestCase):
+      def setUp(self):
+          # Ensure cache doesn't interfere across tests.
+          autoreload.iter_modules_and_files.cache_clear()
+          self.orig_resolve = Path.resolve
+
+      def tearDown(self):
+          autoreload.iter_modules_and_files.cache_clear()
+
+      def _make_fake_resolve(self, marker):
+          """
+          Return a side_effect function for Path.resolve that raises ValueError
+          for paths containing 'marker' in their string form, otherwise calls
+          the original Path.resolve implementation.
+          """
+          orig = self.orig_resolve
+
+          def fake_resolve(self, strict=True):
+              # Identify the Path by its string form.
+              if marker in str(self):
+                  raise ValueError('simulated-valueerror-for-testing')
+              return orig(self, strict=strict)
+          return fake_resolve
+
+      def test_iter_modules_and_files_ignores_valueerror_for_str_extra_file(self):
+          bad_path = '/tmp/contains_bad_marker_file.py'
+          # Patch Path.resolve to raise ValueError for this bad path.
+          with mock.patch.object(Path, 'resolve', side_effect=self._make_fake_resolve('contains_bad_marker')):
+              autoreload.iter_modules_and_files.cache_clear()
+              # Should not raise, and should return an empty frozenset as the bad
+              # path could not be resolved.
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+          self.assertEqual(result, frozenset())
+
+      def test_iter_modules_and_files_ignores_valueerror_for_Path_extra_file(self):
+          bad_path = Path('/tmp/contains_bad_marker_path.py')
+          with mock.patch.object(Path, 'resolve', side_effect=self._make_fake_resolve('contains_bad_marker')):
+              autoreload.iter_modules_and_files.cache_clear()
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+          self.assertEqual(result, frozenset())
+
+      def test_iter_modules_and_files_ignores_valueerror_for_main_module_file_attribute(self):
+          # Create a fake __main__ module with a problematic __file__ attribute.
+          import types
+          fake_main = types.ModuleType('__main__')
+          fake_main.__file__ = '/tmp/contains_bad_marker_main.py'
+          with mock.patch.object(Path, 'resolve', side_effect=self._make_fake_resolve('contains_bad_marker_main')):
+              autoreload.iter_modules_and_files.cache_clear()
+              result = autoreload.iter_modules_and_files((fake_main,), frozenset())
+          self.assertEqual(result, frozenset())
+
+      def test_iter_modules_and_files_logs_on_valueerror(self):
+          bad_path = '/tmp/contains_bad_marker_log.py'
+          with mock.patch.object(Path, 'resolve', side_effect=self._make_fake_resolve('contains_bad_marker_log')):
+              with mock.patch.object(autoreload.logger, 'debug') as mock_debug:
+                  autoreload.iter_modules_and_files.cache_clear()
+                  result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+          # No results for the bad path.
+          self.assertEqual(result, frozenset())
+          # The ValueError should have been logged by the code path added in the fix.
+          self.assertTrue(mock_debug.called)
+          # The logged message should include the ValueError string and the path.
+          logged = ' '.join(str(a) for a in mock_debug.call_args[0])
+          self.assertIn('simulated-valueerror-for-testing', logged)
+          self.assertIn('contains_bad_marker_log', logged)
+
+      def test_iter_modules_and_files_with_mixed_files_some_raise_valueerror(self):
+          # Create a real temporary file to be resolved successfully.
+          td = tempfile.TemporaryDirectory()
+          self.addCleanup(td.cleanup)
+          good_dir = Path(td.name)
+          good_file = good_dir / 'good.py'
+          good_file.touch()
+          bad_path = str(good_dir / 'contains_bad_marker_mixed.py')
+          # Patch resolve: raise for bad_path, succeed for the good file.
+          with mock.patch.object(Path, 'resolve', side_effect=self._make_fake_resolve('contains_bad_marker_mixed')):
+              autoreload.iter_modules_and_files.cache_clear()
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path, str(good_file)]))
+          # The good file should be present, the bad one ignored.
+          resolved_good = good_file.resolve()
+          self.assertIn(resolved_good, result)
+          self.assertNotIn(Path(bad_path), result)
+
+      def test_sys_path_directories_ignores_valueerror_for_sys_path_entry(self):
+          bad_path = '/tmp/contains_bad_marker_syspath.py'
+          # Temporarily append the bad path to sys.path and ensure cleanup.
+          sys.path.append(bad_path)
+          self.addCleanup(lambda: sys.path.remove(bad_path))
+          with mock.patch.object(Path, 'resolve', side_effect=self._make_fake_resolve('contains_bad_marker_syspath')):
+              # Should not raise; bad sys.path entries that raise ValueError are ignored.
+              dirs = list(autoreload.sys_path_directories())
+          # The bad path should not be in the returned directories.
+          self.assertFalse(any('contains_bad_marker_syspath' in str(p) for p in dirs))
+
+      def test_sys_path_directories_ignores_valueerror_for_path_like_entry(self):
+          class DummyPath:
+              def __fspath__(self):
+                  return '/tmp/contains_bad_marker_fspath'
+
+              def __str__(self):
+                  return self.__fspath__()
+
+          dummy = DummyPath()
+          sys.path.append(dummy)
+          self.addCleanup(lambda: sys.path.remove(dummy))
+          with mock.patch.object(Path, 'resolve', side_effect=self._make_fake_resolve('contains_bad_marker_fspath')):
+              dirs = list(autoreload.sys_path_directories())
+          self.assertFalse(any('contains_bad_marker_fspath' in str(p) for p in dirs))
+
+      def test_sys_path_directories_logs_on_valueerror(self):
+          bad_path = '/tmp/contains_bad_marker_log_syspath.py'
+          sys.path.append(bad_path)
+          self.addCleanup(lambda: sys.path.remove(bad_path))
+          with mock.patch.object(Path, 'resolve', side_effect=self._make_fake_resolve('contains_bad_marker_log_syspath')):
+              with mock.patch.object(autoreload.logger, 'debug') as mock_debug:
+                  dirs = list(autoreload.sys_path_directories())
+          self.assertTrue(mock_debug.called)
+          logged = ' '.join(str(a) for a in mock_debug.call_args[0])
+          self.assertIn('simulated-valueerror-for-testing', logged)
+          self.assertIn('contains_bad_marker_log_syspath', logged)
+
+      def test_sys_path_directories_with_mixed_entries_some_raise_valueerror(self):
+          # Create a real temporary directory to be resolved successfully.
+          td = tempfile.TemporaryDirectory()
+          self.addCleanup(td.cleanup)
+          good_dir = Path(td.name).resolve()
+          sys.path.append('/tmp/contains_bad_marker_mixed_syspath')
+          sys.path.append(str(good_dir))
+          self.addCleanup(lambda: sys.path.remove('/tmp/contains_bad_marker_mixed_syspath'))
+          self.addCleanup(lambda: sys.path.remove(str(good_dir)))
+          with mock.patch.object(Path, 'resolve', side_effect=self._make_fake_resolve('contains_bad_marker_mixed_syspath')):
+              dirs = list(autoreload.sys_path_directories())
+          # The valid directory should still be present.
+          self.assertIn(good_dir, dirs)
+          # The bad entry should not be present.
+          self.assertFalse(any('contains_bad_marker_mixed_syspath' in str(p) for p in dirs))
+new_imports_code: |
+  from pathlib import Path
+  import sys
+  import tempfile
+  import os
+  from unittest import mock
+  from django.test import SimpleTestCase
+  from django.utils import autoreload

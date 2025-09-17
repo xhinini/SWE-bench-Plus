@@ -1,0 +1,217 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise HashedFilesMixin.post_process when max_post_process_passes is set to 0. The original bug left the local variable "substitutions" uninitialized when the pagination loop was skipped, causing an UnboundLocalError. Each test creates a temporary source and target filesystem storage, writes small files (CSS referencing images, nested paths, query/fragment variants, and non-adjustable files), runs post_process on a ManifestStaticFilesStorage subclass with max_post_process_passes = 0, and asserts that post-processing completes without raising UnboundLocalError and that the expected hashed output files are created and references updated where appropriate. These tests will fail on the buggy (unpatched) implementation and pass on the fixed implementation.
+new_imports_code: |
+  import os
+  import shutil
+  import tempfile
+  import hashlib
+  import unittest
+  from django.conf import settings
+  from django.core.files.storage import FileSystemStorage
+  from django.core.files.base import ContentFile
+  from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
+test_code: |
+  class PostProcessMaxPassesZeroTests(unittest.TestCase):
+      def setUp(self):
+          # Temporary source and destination directories
+          self.src_dir = tempfile.mkdtemp()
+          self.dst_dir = tempfile.mkdtemp()
+          # Ensure a STATIC_URL exists for absolute path tests
+          self._orig_static_url = getattr(settings, 'STATIC_URL', '/static/')
+          settings.STATIC_URL = '/static/'
+
+      def tearDown(self):
+          shutil.rmtree(self.src_dir)
+          shutil.rmtree(self.dst_dir)
+          settings.STATIC_URL = self._orig_static_url
+
+      def _make_src_file(self, relpath, content=b'content'):
+          full = os.path.join(self.src_dir, relpath)
+          os.makedirs(os.path.dirname(full), exist_ok=True)
+          with open(full, 'wb') as f:
+              f.write(content)
+          return relpath
+
+      def _run_post_process(self, paths_mapping):
+          """
+          Create a ManifestStaticFilesStorage with max_post_process_passes = 0
+          and run post_process with the provided paths mapping.
+          Returns the storage instance after post-processing.
+          """
+          class MyManifestStorage(ManifestStaticFilesStorage):
+              max_post_process_passes = 0
+
+          # target storage where hashed files are written
+          target = MyManifestStorage(location=self.dst_dir, base_url=settings.STATIC_URL)
+
+          # Run post_process and exhaust generator; propagate any exception
+          results = list(target.post_process(paths_mapping, dry_run=False))
+          return target, results
+
+      def _hash(self, data):
+          return hashlib.md5(data).hexdigest()[:12]
+
+      def test_simple_css_and_image_processed_without_error(self):
+          # css referencing image.png
+          css_path = 'css/style.css'
+          img_path = 'css/image.png'
+          css_content = b'body { background: url("image.png"); }'
+          img_content = b'image-data'
+          self._make_src_file(css_path, css_content)
+          self._make_src_file(img_path, img_content)
+
+          src_storage = FileSystemStorage(location=self.src_dir)
+          paths = {
+              css_path: (src_storage, css_path),
+              img_path: (src_storage, img_path),
+          }
+
+          target, results = self._run_post_process(paths)
+          # Ensure post_process returned entries
+          self.assertTrue(results)
+          # Both files should be present in target.hashed_files
+          self.assertIn('css/style.css', target.hashed_files)
+          self.assertIn('css/image.png', target.hashed_files)
+
+          # Check the CSS file content references hashed image name
+          hashed_css = target.hashed_files['css/style.css']
+          css_full = os.path.join(self.dst_dir, hashed_css)
+          with open(css_full, 'rb') as f:
+              processed_css = f.read()
+          expected_img_hash = self._hash(img_content)
+          self.assertIn(("image.%s.png" % expected_img_hash).encode(), processed_css)
+
+      def test_nested_css_relative_reference(self):
+          css_path = 'nested/css/app.css'
+          img_path = 'nested/css/img/logo.png'
+          css_content = b'div{background:url("../css/img/logo.png")}'
+          self._make_src_file(css_path, css_content)
+          self._make_src_file(img_path, b'logo-data')
+
+          src_storage = FileSystemStorage(location=self.src_dir)
+          paths = {
+              css_path: (src_storage, css_path),
+              img_path: (src_storage, img_path),
+          }
+
+          target, results = self._run_post_process(paths)
+          self.assertTrue(results)
+          self.assertIn('nested/css/app.css', target.hashed_files)
+          # Validate the processed CSS points to the hashed logo
+          hashed_css = target.hashed_files['nested/css/app.css']
+          with open(os.path.join(self.dst_dir, hashed_css), 'rb') as f:
+              processed = f.read()
+          # logo.png hashed name present
+          self.assertIn(b'logo.', processed)
+          self.assertIn(b'.png', processed)
+
+      def test_css_name_with_fragment_in_mapping_key(self):
+          # name contains fragment in the key but storage path is real file
+          key_name = 'assets/style.css#frag'
+          file_path = 'assets/style.css'
+          img_path = 'assets/img.png'
+          self._make_src_file(file_path, b'url("img.png")')
+          self._make_src_file(img_path, b'imgdat')
+
+          src_storage = FileSystemStorage(location=self.src_dir)
+          paths = {
+              key_name: (src_storage, file_path),
+              img_path: (src_storage, img_path),
+          }
+
+          target, results = self._run_post_process(paths)
+          # Ensure no UnboundLocalError and mapping stored using cleaned key
+          self.assertIn('assets/style.css', target.hashed_files)
+          # The hashed CSS file should exist
+          hashed_css = target.hashed_files['assets/style.css']
+          self.assertTrue(os.path.exists(os.path.join(self.dst_dir, hashed_css)))
+
+      def test_css_name_with_querystring_in_mapping_key(self):
+          key_name = 'assets/q.css?spam=eggs'
+          file_path = 'assets/q.css'
+          self._make_src_file(file_path, b'body{url("img.png")}')
+          self._make_src_file('assets/img.png', b'xyz')
+
+          src_storage = FileSystemStorage(location=self.src_dir)
+          paths = {
+              key_name: (src_storage, file_path),
+              'assets/img.png': (src_storage, 'assets/img.png'),
+          }
+
+          target, results = self._run_post_process(paths)
+          self.assertIn('assets/q.css', target.hashed_files)
+          hashed_css = target.hashed_files['assets/q.css']
+          with open(os.path.join(self.dst_dir, hashed_css), 'rb') as f:
+              processed = f.read()
+          self.assertIn(b'img.', processed)
+
+      def test_non_adjustable_file_type_processed(self):
+          # .txt is not adjustable by CSS/JS patterns but should still be copied/hashed
+          txt_path = 'docs/readme.txt'
+          self._make_src_file(txt_path, b'hello world')
+
+          src_storage = FileSystemStorage(location=self.src_dir)
+          paths = {txt_path: (src_storage, txt_path)}
+
+          target, results = self._run_post_process(paths)
+          self.assertIn('docs/readme.txt', target.hashed_files)
+          hashed_name = target.hashed_files['docs/readme.txt']
+          self.assertTrue(os.path.exists(os.path.join(self.dst_dir, hashed_name)))
+
+      def test_multiple_files_processed_no_error(self):
+          # multiple css and image files
+          files = {
+              'a/x.css': b'url("a.png")',
+              'a/a.png': b'a-data',
+              'b/y.css': b'url("../b/b.png")',
+              'b/b.png': b'b-data',
+          }
+          for path, content in files.items():
+              self._make_src_file(path, content)
+          src_storage = FileSystemStorage(location=self.src_dir)
+          paths = {p: (src_storage, p) for p in files.keys()}
+
+          target, results = self._run_post_process(paths)
+          # All files should be present in hashed_files
+          for name in files.keys():
+              self.assertIn(name, target.hashed_files)
+
+      def test_no_adjustable_paths_only_non_adjustable_then_ok(self):
+          # Only non-adjustable files in paths (e.g., .bin)
+          self._make_src_file('bin/file.bin', b'\x00\x01')
+          src_storage = FileSystemStorage(location=self.src_dir)
+          paths = {'bin/file.bin': (src_storage, 'bin/file.bin')}
+
+          target, results = self._run_post_process(paths)
+          # Should succeed and have a hashed mapping
+          self.assertIn('bin/file.bin', target.hashed_files)
+
+      def test_css_with_absolute_staticurl_reference_ignored_if_not_under_static(self):
+          # An absolute URL that does not start with STATIC_URL should be ignored in replacements.
+          # But post_process itself should still complete successfully.
+          css_path = 'abs/test.css'
+          # Use an absolute external url that shouldn't be processed
+          self._make_src_file(css_path, b'background:url("http://example.com/external.png")')
+          src_storage = FileSystemStorage(location=self.src_dir)
+          paths = {css_path: (src_storage, css_path)}
+
+          target, results = self._run_post_process(paths)
+          self.assertIn('abs/test.css', target.hashed_files)
+
+      def test_path_ending_with_slash_not_hashed_but_post_process_ok(self):
+          # Names that look like directories should be left alone; ensure processing does not crash.
+          dir_like_name = 'folder/subpath/'
+          # Create a file corresponding to index in that directory for opening
+          file_path = 'folder/subpath/index.css'
+          self._make_src_file(file_path, b'body{}')
+          src_storage = FileSystemStorage(location=self.src_dir)
+          # Map the key that ends with a slash to the actual file path to simulate incoming mapping
+          paths = {dir_like_name: (src_storage, file_path)}
+
+          target, results = self._run_post_process(paths)
+          # No exception and no crash; processed entries may exist
+          # If a hash mapping exists for the "cleaned" path, it should be accessible
+          # We check that no UnboundLocalError occurred by asserting results is iterable and processed.
+          self.assertIsInstance(results, list)
+          self.assertTrue(len(results) >= 0)

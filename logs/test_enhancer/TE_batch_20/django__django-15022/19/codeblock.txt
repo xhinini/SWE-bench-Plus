@@ -1,0 +1,139 @@
+from django.test import RequestFactory, TestCase
+from django.contrib.auth.models import User
+from django.contrib import admin
+from django.contrib.admin.sites import AdminSite
+from .admin import ParentAdmin, ParentAdminTwoSearchFields, ChildAdmin, BandCallableFilterAdmin, ConcertAdmin
+from .models import Parent, Child, Band, Genre, Group
+from django.test import RequestFactory, TestCase
+from django.contrib.auth.models import User
+from django.contrib import admin
+from django.contrib.admin.sites import AdminSite
+from django.db import transaction
+
+from .admin import (
+    ParentAdmin, ParentAdminTwoSearchFields, ChildAdmin, BandCallableFilterAdmin,
+    ConcertAdmin
+)
+from .models import Parent, Child, Band, Genre, Group
+
+class GetSearchResultsTests(TestCase):
+    def setUp(self):
+        # Request factory + superuser
+        self.rf = RequestFactory()
+        self.user = User.objects.create_superuser('admin', 'admin@example.com', 'password')
+        self.request = self.rf.get('/')
+        self.request.user = self.user
+        # Create parents and children for testing.
+        self.parent1 = Parent.objects.create(name='Alpha')
+        self.parent2 = Parent.objects.create(name='Beta')
+        # child that has two-word name and an age (stringified age used in searches)
+        self.child1 = Child.objects.create(name='John Smith', parent=self.parent1, age=30)
+        # child with overlapping token only in age field
+        self.child2 = Child.objects.create(name='Johnny', parent=self.parent2, age=30)
+        # child to test quoted phrase
+        self.child3 = Child.objects.create(name='John "The Man" Smith', parent=self.parent1, age=45)
+
+        # Bands/Genres for m2m duplicate-spawning tests
+        self.genre_rock = Genre.objects.create(name='rock')
+        self.genre_pop = Genre.objects.create(name='pop')
+        self.band1 = Band.objects.create(name='The Band', nr_of_members=4)
+        self.band2 = Band.objects.create(name='The Other Band', nr_of_members=6)
+        self.band1.genres.add(self.genre_rock, self.genre_pop)
+        self.band2.genres.add(self.genre_rock)
+
+        # Group for nested lookups test (ConcertAdmin uses group__members__name)
+        g1 = Group.objects.create(name='Group1')
+        # If Group has members m2m, attach Child or Player with name; re-use Child as member if allowed.
+        # Some test setups may have separate player model; attempt to attach if attribute exists.
+        try:
+            # If Group has M2M 'members' to Child
+            g1.members.add(self.child1)
+        except Exception:
+            # otherwise ignore, test that uses ConcertAdmin will still be valid in the environment
+            pass
+
+    def test_single_term_search_matches_child_name(self):
+        admin_instance = ChildAdmin(Child, AdminSite())
+        qs, may_have_duplicates = admin_instance.get_search_results(self.request, Child.objects.all(), 'John')
+        self.assertIn(self.child1, qs)
+        self.assertIn(self.child2, qs)
+
+    def test_multi_term_search_all_terms_must_match(self):
+        # Searching "John 30" should match child1 and child2 (both have 'John*' and age 30),
+        # but when using a full two-word name "John Smith" (two tokens) should match child1 only.
+        admin_instance = ParentAdminTwoSearchFields(Parent, AdminSite())
+        # Search across related fields (child__name child__age) for both tokens
+        qs_both, _ = admin_instance.get_search_results(self.request, Parent.objects.all(), 'John 30')
+        self.assertIn(self.parent1, qs_both)
+        self.assertIn(self.parent2, qs_both)
+
+        qs_phrase, _ = admin_instance.get_search_results(self.request, Parent.objects.all(), 'John Smith')
+        # parent1 should be matched because it has child 'John Smith'
+        self.assertIn(self.parent1, qs_phrase)
+        # parent2 shouldn't be matched by exact two-token phrase (child 'Johnny' != 'John Smith')
+        self.assertNotIn(self.parent2, qs_phrase)
+
+    def test_quoted_phrase_search_treated_as_single_term(self):
+        # Quoted phrase should be treated as a single search term.
+        admin_instance = ParentAdmin(Parent, AdminSite())
+        qs, _ = admin_instance.get_search_results(self.request, Parent.objects.all(), '"John Smith"')
+        # parent1 has a child with name 'John Smith'
+        self.assertIn(self.parent1, qs)
+        # Searching the full quoted string without splitting should not match parent2
+        self.assertNotIn(self.parent2, qs)
+
+    def test_prefix_lookup_search_behavior(self):
+        # Create an admin that uses '^' prefix (istartswith). Use ChildAdmin directly which uses normal
+        # behavior; instead create a ModelAdmin with '^name' to verify prefix handling.
+        class PrefixAdmin(admin.ModelAdmin):
+            search_fields = ('^name',)
+
+        admin_instance = PrefixAdmin(Child, AdminSite())
+        qs, _ = admin_instance.get_search_results(self.request, Child.objects.all(), 'John')
+        # 'John Smith' and 'Johnny' both start with 'John'
+        self.assertIn(self.child1, qs)
+        self.assertIn(self.child2, qs)
+
+    def test_search_across_related_field(self):
+        # ParentAdmin uses list_filter/search_fields on child__name in admin.py above; instantiate
+        admin_instance = ParentAdmin(Parent, AdminSite())
+        qs, _ = admin_instance.get_search_results(self.request, Parent.objects.all(), 'John')
+        self.assertIn(self.parent1, qs)
+
+    def test_m2m_search_spawns_duplicates_flag(self):
+        # Use BandCallableFilterAdmin to search on a m2m related field (genres or members)
+        admin_instance = BandCallableFilterAdmin(Band, AdminSite())
+        qs, may_have_duplicates = admin_instance.get_search_results(self.request, Band.objects.all(), 'rock')
+        # There are two bands related to 'rock'; duplicates flag should be False/True depending on lookup.
+        # The important check is that the queryset contains expected bands.
+        self.assertIn(self.band1, qs)
+        self.assertIn(self.band2, qs)
+        # may_have_duplicates can be True when using lookups that spawn duplicates (m2m). Assert it's a bool.
+        self.assertIsInstance(may_have_duplicates, bool)
+
+    def test_case_insensitive_search(self):
+        admin_instance = ChildAdmin(Child, AdminSite())
+        qs_upper, _ = admin_instance.get_search_results(self.request, Child.objects.all(), 'JOHN')
+        self.assertIn(self.child1, qs_upper)
+        self.assertIn(self.child2, qs_upper)
+
+    def test_search_with_pk_lookup(self):
+        # Search with 'pk' in search_fields maps to primary key; create admin for Child that searches on 'pk' explicitly
+        class PKAdmin(admin.ModelAdmin):
+            search_fields = ('pk',)
+
+        admin_instance = PKAdmin(Child, AdminSite())
+        qs, _ = admin_instance.get_search_results(self.request, Child.objects.all(), str(self.child1.pk))
+        self.assertIn(self.child1, qs)
+        self.assertNotIn(self.child2, qs)
+
+    def test_search_ignores_nonexistent_related_field(self):
+        # Ensure that a search_field containing a nonexistent transform doesn't crash and is treated as a lookup
+        class WeirdAdmin(admin.ModelAdmin):
+            search_fields = ('nonexistent__transform', 'name')
+
+        admin_instance = WeirdAdmin(Child, AdminSite())
+        # Should at least search on 'name' and return matching children
+        qs, _ = admin_instance.get_search_results(self.request, Child.objects.all(), 'John')
+        self.assertIn(self.child1, qs)
+        self.assertIn(self.child2, qs)

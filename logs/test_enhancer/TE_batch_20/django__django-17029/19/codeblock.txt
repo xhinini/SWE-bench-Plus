@@ -1,0 +1,190 @@
+import types
+import types
+from django.apps import apps
+from django.contrib.admin.models import LogEntry
+from django.contrib.contenttypes.models import ContentType
+from django.test import SimpleTestCase
+
+
+class ClearCacheRegressionsTests(SimpleTestCase):
+    def _get_currsize(self):
+        return apps.get_swappable_settings_name.cache_info().currsize
+
+    def _populate_swappable_cache(self, key):
+        # Force a cached entry for the given key
+        apps.get_swappable_settings_name(key)
+
+    def _monkeypatch_expire(self, model, func):
+        """
+        Replace model._meta._expire_cache with `func`.
+        Returns a callable that restores the original method.
+        """
+        original = model._meta._expire_cache
+        model._meta._expire_cache = types.MethodType(lambda self=None: func(), model._meta)
+
+        def restore():
+            model._meta._expire_cache = original
+
+        return restore
+
+    def test_clear_cache_clears_swappable_when_expire_calls_swappable(self):
+        # Populate the cache first.
+        self._populate_swappable_cache("admin.LogEntry")
+        self.assertGreater(self._get_currsize(), 0)
+
+        # Make LogEntry._meta._expire_cache repopulate the swappable cache
+        def repopulate():
+            apps.get_swappable_settings_name("admin.LogEntry")
+
+        restore = self._monkeypatch_expire(LogEntry, repopulate)
+        try:
+            apps.clear_cache()
+            # After clear_cache the swappable cache must be empty.
+            self.assertEqual(self._get_currsize(), 0)
+        finally:
+            restore()
+
+    def test_clear_cache_clears_swappable_when_multiple_models_repopulate(self):
+        # Populate multiple keys
+        self._populate_swappable_cache("admin.LogEntry")
+        self._populate_swappable_cache("contenttypes.ContentType")
+        self.assertGreaterEqual(self._get_currsize(), 2)
+
+        # Arrange both models to repopulate the cache during expire
+        def repopulate_admin():
+            apps.get_swappable_settings_name("admin.LogEntry")
+
+        def repopulate_ct():
+            apps.get_swappable_settings_name("contenttypes.ContentType")
+
+        restore1 = self._monkeypatch_expire(LogEntry, repopulate_admin)
+        restore2 = self._monkeypatch_expire(ContentType, repopulate_ct)
+        try:
+            apps.clear_cache()
+            self.assertEqual(self._get_currsize(), 0)
+        finally:
+            restore1()
+            restore2()
+
+    def test_clear_cache_final_zero_after_repopulation_during_expire_loop(self):
+        # Populate a key
+        self._populate_swappable_cache("admin.LogEntry")
+        self.assertGreater(self._get_currsize(), 0)
+
+        # Have expire repopulate a *different* key
+        def repopulate_other():
+            apps.get_swappable_settings_name("some.other")
+
+        restore = self._monkeypatch_expire(LogEntry, repopulate_other)
+        try:
+            apps.clear_cache()
+            # Ensure both the original and the newly repopulated key are gone.
+            self.assertEqual(self._get_currsize(), 0)
+        finally:
+            restore()
+
+    def test_clear_cache_with_ready_false_clears_swappable_without_expire(self):
+        # When apps.ready is False, clear_cache should still clear swappable
+        self._populate_swappable_cache("admin.LogEntry")
+        self.assertGreater(self._get_currsize(), 0)
+        prev_ready = apps.ready
+        try:
+            apps.ready = False
+            apps.clear_cache()
+            self.assertEqual(self._get_currsize(), 0)
+        finally:
+            apps.ready = prev_ready
+
+    def test_clear_cache_handles_none_values_in_swappable_cache(self):
+        # Call with a key that returns None (most common case)
+        self._populate_swappable_cache("admin.LogEntry")
+        # Ensure it cached the None (currsize > 0)
+        self.assertGreater(self._get_currsize(), 0)
+
+        # Make expire repopulate the same key
+        def repopulate():
+            apps.get_swappable_settings_name("admin.LogEntry")
+
+        restore = self._monkeypatch_expire(LogEntry, repopulate)
+        try:
+            apps.clear_cache()
+            self.assertEqual(self._get_currsize(), 0)
+        finally:
+            restore()
+
+    def test_clear_cache_idempotent_multiple_calls(self):
+        # Populate and then clear multiple times
+        self._populate_swappable_cache("admin.LogEntry")
+        self.assertGreater(self._get_currsize(), 0)
+        apps.clear_cache()
+        self.assertEqual(self._get_currsize(), 0)
+        # Second call should still leave cache empty
+        apps.clear_cache()
+        self.assertEqual(self._get_currsize(), 0)
+
+    def test_clear_cache_clears_all_keys_even_when_some_repopulate(self):
+        # Populate two keys
+        self._populate_swappable_cache("admin.LogEntry")
+        self._populate_swappable_cache("contenttypes.ContentType")
+        self.assertGreaterEqual(self._get_currsize(), 2)
+
+        # Only one model repopulates during expire; final cache must be empty
+        def repopulate_admin():
+            apps.get_swappable_settings_name("admin.LogEntry")
+
+        restore = self._monkeypatch_expire(LogEntry, repopulate_admin)
+        try:
+            apps.clear_cache()
+            self.assertEqual(self._get_currsize(), 0)
+        finally:
+            restore()
+
+    def test_clear_cache_allows_repopulation_after_clear(self):
+        # Populate, then clear, then ensure calling get_swappable_settings_name repopulates anew
+        self._populate_swappable_cache("admin.LogEntry")
+        self.assertGreater(self._get_currsize(), 0)
+        apps.clear_cache()
+        self.assertEqual(self._get_currsize(), 0)
+        # Now a call should populate the cache again
+        apps.get_swappable_settings_name("admin.LogEntry")
+        self.assertEqual(self._get_currsize(), 1)
+
+    def test_clear_cache_with_expire_raising_exception_still_clears_swappable_first(self):
+        # Populate cache
+        self._populate_swappable_cache("admin.LogEntry")
+        self.assertGreater(self._get_currsize(), 0)
+
+        # Make expire raise an exception after attempting to repopulate
+        def raise_after_repopulate():
+            apps.get_swappable_settings_name("admin.LogEntry")
+            raise RuntimeError("boom")
+
+        restore = self._monkeypatch_expire(LogEntry, raise_after_repopulate)
+        try:
+            with self.assertRaisesMessage(RuntimeError, "boom"):
+                apps.clear_cache()
+            # Even if expire raised, the swappable cache must be cleared (no leftover entries).
+            self.assertEqual(self._get_currsize(), 0)
+        finally:
+            restore()
+
+    def test_clear_cache_clears_models_cache_too(self):
+        # Ensure the get_models cache is cleared as well
+        # Fill get_models cache
+        apps.get_models()
+        self.assertGreater(apps.get_models.cache_info().currsize, 0)
+        # Populate swappable cache so both are non-empty
+        self._populate_swappable_cache("admin.LogEntry")
+        self.assertGreater(self._get_currsize(), 0)
+
+        # Have expire repopulate swappable to simulate mid-clear repopulation
+        def repopulate():
+            apps.get_swappable_settings_name("admin.LogEntry")
+
+        restore = self._monkeypatch_expire(LogEntry, repopulate)
+        try:
+            apps.clear_cache()
+            self.assertEqual(self._get_currsize(), 0)
+            self.assertEqual(apps.get_models.cache_info().currsize, 0)
+        finally:
+            restore()

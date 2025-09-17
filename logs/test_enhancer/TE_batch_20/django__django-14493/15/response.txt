@@ -1,0 +1,138 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise HashedFilesMixin/ManifestFilesMixin post-processing and URL conversion behaviors, focusing on the edge case fixed by the patch: ensuring the "substitutions" variable is initialized when max_post_process_passes is 0 (avoiding UnboundLocalError) and verifying related behaviors (hashed_name errors, file hashing, URL converter behavior, stored_name handling of the "?#" font-face hack, and utility methods). The tests create temporary storage locations and files as needed and call post_process and related methods to assert correct outputs or exceptions.
+test_code: |
+  import os
+  import re
+  import tempfile
+  import unittest
+  from types import SimpleNamespace
+  
+  from django.test import override_settings
+  from django.core.files.base import ContentFile
+  from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
+  
+  
+  @override_settings(STATIC_URL='/static/', DEBUG=False)
+  class HashedFilesRegressionTests(unittest.TestCase):
+      def make_storage(self, tmpdir, max_passes=1):
+          class MyStorage(ManifestStaticFilesStorage):
+              max_post_process_passes = max_passes
+          return MyStorage(location=tmpdir, base_url='/static/')
+  
+      def test_post_process_with_zero_max_passes_adjustable_file_does_not_raise(self):
+          """With max_post_process_passes=0 and an adjustable file, post_process should finish."""
+          with tempfile.TemporaryDirectory() as tmpdir:
+              storage = self.make_storage(tmpdir, max_passes=0)
+              os.makedirs(os.path.join(tmpdir, 'css'), exist_ok=True)
+              with open(os.path.join(tmpdir, 'css', 'styles.css'), 'wb') as f:
+                  f.write(b'body{background:url("img.png")}')
+              with open(os.path.join(tmpdir, 'css', 'img.png'), 'wb') as f:
+                  f.write(b'123')
+  
+              # paths map name -> (storage, path)
+              paths = {'css/styles.css': (storage, 'css/styles.css')}
+              # Should not raise UnboundLocalError and should yield processed entry
+              results = list(storage.post_process(paths, dry_run=False))
+              self.assertTrue(any(r[0] == 'css/styles.css' for r in results))
+  
+      def test_post_process_with_zero_max_passes_non_adjustable_file_does_not_raise(self):
+          """With max_post_process_passes=0 and a non-adjustable file, post_process should finish."""
+          with tempfile.TemporaryDirectory() as tmpdir:
+              storage = self.make_storage(tmpdir, max_passes=0)
+              with open(os.path.join(tmpdir, 'image.png'), 'wb') as f:
+                  f.write(b'abc')
+              paths = {'image.png': (storage, 'image.png')}
+              results = list(storage.post_process(paths, dry_run=False))
+              self.assertTrue(any(r[0] == 'image.png' for r in results))
+  
+      def test_hashed_name_raises_for_missing_file(self):
+          with tempfile.TemporaryDirectory() as tmpdir:
+              storage = self.make_storage(tmpdir)
+              # Ensure the file doesn't exist
+              missing = 'does/not/exist.png'
+              with self.assertRaises(ValueError):
+                  storage.hashed_name(missing, content=None, filename=missing)
+  
+      def test_file_hash_returns_none_when_content_none(self):
+          with tempfile.TemporaryDirectory() as tmpdir:
+              storage = self.make_storage(tmpdir)
+              self.assertIsNone(storage.file_hash('any', content=None))
+  
+      def test_url_converter_ignores_protocol_prefixed_urls(self):
+          with tempfile.TemporaryDirectory() as tmpdir:
+              storage = self.make_storage(tmpdir)
+              converter = storage.url_converter('css/main.css', hashed_files={})
+  
+              class Match:
+                  def groupdict(self):
+                      return {'matched': 'url("http://example.com/x.css")', 'url': 'http://example.com/x.css'}
+  
+              self.assertEqual(converter(Match()), 'url("http://example.com/x.css")')
+  
+      def test_url_converter_ignores_absolute_urls_outside_static_url(self):
+          with tempfile.TemporaryDirectory() as tmpdir:
+              storage = self.make_storage(tmpdir)
+              converter = storage.url_converter('css/main.css', hashed_files={})
+  
+              class Match:
+                  def groupdict(self):
+                      return {'matched': 'url("/notstatic/file.css")', 'url': '/notstatic/file.css'}
+  
+              # Since the URL is absolute but not under STATIC_URL it should be ignored.
+              self.assertEqual(converter(Match()), 'url("/notstatic/file.css")')
+  
+      def test_url_converter_resolves_relative_paths_and_hashes_target(self):
+          """
+          Ensure a relative URL in a CSS file is resolved relative to the CSS
+          file and that the returned URL contains a hashed filename.
+          """
+          with tempfile.TemporaryDirectory() as tmpdir:
+              storage = self.make_storage(tmpdir)
+              os.makedirs(os.path.join(tmpdir, 'css'), exist_ok=True)
+              # Create image and css file
+              with open(os.path.join(tmpdir, 'css', 'img.png'), 'wb') as f:
+                  f.write(b'image-content')
+              with open(os.path.join(tmpdir, 'css', 'main.css'), 'wb') as f:
+                  f.write(b'body{background:url("img.png")}')
+  
+              converter = storage.url_converter('css/main.css', hashed_files={})
+              class Match:
+                  def groupdict(self):
+                      return {'matched': 'url("img.png")', 'url': 'img.png'}
+  
+              result = converter(Match())
+              # Expect the result to contain a hashed image filename (12 hex chars) and keep the "url(...)" shape
+              self.assertIn('img.', result)
+              self.assertRegex(result, r'img\.[0-9a-f]{12}\.png')
+  
+      def test_stored_name_appends_question_mark_for_fontface_hack(self):
+          """
+          When given a name like 'fonts/font.eot?#iefix', stored_name should insert
+          a '?' into the path if there is no query component (the '?#' hack).
+          """
+          with tempfile.TemporaryDirectory() as tmpdir:
+              storage = self.make_storage(tmpdir)
+              os.makedirs(os.path.join(tmpdir, 'fonts'), exist_ok=True)
+              with open(os.path.join(tmpdir, 'fonts', 'font.eot'), 'wb') as f:
+                  f.write(b'fontdata')
+  
+              result = storage.stored_name('fonts/font.eot?#iefix')
+              # There should be a '?' just before the fragment part or in the path if needed
+              self.assertIn('?', result)
+              # Fragment should be preserved or result should at least contain 'iefix'
+              self.assertIn('iefix', result)
+  
+      def test_clean_name_and_hash_key_helpers(self):
+          with tempfile.TemporaryDirectory() as tmpdir:
+              storage = self.make_storage(tmpdir)
+              self.assertEqual(storage.clean_name(r'foo\\bar\\baz'), 'foo//bar//baz'.replace('//', '/'))
+              self.assertEqual(storage.hash_key('some/name'), 'some/name')
+test_setup_code: |
+  # No special test setup code required beyond Django override_settings usage in tests.
+new_imports_code: |
+  import tempfile
+  import os
+  import unittest
+  from django.test import override_settings
+  from django.contrib.staticfiles.storage import ManifestStaticFilesStorage

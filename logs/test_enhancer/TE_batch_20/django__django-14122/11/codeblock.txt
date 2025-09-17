@@ -1,0 +1,139 @@
+# No new imports required beyond those used in the existing tests file.
+from datetime import datetime
+from operator import attrgetter
+
+from django.db.models import (
+    Count, Max, Value, F, RawSQL,
+)
+from django.db.models.functions import Upper
+from django.test import TestCase
+
+from .models import Article, Author
+
+
+class GroupByMetaOrderingRegressionTests(TestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        # Setup similar base data as existing tests.
+        cls.a1 = Article.objects.create(headline="Article 1", pub_date=datetime(2005, 7, 26))
+        cls.a2 = Article.objects.create(headline="Article 2", pub_date=datetime(2005, 7, 27))
+        cls.a3 = Article.objects.create(headline="Article 3", pub_date=datetime(2005, 7, 27))
+        cls.a4 = Article.objects.create(headline="Article 4", pub_date=datetime(2005, 7, 28))
+        cls.author_1 = Author.objects.create(name="Name 1")
+        cls.author_2 = Author.objects.create(name="Name 2")
+        # Attach authors to articles to create grouping variety
+        Article.objects.filter(headline__in=["Article 1", "Article 2", "Article 3"]).update(author=cls.author_1)
+        Article.objects.filter(headline="Article 4").update(author=cls.author_2)
+
+    def assert_author_counts(self, qs):
+        """
+        Helper: return mapping author_id -> count for a values/annotate queryset.
+        Ensures stable ordering-insensitive comparison.
+        """
+        results = list(qs)
+        return {item['author']: item['count'] for item in results}
+
+    def test_values_annotate_with_meta_ordering_keeps_grouping_by_values(self):
+        # Default Meta.ordering exists on Article. Ensure values('author') aggregation
+        # groups only by author, not by Meta.ordering fields.
+        qs = Article.objects.values('author').annotate(count=Count('pk'))
+        counts = self.assert_author_counts(qs)
+        expected = {
+            self.author_1.pk: 3,
+            self.author_2.pk: 1,
+        }
+        self.assertEqual(counts, expected)
+
+    def test_values_annotate_with_meta_ordering_and_functional_ordering(self):
+        # Ordering with a function on a related field should not change grouping.
+        qs = Article.objects.values('author').annotate(count=Count('pk')).order_by(Upper('headline'))
+        counts = self.assert_author_counts(qs)
+        expected = {
+            self.author_1.pk: 3,
+            self.author_2.pk: 1,
+        }
+        self.assertEqual(counts, expected)
+
+    def test_values_multiple_fields_then_trim_values_keeps_expected_grouping(self):
+        # Complex sequence: values(...).annotate(...).values(...) - ensure final grouping
+        # corresponds to the last values() call.
+        qs = Article.objects.values('headline', 'author').annotate(count=Count('pk')).values('author').annotate(count=Count('pk'))
+        counts = self.assert_author_counts(qs)
+        expected = {
+            self.author_1.pk: 3,
+            self.author_2.pk: 1,
+        }
+        self.assertEqual(counts, expected)
+
+    def test_having_clause_from_filtering_on_annotation_does_not_pull_in_meta_ordering(self):
+        # Filtering on an annotation produces HAVING; group by should remain by values()
+        qs = Article.objects.values('author').annotate(last_date=Max('pub_date'), count=Count('pk')).filter(last_date__gt=datetime(2005, 7, 26))
+        counts = self.assert_author_counts(qs)
+        # author_1 has last_date 2005-07-27 (>=27) and count 3, author_2 has 2005-07-28 count 1
+        expected = {
+            self.author_1.pk: 3,
+            self.author_2.pk: 1,
+        }
+        self.assertEqual(counts, expected)
+
+    def test_distinct_with_values_and_annotate_grouping(self):
+        # Distinct + values + annotate should still aggregate by the values() fields.
+        qs = Article.objects.values('author').distinct().annotate(count=Count('pk'))
+        counts = self.assert_author_counts(qs)
+        expected = {
+            self.author_1.pk: 3,
+            self.author_2.pk: 1,
+        }
+        self.assertEqual(counts, expected)
+
+    def test_extra_select_order_by_does_not_alter_grouping(self):
+        # extra(select=..., order_by=...) may add ordering expressions; ensure grouping is unchanged.
+        qs = Article.objects.extra(select={"foo": "pub_date"}, order_by=["foo", "headline"]).values('author').annotate(count=Count('pk'))
+        counts = self.assert_author_counts(qs)
+        expected = {
+            self.author_1.pk: 3,
+            self.author_2.pk: 1,
+        }
+        self.assertEqual(counts, expected)
+
+    def test_subquery_annotation_ordering_does_not_affect_grouping(self):
+        # Subquery annotation that orders internally shouldn't change outer GROUP BY.
+        from django.db.models import OuterRef, Subquery, DateTimeField
+        subq = Article.objects.filter(author=OuterRef('pk')).order_by().values('author').annotate(last_date=Max('pub_date')).values('last_date')
+        authors = Author.objects.annotate(last_date=Subquery(subq, output_field=DateTimeField())).values('pk', 'last_date')
+        # Ensure authors annotated subquery returns expected last_date values and no extra grouping
+        result = {a['pk']: a['last_date'] for a in authors}
+        # author_1 last_date = 2005-07-27, author_2 last_date = 2005-07-28
+        self.assertEqual(result[self.author_1.pk].date(), datetime(2005, 7, 27).date())
+        self.assertEqual(result[self.author_2.pk].date(), datetime(2005, 7, 28).date())
+
+    def test_ordering_by_masked_annotation_does_not_break_grouping(self):
+        # Order by an annotation that is not part of the select (masked annotation).
+        qs = Article.objects.annotate(masked=Value('x')).values('author').annotate(count=Count('pk')).order_by('masked')
+        counts = self.assert_author_counts(qs)
+        expected = {
+            self.author_1.pk: 3,
+            self.author_2.pk: 1,
+        }
+        self.assertEqual(counts, expected)
+
+    def test_order_by_rawsql_does_not_inject_meta_ordering_into_group_by(self):
+        # Ordering by explicit table.name via RawSQL should not cause GROUP BY to include Meta.ordering columns.
+        qs = Article.objects.values('author').annotate(count=Count('pk')).order_by(RawSQL("%s.headline" % Article._meta.db_table, ()))
+        counts = self.assert_author_counts(qs)
+        expected = {
+            self.author_1.pk: 3,
+            self.author_2.pk: 1,
+        }
+        self.assertEqual(counts, expected)
+
+    def test_f_expression_in_ordering_does_not_change_aggregation(self):
+        # Ordering by an F expression (on a simple field) should not alter the grouping.
+        qs = Article.objects.values('author').annotate(count=Count('pk')).order_by(F('headline'))
+        counts = self.assert_author_counts(qs)
+        expected = {
+            self.author_1.pk: 3,
+            self.author_2.pk: 1,
+        }
+        self.assertEqual(counts, expected)

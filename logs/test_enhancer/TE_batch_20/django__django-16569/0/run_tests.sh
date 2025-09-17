@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.RegressionAddFieldsTests.test_all_forms_have_delete_when_can_delete_extra_true_with_initial forms_tests.tests.test_formsets_llm.RegressionAddFieldsTests.test_empty_form_access_does_not_raise_typeerror forms_tests.tests.test_formsets_llm.RegressionAddFieldsTests.test_empty_form_has_delete_when_can_delete_extra_true forms_tests.tests.test_formsets_llm.RegressionAddFieldsTests.test_empty_form_multiple_access_consistent forms_tests.tests.test_formsets_llm.RegressionAddFieldsTests.test_empty_form_no_delete_when_can_delete_extra_false forms_tests.tests.test_formsets_llm.RegressionAddFieldsTests.test_empty_form_no_delete_when_can_delete_false forms_tests.tests.test_formsets_llm.RegressionAddFieldsTests.test_empty_form_widget_type_for_deletion_hiddeninput forms_tests.tests.test_formsets_llm.RegressionAddFieldsTests.test_empty_form_with_extra_zero_and_can_delete_extra_false forms_tests.tests.test_formsets_llm.RegressionAddFieldsTests.test_get_form_kwargs_handles_index_none_and_no_error forms_tests.tests.test_formsets_llm.RegressionAddFieldsTests.test_initial_form_has_delete_only_for_initial_when_can_delete_extra_false
+coverage json -o coverage.json
+: '>>>>> End Test Output'

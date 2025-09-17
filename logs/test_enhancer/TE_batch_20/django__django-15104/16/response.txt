@@ -1,0 +1,173 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that only_relation_agnostic_fields and the autodetector's change-detection logic do not raise when a field's deconstructed kwargs lack a 'to' key (for example, because a custom Field.deconstruct removed it). They exercise direct calls to only_relation_agnostic_fields and integration paths of _detect_changes for creating models, renaming models, and altering fields involving such custom ForeignKey subclasses. These would have raised KeyError with the original `del deconstruction[2]['to']` behavior.
+test_code: |
+  from django.test import SimpleTestCase
+  from django.db import models
+  from django.db.migrations.autodetector import MigrationAutodetector
+  from django.db.migrations.state import ModelState, ProjectState
+  from django.db.migrations.questioner import MigrationQuestioner
+
+  class HardcodedForeignKey(models.ForeignKey):
+      """
+      A ForeignKey that hardcodes 'to' during __init__ (so remote_field.model is set),
+      but removes 'to' during deconstruct(), causing the deconstructed kwargs to
+      not contain 'to' (the case that caused KeyError with `del ...['to']`).
+      """
+      def __init__(self, *args, **kwargs):
+          # Hardcode the 'to' argument so the field acts like a relation.
+          kwargs['to'] = 'testapp.Author'
+          super().__init__(*args, **kwargs)
+
+      def deconstruct(self):
+          name, path, args, kwargs = super().deconstruct()
+          # Remove 'to' from the deconstructed kwargs to simulate custom behavior.
+          kwargs.pop('to', None)
+          return name, path, args, kwargs
+
+  class DummyField(models.CharField):
+      """A field without a remote_field (used to ensure no mutation attempted)."""
+      pass
+
+  class OnlyRelationAgnosticFieldsTests(SimpleTestCase):
+      def setUp(self):
+          # Use minimal ProjectState instances; MigrationAutodetector only needs an instance
+          self.autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+
+      def test_handles_custom_fk_missing_to_key(self):
+          """only_relation_agnostic_fields must not raise when 'to' is missing."""
+          fields = {'fk': HardcodedForeignKey(on_delete=models.CASCADE)}
+          fields_def = self.autodetector.only_relation_agnostic_fields(fields)
+          self.assertEqual(len(fields_def), 1)
+          # kwargs dict should not contain 'to' (either because it was absent or popped)
+          self.assertNotIn('to', fields_def[0][2])
+
+      def test_removes_to_when_present(self):
+          """A normal ForeignKey's deconstruction should have 'to' removed."""
+          fields = {'fk': models.ForeignKey('testapp.Author', models.CASCADE)}
+          fields_def = self.autodetector.only_relation_agnostic_fields(fields)
+          self.assertEqual(len(fields_def), 1)
+          self.assertNotIn('to', fields_def[0][2])
+
+      def test_multiple_fields_one_missing_to(self):
+          """Mix of normal FK and custom FK should both be safe and return sane defs."""
+          fields = {
+              'normal': models.ForeignKey('testapp.Author', models.CASCADE),
+              'custom': HardcodedForeignKey(on_delete=models.CASCADE),
+          }
+          fields_def = self.autodetector.only_relation_agnostic_fields(fields)
+          # Two fields returned
+          self.assertEqual(len(fields_def), 2)
+          for _, kwargs in ((d[0], d[2]) for d in fields_def):
+              self.assertNotIn('to', kwargs)
+
+      def test_preserves_other_kwargs(self):
+          """Other kwargs (e.g., db_column) should be preserved in deconstructed kwargs."""
+          class FKWithDbColumn(models.ForeignKey):
+              def __init__(self, *args, **kwargs):
+                  kwargs['to'] = 'testapp.Author'
+                  kwargs['db_column'] = 'foo_col'
+                  super().__init__(*args, **kwargs)
+
+              def deconstruct(self):
+                  name, path, args, kwargs = super().deconstruct()
+                  # Simulate removal of 'to' but preserve other kwargs.
+                  kwargs.pop('to', None)
+                  return name, path, args, kwargs
+
+          fields = {'fk': FKWithDbColumn(on_delete=models.CASCADE)}
+          fields_def = self.autodetector.only_relation_agnostic_fields(fields)
+          self.assertEqual(len(fields_def), 1)
+          self.assertNotIn('to', fields_def[0][2])
+          self.assertIn('db_column', fields_def[0][2])
+          self.assertEqual(fields_def[0][2]['db_column'], 'foo_col')
+
+      def test_ignores_non_relation_fields(self):
+          """Fields without remote_field should be returned deconstructed unchanged."""
+          fields = {'f': DummyField(max_length=10)}
+          fields_def = self.autodetector.only_relation_agnostic_fields(fields)
+          self.assertEqual(len(fields_def), 1)
+          # No 'to' possible; just ensure returned structure is a 3-tuple (path, args, kwargs)
+          self.assertEqual(len(fields_def[0]), 3)
+
+  class IntegrationAutodetectorTests(SimpleTestCase):
+      def test_create_model_with_custom_fk_missing_to(self):
+          """Creating a model that contains a custom FK (deconstruct drops 'to') must succeed."""
+          before = ProjectState()
+          after = ProjectState()
+          # New Book model with the HardcodedForeignKey
+          after.add_model(ModelState('testapp', 'Book', [
+              ('id', models.AutoField(primary_key=True)),
+              ('author', HardcodedForeignKey(on_delete=models.CASCADE)),
+          ]))
+          autodetector = MigrationAutodetector(before, after)
+          changes = autodetector._detect_changes()
+          # Ensure a migration was generated for testapp and it's a CreateModel
+          self.assertIn('testapp', changes)
+          self.assertTrue(any(op.__class__.__name__ == 'CreateModel'
+                              for op in changes['testapp'][0].operations))
+
+      def test_rename_model_with_custom_fk_missing_to(self):
+          """
+          Renaming detection that relies on only_relation_agnostic_fields must not
+          fail when a related field's deconstructed kwargs lack 'to'.
+          """
+          before = ProjectState()
+          after = ProjectState()
+          # Old model named Contract
+          before.add_model(ModelState('testapp', 'Contract', [
+              ('id', models.AutoField(primary_key=True)),
+              ('author', models.ForeignKey('testapp.Author', models.CASCADE)),
+              ('publisher', models.ForeignKey('testapp.Publisher', models.CASCADE)),
+          ]))
+          # New model Deal in same app with equivalent fields, but use custom FK that drops 'to'
+          after.add_model(ModelState('testapp', 'Deal', [
+              ('id', models.AutoField(primary_key=True)),
+              ('author', HardcodedForeignKey(on_delete=models.CASCADE)),
+              ('publisher', HardcodedForeignKey(on_delete=models.CASCADE)),
+          ]))
+          # Add the referenced models so resolve_fields_and_relations works
+          before.add_model(ModelState('testapp', 'Author', [('id', models.AutoField(primary_key=True))]))
+          before.add_model(ModelState('testapp', 'Publisher', [('id', models.AutoField(primary_key=True))]))
+          after.add_model(ModelState('testapp', 'Author', [('id', models.AutoField(primary_key=True))]))
+          after.add_model(ModelState('testapp', 'Publisher', [('id', models.AutoField(primary_key=True))]))
+
+          autodetector = MigrationAutodetector(before, after, questioner=MigrationQuestioner({'ask_rename_model': True}))
+          changes = autodetector._detect_changes()
+          # Should detect a RenameModel for testapp
+          self.assertIn('testapp', changes)
+          op_names = [op.__class__.__name__ for op in changes['testapp'][0].operations]
+          self.assertIn('RenameModel', op_names)
+
+      def test_alter_field_to_custom_fk_missing_to(self):
+          """Altering an existing field to a custom FK (dropping 'to' in deconstruct) must produce AlterField."""
+          before = ProjectState()
+          after = ProjectState()
+          # Provide the target models used by the FK
+          before.add_model(ModelState('testapp', 'Author', [('id', models.AutoField(primary_key=True))]))
+          after.add_model(ModelState('testapp', 'Author', [('id', models.AutoField(primary_key=True))]))
+
+          # Model with an IntegerField originally
+          before.add_model(ModelState('testapp', 'Book', [
+              ('id', models.AutoField(primary_key=True)),
+              ('writer', models.IntegerField()),
+          ]))
+          # Now change 'writer' to a relation using our custom FK
+          after.add_model(ModelState('testapp', 'Book', [
+              ('id', models.AutoField(primary_key=True)),
+              ('writer', HardcodedForeignKey(on_delete=models.CASCADE)),
+          ]))
+
+          autodetector = MigrationAutodetector(before, after)
+          changes = autodetector._detect_changes()
+          # There should be an AlterField (or RemoveField+AddField depending on type change),
+          # but in either case a migration should be present for testapp.
+          self.assertIn('testapp', changes)
+          # Ensure at least one operation touches the 'writer' field (AlterField or AddField/RemoveField)
+          ops = [op.__class__.__name__ for op in changes['testapp'][0].operations]
+          self.assertTrue(any(op in ('AlterField', 'AddField', 'RemoveField') for op in ops))
+new_imports_code: |
+  from django.db import models
+  from django.db.migrations.autodetector import MigrationAutodetector
+  from django.db.migrations.state import ModelState, ProjectState
+  from django.db.migrations.questioner import MigrationQuestioner

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 queries.test_bulk_update_llm.ExpressionImportRemovalTests.setUp queries.test_bulk_update_llm.ExpressionImportRemovalTests.test_attribute_access_raises_attribute_error queries.test_bulk_update_llm.ExpressionImportRemovalTests.test_attrs_do_not_contain_expression queries.test_bulk_update_llm.ExpressionImportRemovalTests.test_from_import_in_local_namespace_fails queries.test_bulk_update_llm.ExpressionImportRemovalTests.test_from_import_raises_import_error queries.test_bulk_update_llm.ExpressionImportRemovalTests.test_getattr_without_default_raises queries.test_bulk_update_llm.ExpressionImportRemovalTests.test_importlib_attribute_missing queries.test_bulk_update_llm.ExpressionImportRemovalTests.test_module_dict_has_no_expression_key queries.test_bulk_update_llm.ExpressionImportRemovalTests.test_name_not_in_dir queries.test_bulk_update_llm.ExpressionImportRemovalTests.test_no_attribute_via_getattr
+coverage json -o coverage.json
+: '>>>>> End Test Output'

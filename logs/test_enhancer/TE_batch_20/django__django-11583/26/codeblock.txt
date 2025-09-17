@@ -1,0 +1,153 @@
+from unittest import mock
+from django.test import SimpleTestCase
+from pathlib import Path
+import tempfile
+import shutil
+import os
+import sys
+import types
+from django.utils import autoreload
+from unittest import mock
+from django.test import SimpleTestCase
+from pathlib import Path
+import tempfile
+import shutil
+import os
+import sys
+import types
+
+from django.utils import autoreload
+
+class ValueErrorHandlingTests(SimpleTestCase):
+    def setUp(self):
+        # Temporary directory and files for "good" paths.
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.tempdir = Path(self._td.name).resolve().absolute()
+        self.good_file = self.tempdir / "good.py"
+        self.good_file.parent.mkdir(parents=True, exist_ok=True)
+        self.good_file.touch()
+        # Ensure caches don't interfere between tests
+        autoreload.iter_modules_and_files.cache_clear()
+
+    def _patch_resolve_raising_for(self, bad_identifier, exc_message='not embedded null byte'):
+        """
+        Patch Path.resolve so that it raises ValueError(exc_message) when the
+        path string contains bad_identifier. Other paths delegate to the real resolve.
+        """
+        original_resolve = Path.resolve
+
+        def fake_resolve(self, strict=True):
+            if bad_identifier in str(self):
+                raise ValueError(exc_message)
+            return original_resolve(self, strict=strict)
+
+        return mock.patch.object(Path, 'resolve', side_effect=fake_resolve)
+
+    def test_iter_modules_and_files_ignores_bad_string_path(self):
+        """A bad string path in extra_files that triggers ValueError should be ignored."""
+        bad_path = "/some/bad/path/contains_bad"
+        with self._patch_resolve_raising_for("contains_bad"):
+            result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+        # Should be empty set, not raising
+        self.assertEqual(result, frozenset())
+
+    def test_iter_modules_and_files_ignores_bad_path_object(self):
+        """A bad Path object in extra_files that triggers ValueError should be ignored."""
+        bad_path = Path("/some/other/bad/path_contains_badobj")
+        with self._patch_resolve_raising_for("badobj"):
+            result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+        self.assertEqual(result, frozenset())
+
+    def test_iter_modules_and_files_includes_good_and_ignores_bad(self):
+        """When mixed good and bad extra_files are provided, the good one is included and bad ignored."""
+        bad_path = "/tmp/this_is_bad_path_marker"
+        with self._patch_resolve_raising_for("bad_path_marker"):
+            result = autoreload.iter_modules_and_files((), frozenset([str(self.good_file), bad_path]))
+        # The resolved good file should be present
+        resolved_good = self.good_file.resolve()
+        self.assertIn(resolved_good, result)
+        # Bad path should not be in results
+        self.assertNotIn(Path(bad_path), result)
+
+    def test_iter_modules_and_files_handles_value_error_from_module_spec_origin(self):
+        """If a module.__spec__.origin resolution raises ValueError, it should be ignored."""
+        bad_origin = "/origin/this_is_bad_origin_marker"
+        mod = types.ModuleType("dummy")
+        # Create a fake spec object with has_location True and an origin that is "bad"
+        spec = types.SimpleNamespace(has_location=True, loader=object(), origin=bad_origin)
+        mod.__spec__ = spec
+        with self._patch_resolve_raising_for("bad_origin_marker"):
+            # The bad_origin string intentionally does NOT include the marker, so patch won't raise yet.
+            # To cause the raise, use a marker present in the origin string.
+            mod.__spec__.origin = "/origin/this_is_bad_origin_marker"
+            result = autoreload.iter_modules_and_files((mod,), frozenset())
+        # Should not raise and result should not contain the bad origin
+        self.assertNotIn(Path(mod.__spec__.origin), result)
+
+    def test_iter_modules_and_files_handles_value_error_from_main_module_file(self):
+        """A __main__ module with a __file__ that raises ValueError on resolve should be ignored."""
+        # Create a fake __main__-like module
+        fake_main = types.ModuleType("__main__")
+        fake_main.__file__ = "/main/this_is_bad_main_marker"
+        with self._patch_resolve_raising_for("bad_main_marker"):
+            # Ensure the string contains our marker to trigger the fake resolve
+            fake_main.__file__ = "/main/this_is_bad_main_marker"
+            result = autoreload.iter_modules_and_files((fake_main,), frozenset())
+        self.assertEqual(result, frozenset())
+
+    def test_sys_path_directories_ignores_bad_entry_in_sys_path(self):
+        """A sys.path entry that raises ValueError on resolve should be ignored by sys_path_directories()."""
+        bad_entry = "/sys/path/with_bad_marker"
+        original_sys_path = list(sys.path)
+        sys.path.append(bad_entry)
+        self.addCleanup(lambda: sys.path.clear() or sys.path.extend(original_sys_path))
+        with self._patch_resolve_raising_for("bad_marker"):
+            # Make sure the bad_entry contains the marker to trigger the fake resolve
+            sys.path[-1] = "/sys/path/with_bad_marker_and_bad_marker"
+            dirs = list(autoreload.sys_path_directories())
+        # The bad entry should not be present
+        self.assertNotIn(Path(bad_entry), dirs)
+
+    def test_sys_path_directories_includes_good_and_ignores_bad(self):
+        """When sys.path contains both valid and bad entries, the valid one is returned."""
+        good_entry = str(self.tempdir)
+        bad_entry = "/another/bad/entry_marker"
+        original_sys_path = list(sys.path)
+        sys.path.append(bad_entry)
+        sys.path.append(good_entry)
+        self.addCleanup(lambda: sys.path.clear() or sys.path.extend(original_sys_path))
+        with self._patch_resolve_raising_for("entry_marker"):
+            # Make sure bad entry contains the marker
+            sys.path[ -2 ] = "/another/bad/entry_marker_here"
+            result = list(autoreload.sys_path_directories())
+        self.assertIn(self.tempdir, result)
+        # Ensure no path containing 'entry_marker' is present
+        self.assertTrue(all("entry_marker" not in str(p) for p in result))
+
+    def test_multiple_bad_sys_path_entries_do_not_raise(self):
+        """Multiple bad entries in sys.path that raise ValueError should not cause an exception."""
+        bad1 = "/bad_one_marker"
+        bad2 = "/bad_two_marker"
+        original_sys_path = list(sys.path)
+        sys.path.extend([bad1, bad2, str(self.tempdir)])
+        self.addCleanup(lambda: sys.path.clear() or sys.path.extend(original_sys_path))
+        with self._patch_resolve_raising_for("marker"):
+            # Ensure both bad entries contain the 'marker'
+            sys.path[ -3 ] = "/bad_one_marker_here"
+            sys.path[ -2 ] = "/bad_two_marker_here"
+            result = list(autoreload.sys_path_directories())
+        # Should include the good tempdir despite the bad entries
+        self.assertIn(self.tempdir, result)
+
+    def test_iter_modules_and_files_ignores_value_error_with_nonembedded_message(self):
+        """
+        Specifically ensure that a ValueError with an arbitrary message does not
+        cause the function to raise (this targets the incorrect behavior in the
+        candidate patch which only allowed 'embedded null byte' messages).
+        """
+        bad_path = "/unique_bad_message_marker"
+        with self._patch_resolve_raising_for("unique_bad_message_marker", exc_message="some other message"):
+            # Should not raise and should return empty set
+            result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+        self.assertEqual(result, frozenset())

@@ -1,0 +1,133 @@
+import sys
+import tempfile
+import types
+from pathlib import Path
+from unittest import mock
+import sys
+import tempfile
+import types
+from pathlib import Path
+from unittest import mock
+
+from django.test import SimpleTestCase
+from django.utils import autoreload
+
+class ValueErrorHandlingRegressionTests(SimpleTestCase):
+    def setUp(self):
+        # Ensure cached functions are cleared between tests.
+        autoreload.iter_modules_and_files.cache_clear()
+
+    def _patch_resolve_to_raise_for(self, marker, exc_message="custom error"):
+        """
+        Patch Path.resolve to raise ValueError(exc_message) when the path
+        string contains marker. Otherwise call original resolve().
+        """
+        orig_resolve = Path.resolve
+
+        def fake_resolve(self, *args, **kwargs):
+            if marker in str(self):
+                raise ValueError(exc_message)
+            return orig_resolve(self, *args, **kwargs)
+
+        return mock.patch.object(Path, 'resolve', new=fake_resolve)
+
+    def test_iter_modules_and_files_ignores_value_error_for_extra_file_string(self):
+        # Passing an extra_files entry as a string that triggers ValueError
+        bad_path = "/tmp/this_is_a_bad_path_marker_extra_file"
+        with self._patch_resolve_to_raise_for("bad_path_marker"):
+            result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+        # Should skip the bad path and return an empty frozenset (no exception)
+        self.assertEqual(result, frozenset())
+
+    def test_iter_modules_and_files_ignores_value_error_for_extra_file_path(self):
+        # Passing an extra_files entry as a Path that triggers ValueError
+        bad_path = Path("/tmp/this_is_a_bad_path_marker_path")
+        with self._patch_resolve_to_raise_for("bad_path_marker"):
+            result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+        self.assertEqual(result, frozenset())
+
+    def test_iter_modules_and_files_ignores_value_error_on_main_module_file(self):
+        # Simulate a __main__ module whose __file__ path raises ValueError when resolved.
+        fake_main = types.ModuleType('__main__')
+        fake_main.__file__ = "/tmp/this_is_a_bad_path_marker_main"
+        with self._patch_resolve_to_raise_for("bad_path_marker"):
+            result = autoreload.iter_modules_and_files((fake_main,), frozenset())
+        self.assertEqual(result, frozenset())
+
+    def test_iter_modules_and_files_processes_good_and_ignores_bad_mixed(self):
+        # Ensure that when one path raises ValueError, other (good) paths are still processed.
+        td = tempfile.TemporaryDirectory()
+        good_file = Path(td.name) / "good.py"
+        good_file.parent.mkdir(parents=True, exist_ok=True)
+        good_file.write_text("# good")
+        bad_path = str(Path(td.name) / "this_is_a_bad_path_marker_mixed")
+        with self._patch_resolve_to_raise_for("bad_path_marker"):
+            result = autoreload.iter_modules_and_files((), frozenset([str(good_file), bad_path]))
+        # The good file should be present (resolved), the bad one skipped.
+        resolved_good = good_file.resolve()
+        self.assertIn(resolved_good, result)
+        td.cleanup()
+
+    def test_sys_path_directories_ignores_value_error_entry(self):
+        # Adding a sys.path entry that will raise ValueError when resolved should be skipped.
+        bad_entry = "/tmp/this_is_a_bad_path_marker_sys_path"
+        with mock.patch.object(sys, 'path', new=list(sys.path) + [bad_entry]):
+            with self._patch_resolve_to_raise_for("bad_path_marker"):
+                # Should not raise and should skip the bad entry.
+                dirs = list(autoreload.sys_path_directories())
+        # Ensure the bad entry is not present as a resolved Path in the results.
+        for p in dirs:
+            self.assertNotIn("this_is_a_bad_path_marker_sys_path", str(p))
+
+    def test_sys_path_directories_handles_multiple_entries_one_bad(self):
+        # When multiple sys.path entries exist and only one raises ValueError, others are returned.
+        td = tempfile.TemporaryDirectory()
+        good_dir = Path(td.name).resolve()
+        bad_entry = "/tmp/this_is_a_bad_path_marker_sys_path_multi"
+        with mock.patch.object(sys, 'path', new=[str(good_dir), bad_entry]):
+            with self._patch_resolve_to_raise_for("bad_path_marker"):
+                dirs = list(autoreload.sys_path_directories())
+        self.assertIn(good_dir, dirs)
+        for p in dirs:
+            self.assertNotIn("this_is_a_bad_path_marker_sys_path_multi", str(p))
+        td.cleanup()
+
+    def test_iter_all_python_module_files_ignores_value_error_from_sys_modules_origin(self):
+        # Create a fake module with a __spec__ having an origin that triggers ValueError.
+        fake_mod = types.ModuleType("test_fake_bad_module")
+        spec = types.SimpleNamespace(has_location=True, loader=object(), origin="/tmp/this_is_a_bad_path_marker_spec_origin")
+        fake_mod.__spec__ = spec
+        sys.modules["test_fake_bad_module"] = fake_mod
+        self.addCleanup(lambda: sys.modules.pop("test_fake_bad_module", None))
+        with self._patch_resolve_to_raise_for("bad_path_marker"):
+            # Calling iter_all_python_module_files should not raise and should ignore the bad origin.
+            files = list(autoreload.iter_all_python_module_files())
+        # Ensure our bad origin is not present in the results.
+        for p in files:
+            self.assertNotIn("this_is_a_bad_path_marker_spec_origin", str(p))
+
+    def test_iter_modules_and_files_ignores_value_error_with_unusual_message(self):
+        # Ensure ValueError with a message different from 'embedded null byte' is also ignored.
+        # This is the crux of the regression: the model patch re-raises unless the message equals
+        # 'embedded null byte'. The correct behavior is to ignore any ValueError from resolve().
+        bad_path = "/tmp/bad_marker_unusual_message"
+        with self._patch_resolve_to_raise_for("bad_marker_unusual_message", exc_message="some other message"):
+            result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+        self.assertEqual(result, frozenset())
+
+    def test_iter_modules_and_files_skips_on_value_error_and_keeps_cache_behaviour(self):
+        # Verify that the function continues to return valid results when cached and when a ValueError occurs.
+        td = tempfile.TemporaryDirectory()
+        good_file = Path(td.name) / "cached_good.py"
+        good_file.parent.mkdir(parents=True, exist_ok=True)
+        good_file.write_text("# good")
+        bad_path = str(Path(td.name) / "bad_marker_cached")
+        # First call with only good file to populate cache for a particular key.
+        autoreload.iter_modules_and_files.cache_clear()
+        res1 = autoreload.iter_modules_and_files((), frozenset([str(good_file)]))
+        self.assertIn(good_file.resolve(), res1)
+        # Now call with a new frozenset that includes a bad path; cache key differs so it will call resolve again.
+        with self._patch_resolve_to_raise_for("bad_marker_cached"):
+            res2 = autoreload.iter_modules_and_files((), frozenset([str(good_file), bad_path]))
+        self.assertIn(good_file.resolve(), res2)
+        td.cleanup()

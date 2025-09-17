@@ -1,0 +1,1746 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `xarray/core/combine.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 import itertools
+2 import warnings
+3 from collections import Counter, OrderedDict
+4 from textwrap import dedent
+5 
+6 import pandas as pd
+7 
+8 from .dataarray import DataArray
+9 from .dataset import Dataset
+10 from .concat import concat
+11 from . import dtypes
+12 from .merge import merge
+13 
+14 
+15 def _infer_concat_order_from_positions(datasets):
+16     combined_ids = OrderedDict(_infer_tile_ids_from_nested_list(datasets, ()))
+17     return combined_ids
+18 
+19 
+20 def _infer_tile_ids_from_nested_list(entry, current_pos):
+21     """
+22     Given a list of lists (of lists...) of objects, returns a iterator
+23     which returns a tuple containing the index of each object in the nested
+24     list structure as the key, and the object. This can then be called by the
+25     dict constructor to create a dictionary of the objects organised by their
+26     position in the original nested list.
+27 
+28     Recursively traverses the given structure, while keeping track of the
+29     current position. Should work for any type of object which isn't a list.
+30 
+31     Parameters
+32     ----------
+33     entry : list[list[obj, obj, ...], ...]
+34         List of lists of arbitrary depth, containing objects in the order
+35         they are to be concatenated.
+36 
+37     Returns
+38     -------
+39     combined_tile_ids : dict[tuple(int, ...), obj]
+40     """
+41 
+42     if isinstance(entry, list):
+43         for i, item in enumerate(entry):
+44             for result in _infer_tile_ids_from_nested_list(item,
+45                                                            current_pos + (i,)):
+46                 yield result
+47     else:
+48         yield current_pos, entry
+49 
+50 
+51 def _infer_concat_order_from_coords(datasets):
+52 
+53     concat_dims = []
+54     tile_ids = [() for ds in datasets]
+55 
+56     # All datasets have same variables because they've been grouped as such
+57     ds0 = datasets[0]
+58     for dim in ds0.dims:
+59 
+60         # Check if dim is a coordinate dimension
+61         if dim in ds0:
+62 
+63             # Need to read coordinate values to do ordering
+64             indexes = [ds.indexes.get(dim) for ds in datasets]
+65             if any(index is None for index in indexes):
+66                 raise ValueError("Every dimension needs a coordinate for "
+67                                  "inferring concatenation order")
+68 
+69             # If dimension coordinate values are same on every dataset then
+70             # should be leaving this dimension alone (it's just a "bystander")
+71             if not all(index.equals(indexes[0]) for index in indexes[1:]):
+72 
+73                 # Infer order datasets should be arranged in along this dim
+74                 concat_dims.append(dim)
+75 
+76                 if all(index.is_monotonic_increasing for index in indexes):
+77                     ascending = True
+78                 elif all(index.is_monotonic_decreasing for index in indexes):
+79                     ascending = False
+80                 else:
+81                     raise ValueError("Coordinate variable {} is neither "
+82                                      "monotonically increasing nor "
+83                                      "monotonically decreasing on all datasets"
+84                                      .format(dim))
+85 
+86                 # Assume that any two datasets whose coord along dim starts
+87                 # with the same value have the same coord values throughout.
+88                 if any(index.size == 0 for index in indexes):
+89                     raise ValueError('Cannot handle size zero dimensions')
+90                 first_items = pd.Index([index.take([0])
+91                                         for index in indexes])
+92 
+93                 # Sort datasets along dim
+94                 # We want rank but with identical elements given identical
+95                 # position indices - they should be concatenated along another
+96                 # dimension, not along this one
+97                 series = first_items.to_series()
+98                 rank = series.rank(method='dense', ascending=ascending)
+99                 order = rank.astype(int).values - 1
+100 
+101                 # Append positions along extra dimension to structure which
+102                 # encodes the multi-dimensional concatentation order
+103                 tile_ids = [tile_id + (position,) for tile_id, position
+104                             in zip(tile_ids, order)]
+105 
+106     if len(datasets) > 1 and not concat_dims:
+107         raise ValueError("Could not find any dimension coordinates to use to "
+108                          "order the datasets for concatenation")
+109 
+110     combined_ids = OrderedDict(zip(tile_ids, datasets))
+111 
+112     return combined_ids, concat_dims
+113 
+114 
+115 def _check_shape_tile_ids(combined_tile_ids):
+116     tile_ids = combined_tile_ids.keys()
+117 
+118     # Check all tuples are the same length
+119     # i.e. check that all lists are nested to the same depth
+120     nesting_depths = [len(tile_id) for tile_id in tile_ids]
+121     if not nesting_depths:
+122         nesting_depths = [0]
+123     if not set(nesting_depths) == {nesting_depths[0]}:
+124         raise ValueError("The supplied objects do not form a hypercube because"
+125                          " sub-lists do not have consistent depths")
+126 
+127     # Check all lists along one dimension are same length
+128     for dim in range(nesting_depths[0]):
+129         indices_along_dim = [tile_id[dim] for tile_id in tile_ids]
+130         occurrences = Counter(indices_along_dim)
+131         if len(set(occurrences.values())) != 1:
+132             raise ValueError("The supplied objects do not form a hypercube "
+133                              "because sub-lists do not have consistent "
+134                              "lengths along dimension" + str(dim))
+135 
+136 
+137 def _combine_nd(combined_ids, concat_dims, data_vars='all',
+138                 coords='different', compat='no_conflicts',
+139                 fill_value=dtypes.NA):
+140     """
+141     Combines an N-dimensional structure of datasets into one by applying a
+142     series of either concat and merge operations along each dimension.
+143 
+144     No checks are performed on the consistency of the datasets, concat_dims or
+145     tile_IDs, because it is assumed that this has already been done.
+146 
+147     Parameters
+148     ----------
+149     combined_ids : Dict[Tuple[int, ...]], xarray.Dataset]
+150         Structure containing all datasets to be concatenated with "tile_IDs" as
+151         keys, which specify position within the desired final combined result.
+152     concat_dims : sequence of str
+153         The dimensions along which the datasets should be concatenated. Must be
+154         in order, and the length must match the length of the tuples used as
+155         keys in combined_ids. If the string is a dimension name then concat
+156         along that dimension, if it is None then merge.
+157 
+158     Returns
+159     -------
+160     combined_ds : xarray.Dataset
+161     """
+162 
+163     example_tile_id = next(iter(combined_ids.keys()))
+164 
+165     n_dims = len(example_tile_id)
+166     if len(concat_dims) != n_dims:
+167         raise ValueError("concat_dims has length {} but the datasets "
+168                          "passed are nested in a {}-dimensional structure"
+169                          .format(len(concat_dims), n_dims))
+170 
+171     # Each iteration of this loop reduces the length of the tile_ids tuples
+172     # by one. It always combines along the first dimension, removing the first
+173     # element of the tuple
+174     for concat_dim in concat_dims:
+175         combined_ids = _combine_all_along_first_dim(combined_ids,
+176                                                     dim=concat_dim,
+177                                                     data_vars=data_vars,
+178                                                     coords=coords,
+179                                                     compat=compat,
+180                                                     fill_value=fill_value)
+181     (combined_ds,) = combined_ids.values()
+182     return combined_ds
+183 
+184 
+185 def _combine_all_along_first_dim(combined_ids, dim, data_vars, coords, compat,
+186                                  fill_value=dtypes.NA):
+187 
+188     # Group into lines of datasets which must be combined along dim
+189     # need to sort by _new_tile_id first for groupby to work
+190     # TODO remove all these sorted OrderedDicts once python >= 3.6 only
+191     combined_ids = OrderedDict(sorted(combined_ids.items(), key=_new_tile_id))
+192     grouped = itertools.groupby(combined_ids.items(), key=_new_tile_id)
+193 
+194     # Combine all of these datasets along dim
+195     new_combined_ids = {}
+196     for new_id, group in grouped:
+197         combined_ids = OrderedDict(sorted(group))
+198         datasets = combined_ids.values()
+199         new_combined_ids[new_id] = _combine_1d(datasets, dim, compat,
+200                                                data_vars, coords, fill_value)
+201     return new_combined_ids
+202 
+203 
+204 def _combine_1d(datasets, concat_dim, compat='no_conflicts', data_vars='all',
+205                 coords='different', fill_value=dtypes.NA):
+206     """
+207     Applies either concat or merge to 1D list of datasets depending on value
+208     of concat_dim
+209     """
+210 
+211     if concat_dim is not None:
+212         try:
+213             combined = concat(datasets, dim=concat_dim, data_vars=data_vars,
+214                               coords=coords, fill_value=fill_value)
+215         except ValueError as err:
+216             if "encountered unexpected variable" in str(err):
+217                 raise ValueError("These objects cannot be combined using only "
+218                                  "xarray.combine_nested, instead either use "
+219                                  "xarray.combine_by_coords, or do it manually "
+220                                  "with xarray.concat, xarray.merge and "
+221                                  "xarray.align")
+222             else:
+223                 raise
+224     else:
+225         combined = merge(datasets, compat=compat, fill_value=fill_value)
+226 
+227     return combined
+228 
+229 
+230 def _new_tile_id(single_id_ds_pair):
+231     tile_id, ds = single_id_ds_pair
+232     return tile_id[1:]
+233 
+234 
+235 def _nested_combine(datasets, concat_dims, compat, data_vars, coords, ids,
+236                     fill_value=dtypes.NA):
+237 
+238     if len(datasets) == 0:
+239         return Dataset()
+240 
+241     # Arrange datasets for concatenation
+242     # Use information from the shape of the user input
+243     if not ids:
+244         # Determine tile_IDs by structure of input in N-D
+245         # (i.e. ordering in list-of-lists)
+246         combined_ids = _infer_concat_order_from_positions(datasets)
+247     else:
+248         # Already sorted so just use the ids already passed
+249         combined_ids = OrderedDict(zip(ids, datasets))
+250 
+251     # Check that the inferred shape is combinable
+252     _check_shape_tile_ids(combined_ids)
+253 
+254     # Apply series of concatenate or merge operations along each dimension
+255     combined = _combine_nd(combined_ids, concat_dims, compat=compat,
+256                            data_vars=data_vars, coords=coords,
+257                            fill_value=fill_value)
+258     return combined
+259 
+260 
+261 def combine_nested(datasets, concat_dim, compat='no_conflicts',
+262                    data_vars='all', coords='different', fill_value=dtypes.NA):
+263     """
+264     Explicitly combine an N-dimensional grid of datasets into one by using a
+265     succession of concat and merge operations along each dimension of the grid.
+266 
+267     Does not sort the supplied datasets under any circumstances, so the
+268     datasets must be passed in the order you wish them to be concatenated. It
+269     does align coordinates, but different variables on datasets can cause it to
+270     fail under some scenarios. In complex cases, you may need to clean up your
+271     data and use concat/merge explicitly.
+272 
+273     To concatenate along multiple dimensions the datasets must be passed as a
+274     nested list-of-lists, with a depth equal to the length of ``concat_dims``.
+275     ``manual_combine`` will concatenate along the top-level list first.
+276 
+277     Useful for combining datasets from a set of nested directories, or for
+278     collecting the output of a simulation parallelized along multiple
+279     dimensions.
+280 
+281     Parameters
+282     ----------
+283     datasets : list or nested list of xarray.Dataset objects.
+284         Dataset objects to combine.
+285         If concatenation or merging along more than one dimension is desired,
+286         then datasets must be supplied in a nested list-of-lists.
+287     concat_dim : str, or list of str, DataArray, Index or None
+288         Dimensions along which to concatenate variables, as used by
+289         :py:func:`xarray.concat`.
+290         Set ``concat_dim=[..., None, ...]`` explicitly to disable concatenation
+291         and merge instead along a particular dimension.
+292         The position of ``None`` in the list specifies the dimension of the
+293         nested-list input along which to merge.
+294         Must be the same length as the depth of the list passed to
+295         ``datasets``.
+296     compat : {'identical', 'equals', 'broadcast_equals',
+297               'no_conflicts'}, optional
+298         String indicating how to compare variables of the same name for
+299         potential merge conflicts:
+300 
+301         - 'broadcast_equals': all values must be equal when variables are
+302           broadcast against each other to ensure common dimensions.
+303         - 'equals': all values and dimensions must be the same.
+304         - 'identical': all values, dimensions and attributes must be the
+305           same.
+306         - 'no_conflicts': only values which are not null in both datasets
+307           must be equal. The returned dataset then contains the combination
+308           of all non-null values.
+309     data_vars : {'minimal', 'different', 'all' or list of str}, optional
+310         Details are in the documentation of concat
+311     coords : {'minimal', 'different', 'all' or list of str}, optional
+312         Details are in the documentation of concat
+313     fill_value : scalar, optional
+314         Value to use for newly missing values
+315 
+316     Returns
+317     -------
+318     combined : xarray.Dataset
+319 
+320     Examples
+321     --------
+322 
+323     A common task is collecting data from a parallelized simulation in which
+324     each processor wrote out to a separate file. A domain which was decomposed
+325     into 4 parts, 2 each along both the x and y axes, requires organising the
+326     datasets into a doubly-nested list, e.g:
+327 
+328     >>> x1y1
+329     <xarray.Dataset>
+330     Dimensions:         (x: 2, y: 2)
+331     Dimensions without coordinates: x, y
+332     Data variables:
+333       temperature       (x, y) float64 11.04 23.57 20.77 ...
+334       precipitation     (x, y) float64 5.904 2.453 3.404 ...
+335 
+336     >>> ds_grid = [[x1y1, x1y2], [x2y1, x2y2]]
+337     >>> combined = xr.combine_nested(ds_grid, concat_dim=['x', 'y'])
+338     <xarray.Dataset>
+339     Dimensions:         (x: 4, y: 4)
+340     Dimensions without coordinates: x, y
+341     Data variables:
+342       temperature       (x, y) float64 11.04 23.57 20.77 ...
+343       precipitation     (x, y) float64 5.904 2.453 3.404 ...
+344 
+345     ``manual_combine`` can also be used to explicitly merge datasets with
+346     different variables. For example if we have 4 datasets, which are divided
+347     along two times, and contain two different variables, we can pass ``None``
+348     to ``concat_dim`` to specify the dimension of the nested list over which
+349     we wish to use ``merge`` instead of ``concat``:
+350 
+351     >>> t1temp
+352     <xarray.Dataset>
+353     Dimensions:         (t: 5)
+354     Dimensions without coordinates: t
+355     Data variables:
+356       temperature       (t) float64 11.04 23.57 20.77 ...
+357 
+358     >>> t1precip
+359     <xarray.Dataset>
+360     Dimensions:         (t: 5)
+361     Dimensions without coordinates: t
+362     Data variables:
+363       precipitation     (t) float64 5.904 2.453 3.404 ...
+364 
+365     >>> ds_grid = [[t1temp, t1precip], [t2temp, t2precip]]
+366     >>> combined = xr.combine_nested(ds_grid, concat_dim=['t', None])
+367     <xarray.Dataset>
+368     Dimensions:         (t: 10)
+369     Dimensions without coordinates: t
+370     Data variables:
+371       temperature       (t) float64 11.04 23.57 20.77 ...
+372       precipitation     (t) float64 5.904 2.453 3.404 ...
+373 
+374     See also
+375     --------
+376     concat
+377     merge
+378     auto_combine
+379     """
+380     if isinstance(concat_dim, (str, DataArray)) or concat_dim is None:
+381         concat_dim = [concat_dim]
+382 
+383     # The IDs argument tells _manual_combine that datasets aren't yet sorted
+384     return _nested_combine(datasets, concat_dims=concat_dim, compat=compat,
+385                            data_vars=data_vars, coords=coords, ids=False,
+386                            fill_value=fill_value)
+387 
+388 
+389 def vars_as_keys(ds):
+390     return tuple(sorted(ds))
+391 
+392 
+393 def combine_by_coords(datasets, compat='no_conflicts', data_vars='all',
+394                       coords='different', fill_value=dtypes.NA):
+395     """
+396     Attempt to auto-magically combine the given datasets into one by using
+397     dimension coordinates.
+398 
+399     This method attempts to combine a group of datasets along any number of
+400     dimensions into a single entity by inspecting coords and metadata and using
+401     a combination of concat and merge.
+402 
+403     Will attempt to order the datasets such that the values in their dimension
+404     coordinates are monotonic along all dimensions. If it cannot determine the
+405     order in which to concatenate the datasets, it will raise a ValueError.
+406     Non-coordinate dimensions will be ignored, as will any coordinate
+407     dimensions which do not vary between each dataset.
+408 
+409     Aligns coordinates, but different variables on datasets can cause it
+410     to fail under some scenarios. In complex cases, you may need to clean up
+411     your data and use concat/merge explicitly (also see `manual_combine`).
+412 
+413     Works well if, for example, you have N years of data and M data variables,
+414     and each combination of a distinct time period and set of data variables is
+415     saved as its own dataset. Also useful for if you have a simulation which is
+416     parallelized in multiple dimensions, but has global coordinates saved in
+417     each file specifying the positions of points within the global domain.
+418 
+419     Parameters
+420     ----------
+421     datasets : sequence of xarray.Dataset
+422         Dataset objects to combine.
+423     compat : {'identical', 'equals', 'broadcast_equals',
+424               'no_conflicts'}, optional
+425         String indicating how to compare variables of the same name for
+426         potential conflicts:
+427 
+428         - 'broadcast_equals': all values must be equal when variables are
+429           broadcast against each other to ensure common dimensions.
+430         - 'equals': all values and dimensions must be the same.
+431         - 'identical': all values, dimensions and attributes must be the
+432           same.
+433         - 'no_conflicts': only values which are not null in both datasets
+434           must be equal. The returned dataset then contains the combination
+435           of all non-null values.
+436     data_vars : {'minimal', 'different', 'all' or list of str}, optional
+437         Details are in the documentation of concat
+438     coords : {'minimal', 'different', 'all' or list of str}, optional
+439         Details are in the documentation of concat
+440     fill_value : scalar, optional
+441         Value to use for newly missing values
+442 
+443     Returns
+444     -------
+445     combined : xarray.Dataset
+446 
+447     See also
+448     --------
+449     concat
+450     merge
+451     combine_nested
+452 
+453     Examples
+454     --------
+455 
+456     Combining two datasets using their common dimension coordinates. Notice
+457     they are concatenated based on the values in their dimension coordinates,
+458     not on their position in the list passed to `combine_by_coords`.
+459 
+460     >>> x1
+461     <xarray.Dataset>
+462     Dimensions:         (x: 3)
+463     Coords:
+464       * position        (x) int64   0 1 2
+465     Data variables:
+466         temperature     (x) float64 11.04 23.57 20.77 ...
+467 
+468     >>> x2
+469     <xarray.Dataset>
+470     Dimensions:         (x: 3)
+471     Coords:
+472       * position        (x) int64   3 4 5
+473     Data variables:
+474         temperature     (x) float64 6.97 8.13 7.42 ...
+475 
+476     >>> combined = xr.combine_by_coords([x2, x1])
+477     <xarray.Dataset>
+478     Dimensions:         (x: 6)
+479     Coords:
+480       * position        (x) int64   0 1 2 3 4 5
+481     Data variables:
+482         temperature     (x) float64 11.04 23.57 20.77 ...
+483     """
+484 
+485     # Group by data vars
+486     sorted_datasets = sorted(datasets, key=vars_as_keys)
+487     grouped_by_vars = itertools.groupby(sorted_datasets, key=vars_as_keys)
+488 
+489     # Perform the multidimensional combine on each group of data variables
+490     # before merging back together
+491     concatenated_grouped_by_data_vars = []
+492     for vars, datasets_with_same_vars in grouped_by_vars:
+493         combined_ids, concat_dims = _infer_concat_order_from_coords(
+494             list(datasets_with_same_vars))
+495 
+496         _check_shape_tile_ids(combined_ids)
+497 
+498         # Concatenate along all of concat_dims one by one to create single ds
+499         concatenated = _combine_nd(combined_ids, concat_dims=concat_dims,
+500                                    data_vars=data_vars, coords=coords,
+501                                    fill_value=fill_value)
+502 
+503         # Check the overall coordinates are monotonically increasing
+504         for dim in concat_dims:
+505             indexes = concatenated.indexes.get(dim)
+506             if not (indexes.is_monotonic_increasing
+507                     or indexes.is_monotonic_decreasing):
+508                 raise ValueError("Resulting object does not have monotonic"
+509                                  " global indexes along dimension {}"
+510                                  .format(dim))
+511         concatenated_grouped_by_data_vars.append(concatenated)
+512 
+513     return merge(concatenated_grouped_by_data_vars, compat=compat,
+514                  fill_value=fill_value)
+515 
+516 
+517 # Everything beyond here is only needed until the deprecation cycle in #2616
+518 # is completed
+519 
+520 
+521 _CONCAT_DIM_DEFAULT = '__infer_concat_dim__'
+522 
+523 
+524 def auto_combine(datasets, concat_dim='_not_supplied', compat='no_conflicts',
+525                  data_vars='all', coords='different', fill_value=dtypes.NA,
+526                  from_openmfds=False):
+527     """
+528     Attempt to auto-magically combine the given datasets into one.
+529 
+530     This entire function is deprecated in favour of ``combine_nested`` and
+531     ``combine_by_coords``.
+532 
+533     This method attempts to combine a list of datasets into a single entity by
+534     inspecting metadata and using a combination of concat and merge.
+535     It does not concatenate along more than one dimension or sort data under
+536     any circumstances. It does align coordinates, but different variables on
+537     datasets can cause it to fail under some scenarios. In complex cases, you
+538     may need to clean up your data and use ``concat``/``merge`` explicitly.
+539     ``auto_combine`` works well if you have N years of data and M data
+540     variables, and each combination of a distinct time period and set of data
+541     variables is saved its own dataset.
+542 
+543     Parameters
+544     ----------
+545     datasets : sequence of xarray.Dataset
+546         Dataset objects to merge.
+547     concat_dim : str or DataArray or Index, optional
+548         Dimension along which to concatenate variables, as used by
+549         :py:func:`xarray.concat`. You only need to provide this argument if
+550         the dimension along which you want to concatenate is not a dimension
+551         in the original datasets, e.g., if you want to stack a collection of
+552         2D arrays along a third dimension.
+553         By default, xarray attempts to infer this argument by examining
+554         component files. Set ``concat_dim=None`` explicitly to disable
+555         concatenation.
+556     compat : {'identical', 'equals', 'broadcast_equals',
+557              'no_conflicts'}, optional
+558         String indicating how to compare variables of the same name for
+559         potential conflicts:
+560         - 'broadcast_equals': all values must be equal when variables are
+561           broadcast against each other to ensure common dimensions.
+562         - 'equals': all values and dimensions must be the same.
+563         - 'identical': all values, dimensions and attributes must be the
+564           same.
+565         - 'no_conflicts': only values which are not null in both datasets
+566           must be equal. The returned dataset then contains the combination
+567           of all non-null values.
+568     data_vars : {'minimal', 'different', 'all' or list of str}, optional
+569         Details are in the documentation of concat
+570     coords : {'minimal', 'different', 'all' o list of str}, optional
+571         Details are in the documentation of concat
+572     fill_value : scalar, optional
+573         Value to use for newly missing values
+574 
+575     Returns
+576     -------
+577     combined : xarray.Dataset
+578 
+579     See also
+580     --------
+581     concat
+582     Dataset.merge
+583     """
+584 
+585     if not from_openmfds:
+586         basic_msg = dedent("""\
+587         In xarray version 0.13 `auto_combine` will be deprecated. See
+588         http://xarray.pydata.org/en/stable/combining.html#combining-multi""")
+589         warnings.warn(basic_msg, FutureWarning, stacklevel=2)
+590 
+591     if concat_dim == '_not_supplied':
+592         concat_dim = _CONCAT_DIM_DEFAULT
+593         message = ''
+594     else:
+595         message = dedent("""\
+596         Also `open_mfdataset` will no longer accept a `concat_dim` argument.
+597         To get equivalent behaviour from now on please use the new
+598         `combine_nested` function instead (or the `combine='nested'` option to
+599         `open_mfdataset`).""")
+600 
+601     if _dimension_coords_exist(datasets):
+602         message += dedent("""\
+603         The datasets supplied have global dimension coordinates. You may want
+604         to use the new `combine_by_coords` function (or the
+605         `combine='by_coords'` option to `open_mfdataset`) to order the datasets
+606         before concatenation. Alternatively, to continue concatenating based
+607         on the order the datasets are supplied in future, please use the new
+608         `combine_nested` function (or the `combine='nested'` option to
+609         open_mfdataset).""")
+610     else:
+611         message += dedent("""\
+612         The datasets supplied do not have global dimension coordinates. In
+613         future, to continue concatenating without supplying dimension
+614         coordinates, please use the new `combine_nested` function (or the
+615         `combine='nested'` option to open_mfdataset.""")
+616 
+617     if _requires_concat_and_merge(datasets):
+618         manual_dims = [concat_dim].append(None)
+619         message += dedent("""\
+620         The datasets supplied require both concatenation and merging. From
+621         xarray version 0.13 this will operation will require either using the
+622         new `combine_nested` function (or the `combine='nested'` option to
+623         open_mfdataset), with a nested list structure such that you can combine
+624         along the dimensions {}. Alternatively if your datasets have global
+625         dimension coordinates then you can use the new `combine_by_coords`
+626         function.""".format(manual_dims))
+627 
+628     warnings.warn(message, FutureWarning, stacklevel=2)
+629 
+630     return _old_auto_combine(datasets, concat_dim=concat_dim,
+631                              compat=compat, data_vars=data_vars,
+632                              coords=coords, fill_value=fill_value)
+633 
+634 
+635 def _dimension_coords_exist(datasets):
+636     """
+637     Check if the datasets have consistent global dimension coordinates
+638     which would in future be used by `auto_combine` for concatenation ordering.
+639     """
+640 
+641     # Group by data vars
+642     sorted_datasets = sorted(datasets, key=vars_as_keys)
+643     grouped_by_vars = itertools.groupby(sorted_datasets, key=vars_as_keys)
+644 
+645     # Simulates performing the multidimensional combine on each group of data
+646     # variables before merging back together
+647     try:
+648         for vars, datasets_with_same_vars in grouped_by_vars:
+649             _infer_concat_order_from_coords(list(datasets_with_same_vars))
+650         return True
+651     except ValueError:
+652         # ValueError means datasets don't have global dimension coordinates
+653         # Or something else went wrong in trying to determine them
+654         return False
+655 
+656 
+657 def _requires_concat_and_merge(datasets):
+658     """
+659     Check if the datasets require the use of both xarray.concat and
+660     xarray.merge, which in future might require the user to use
+661     `manual_combine` instead.
+662     """
+663     # Group by data vars
+664     sorted_datasets = sorted(datasets, key=vars_as_keys)
+665     grouped_by_vars = itertools.groupby(sorted_datasets, key=vars_as_keys)
+666 
+667     return len(list(grouped_by_vars)) > 1
+668 
+669 
+670 def _old_auto_combine(datasets, concat_dim=_CONCAT_DIM_DEFAULT,
+671                       compat='no_conflicts',
+672                       data_vars='all', coords='different',
+673                       fill_value=dtypes.NA):
+674     if concat_dim is not None:
+675         dim = None if concat_dim is _CONCAT_DIM_DEFAULT else concat_dim
+676 
+677         sorted_datasets = sorted(datasets, key=vars_as_keys)
+678         grouped = itertools.groupby(sorted_datasets, key=vars_as_keys)
+679 
+680         concatenated = [_auto_concat(list(datasets), dim=dim,
+681                                      data_vars=data_vars, coords=coords,
+682                                      fill_value=fill_value)
+683                         for vars, datasets in grouped]
+684     else:
+685         concatenated = datasets
+686     merged = merge(concatenated, compat=compat, fill_value=fill_value)
+687     return merged
+688 
+689 
+690 def _auto_concat(datasets, dim=None, data_vars='all', coords='different',
+691                  fill_value=dtypes.NA):
+692     if len(datasets) == 1 and dim is None:
+693         # There is nothing more to combine, so kick out early.
+694         return datasets[0]
+695     else:
+696         if dim is None:
+697             ds0 = datasets[0]
+698             ds1 = datasets[1]
+699             concat_dims = set(ds0.dims)
+700             if ds0.dims != ds1.dims:
+701                 dim_tuples = set(ds0.dims.items()) - set(ds1.dims.items())
+702                 concat_dims = set(i for i, _ in dim_tuples)
+703             if len(concat_dims) > 1:
+704                 concat_dims = set(d for d in concat_dims
+705                                   if not ds0[d].equals(ds1[d]))
+706             if len(concat_dims) > 1:
+707                 raise ValueError('too many different dimensions to '
+708                                  'concatenate: %s' % concat_dims)
+709             elif len(concat_dims) == 0:
+710                 raise ValueError('cannot infer dimension to concatenate: '
+711                                  'supply the ``concat_dim`` argument '
+712                                  'explicitly')
+713             dim, = concat_dims
+714         return concat(datasets, dim=dim, data_vars=data_vars, coords=coords,
+715                       fill_value=fill_value)
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `xarray/core/combine.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/xarray/core/combine.py b/xarray/core/combine.py
+--- a/xarray/core/combine.py
++++ b/xarray/core/combine.py
+@@ -501,14 +501,13 @@ def combine_by_coords(datasets, compat='no_conflicts', data_vars='all',
+                                    fill_value=fill_value)
+ 
+         # Check the overall coordinates are monotonically increasing
+-        for dim in concatenated.dims:
+-            if dim in concatenated:
+-                indexes = concatenated.indexes.get(dim)
+-                if not (indexes.is_monotonic_increasing
+-                        or indexes.is_monotonic_decreasing):
+-                    raise ValueError("Resulting object does not have monotonic"
+-                                     " global indexes along dimension {}"
+-                                     .format(dim))
++        for dim in concat_dims:
++            indexes = concatenated.indexes.get(dim)
++            if not (indexes.is_monotonic_increasing
++                    or indexes.is_monotonic_decreasing):
++                raise ValueError("Resulting object does not have monotonic"
++                                 " global indexes along dimension {}"
++                                 .format(dim))
+         concatenated_grouped_by_data_vars.append(concatenated)
+ 
+     return merge(concatenated_grouped_by_data_vars, compat=compat,
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/reproduce_error.py b/reproduce_error.py
+new file mode 100644
+index 00000000..25fd4873
+--- /dev/null
++++ b/reproduce_error.py
+@@ -0,0 +1,29 @@
++import xarray as xr
++import numpy as np
++
++# Non-monotonic y coordinates
++yCoord = ['a', 'c', 'b']  # raises ValueError on combine
++
++ds1 = xr.Dataset(
++    data_vars=dict(
++        data=(['x', 'y'], np.random.rand(3, 3))
++    ),
++    coords=dict(
++        x=[1, 2, 3],
++        y=yCoord
++    )
++)
++
++ds2 = xr.Dataset(
++    data_vars=dict(
++        data=(['x', 'y'], np.random.rand(4, 3))
++    ),
++    coords = dict(
++        x=[4, 5, 6, 7],
++        y=yCoord
++    )
++)
++
++print("Attempting to combine datasets...")
++ds3 = xr.combine_by_coords((ds1, ds2))
++print("Success! Combined dataset shape:", ds3.data.shape)
+\ No newline at end of file
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 00000000..1e92653b
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,82 @@
++import xarray as xr
++import numpy as np
++
++def test_case(name, case):
++    print(f"\nTesting {name}...")
++    try:
++        result = xr.combine_by_coords(case)
++        if 'data' in result:
++            print("Success! Combined shape:", result.data.shape)
++        else:
++            print("Success! Dataset variables:", list(result.data_vars.keys()))
++        return True
++    except Exception as e:
++        print("Failed with error:", str(e))
++        return False
++
++# Test case 1: Multiple dimensions, some monotonic and some not
++yCoord = ['a', 'c', 'b']  # non-monotonic
++zCoord = [1, 2, 3]  # monotonic
++
++ds1 = xr.Dataset(
++    data_vars=dict(
++        data=(['x', 'y', 'z'], np.random.rand(2, 3, 3))
++    ),
++    coords=dict(
++        x=[1, 2],
++        y=yCoord,
++        z=zCoord
++    )
++)
++
++ds2 = xr.Dataset(
++    data_vars=dict(
++        data=(['x', 'y', 'z'], np.random.rand(2, 3, 3))
++    ),
++    coords=dict(
++        x=[3, 4],
++        y=yCoord,  # Same non-monotonic y coords
++        z=zCoord   # Same monotonic z coords
++    )
++)
++
++test_case("Multiple dimensions with mixed monotonicity", [ds1, ds2])
++
++# Test case 2: Empty dataset
++ds_empty = xr.Dataset(
++    data_vars=dict(
++        data=(['x', 'y'], np.array([]).reshape(0, 0))
++    ),
++    coords=dict(
++        x=[],
++        y=[]
++    )
++)
++
++test_case("Empty dataset", [ds_empty])
++
++# Test case 3: Single dataset
++test_case("Single dataset", [ds1])
++
++# Test case 4: Datasets with different variables but same coords
++ds3 = xr.Dataset(
++    data_vars=dict(
++        temp=(['x', 'y'], np.random.rand(2, 3))
++    ),
++    coords=dict(
++        x=[1, 2],
++        y=yCoord
++    )
++)
++
++ds4 = xr.Dataset(
++    data_vars=dict(
++        humidity=(['x', 'y'], np.random.rand(2, 3))
++    ),
++    coords=dict(
++        x=[3, 4],
++        y=yCoord
++    )
++)
++
++test_case("Different variables, same coords", [ds3, ds4])
+\ No newline at end of file
+diff --git a/xarray/core/combine.py b/xarray/core/combine.py
+index 37ae903b..3a41c38e 100644
+--- a/xarray/core/combine.py
++++ b/xarray/core/combine.py
+@@ -501,7 +501,8 @@ def combine_by_coords(datasets, compat='no_conflicts', data_vars='all',
+                                    fill_value=fill_value)
+ 
+         # Check the overall coordinates are monotonically increasing
+-        for dim in concatenated.dims:
++        # Only check dimensions that were actually concatenated
++        for dim in concat_dims:
+             if dim in concatenated:
+                 indexes = concatenated.indexes.get(dim)
+                 if not (indexes.is_monotonic_increasing
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `xarray/tests/test_combine.py` that contains the existing tests.
+-----------------------------------------------------------
+from collections import OrderedDict
+from itertools import product
+from datetime import datetime
+
+import numpy as np
+import pytest
+
+from xarray import (DataArray, Dataset, concat, combine_by_coords,
+                    combine_nested)
+from xarray import auto_combine
+from xarray.core import dtypes
+from xarray.core.combine import (
+    _new_tile_id, _check_shape_tile_ids, _combine_all_along_first_dim,
+    _combine_nd, _infer_concat_order_from_positions,
+    _infer_concat_order_from_coords)
+
+from . import (assert_identical, assert_equal, raises_regex)
+from .test_dataset import create_test_data
+
+
+def assert_combined_tile_ids_equal(dict1, dict2):
+    assert len(dict1) == len(dict2)
+    for k, v in dict1.items():
+        assert k in dict2.keys()
+        assert_equal(dict1[k], dict2[k])
+
+
+class TestTileIDsFromNestedList:
+    def test_1d(self):
+        ds = create_test_data
+        input = [ds(0), ds(1)]
+
+        expected = {(0,): ds(0), (1,): ds(1)}
+        actual = _infer_concat_order_from_positions(input)
+        assert_combined_tile_ids_equal(expected, actual)
+
+    def test_2d(self):
+        ds = create_test_data
+        input = [[ds(0), ds(1)], [ds(2), ds(3)], [ds(4), ds(5)]]
+
+        expected = {(0, 0): ds(0), (0, 1): ds(1),
+                    (1, 0): ds(2), (1, 1): ds(3),
+                    (2, 0): ds(4), (2, 1): ds(5)}
+        actual = _infer_concat_order_from_positions(input)
+        assert_combined_tile_ids_equal(expected, actual)
+
+    def test_3d(self):
+        ds = create_test_data
+        input = [[[ds(0), ds(1)], [ds(2), ds(3)], [ds(4), ds(5)]],
+                 [[ds(6), ds(7)], [ds(8), ds(9)], [ds(10), ds(11)]]]
+
+        expected = {(0, 0, 0): ds(0), (0, 0, 1): ds(1),
+                    (0, 1, 0): ds(2), (0, 1, 1): ds(3),
+                    (0, 2, 0): ds(4), (0, 2, 1): ds(5),
+                    (1, 0, 0): ds(6), (1, 0, 1): ds(7),
+                    (1, 1, 0): ds(8), (1, 1, 1): ds(9),
+                    (1, 2, 0): ds(10), (1, 2, 1): ds(11)}
+        actual = _infer_concat_order_from_positions(input)
+        assert_combined_tile_ids_equal(expected, actual)
+
+    def test_single_dataset(self):
+        ds = create_test_data(0)
+        input = [ds]
+
+        expected = {(0,): ds}
+        actual = _infer_concat_order_from_positions(input)
+        assert_combined_tile_ids_equal(expected, actual)
+
+    def test_redundant_nesting(self):
+        ds = create_test_data
+        input = [[ds(0)], [ds(1)]]
+
+        expected = {(0, 0): ds(0), (1, 0): ds(1)}
+        actual = _infer_concat_order_from_positions(input)
+        assert_combined_tile_ids_equal(expected, actual)
+
+    def test_ignore_empty_list(self):
+        ds = create_test_data(0)
+        input = [ds, []]
+        expected = {(0,): ds}
+        actual = _infer_concat_order_from_positions(input)
+        assert_combined_tile_ids_equal(expected, actual)
+
+    def test_uneven_depth_input(self):
+        # Auto_combine won't work on ragged input
+        # but this is just to increase test coverage
+        ds = create_test_data
+        input = [ds(0), [ds(1), ds(2)]]
+
+        expected = {(0,): ds(0), (1, 0): ds(1), (1, 1): ds(2)}
+        actual = _infer_concat_order_from_positions(input)
+        assert_combined_tile_ids_equal(expected, actual)
+
+    def test_uneven_length_input(self):
+        # Auto_combine won't work on ragged input
+        # but this is just to increase test coverage
+        ds = create_test_data
+        input = [[ds(0)], [ds(1), ds(2)]]
+
+        expected = {(0, 0): ds(0), (1, 0): ds(1), (1, 1): ds(2)}
+        actual = _infer_concat_order_from_positions(input)
+        assert_combined_tile_ids_equal(expected, actual)
+
+    def test_infer_from_datasets(self):
+        ds = create_test_data
+        input = [ds(0), ds(1)]
+
+        expected = {(0,): ds(0), (1,): ds(1)}
+        actual = _infer_concat_order_from_positions(input)
+        assert_combined_tile_ids_equal(expected, actual)
+
+
+class TestTileIDsFromCoords:
+    def test_1d(self):
+        ds0 = Dataset({'x': [0, 1]})
+        ds1 = Dataset({'x': [2, 3]})
+
+        expected = {(0,): ds0, (1,): ds1}
+        actual, concat_dims = _infer_concat_order_from_coords([ds1, ds0])
+        assert_combined_tile_ids_equal(expected, actual)
+        assert concat_dims == ['x']
+
+    def test_2d(self):
+        ds0 = Dataset({'x': [0, 1], 'y': [10, 20, 30]})
+        ds1 = Dataset({'x': [2, 3], 'y': [10, 20, 30]})
+        ds2 = Dataset({'x': [0, 1], 'y': [40, 50, 60]})
+        ds3 = Dataset({'x': [2, 3], 'y': [40, 50, 60]})
+        ds4 = Dataset({'x': [0, 1], 'y': [70, 80, 90]})
+        ds5 = Dataset({'x': [2, 3], 'y': [70, 80, 90]})
+
+        expected = {(0, 0): ds0, (1, 0): ds1,
+                    (0, 1): ds2, (1, 1): ds3,
+                    (0, 2): ds4, (1, 2): ds5}
+        actual, concat_dims = _infer_concat_order_from_coords([ds1, ds0, ds3,
+                                                               ds5, ds2, ds4])
+        assert_combined_tile_ids_equal(expected, actual)
+        assert concat_dims == ['x', 'y']
+
+    def test_no_dimension_coords(self):
+        ds0 = Dataset({'foo': ('x', [0, 1])})
+        ds1 = Dataset({'foo': ('x', [2, 3])})
+        with raises_regex(ValueError, "Could not find any dimension"):
+            _infer_concat_order_from_coords([ds1, ds0])
+
+    def test_coord_not_monotonic(self):
+        ds0 = Dataset({'x': [0, 1]})
+        ds1 = Dataset({'x': [3, 2]})
+        with raises_regex(ValueError, "Coordinate variable x is neither "
+                                      "monotonically increasing nor"):
+            _infer_concat_order_from_coords([ds1, ds0])
+
+    def test_coord_monotonically_decreasing(self):
+        ds0 = Dataset({'x': [3, 2]})
+        ds1 = Dataset({'x': [1, 0]})
+
+        expected = {(0,): ds0, (1,): ds1}
+        actual, concat_dims = _infer_concat_order_from_coords([ds1, ds0])
+        assert_combined_tile_ids_equal(expected, actual)
+        assert concat_dims == ['x']
+
+    def test_no_concatenation_needed(self):
+        ds = Dataset({'foo': ('x', [0, 1])})
+        expected = {(): ds}
+        actual, concat_dims = _infer_concat_order_from_coords([ds])
+        assert_combined_tile_ids_equal(expected, actual)
+        assert concat_dims == []
+
+    def test_2d_plus_bystander_dim(self):
+        ds0 = Dataset({'x': [0, 1], 'y': [10, 20, 30], 't': [0.1, 0.2]})
+        ds1 = Dataset({'x': [2, 3], 'y': [10, 20, 30], 't': [0.1, 0.2]})
+        ds2 = Dataset({'x': [0, 1], 'y': [40, 50, 60], 't': [0.1, 0.2]})
+        ds3 = Dataset({'x': [2, 3], 'y': [40, 50, 60], 't': [0.1, 0.2]})
+
+        expected = {(0, 0): ds0, (1, 0): ds1,
+                    (0, 1): ds2, (1, 1): ds3}
+        actual, concat_dims = _infer_concat_order_from_coords([ds1, ds0,
+                                                               ds3, ds2])
+        assert_combined_tile_ids_equal(expected, actual)
+        assert concat_dims == ['x', 'y']
+
+    def test_string_coords(self):
+        ds0 = Dataset({'person': ['Alice', 'Bob']})
+        ds1 = Dataset({'person': ['Caroline', 'Daniel']})
+
+        expected = {(0,): ds0, (1,): ds1}
+        actual, concat_dims = _infer_concat_order_from_coords([ds1, ds0])
+        assert_combined_tile_ids_equal(expected, actual)
+        assert concat_dims == ['person']
+
+    # Decided against natural sorting of string coords GH #2616
+    def test_lexicographic_sort_string_coords(self):
+        ds0 = Dataset({'simulation': ['run8', 'run9']})
+        ds1 = Dataset({'simulation': ['run10', 'run11']})
+
+        expected = {(0,): ds1, (1,): ds0}
+        actual, concat_dims = _infer_concat_order_from_coords([ds1, ds0])
+        assert_combined_tile_ids_equal(expected, actual)
+        assert concat_dims == ['simulation']
+
+    def test_datetime_coords(self):
+        ds0 = Dataset({'time': [datetime(2000, 3, 6), datetime(2001, 3, 7)]})
+        ds1 = Dataset({'time': [datetime(1999, 1, 1), datetime(1999, 2, 4)]})
+
+        expected = {(0,): ds1, (1,): ds0}
+        actual, concat_dims = _infer_concat_order_from_coords([ds0, ds1])
+        assert_combined_tile_ids_equal(expected, actual)
+        assert concat_dims == ['time']
+
+
+@pytest.fixture(scope='module')
+def create_combined_ids():
+    return _create_combined_ids
+
+
+def _create_combined_ids(shape):
+    tile_ids = _create_tile_ids(shape)
+    nums = range(len(tile_ids))
+    return {tile_id: create_test_data(num)
+            for tile_id, num in zip(tile_ids, nums)}
+
+
+def _create_tile_ids(shape):
+    tile_ids = product(*(range(i) for i in shape))
+    return list(tile_ids)
+
+
+class TestNewTileIDs:
+    @pytest.mark.parametrize("old_id, new_id", [((3, 0, 1), (0, 1)),
+                                                ((0, 0), (0,)),
+                                                ((1,), ()),
+                                                ((0,), ()),
+                                                ((1, 0), (0,))])
+    def test_new_tile_id(self, old_id, new_id):
+        ds = create_test_data
+        assert _new_tile_id((old_id, ds)) == new_id
+
+    def test_get_new_tile_ids(self, create_combined_ids):
+        shape = (1, 2, 3)
+        combined_ids = create_combined_ids(shape)
+
+        expected_tile_ids = sorted(combined_ids.keys())
+        actual_tile_ids = _create_tile_ids(shape)
+        assert expected_tile_ids == actual_tile_ids
+
+
+class TestCombineND:
+    @pytest.mark.parametrize("concat_dim", ['dim1', 'new_dim'])
+    def test_concat_once(self, create_combined_ids, concat_dim):
+        shape = (2,)
+        combined_ids = create_combined_ids(shape)
+        ds = create_test_data
+        result = _combine_all_along_first_dim(combined_ids, dim=concat_dim,
+                                              data_vars='all',
+                                              coords='different',
+                                              compat='no_conflicts')
+
+        expected_ds = concat([ds(0), ds(1)], dim=concat_dim)
+        assert_combined_tile_ids_equal(result, {(): expected_ds})
+
+    def test_concat_only_first_dim(self, create_combined_ids):
+        shape = (2, 3)
+        combined_ids = create_combined_ids(shape)
+        result = _combine_all_along_first_dim(combined_ids, dim='dim1',
+                                              data_vars='all',
+                                              coords='different',
+                                              compat='no_conflicts')
+
+        ds = create_test_data
+        partway1 = concat([ds(0), ds(3)], dim='dim1')
+        partway2 = concat([ds(1), ds(4)], dim='dim1')
+        partway3 = concat([ds(2), ds(5)], dim='dim1')
+        expected_datasets = [partway1, partway2, partway3]
+        expected = {(i,): ds for i, ds in enumerate(expected_datasets)}
+
+        assert_combined_tile_ids_equal(result, expected)
+
+    @pytest.mark.parametrize("concat_dim", ['dim1', 'new_dim'])
+    def test_concat_twice(self, create_combined_ids, concat_dim):
+        shape = (2, 3)
+        combined_ids = create_combined_ids(shape)
+        result = _combine_nd(combined_ids, concat_dims=['dim1', concat_dim])
+
+        ds = create_test_data
+        partway1 = concat([ds(0), ds(3)], dim='dim1')
+        partway2 = concat([ds(1), ds(4)], dim='dim1')
+        partway3 = concat([ds(2), ds(5)], dim='dim1')
+        expected = concat([partway1, partway2, partway3], dim=concat_dim)
+
+        assert_equal(result, expected)
+
+
+class TestCheckShapeTileIDs:
+    def test_check_depths(self):
+        ds = create_test_data(0)
+        combined_tile_ids = {(0,): ds, (0, 1): ds}
+        with raises_regex(ValueError, 'sub-lists do not have '
+                                      'consistent depths'):
+            _check_shape_tile_ids(combined_tile_ids)
+
+    def test_check_lengths(self):
+        ds = create_test_data(0)
+        combined_tile_ids = {(0, 0): ds, (0, 1): ds, (0, 2): ds,
+                             (1, 0): ds, (1, 1): ds}
+        with raises_regex(ValueError, 'sub-lists do not have '
+                                      'consistent lengths'):
+            _check_shape_tile_ids(combined_tile_ids)
+
+
+class TestManualCombine:
+    def test_manual_concat(self):
+        objs = [Dataset({'x': [0]}), Dataset({'x': [1]})]
+        expected = Dataset({'x': [0, 1]})
+        actual = combine_nested(objs, concat_dim='x')
+        assert_identical(expected, actual)
+        actual = combine_nested(objs, concat_dim=['x'])
+        assert_identical(expected, actual)
+
+        actual = combine_nested([actual], concat_dim=None)
+        assert_identical(expected, actual)
+
+        actual = combine_nested([actual], concat_dim='x')
+        assert_identical(expected, actual)
+
+        objs = [Dataset({'x': [0, 1]}), Dataset({'x': [2]})]
+        actual = combine_nested(objs, concat_dim='x')
+        expected = Dataset({'x': [0, 1, 2]})
+        assert_identical(expected, actual)
+
+        # ensure manual_combine handles non-sorted variables
+        objs = [Dataset(OrderedDict([('x', ('a', [0])), ('y', ('a', [0]))])),
+                Dataset(OrderedDict([('y', ('a', [1])), ('x', ('a', [1]))]))]
+        actual = combine_nested(objs, concat_dim='a')
+        expected = Dataset({'x': ('a', [0, 1]), 'y': ('a', [0, 1])})
+        assert_identical(expected, actual)
+
+        objs = [Dataset({'x': [0], 'y': [0]}), Dataset({'x': [0]})]
+        with pytest.raises(KeyError):
+            combine_nested(objs, concat_dim='x')
+
+    def test_empty_input(self):
+        assert_identical(Dataset(), combine_nested([], concat_dim='x'))
+
+    # Fails because of concat's weird treatment of dimension coords, see #2975
+    @pytest.mark.xfail
+    def test_manual_concat_too_many_dims_at_once(self):
+        objs = [Dataset({'x': [0], 'y': [1]}), Dataset({'y': [0], 'x': [1]})]
+        with pytest.raises(ValueError, match="not equal across datasets"):
+            combine_nested(objs, concat_dim='x', coords='minimal')
+
+    def test_manual_concat_along_new_dim(self):
+        objs = [Dataset({'a': ('x', [10]), 'x': [0]}),
+                Dataset({'a': ('x', [20]), 'x': [0]})]
+        expected = Dataset({'a': (('t', 'x'), [[10], [20]]), 'x': [0]})
+        actual = combine_nested(objs, concat_dim='t')
+        assert_identical(expected, actual)
+
+        # Same but with a DataArray as new dim, see GH #1988 and #2647
+        dim = DataArray([100, 150], name='baz', dims='baz')
+        expected = Dataset({'a': (('baz', 'x'), [[10], [20]]),
+                            'x': [0], 'baz': [100, 150]})
+        actual = combine_nested(objs, concat_dim=dim)
+        assert_identical(expected, actual)
+
+    def test_manual_merge(self):
+        data = Dataset({'x': 0})
+        actual = combine_nested([data, data, data], concat_dim=None)
+        assert_identical(data, actual)
+
+        ds1 = Dataset({'a': ('x', [1, 2]), 'x': [0, 1]})
+        ds2 = Dataset({'a': ('x', [2, 3]), 'x': [1, 2]})
+        expected = Dataset({'a': ('x', [1, 2, 3]), 'x': [0, 1, 2]})
+        actual = combine_nested([ds1, ds2], concat_dim=None)
+        assert_identical(expected, actual)
+        actual = combine_nested([ds1, ds2], concat_dim=[None])
+        assert_identical(expected, actual)
+
+        tmp1 = Dataset({'x': 0})
+        tmp2 = Dataset({'x': np.nan})
+        actual = combine_nested([tmp1, tmp2], concat_dim=None)
+        assert_identical(tmp1, actual)
+        actual = combine_nested([tmp1, tmp2], concat_dim=[None])
+        assert_identical(tmp1, actual)
+
+        # Single object, with a concat_dim explicitly provided
+        # Test the issue reported in GH #1988
+        objs = [Dataset({'x': 0, 'y': 1})]
+        dim = DataArray([100], name='baz', dims='baz')
+        actual = combine_nested(objs, concat_dim=[dim])
+        expected = Dataset({'x': ('baz', [0]), 'y': ('baz', [1])},
+                           {'baz': [100]})
+        assert_identical(expected, actual)
+
+        # Just making sure that auto_combine is doing what is
+        # expected for non-scalar values, too.
+        objs = [Dataset({'x': ('z', [0, 1]), 'y': ('z', [1, 2])})]
+        dim = DataArray([100], name='baz', dims='baz')
+        actual = combine_nested(objs, concat_dim=[dim])
+        expected = Dataset({'x': (('baz', 'z'), [[0, 1]]),
+                            'y': (('baz', 'z'), [[1, 2]])},
+                           {'baz': [100]})
+        assert_identical(expected, actual)
+
+    def test_concat_multiple_dims(self):
+        objs = [[Dataset({'a': (('x', 'y'), [[0]])}),
+                 Dataset({'a': (('x', 'y'), [[1]])})],
+                [Dataset({'a': (('x', 'y'), [[2]])}),
+                 Dataset({'a': (('x', 'y'), [[3]])})]]
+        actual = combine_nested(objs, concat_dim=['x', 'y'])
+        expected = Dataset({'a': (('x', 'y'), [[0, 1], [2, 3]])})
+        assert_identical(expected, actual)
+
+    def test_concat_name_symmetry(self):
+        """Inspired by the discussion on GH issue #2777"""
+
+        da1 = DataArray(name='a', data=[[0]], dims=['x', 'y'])
+        da2 = DataArray(name='b', data=[[1]], dims=['x', 'y'])
+        da3 = DataArray(name='a', data=[[2]], dims=['x', 'y'])
+        da4 = DataArray(name='b', data=[[3]], dims=['x', 'y'])
+
+        x_first = combine_nested([[da1, da2], [da3, da4]],
+                                 concat_dim=['x', 'y'])
+        y_first = combine_nested([[da1, da3], [da2, da4]],
+                                 concat_dim=['y', 'x'])
+
+        assert_identical(x_first, y_first)
+
+    def test_concat_one_dim_merge_another(self):
+        data = create_test_data()
+        data1 = data.copy(deep=True)
+        data2 = data.copy(deep=True)
+
+        objs = [[data1.var1.isel(dim2=slice(4)),
+                 data2.var1.isel(dim2=slice(4, 9))],
+                [data1.var2.isel(dim2=slice(4)),
+                 data2.var2.isel(dim2=slice(4, 9))]]
+
+        expected = data[['var1', 'var2']]
+        actual = combine_nested(objs, concat_dim=[None, 'dim2'])
+        assert expected.identical(actual)
+
+    def test_auto_combine_2d(self):
+        ds = create_test_data
+
+        partway1 = concat([ds(0), ds(3)], dim='dim1')
+        partway2 = concat([ds(1), ds(4)], dim='dim1')
+        partway3 = concat([ds(2), ds(5)], dim='dim1')
+        expected = concat([partway1, partway2, partway3], dim='dim2')
+
+        datasets = [[ds(0), ds(1), ds(2)], [ds(3), ds(4), ds(5)]]
+        result = combine_nested(datasets, concat_dim=['dim1', 'dim2'])
+        assert_equal(result, expected)
+
+    def test_manual_combine_missing_data_new_dim(self):
+        # Your data includes "time" and "station" dimensions, and each year's
+        # data has a different set of stations.
+        datasets = [Dataset({'a': ('x', [2, 3]), 'x': [1, 2]}),
+                    Dataset({'a': ('x', [1, 2]), 'x': [0, 1]})]
+        expected = Dataset({'a': (('t', 'x'),
+                                  [[np.nan, 2, 3], [1, 2, np.nan]])},
+                           {'x': [0, 1, 2]})
+        actual = combine_nested(datasets, concat_dim='t')
+        assert_identical(expected, actual)
+
+    def test_invalid_hypercube_input(self):
+        ds = create_test_data
+
+        datasets = [[ds(0), ds(1), ds(2)], [ds(3), ds(4)]]
+        with raises_regex(ValueError, 'sub-lists do not have '
+                                      'consistent lengths'):
+            combine_nested(datasets, concat_dim=['dim1', 'dim2'])
+
+        datasets = [[ds(0), ds(1)], [[ds(3), ds(4)]]]
+        with raises_regex(ValueError, 'sub-lists do not have '
+                                      'consistent depths'):
+            combine_nested(datasets, concat_dim=['dim1', 'dim2'])
+
+        datasets = [[ds(0), ds(1)], [ds(3), ds(4)]]
+        with raises_regex(ValueError, 'concat_dims has length'):
+            combine_nested(datasets, concat_dim=['dim1'])
+
+    def test_merge_one_dim_concat_another(self):
+        objs = [[Dataset({'foo': ('x', [0, 1])}),
+                 Dataset({'bar': ('x', [10, 20])})],
+                [Dataset({'foo': ('x', [2, 3])}),
+                 Dataset({'bar': ('x', [30, 40])})]]
+        expected = Dataset({'foo': ('x', [0, 1, 2, 3]),
+                            'bar': ('x', [10, 20, 30, 40])})
+
+        actual = combine_nested(objs, concat_dim=['x', None], compat='equals')
+        assert_identical(expected, actual)
+
+        # Proving it works symmetrically
+        objs = [[Dataset({'foo': ('x', [0, 1])}),
+                 Dataset({'foo': ('x', [2, 3])})],
+                [Dataset({'bar': ('x', [10, 20])}),
+                 Dataset({'bar': ('x', [30, 40])})]]
+        actual = combine_nested(objs, concat_dim=[None, 'x'], compat='equals')
+        assert_identical(expected, actual)
+
+    def test_combine_concat_over_redundant_nesting(self):
+        objs = [[Dataset({'x': [0]}), Dataset({'x': [1]})]]
+        actual = combine_nested(objs, concat_dim=[None, 'x'])
+        expected = Dataset({'x': [0, 1]})
+        assert_identical(expected, actual)
+
+        objs = [[Dataset({'x': [0]})], [Dataset({'x': [1]})]]
+        actual = combine_nested(objs, concat_dim=['x', None])
+        expected = Dataset({'x': [0, 1]})
+        assert_identical(expected, actual)
+
+        objs = [[Dataset({'x': [0]})]]
+        actual = combine_nested(objs, concat_dim=[None, None])
+        expected = Dataset({'x': [0]})
+        assert_identical(expected, actual)
+
+    def test_manual_combine_but_need_auto_combine(self):
+        objs = [Dataset({'x': [0, 1]}), Dataset({'x': [2], 'wall': [0]})]
+        with raises_regex(ValueError, 'cannot be combined'):
+            combine_nested(objs, concat_dim='x')
+
+    @pytest.mark.parametrize('fill_value', [dtypes.NA, 2, 2.0])
+    def test_combine_nested_fill_value(self, fill_value):
+        datasets = [Dataset({'a': ('x', [2, 3]), 'x': [1, 2]}),
+                    Dataset({'a': ('x', [1, 2]), 'x': [0, 1]})]
+        if fill_value == dtypes.NA:
+            # if we supply the default, we expect the missing value for a
+            # float array
+            fill_value = np.nan
+        expected = Dataset({'a': (('t', 'x'),
+                                  [[fill_value, 2, 3], [1, 2, fill_value]])},
+                           {'x': [0, 1, 2]})
+        actual = combine_nested(datasets, concat_dim='t',
+                                fill_value=fill_value)
+        assert_identical(expected, actual)
+
+
+class TestCombineAuto:
+    def test_combine_by_coords(self):
+        objs = [Dataset({'x': [0]}), Dataset({'x': [1]})]
+        actual = combine_by_coords(objs)
+        expected = Dataset({'x': [0, 1]})
+        assert_identical(expected, actual)
+
+        actual = combine_by_coords([actual])
+        assert_identical(expected, actual)
+
+        objs = [Dataset({'x': [0, 1]}), Dataset({'x': [2]})]
+        actual = combine_by_coords(objs)
+        expected = Dataset({'x': [0, 1, 2]})
+        assert_identical(expected, actual)
+
+        # ensure auto_combine handles non-sorted variables
+        objs = [Dataset({'x': ('a', [0]), 'y': ('a', [0]), 'a': [0]}),
+                Dataset({'x': ('a', [1]), 'y': ('a', [1]), 'a': [1]})]
+        actual = combine_by_coords(objs)
+        expected = Dataset({'x': ('a', [0, 1]), 'y': ('a', [0, 1]),
+                            'a': [0, 1]})
+        assert_identical(expected, actual)
+
+        objs = [Dataset({'x': [0], 'y': [0]}), Dataset({'y': [1], 'x': [1]})]
+        actual = combine_by_coords(objs)
+        expected = Dataset({'x': [0, 1], 'y': [0, 1]})
+        assert_equal(actual, expected)
+
+        objs = [Dataset({'x': 0}), Dataset({'x': 1})]
+        with raises_regex(ValueError, 'Could not find any dimension '
+                                      'coordinates'):
+            combine_by_coords(objs)
+
+        objs = [Dataset({'x': [0], 'y': [0]}), Dataset({'x': [0]})]
+        with raises_regex(ValueError, 'Every dimension needs a coordinate'):
+            combine_by_coords(objs)
+
+        def test_empty_input(self):
+            assert_identical(Dataset(), combine_by_coords([]))
+
+    def test_infer_order_from_coords(self):
+        data = create_test_data()
+        objs = [data.isel(dim2=slice(4, 9)), data.isel(dim2=slice(4))]
+        actual = combine_by_coords(objs)
+        expected = data
+        assert expected.broadcast_equals(actual)
+
+    def test_combine_leaving_bystander_dimensions(self):
+        # Check non-monotonic bystander dimension coord doesn't raise
+        # ValueError on combine (https://github.com/pydata/xarray/issues/3150)
+        ycoord = ['a', 'c', 'b']
+
+        data = np.random.rand(7, 3)
+
+        ds1 = Dataset(data_vars=dict(data=(['x', 'y'], data[:3, :])),
+                      coords=dict(x=[1, 2, 3], y=ycoord))
+
+        ds2 = Dataset(data_vars=dict(data=(['x', 'y'], data[3:, :])),
+                      coords=dict(x=[4, 5, 6, 7], y=ycoord))
+
+        expected = Dataset(data_vars=dict(data=(['x', 'y'], data)),
+                           coords=dict(x=[1, 2, 3, 4, 5, 6, 7], y=ycoord))
+
+        actual = combine_by_coords((ds1, ds2))
+        assert_identical(expected, actual)
+
+    def test_combine_by_coords_previously_failed(self):
+        # In the above scenario, one file is missing, containing the data for
+        # one year's data for one variable.
+        datasets = [Dataset({'a': ('x', [0]), 'x': [0]}),
+                    Dataset({'b': ('x', [0]), 'x': [0]}),
+                    Dataset({'a': ('x', [1]), 'x': [1]})]
+        expected = Dataset({'a': ('x', [0, 1]), 'b': ('x', [0, np.nan])},
+                           {'x': [0, 1]})
+        actual = combine_by_coords(datasets)
+        assert_identical(expected, actual)
+
+    def test_combine_by_coords_still_fails(self):
+        # concat can't handle new variables (yet):
+        # https://github.com/pydata/xarray/issues/508
+        datasets = [Dataset({'x': 0}, {'y': 0}),
+                    Dataset({'x': 1}, {'y': 1, 'z': 1})]
+        with pytest.raises(ValueError):
+            combine_by_coords(datasets, 'y')
+
+    def test_combine_by_coords_no_concat(self):
+        objs = [Dataset({'x': 0}), Dataset({'y': 1})]
+        actual = combine_by_coords(objs)
+        expected = Dataset({'x': 0, 'y': 1})
+        assert_identical(expected, actual)
+
+        objs = [Dataset({'x': 0, 'y': 1}), Dataset({'y': np.nan, 'z': 2})]
+        actual = combine_by_coords(objs)
+        expected = Dataset({'x': 0, 'y': 1, 'z': 2})
+        assert_identical(expected, actual)
+
+    def test_check_for_impossible_ordering(self):
+        ds0 = Dataset({'x': [0, 1, 5]})
+        ds1 = Dataset({'x': [2, 3]})
+        with raises_regex(ValueError, "does not have monotonic global indexes"
+                                      " along dimension x"):
+            combine_by_coords([ds1, ds0])
+
+
+@pytest.mark.filterwarnings("ignore:In xarray version 0.13 `auto_combine` "
+                            "will be deprecated")
+@pytest.mark.filterwarnings("ignore:Also `open_mfdataset` will no longer")
+@pytest.mark.filterwarnings("ignore:The datasets supplied")
+class TestAutoCombineOldAPI:
+    """
+    Set of tests which check that old 1-dimensional auto_combine behaviour is
+    still satisfied. #2616
+    """
+    def test_auto_combine(self):
+        objs = [Dataset({'x': [0]}), Dataset({'x': [1]})]
+        actual = auto_combine(objs)
+        expected = Dataset({'x': [0, 1]})
+        assert_identical(expected, actual)
+
+        actual = auto_combine([actual])
+        assert_identical(expected, actual)
+
+        objs = [Dataset({'x': [0, 1]}), Dataset({'x': [2]})]
+        actual = auto_combine(objs)
+        expected = Dataset({'x': [0, 1, 2]})
+        assert_identical(expected, actual)
+
+        # ensure auto_combine handles non-sorted variables
+        objs = [Dataset(OrderedDict([('x', ('a', [0])), ('y', ('a', [0]))])),
+                Dataset(OrderedDict([('y', ('a', [1])), ('x', ('a', [1]))]))]
+        actual = auto_combine(objs)
+        expected = Dataset({'x': ('a', [0, 1]), 'y': ('a', [0, 1])})
+        assert_identical(expected, actual)
+
+        objs = [Dataset({'x': [0], 'y': [0]}), Dataset({'y': [1], 'x': [1]})]
+        with raises_regex(ValueError, 'too many .* dimensions'):
+            auto_combine(objs)
+
+        objs = [Dataset({'x': 0}), Dataset({'x': 1})]
+        with raises_regex(ValueError, 'cannot infer dimension'):
+            auto_combine(objs)
+
+        objs = [Dataset({'x': [0], 'y': [0]}), Dataset({'x': [0]})]
+        with pytest.raises(KeyError):
+            auto_combine(objs)
+
+    def test_auto_combine_previously_failed(self):
+        # In the above scenario, one file is missing, containing the data for
+        # one year's data for one variable.
+        datasets = [Dataset({'a': ('x', [0]), 'x': [0]}),
+                    Dataset({'b': ('x', [0]), 'x': [0]}),
+                    Dataset({'a': ('x', [1]), 'x': [1]})]
+        expected = Dataset({'a': ('x', [0, 1]), 'b': ('x', [0, np.nan])},
+                           {'x': [0, 1]})
+        actual = auto_combine(datasets)
+        assert_identical(expected, actual)
+
+        # Your data includes "time" and "station" dimensions, and each year's
+        # data has a different set of stations.
+        datasets = [Dataset({'a': ('x', [2, 3]), 'x': [1, 2]}),
+                    Dataset({'a': ('x', [1, 2]), 'x': [0, 1]})]
+        expected = Dataset({'a': (('t', 'x'),
+                                  [[np.nan, 2, 3], [1, 2, np.nan]])},
+                           {'x': [0, 1, 2]})
+        actual = auto_combine(datasets, concat_dim='t')
+        assert_identical(expected, actual)
+
+    def test_auto_combine_still_fails(self):
+        # concat can't handle new variables (yet):
+        # https://github.com/pydata/xarray/issues/508
+        datasets = [Dataset({'x': 0}, {'y': 0}),
+                    Dataset({'x': 1}, {'y': 1, 'z': 1})]
+        with pytest.raises(ValueError):
+            auto_combine(datasets, 'y')
+
+    def test_auto_combine_no_concat(self):
+        objs = [Dataset({'x': 0}), Dataset({'y': 1})]
+        actual = auto_combine(objs)
+        expected = Dataset({'x': 0, 'y': 1})
+        assert_identical(expected, actual)
+
+        objs = [Dataset({'x': 0, 'y': 1}), Dataset({'y': np.nan, 'z': 2})]
+        actual = auto_combine(objs)
+        expected = Dataset({'x': 0, 'y': 1, 'z': 2})
+        assert_identical(expected, actual)
+
+        data = Dataset({'x': 0})
+        actual = auto_combine([data, data, data], concat_dim=None)
+        assert_identical(data, actual)
+
+        # Single object, with a concat_dim explicitly provided
+        # Test the issue reported in GH #1988
+        objs = [Dataset({'x': 0, 'y': 1})]
+        dim = DataArray([100], name='baz', dims='baz')
+        actual = auto_combine(objs, concat_dim=dim)
+        expected = Dataset({'x': ('baz', [0]), 'y': ('baz', [1])},
+                           {'baz': [100]})
+        assert_identical(expected, actual)
+
+        # Just making sure that auto_combine is doing what is
+        # expected for non-scalar values, too.
+        objs = [Dataset({'x': ('z', [0, 1]), 'y': ('z', [1, 2])})]
+        dim = DataArray([100], name='baz', dims='baz')
+        actual = auto_combine(objs, concat_dim=dim)
+        expected = Dataset({'x': (('baz', 'z'), [[0, 1]]),
+                            'y': (('baz', 'z'), [[1, 2]])},
+                           {'baz': [100]})
+        assert_identical(expected, actual)
+
+    def test_auto_combine_order_by_appearance_not_coords(self):
+        objs = [Dataset({'foo': ('x', [0])}, coords={'x': ('x', [1])}),
+                Dataset({'foo': ('x', [1])}, coords={'x': ('x', [0])})]
+        actual = auto_combine(objs)
+        expected = Dataset({'foo': ('x', [0, 1])},
+                           coords={'x': ('x', [1, 0])})
+        assert_identical(expected, actual)
+
+    @pytest.mark.parametrize('fill_value', [dtypes.NA, 2, 2.0])
+    def test_auto_combine_fill_value(self, fill_value):
+        datasets = [Dataset({'a': ('x', [2, 3]), 'x': [1, 2]}),
+                    Dataset({'a': ('x', [1, 2]), 'x': [0, 1]})]
+        if fill_value == dtypes.NA:
+            # if we supply the default, we expect the missing value for a
+            # float array
+            fill_value = np.nan
+        expected = Dataset({'a': (('t', 'x'),
+                                  [[fill_value, 2, 3], [1, 2, fill_value]])},
+                           {'x': [0, 1, 2]})
+        actual = auto_combine(datasets, concat_dim='t', fill_value=fill_value)
+        assert_identical(expected, actual)
+
+
+class TestAutoCombineDeprecation:
+    """
+    Set of tests to check that FutureWarnings are correctly raised until the
+    deprecation cycle is complete. #2616
+    """
+    def test_auto_combine_with_concat_dim(self):
+        objs = [Dataset({'x': [0]}), Dataset({'x': [1]})]
+        with pytest.warns(FutureWarning, match="`concat_dim`"):
+            auto_combine(objs, concat_dim='x')
+
+    def test_auto_combine_with_merge_and_concat(self):
+        objs = [Dataset({'x': [0]}),
+                Dataset({'x': [1]}),
+                Dataset({'z': ((), 99)})]
+        with pytest.warns(FutureWarning, match="require both concatenation"):
+            auto_combine(objs)
+
+    def test_auto_combine_with_coords(self):
+        objs = [Dataset({'foo': ('x', [0])}, coords={'x': ('x', [0])}),
+                Dataset({'foo': ('x', [1])}, coords={'x': ('x', [1])})]
+        with pytest.warns(FutureWarning, match="supplied have global"):
+            auto_combine(objs)
+
+    def test_auto_combine_without_coords(self):
+        objs = [Dataset({'foo': ('x', [0])}),
+                Dataset({'foo': ('x', [1])})]
+        with pytest.warns(FutureWarning, match="supplied do not have global"):
+            auto_combine(objs)
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""

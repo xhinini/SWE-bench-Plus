@@ -1,0 +1,251 @@
+from types import SimpleNamespace
+from requests.exceptions import HTTPError
+import json
+from types import SimpleNamespace
+from unittest import mock
+import pytest
+from requests.exceptions import HTTPError
+
+# Helper response factory to emulate requests.Response-like objects used by the builder.
+class MockResponse:
+    def __init__(self, url, method='GET', headers=None, chunks=None, raise_exc=None, history=None):
+        self.url = url
+        self.headers = headers or {}
+        # iter_content yields bytes or str consistent with decode_unicode handling in code
+        self._chunks = chunks or []
+        self.history = history or []
+        self.request = SimpleNamespace(method=method)
+        self._raise_exc = raise_exc
+        # include a .status_code for attaching to exceptions when needed
+        self.status_code = getattr(raise_exc, 'response_status', 200) if raise_exc else 200
+
+    def iter_content(self, chunk_size=1, decode_unicode=False):
+        # emulate requests' behavior: when decode_unicode=True, chunks are str; otherwise bytes
+        for c in self._chunks:
+            yield c
+
+    def raise_for_status(self):
+        if self._raise_exc:
+            # attach a response-like object on the exception to mimic requests' HTTPError
+            if not hasattr(self._raise_exc, 'response') or self._raise_exc.response is None:
+                # create a small object with status_code
+                resp = SimpleNamespace(status_code=getattr(self._raise_exc, 'response_status', None))
+                self._raise_exc.response = resp
+            raise self._raise_exc
+
+def append_link(app, uri):
+    # Append a simple external-link reference to the standard links.txt used in the testroot
+    p = app.srcdir / 'links.txt'
+    with open(p, 'a', encoding='utf-8') as f:
+        f.write("\n`added link <{0}>`_\n".format(uri))
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_on_non_html_reports_broken(app, status, warning):
+    uri = 'https://example.com/bin#myanchor'
+    append_link(app, uri)
+
+    # HEAD returns non-HTML; candidate model would treat as working, real behavior should perform GET and
+    # then report anchor not found (broken).
+    head_resp = MockResponse(url=uri.split('#')[0], method='HEAD',
+                             headers={'content-type': 'application/octet-stream'},
+                             chunks=[b'nope'], raise_exc=None)
+    get_resp = MockResponse(url=uri.split('#')[0], method='GET',
+                            headers={'content-type': 'application/octet-stream'},
+                            chunks=[b'<html><body>no anchor here</body></html>'],
+                            raise_exc=None)
+
+    with mock.patch('sphinx.builders.linkcheck.requests.head', return_value=head_resp) as mhead:
+        with mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp) as mget:
+            app.builder.build_all()
+
+    content = (app.outdir / 'output.json').read_text()
+    rows = [json.loads(x) for x in content.splitlines()]
+    rowsby = {row['uri']: row for row in rows}
+    assert uri in rowsby
+    assert rowsby[uri]['status'] == 'broken'
+    assert "Anchor 'myanchor' not found" in rowsby[uri]['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_on_404_reports_http_error(app, status, warning):
+    uri = 'https://example.com/missing#anchor'
+    append_link(app, uri)
+
+    # Simulate GET raising HTTPError 404
+    err = HTTPError("404 Client Error: Not Found for url: " + uri.split('#')[0])
+    err.response_status = 404
+    get_resp = MockResponse(url=uri.split('#')[0], method='GET',
+                            headers={'content-type': 'text/html'},
+                            chunks=[b'not found page'],
+                            raise_exc=err)
+
+    # HEAD may or may not be called; ensure both are patched to return the GET-mock if used
+    with mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp):
+        with mock.patch('sphinx.builders.linkcheck.requests.head', return_value=get_resp):
+            app.builder.build_all()
+
+    content = (app.outdir / 'output.json').read_text()
+    rows = [json.loads(x) for x in content.splitlines()]
+    rowsby = {row['uri']: row for row in rows}
+    assert uri in rowsby
+    assert rowsby[uri]['status'] == 'broken'
+    # should report the HTTPError's message (404)
+    assert '404 Client Error' in rowsby[uri]['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_present_reports_working(app, status, warning):
+    uri = 'https://example.com/page#present'
+    append_link(app, uri)
+
+    html = b'<html><body><a id="present"></a></body></html>'
+    get_resp = MockResponse(url=uri.split('#')[0], method='GET',
+                            headers={'content-type': 'text/html; charset=utf-8'},
+                            chunks=[html], raise_exc=None)
+
+    with mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp):
+        with mock.patch('sphinx.builders.linkcheck.requests.head', return_value=get_resp):
+            app.builder.build_all()
+
+    content = (app.outdir / 'output.json').read_text()
+    rows = [json.loads(x) for x in content.splitlines()]
+    rowsby = {row['uri']: row for row in rows}
+    assert uri in rowsby
+    assert rowsby[uri]['status'] == 'working'
+    assert rowsby[uri]['info'] == ''
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_percent_encoded_anchor_decoded_and_found(app, status, warning):
+    # Anchor uses percent-encoding; the parser should unquote before matching.
+    uri = 'https://example.com/enc#hello%20world'
+    append_link(app, uri)
+
+    html = b'<html><body><div id="hello world"></div></body></html>'
+    get_resp = MockResponse(url=uri.split('#')[0], method='GET',
+                            headers={'content-type': 'text/html'},
+                            chunks=[html], raise_exc=None)
+
+    with mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp):
+        with mock.patch('sphinx.builders.linkcheck.requests.head', return_value=get_resp):
+            app.builder.build_all()
+
+    content = (app.outdir / 'output.json').read_text()
+    rows = [json.loads(x) for x in content.splitlines()]
+    rowsby = {row['uri']: row for row in rows}
+    assert uri in rowsby
+    assert rowsby[uri]['status'] == 'working'
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_iter_content_bytes_decoded_for_anchor_check(app, status, warning):
+    uri = 'https://example.com/bytes#b'
+    append_link(app, uri)
+
+    # Provide bytes chunks (requests.iter_content may yield bytes)
+    html_chunks = [b'<html><body>', b'<a id="b">', b'</a></body></html>']
+    get_resp = MockResponse(url=uri.split('#')[0], method='GET',
+                            headers={'content-type': 'text/html'},
+                            chunks=html_chunks, raise_exc=None)
+
+    with mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp):
+        with mock.patch('sphinx.builders.linkcheck.requests.head', return_value=get_resp):
+            app.builder.build_all()
+
+    content = (app.outdir / 'output.json').read_text()
+    rows = [json.loads(x) for x in content.splitlines()]
+    rowsby = {row['uri']: row for row in rows}
+    assert uri in rowsby
+    assert rowsby[uri]['status'] == 'working'
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_redirect_with_anchor_reports_redirected_with_history_code(app, status, warning):
+    uri = 'https://example.com/old#target'
+    append_link(app, uri)
+
+    # Simulate a redirect history: last history item with status 301 and final URL different
+    history = [SimpleNamespace(status_code=301)]
+    final_url = 'https://example.com/new'
+    get_resp = MockResponse(url=final_url, method='GET',
+                            headers={'content-type': 'text/html'},
+                            chunks=[b'<html><body><div id="target"></div></body></html>'],
+                            raise_exc=None, history=history)
+
+    with mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp):
+        with mock.patch('sphinx.builders.linkcheck.requests.head', return_value=get_resp):
+            app.builder.build_all()
+
+    content = (app.outdir / 'output.json').read_text()
+    rows = [json.loads(x) for x in content.splitlines()]
+    rowsby = {row['uri']: row for row in rows}
+    assert uri in rowsby
+    assert rowsby[uri]['status'] == 'redirected'
+    # info contains the new URL (with anchor appended by code)
+    assert final_url + '#target' in rowsby[uri]['info']
+    assert rowsby[uri]['code'] == 301
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_missing_in_html_reports_anchor_not_found(app, status, warning):
+    uri = 'https://example.com/noanchor#lost'
+    append_link(app, uri)
+
+    get_resp = MockResponse(url=uri.split('#')[0], method='GET',
+                            headers={'content-type': 'text/html'},
+                            chunks=[b'<html><body>No anchors here</body></html>'],
+                            raise_exc=None)
+
+    with mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp):
+        with mock.patch('sphinx.builders.linkcheck.requests.head', return_value=get_resp):
+            app.builder.build_all()
+
+    content = (app.outdir / 'output.json').read_text()
+    rows = [json.loads(x) for x in content.splitlines()]
+    rowsby = {row['uri']: row for row in rows}
+    assert uri in rowsby
+    assert rowsby[uri]['status'] == 'broken'
+    assert "Anchor 'lost' not found" in rowsby[uri]['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_non_html_content_with_anchor_still_checked_and_reported(app, status, warning):
+    # Ensure that non-HTML content does not bypass anchor checks silently.
+    uri = 'https://example.com/data#x'
+    append_link(app, uri)
+
+    # HEAD indicates non-HTML; but the correct behavior is to GET and then check for the anchor.
+    head_resp = MockResponse(url=uri.split('#')[0], method='HEAD',
+                             headers={'content-type': 'application/pdf'},
+                             chunks=[b'%PDF-1.4'], raise_exc=None)
+    get_resp = MockResponse(url=uri.split('#')[0], method='GET',
+                            headers={'content-type': 'application/pdf'},
+                            chunks=[b'%PDF-1.4 binary content without anchor'],
+                            raise_exc=None)
+
+    # Candidate (incorrect) implementation would return working after seeing non-HTML on HEAD.
+    # The correct behavior is to perform the GET and then report broken when the anchor is missing.
+    with mock.patch('sphinx.builders.linkcheck.requests.head', return_value=head_resp):
+        with mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp):
+            app.builder.build_all()
+
+    content = (app.outdir / 'output.json').read_text()
+    rows = [json.loads(x) for x in content.splitlines()]
+    rowsby = {row['uri']: row for row in rows}
+    assert uri in rowsby
+    assert rowsby[uri]['status'] == 'broken'
+    assert "Anchor 'x' not found" in rowsby[uri]['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_with_multiple_chunks_found_correctly(app, status, warning):
+    uri = 'https://example.com/chunks#multi'
+    append_link(app, uri)
+
+    # anchor spans across chunks: ensure parser continues across chunks and finds it.
+    chunks = [b'<html><body><div ', b'id="multi">', b'</div></body></html>']
+    get_resp = MockResponse(url=uri.split('#')[0], method='GET',
+                            headers={'content-type': 'text/html'},
+                            chunks=chunks, raise_exc=None)
+
+    with mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp):
+        with mock.patch('sphinx.builders.linkcheck.requests.head', return_value=get_resp):
+            app.builder.build_all()
+
+    content = (app.outdir / 'output.json').read_text()
+    rows = [json.loads(x) for x in content.splitlines()]
+    rowsby = {row['uri']: row for row in rows}
+    assert uri in rowsby
+    assert rowsby[uri]['status'] == 'working'

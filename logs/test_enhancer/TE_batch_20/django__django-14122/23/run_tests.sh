@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 ordering.tests_llm.GroupByOrderingRegressionTests.get_group_by_clause ordering.tests_llm.GroupByOrderingRegressionTests.setUpTestData ordering.tests_llm.GroupByOrderingRegressionTests.test_annotation_ordering_respected_when_explicit ordering.tests_llm.GroupByOrderingRegressionTests.test_default_meta_ordering_does_not_add_meta_fields_to_group_by ordering.tests_llm.GroupByOrderingRegressionTests.test_explicit_order_by_adds_columns_to_group_by_when_order_by_used_on_qs ordering.tests_llm.GroupByOrderingRegressionTests.test_extra_order_by_table_name_included_in_group_by_when_explicit ordering.tests_llm.GroupByOrderingRegressionTests.test_having_expressions_are_kept_in_group_by_processing ordering.tests_llm.GroupByOrderingRegressionTests.test_order_by_f_expression_is_considered_when_explicit_ordering ordering.tests_llm.GroupByOrderingRegressionTests.test_order_by_on_cast_expression_includes_cast_column_when_explicit ordering.tests_llm.GroupByOrderingRegressionTests.test_random_ordering_does_not_affect_group_by ordering.tests_llm.GroupByOrderingRegressionTests.test_values_on_pub_date_respects_explicit_group_by
+coverage json -o coverage.json
+: '>>>>> End Test Output'

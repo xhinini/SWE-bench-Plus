@@ -1,0 +1,210 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These tests verify the async behavior of StaticFilesHandlerMixin.get_response_async,
+  ensuring that asgiref.sync.sync_to_async is used to call the synchronous serve and
+  response_for_exception functions. They also cover path handling and file path
+  extraction logic in the mixin and ensure ASGIStaticFilesHandler forwards non-matching
+  scopes to the wrapped application. The tests will fail for the candidate (model)
+  patch which omits use of sync_to_async in get_response_async.
+test_code: |
+  import asyncio
+  import types
+  from urllib.parse import urlparse
+  
+  import pytest
+  from django.http import Http404
+  
+  from django.contrib.staticfiles import handlers as handlers_module
+  
+  class DummyHandler(handlers_module.StaticFilesHandlerMixin):
+      def __init__(self, base_url="/static/"):
+          # Avoid calling get_base_url (which checks settings); set base_url directly.
+          self.base_url = urlparse(base_url)
+  
+  class DummyRequest:
+      def __init__(self, path):
+          self.path = path
+  
+  def make_spy_sync_to_async(calls):
+      """
+      Return a sync_to_async replacement that records the passed-in function
+      objects (bound/unbound) in 'calls' in the order they are wrapped, and
+      returns an async wrapper that calls the original function.
+      """
+      def spy(func):
+          async def wrapper(*args, **kwargs):
+              calls.append(func)
+              return func(*args, **kwargs)
+          return wrapper
+      return spy
+  
+  def test_get_response_async_uses_sync_to_async_on_success():
+      handler = DummyHandler()
+      request = DummyRequest("/static/test.txt")
+  
+      # serve returns a sentinel value
+      def serve(req):
+          return "served-ok"
+      handler.serve = serve
+  
+      calls = []
+      original_sync_to_async = handlers_module.sync_to_async
+      handlers_module.sync_to_async = make_spy_sync_to_async(calls)
+      try:
+          result = asyncio.run(handler.get_response_async(request))
+          assert result == "served-ok"
+          # Ensure sync_to_async was used and got the bound function (serve)
+          assert len(calls) == 1
+          assert calls[0].__name__ == "serve"
+      finally:
+          handlers_module.sync_to_async = original_sync_to_async
+  
+  def test_get_response_async_returns_value_from_serve_bound_method():
+      handler = DummyHandler()
+      request = DummyRequest("/static/foo")
+  
+      # Use a bound method on the handler to ensure the bound method is passed to sync_to_async
+      def serve_bound(req):
+          return "bound-result"
+      # attach as bound method
+      handler.serve = types.MethodType(serve_bound, handler)
+  
+      calls = []
+      original_sync_to_async = handlers_module.sync_to_async
+      handlers_module.sync_to_async = make_spy_sync_to_async(calls)
+      try:
+          result = asyncio.run(handler.get_response_async(request))
+          assert result == "bound-result"
+          assert len(calls) == 1
+          # The function passed should be the bound method; its __self__ should be handler
+          assert getattr(calls[0], "__self__", None) is handler
+      finally:
+          handlers_module.sync_to_async = original_sync_to_async
+  
+  def test_get_response_async_calls_response_for_exception_on_http404():
+      handler = DummyHandler()
+      request = DummyRequest("/static/missing")
+  
+      # serve raises Http404
+      def serve_404(req):
+          raise Http404("not found")
+      handler.serve = serve_404
+  
+      # stub response_for_exception to return a sentinel
+      original_rfe = handlers_module.response_for_exception
+      handlers_module.response_for_exception = lambda req, exc: "handled-404"
+  
+      calls = []
+      original_sync_to_async = handlers_module.sync_to_async
+      handlers_module.sync_to_async = make_spy_sync_to_async(calls)
+      try:
+          result = asyncio.run(handler.get_response_async(request))
+          assert result == "handled-404"
+          # Ensure sync_to_async was used twice: for serve and for response_for_exception
+          assert len(calls) == 2
+          assert calls[0].__name__ == "serve_404" or calls[0] is serve_404
+          # second call should be the response_for_exception function from the module
+          assert calls[1] is handlers_module.response_for_exception
+      finally:
+          handlers_module.sync_to_async = original_sync_to_async
+          handlers_module.response_for_exception = original_rfe
+  
+  def test_get_response_async_propagates_non_http404_exception():
+      handler = DummyHandler()
+      request = DummyRequest("/static/error")
+  
+      def serve_error(req):
+          raise ValueError("boom")
+      handler.serve = serve_error
+  
+      calls = []
+      original_sync_to_async = handlers_module.sync_to_async
+      handlers_module.sync_to_async = make_spy_sync_to_async(calls)
+      try:
+          with pytest.raises(ValueError):
+              asyncio.run(handler.get_response_async(request))
+          # sync_to_async should have been used exactly once for the serve call
+          assert len(calls) == 1
+          assert calls[0] is serve_error
+      finally:
+          handlers_module.sync_to_async = original_sync_to_async
+  
+  def test_get_response_async_uses_sync_to_async_for_response_for_exception():
+      """
+      Similar to previous, but assert that response_for_exception is indeed wrapped
+      and called through sync_to_async (i.e., appears in calls list).
+      """
+      handler = DummyHandler()
+      request = DummyRequest("/static/missing2")
+  
+      def serve_404(req):
+          raise Http404()
+      handler.serve = serve_404
+  
+      # stub response_for_exception to return a sentinel
+      original_rfe = handlers_module.response_for_exception
+      handlers_module.response_for_exception = lambda req, exc: "handled-404-2"
+  
+      calls = []
+      original_sync_to_async = handlers_module.sync_to_async
+      handlers_module.sync_to_async = make_spy_sync_to_async(calls)
+      try:
+          result = asyncio.run(handler.get_response_async(request))
+          assert result == "handled-404-2"
+          # Ensure serve and response_for_exception both passed through sync_to_async
+          assert calls[0] is serve_404
+          assert calls[1] is handlers_module.response_for_exception
+      finally:
+          handlers_module.sync_to_async = original_sync_to_async
+          handlers_module.response_for_exception = original_rfe
+  
+  def test__should_handle_respects_host_in_base_url():
+      # If base_url includes a host (netloc), _should_handle should return False
+      handler = DummyHandler(base_url="http://example.com/static/")
+      assert handler._should_handle("/static/file") is False
+      # If netloc empty, should be True for matching path
+      handler_no_host = DummyHandler(base_url="/static/")
+      assert handler_no_host._should_handle("/static/file") is True
+  
+  def test__should_handle_accepts_paths_equal_to_base_path():
+      handler = DummyHandler(base_url="/static/")
+      # path equal to base path should be handled
+      assert handler._should_handle("/static/") is True
+      # path that is a prefix but not starting with base path should not be handled
+      assert handler._should_handle("/other/static/") is False
+  
+  def test_file_path_converts_url_to_path():
+      handler = DummyHandler(base_url="/static/")
+      url = "/static/foo/bar/baz.txt"
+      # Should strip the base_url path and convert using url2pathname
+      rel = handler.file_path(url)
+      # On most platforms this equals 'foo/bar/baz.txt'
+      assert rel.endswith("foo/bar/baz.txt")
+  
+  def test_asgi_handler_pass_through_for_non_matching_scope():
+      # Construct an ASGI handler instance without calling its __init__
+      # to avoid settings checks. Only set attributes used by __call__.
+      async def dummy_app(scope, receive, send):
+          return "app-result"
+  
+      handler = object.__new__(handlers_module.ASGIStaticFilesHandler)
+      handler.application = dummy_app
+      handler.base_url = urlparse("/static/")
+  
+      # Non-http scope should be passed through
+      scope_non_http = {"type": "websocket", "path": "/static/test.txt"}
+      result = asyncio.run(handler.__call__(scope_non_http, None, None))
+      assert result == "app-result"
+  
+      # HTTP scope but non-matching path should also be passed through
+      scope_non_matching = {"type": "http", "path": "/not-static/foo"}
+      result2 = asyncio.run(handler.__call__(scope_non_matching, None, None))
+      assert result2 == "app-result"
+new_imports_code: |
+  import asyncio
+  import types
+  from urllib.parse import urlparse
+  import pytest
+  from django.http import Http404
+  from django.contrib.staticfiles import handlers as handlers_module

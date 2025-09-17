@@ -1,0 +1,59 @@
+from decimal import Decimal
+
+from django.db import models
+from django.test import TestCase
+
+
+class DecimalFieldTupleConversionTests(TestCase):
+
+    def test_to_python_accepts_simple_decimal_tuple(self):
+        f = models.DecimalField()
+        value = (0, (1, 2, 3), -3)
+        self.assertEqual(f.to_python(value), Decimal('0.123'))
+
+    def test_to_python_accepts_decimal_as_tuple(self):
+        f = models.DecimalField()
+        tup = Decimal('1.23').as_tuple()
+        self.assertEqual(f.to_python(tup), Decimal('1.23'))
+
+    def test_to_python_accepts_subclassed_tuple(self):
+        class MyTuple(tuple):
+            pass
+        f = models.DecimalField()
+        value = MyTuple((0, (4, 5, 6), -3))
+        self.assertEqual(f.to_python(value), Decimal('0.456'))
+
+    def test_to_python_accepts_negative_sign_tuple(self):
+        f = models.DecimalField()
+        value = (1, (1, 2), -2)
+        self.assertEqual(f.to_python(value), Decimal('-0.12'))
+
+    def test_to_python_accepts_zero_exponent_tuple(self):
+        f = models.DecimalField()
+        value = (0, (1, 2, 3), 0)
+        self.assertEqual(f.to_python(value), Decimal('123'))
+
+    def test_to_python_accepts_positive_exponent_tuple(self):
+        f = models.DecimalField()
+        value = (0, (1,), 5)
+        self.assertEqual(f.to_python(value), Decimal('100000'))
+
+    def test_to_python_accepts_negative_large_exponent_tuple(self):
+        f = models.DecimalField()
+        value = (0, (1,), -5)
+        self.assertEqual(f.to_python(value), Decimal('0.00001'))
+
+    def test_to_python_accepts_negative_decimal_as_tuple(self):
+        f = models.DecimalField()
+        tup = Decimal('-45.6').as_tuple()
+        self.assertEqual(f.to_python(tup), Decimal('-45.6'))
+
+    def test_to_python_accepts_zero_tuple(self):
+        f = models.DecimalField()
+        value = (0, (0,), 0)
+        self.assertEqual(f.to_python(value), Decimal('0'))
+
+    def test_to_python_accepts_various_digits_and_exponent(self):
+        f = models.DecimalField()
+        value = (0, (9, 8, 7), -1)
+        self.assertEqual(f.to_python(value), Decimal('98.7'))

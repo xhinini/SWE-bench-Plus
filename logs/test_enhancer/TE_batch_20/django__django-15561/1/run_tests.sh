@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 schema.tests_llm.NonDbAttrsAlterFieldTests.test_add_new_field_class_with_extra_non_db_attr_no_queries schema.tests_llm.NonDbAttrsAlterFieldTests.test_change_single_custom_non_db_attr_no_queries schema.tests_llm.NonDbAttrsAlterFieldTests.test_changing_only_verbose_non_db_attrs_no_queries schema.tests_llm.NonDbAttrsAlterFieldTests.test_custom_non_db_attr_and_builtin_non_db_attr_changed_no_queries schema.tests_llm.NonDbAttrsAlterFieldTests.test_many_custom_non_db_attrs_combined_no_queries schema.tests_llm.NonDbAttrsAlterFieldTests.test_multiple_custom_non_db_attrs_on_new_field_no_queries schema.tests_llm.NonDbAttrsAlterFieldTests.test_non_db_attr_present_only_on_old_field_no_queries schema.tests_llm.NonDbAttrsAlterFieldTests.test_non_db_attrs_on_one_side_only_no_queries schema.tests_llm.NonDbAttrsAlterFieldTests.test_swap_between_two_field_classes_with_distinct_non_db_attrs_no_queries
+coverage json -o coverage.json
+: '>>>>> End Test Output'

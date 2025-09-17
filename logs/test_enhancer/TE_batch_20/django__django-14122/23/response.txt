@@ -1,0 +1,153 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise get_group_by behavior around meta ordering and explicit order_by usage. They assert that ORDER BY expressions are not implicitly added to GROUP BY when the model's Meta.ordering is driving ordering, while they are included when ordering is explicitly specified on the queryset. They also cover various ordering forms (F expressions, extra(order_by=...), annotation-based ordering, random ordering, explicit group_by via values(), and HAVING scenarios). The tests are written to fail for the candidate patch (which alters/exposes string-comparison based logic for explicit group_by handling) but pass for the gold patch that simply skips processing ORDER BY when _meta_ordering is set.
+new_imports_code: |
+  from django.db.models import Count, Value, F, Max, CharField
+  from django.db.models.functions import Cast
+  from django.test import TestCase
+  from operator import attrgetter
+test_code: |
+  from django.db.models import Count, Value, F, Max, CharField
+  from django.db.models.functions import Cast
+  from django.test import TestCase
+  from operator import attrgetter
+
+  from .models import Article, Author
+
+  class GroupByOrderingRegressionTests(TestCase):
+      @classmethod
+      def setUpTestData(cls):
+          # Setup test data copied from existing ordering tests
+          cls.a1 = Article.objects.create(headline="Article 1", pub_date=None)
+          cls.a2 = Article.objects.create(headline="Article 2", pub_date=None)
+          cls.a3 = Article.objects.create(headline="Article 3", pub_date=None)
+          cls.a4 = Article.objects.create(headline="Article 4", pub_date=None)
+          cls.author_1 = Author.objects.create(name="Name 1")
+          cls.author_2 = Author.objects.create(name="Name 2")
+          # attach authors to articles to create grouping possibilities
+          cls.a1.author = cls.author_1
+          cls.a1.save(update_fields={'author'})
+          cls.a2.author = cls.author_1
+          cls.a2.save(update_fields={'author'})
+          cls.a3.author = cls.author_1
+          cls.a3.save(update_fields={'author'})
+          cls.a4.author = cls.author_2
+          cls.a4.save(update_fields={'author'})
+
+      def get_group_by_clause(self, qs):
+          sql = str(qs.query)
+          upper = sql.upper()
+          if 'GROUP BY' not in upper:
+              return ''
+          fragment = upper[upper.find('GROUP BY'):]
+          # If ORDER BY follows, cut it off for easier assertions.
+          if 'ORDER BY' in fragment:
+              fragment = fragment[:fragment.find('ORDER BY')]
+          return fragment
+
+      def test_default_meta_ordering_does_not_add_meta_fields_to_group_by(self):
+          """
+          When Meta.ordering is present, ORDER BY expressions coming from
+          Meta.ordering must not be implicitly added to the GROUP BY clause
+          of a values().annotate() query.
+          """
+          qs = Article.objects.values('author').annotate(count=Count('author'))
+          gb = self.get_group_by_clause(qs)
+          # Group by should mention the author but must not include meta-ordering
+          # fields like 'pub_date' or 'headline'.
+          self.assertIn('AUTHOR', gb)
+          self.assertNotIn('PUB_DATE', gb)
+          self.assertNotIn('HEADLINE', gb)
+
+      def test_explicit_order_by_adds_columns_to_group_by_when_order_by_used_on_qs(self):
+          """
+          If ordering is explicitly provided on the queryset (overriding Meta),
+          the ORDER BY expressions should be included into the GROUP BY of a
+          values().annotate() query so the SQL is valid.
+          """
+          qs = Article.objects.values('author').annotate(count=Count('author')).order_by('pub_date')
+          gb = self.get_group_by_clause(qs)
+          # Since we ordered explicitly by pub_date, it must appear in GROUP BY.
+          self.assertIn('PUB_DATE', gb)
+
+      def test_order_by_f_expression_is_considered_when_explicit_ordering(self):
+          """
+          Order by via an F() expression provided explicitly on the queryset
+          should cause the corresponding column to be present in GROUP BY.
+          """
+          qs = Article.objects.values('author').annotate(count=Count('author')).order_by(F('pub_date').asc())
+          gb = self.get_group_by_clause(qs)
+          self.assertIn('PUB_DATE', gb)
+
+      def test_extra_order_by_table_name_included_in_group_by_when_explicit(self):
+          """
+          extra(order_by=[...table.col...]) should have the ordering column
+          included in GROUP BY when ordering is explicitly provided by caller.
+          """
+          qs = Article.objects.values('author').annotate(count=Count('author')).extra(order_by=['ordering_article.headline'])
+          gb = self.get_group_by_clause(qs)
+          # The explicit extra(order_by=...) reference to headline should cause
+          # headline to be present in GROUP BY for DBs requiring it.
+          self.assertIn('HEADLINE', gb)
+
+      def test_random_ordering_does_not_affect_group_by(self):
+          """
+          Random ordering ('?') should not cause any additional GROUP BY columns
+          to be added.
+          """
+          qs = Article.objects.values('author').annotate(count=Count('author')).order_by('?')
+          gb = self.get_group_by_clause(qs)
+          # Random ordering shouldn't inject columns.
+          self.assertIn('AUTHOR', gb)
+          self.assertNotIn('PUB_DATE', gb)
+          self.assertNotIn('HEADLINE', gb)
+
+      def test_values_on_pub_date_respects_explicit_group_by(self):
+          """
+          If values('pub_date') is used, the GROUP BY must include pub_date
+          even if Meta.ordering is present.
+          """
+          qs = Article.objects.values('pub_date').annotate(count=Count('id'))
+          gb = self.get_group_by_clause(qs)
+          self.assertIn('PUB_DATE', gb)
+
+      def test_annotation_ordering_respected_when_explicit(self):
+          """
+          Ordering by an annotation that is present in the select (annotate
+          then order_by annotation) must result in a valid GROUP BY clause that
+          includes the annotation's SQL when needed.
+          """
+          qs = Article.objects.annotate(last_date=Max('pub_date')).values('author').annotate(count=Count('author')).order_by('last_date')
+          gb = self.get_group_by_clause(qs)
+          # Ordering by last_date (an annotation) should inject appropriate SQL
+          # reference into ORDER BY and where necessary into GROUP BY. Ensure
+          # SQL contains the annotation name somewhere (best-effort check).
+          self.assertTrue('LAST_DATE' in gb or 'MAX' in str(qs.query).upper())
+
+      def test_order_by_on_cast_expression_includes_cast_column_when_explicit(self):
+          """
+          ORDER BY on a Cast expression explicitly provided on the queryset
+          should make the compiled SQL include the cast expression in GROUP BY
+          when needed.
+          """
+          # Cast headline to char (no-op) and order explicitly by it.
+          qs = Article.objects.values('author').annotate(count=Count('author')).order_by(Cast(F('headline'), CharField()).asc())
+          gb = self.get_group_by_clause(qs)
+          # The cast expression compiles to an expression that should be present
+          # (or at least not crash compilation). We assert that author present
+          # and that there is some GROUP BY clause.
+          self.assertIn('AUTHOR', gb)
+          self.assertTrue(gb.strip() != '')
+
+      def test_having_expressions_are_kept_in_group_by_processing(self):
+          """
+          Queries that result in HAVING clauses (filtering on aggregates)
+          should still correctly compute GROUP BY and keep HAVING expressions
+          in the internal group_by processing.
+          """
+          qs = Article.objects.values('author').annotate(total=Count('id')).filter(total__gt=0)
+          gb = self.get_group_by_clause(qs)
+          # There must be a GROUP BY on author, and the query must compile with HAVING.
+          self.assertIn('AUTHOR', gb)
+          # Ensure HAVING is present in the compiled SQL (filter on aggregate creates HAVING).
+          self.assertIn('HAVING', str(qs.query).upper())

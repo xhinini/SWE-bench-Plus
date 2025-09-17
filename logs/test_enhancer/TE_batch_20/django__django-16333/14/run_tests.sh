@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.make_custom_form auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.setUp auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_mask_after_validation_then_save auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_mask_before_validation_then_save auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_masked_lookup_on_form_instance_with_different_field_order auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_masked_lookup_with_no_m2m_data auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_multiple_orgs_masked_lookup auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_after_commit_false_then_commit_true_masked_lookup auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_called_twice_with_masked_lookup auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_explicit_commit_true_masked_lookup auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_on_default_usercreation_form_masked_lookup auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_with_masked_save_m2m_does_not_raise auth_tests.test_forms_llm.mask_save_m2m_lookup_raises
+coverage json -o coverage.json
+: '>>>>> End Test Output'

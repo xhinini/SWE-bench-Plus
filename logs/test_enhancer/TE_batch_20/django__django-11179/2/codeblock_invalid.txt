@@ -1,0 +1,202 @@
+from django.test import TestCase
+from django.db import connection, transaction, models
+from django.db.models import sql
+import uuid
+import types
+
+# Reuse an existing model's app_label to ensure the dynamically created
+# models are associated with an app that exists in the test project.
+from .models import A as RefModel, User
+
+def create_dynamic_model(name, field):
+    """
+    Create a dynamic model class with the given name and primary key field.
+    The model will be created in the database using the schema editor.
+    """
+    attrs = {
+        '__module__': __name__,
+        field[0]: field[1],
+        'Meta': type('Meta', (), {'app_label': RefModel._meta.app_label}),
+    }
+    ModelClass = type(name, (models.Model,), attrs)
+    # Create the database table for the model
+    with connection.schema_editor() as schema_editor:
+        schema_editor.create_model(ModelClass)
+    return ModelClass
+
+class AdditionalDeletionTests(TestCase):
+    def test_auto_pk_model_delete_clears_pk(self):
+        """
+        Deleting an instance with an auto integer PK via instance.delete()
+        should clear the in-memory object's pk.
+        """
+        u = User.objects.create()
+        self.assertIsNotNone(u.pk)
+        u.delete()
+        self.assertIsNone(u.pk)
+
+    def test_char_primary_key_model_delete_clears_pk(self):
+        """
+        A model with a CharField primary key should have its in-memory pk
+        cleared after delete().
+        """
+        CharPK = create_dynamic_model(
+            'CharPKModel',
+            ('id', models.CharField(max_length=36, primary_key=True))
+        )
+        obj = CharPK.objects.create(id='custom-1')
+        self.assertEqual(obj.pk, 'custom-1')
+        obj.delete()
+        self.assertIsNone(obj.pk)
+
+    def test_uuid_primary_key_model_delete_clears_pk(self):
+        """
+        A model with a UUIDField primary key should have its in-memory pk
+        cleared after delete().
+        """
+        UUIDPK = create_dynamic_model(
+            'UUIDPKModel',
+            ('id', models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False))
+        )
+        obj = UUIDPK.objects.create()
+        self.assertIsNotNone(obj.pk)
+        obj.delete()
+        self.assertIsNone(obj.pk)
+
+    def test_nonstandard_attname_primary_key_cleared(self):
+        """
+        Primary keys whose attribute/column name differs (attname semantics)
+        must also result in the in-memory pk being cleared after delete().
+        """
+        # field name is "my_id", attname will be "my_id" as well, but test
+        # ensures we don't rely on 'pk' vs field name semantics.
+        CustomAttPK = create_dynamic_model(
+            'CustomAttPKModel',
+            ('my_id', models.CharField(max_length=20, primary_key=True))
+        )
+        o = CustomAttPK.objects.create(my_id='X123')
+        self.assertEqual(getattr(o, CustomAttPK._meta.pk.attname), 'X123')
+        o.delete()
+        self.assertIsNone(getattr(o, CustomAttPK._meta.pk.attname))
+        self.assertIsNone(o.pk)
+
+    def test_model_delete_inside_atomic_clears_pk(self):
+        """
+        Deleting inside an explicit transaction should still clear the pk
+        of the in-memory instance when the delete succeeds.
+        """
+        CharPK = create_dynamic_model(
+            'AtomicCharPKModel',
+            ('id', models.CharField(max_length=36, primary_key=True))
+        )
+        obj = CharPK.objects.create(id='txn-1')
+        with transaction.atomic():
+            obj.delete()
+        self.assertIsNone(obj.pk)
+
+    def test_delete_does_not_clear_pk_on_failure(self):
+        """
+        If the underlying DeleteQuery.delete_batch raises an exception,
+        the in-memory pk should remain unchanged.
+        """
+        # Create a simple model to test against.
+        Temp = create_dynamic_model(
+            'TempFailModel',
+            ('id', models.CharField(max_length=20, primary_key=True))
+        )
+        t = Temp.objects.create(id='will-fail')
+
+        # Monkeypatch the DeleteQuery.delete_batch to raise for this model.
+        original_delete_batch = sql.DeleteQuery.delete_batch
+
+        def raising_delete_batch(self, pks, using):
+            raise RuntimeError("simulated delete failure")
+
+        try:
+            sql.DeleteQuery.delete_batch = raising_delete_batch
+            with self.assertRaises(RuntimeError):
+                t.delete()
+            # pk must remain unchanged on failure
+            self.assertEqual(t.pk, 'will-fail')
+        finally:
+            sql.DeleteQuery.delete_batch = original_delete_batch
+
+    def test_delete_clears_pk_for_model_with_parent_ptr(self):
+        """
+        For models with parent pointers (multi-table inheritance), deleting
+        the child instance via child_instance.delete() should clear the
+        child's in-memory pk.
+        """
+        # Create a parent model and a child model that has a OneToOne parent ptr.
+        Parent = create_dynamic_model(
+            'DelParentModel',
+            ('id', models.AutoField(primary_key=True))
+        )
+        # Define a child model that points to parent via parent_ptr (multi-table)
+        attrs = {
+            '__module__': __name__,
+            'parent_ptr': models.OneToOneField(Parent, on_delete=models.CASCADE, parent_link=True, primary_key=True),
+            'Meta': type('Meta', (), {'app_label': RefModel._meta.app_label}),
+        }
+        Child = type('DelChildModel', (models.Model,), attrs)
+        with connection.schema_editor() as schema_editor:
+            schema_editor.create_model(Child)
+        # Create instances
+        p = Parent.objects.create()
+        c = Child.objects.create(parent_ptr=p)
+        self.assertIsNotNone(c.pk)
+        c.delete()
+        # After deletion, in-memory pk should be None
+        self.assertIsNone(c.pk)
+
+    def test_delete_on_multiple_different_pk_types_clears_pk(self):
+        """
+        Ensure that multiple models of different PK types, when deleted
+        individually, each have their in-memory pk cleared.
+        """
+        CharPK = create_dynamic_model(
+            'MultiCharPKModel',
+            ('id', models.CharField(max_length=36, primary_key=True))
+        )
+        UUIDPK = create_dynamic_model(
+            'MultiUUIDPKModel',
+            ('id', models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False))
+        )
+        c = CharPK.objects.create(id='m1')
+        u = UUIDPK.objects.create()
+        c.delete()
+        u.delete()
+        self.assertIsNone(c.pk)
+        self.assertIsNone(u.pk)
+
+    def test_delete_after_fetching_parent_relationship_clears_pk(self):
+        """
+        If an object has a related single-object parent fetched (so that
+        attribute access to parent exists on the instance), deleting the
+        instance should still clear its pk.
+        """
+        Parent = create_dynamic_model(
+            'RelParentModel',
+            ('id', models.AutoField(primary_key=True))
+        )
+        Child = create_dynamic_model(
+            'RelChildModel',
+            ('id', models.AutoField(primary_key=True))
+        )
+        # Add a ForeignKey from Child to Parent dynamically (separate step)
+        # to avoid overwriting the Child class definition earlier.
+        fk = models.ForeignKey(Parent, on_delete=models.CASCADE, related_name='children')
+        # Inject fk into Child model
+        fk.contribute_to_class(Child, 'parent')
+        with connection.schema_editor() as schema_editor:
+            schema_editor.alter_model(Child)  # ensure column exists in DB
+        p = Parent.objects.create()
+        ch = Child.objects.create(parent=p)
+        # Access the parent relationship (simulate typical usage)
+        _ = ch.parent
+        ch.delete()
+        self.assertIsNone(ch.pk)
+new_imports_code: |
+  import uuid
+  from django.db import connection, transaction, models
+  from django.db.models import sql

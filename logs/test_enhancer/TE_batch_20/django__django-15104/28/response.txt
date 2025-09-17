@@ -1,0 +1,197 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests assert that MigrationAutodetector.only_relation_agnostic_fields and related rename-detection logic correctly handle Field.deconstruct() results that do not include a 'to' key in the deconstructed kwargs. They would have raised KeyError with the original code path that used del deconstruction[2]['to'] but should pass with the patched pop('to', None).
+test_code: |
+  from django.test import SimpleTestCase
+  from django.db import models
+  from django.db.migrations.autodetector import MigrationAutodetector
+  from django.db.migrations.state import ProjectState, ModelState
+  from django.db.migrations.questioner import MigrationQuestioner
+  from django.db.migrations import operations
+  
+  class OnlyRelationAgnosticFieldsRegressionTests(SimpleTestCase):
+      def test_only_relation_agnostic_fields_handles_missing_to_key(self):
+          # A ForeignKey whose deconstruct removes 'to' should not cause an error.
+          class HardcodedForeignKey(models.ForeignKey):
+              def __init__(self, *args, **kwargs):
+                  # Ensure the FK has a model target, but we'll strip it in deconstruct.
+                  super().__init__('app.Target', on_delete=models.CASCADE, **kwargs)
+  
+              def deconstruct(self):
+                  name, path, args, kwargs = super().deconstruct()
+                  # Emulate a deconstruct() that doesn't expose the 'to' kwarg.
+                  kwargs.pop('to', None)
+                  return name, path, args, kwargs
+  
+          autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+          field = HardcodedForeignKey(on_delete=models.CASCADE)
+          # Should not raise; returned deconstruction kwargs must not contain 'to'.
+          defs = autodetector.only_relation_agnostic_fields({'author': field})
+          self.assertEqual(len(defs), 1)
+          _, _, kwargs = defs[0]
+          self.assertNotIn('to', kwargs)
+  
+      def test_only_relation_agnostic_fields_removes_present_to(self):
+          # A normal ForeignKey should have 'to' removed by only_relation_agnostic_fields.
+          autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+          fk = models.ForeignKey('app.Target', on_delete=models.CASCADE)
+          defs = autodetector.only_relation_agnostic_fields({'a': fk})
+          self.assertEqual(len(defs), 1)
+          _, _, kwargs = defs[0]
+          self.assertNotIn('to', kwargs)
+  
+      def test_only_relation_agnostic_fields_multiple_fields(self):
+          # Mixed fields (one normal FK, one custom that removes 'to').
+          class HardcodedForeignKey(models.ForeignKey):
+              def __init__(self, *args, **kwargs):
+                  super().__init__('app.Target', on_delete=models.CASCADE, **kwargs)
+              def deconstruct(self):
+                  name, path, args, kwargs = super().deconstruct()
+                  kwargs.pop('to', None)
+                  return name, path, args, kwargs
+  
+          autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+          fields = {
+              'b_field': models.ForeignKey('app.Target', on_delete=models.CASCADE),
+              'a_field': HardcodedForeignKey(on_delete=models.CASCADE),
+          }
+          defs = autodetector.only_relation_agnostic_fields(fields)
+          # Sorted by field name, so two definitions returned and neither has 'to'
+          self.assertEqual(len(defs), 2)
+          for _, _, kwargs in defs:
+              self.assertNotIn('to', kwargs)
+  
+      def test_detect_rename_with_custom_fk_missing_to(self):
+          # generate_renamed_models should not crash when encountering a field
+          # whose deconstruct lacks 'to' and should detect the rename if fields match.
+          class HardcodedForeignKey(models.ForeignKey):
+              def __init__(self, *args, **kwargs):
+                  super().__init__('otherapp.Target', on_delete=models.CASCADE, **kwargs)
+              def deconstruct(self):
+                  name, path, args, kwargs = super().deconstruct()
+                  kwargs.pop('to', None)
+                  return name, path, args, kwargs
+  
+          # Old model has a normal FK (so deconstruct would include 'to'),
+          # new model has a FK that removes 'to' in deconstruct.
+          before = ProjectState()
+          before.add_model(ModelState('app', 'Old', [
+              ('id', models.AutoField(primary_key=True)),
+              ('fk', models.ForeignKey('otherapp.Target', on_delete=models.CASCADE)),
+          ]))
+          after = ProjectState()
+          after.add_model(ModelState('app', 'New', [
+              ('id', models.AutoField(primary_key=True)),
+              ('fk', HardcodedForeignKey(on_delete=models.CASCADE)),
+          ]))
+          autodetector = MigrationAutodetector(before, after, MigrationQuestioner({'ask_rename_model': True}))
+          changes = autodetector._detect_changes()
+          # Ensure a RenameModel operation was produced for the app.
+          self.assertIn('app', changes)
+          ops = [op for m in changes['app'] for op in m.operations]
+          self.assertTrue(any(isinstance(op, operations.RenameModel) for op in ops))
+  
+      def test_detect_rename_with_custom_fk_missing_to_reversed(self):
+          # Same as previous but swapped: old has custom FK removing 'to', new has normal FK.
+          class HardcodedForeignKey(models.ForeignKey):
+              def __init__(self, *args, **kwargs):
+                  super().__init__('otherapp.Target', on_delete=models.CASCADE, **kwargs)
+              def deconstruct(self):
+                  name, path, args, kwargs = super().deconstruct()
+                  kwargs.pop('to', None)
+                  return name, path, args, kwargs
+  
+          before = ProjectState()
+          before.add_model(ModelState('app', 'Old', [
+              ('id', models.AutoField(primary_key=True)),
+              ('fk', HardcodedForeignKey(on_delete=models.CASCADE)),
+          ]))
+          after = ProjectState()
+          after.add_model(ModelState('app', 'New', [
+              ('id', models.AutoField(primary_key=True)),
+              ('fk', models.ForeignKey('otherapp.Target', on_delete=models.CASCADE)),
+          ]))
+          autodetector = MigrationAutodetector(before, after, MigrationQuestioner({'ask_rename_model': True}))
+          changes = autodetector._detect_changes()
+          self.assertIn('app', changes)
+          ops = [op for m in changes['app'] for op in m.operations]
+          self.assertTrue(any(isinstance(op, operations.RenameModel) for op in ops))
+  
+      def test_create_model_with_custom_fk_no_error(self):
+          # Creating a model that uses a FK whose deconstruct strips 'to' should
+          # produce a CreateModel operation and not raise.
+          class HardcodedForeignKey(models.ForeignKey):
+              def __init__(self, *args, **kwargs):
+                  super().__init__('otherapp.Target', on_delete=models.CASCADE, **kwargs)
+              def deconstruct(self):
+                  name, path, args, kwargs = super().deconstruct()
+                  kwargs.pop('to', None)
+                  return name, path, args, kwargs
+  
+          after = ProjectState()
+          after.add_model(ModelState('app', 'A', [
+              ('id', models.AutoField(primary_key=True)),
+              ('f', HardcodedForeignKey(on_delete=models.CASCADE)),
+          ]))
+          autodetector = MigrationAutodetector(ProjectState(), after)
+          changes = autodetector._detect_changes()
+          # Should have a CreateModel operation for 'app'.
+          self.assertIn('app', changes)
+          ops = [op for m in changes['app'] for op in m.operations]
+          self.assertTrue(any(isinstance(op, operations.CreateModel) for op in ops))
+  
+      def test_only_relation_agnostic_fields_many_to_many_missing_to(self):
+          # Test ManyToManyField subclass that removes 'to' in deconstruct.
+          class HardcodedM2M(models.ManyToManyField):
+              def __init__(self, *args, **kwargs):
+                  super().__init__('otherapp.Target', **kwargs)
+              def deconstruct(self):
+                  name, path, args, kwargs = super().deconstruct()
+                  kwargs.pop('to', None)
+                  return name, path, args, kwargs
+  
+          autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+          m2m = HardcodedM2M()
+          defs = autodetector.only_relation_agnostic_fields({'m2m': m2m})
+          self.assertEqual(len(defs), 1)
+          _, _, kwargs = defs[0]
+          self.assertNotIn('to', kwargs)
+  
+      def test_only_relation_agnostic_fields_with_empty_kwargs(self):
+          # Field whose deconstruct returns empty kwargs should be handled.
+          class EmptyKwFK(models.ForeignKey):
+              def __init__(self, *args, **kwargs):
+                  super().__init__('otherapp.Target', on_delete=models.CASCADE, **kwargs)
+              def deconstruct(self):
+                  name, path, args, kwargs = super().deconstruct()
+                  # Return an empty kwargs dict to simulate deconstruct not exposing any kwarg.
+                  return name, path, args, {}
+  
+          autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+          fk = EmptyKwFK(on_delete=models.CASCADE)
+          defs = autodetector.only_relation_agnostic_fields({'z': fk})
+          self.assertEqual(len(defs), 1)
+          _, _, kwargs = defs[0]
+          # Should be empty dict and no exception thrown
+          self.assertEqual(kwargs, {})
+  
+      def test_only_relation_agnostic_fields_equivalence_with_and_without_to(self):
+          # Ensure that a deconstruction with an explicit 'to' and one that omits it
+          # produce equivalent relation-agnostic field definitions (i.e., both have no 'to').
+          class HardcodedForeignKey(models.ForeignKey):
+              def __init__(self, *args, **kwargs):
+                  super().__init__('otherapp.Target', on_delete=models.CASCADE, **kwargs)
+              def deconstruct(self):
+                  name, path, args, kwargs = super().deconstruct()
+                  kwargs.pop('to', None)
+                  return name, path, args, kwargs
+  
+          autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+          defs_with_to = autodetector.only_relation_agnostic_fields({'a': models.ForeignKey('otherapp.Target', on_delete=models.CASCADE)})
+          defs_without_to = autodetector.only_relation_agnostic_fields({'a': HardcodedForeignKey(on_delete=models.CASCADE)})
+          self.assertEqual(defs_with_to, defs_without_to)
+new_imports_code: |
+  from django.db import models
+  from django.db.migrations.state import ProjectState, ModelState
+  from django.db.migrations.questioner import MigrationQuestioner
+  from django.db.migrations import operations

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_renderer_precedence_ignores_renderer_in_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_use_required_attribute_false_even_if_overridden_in_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_with_auto_id_prefix_and_renderer_in_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_with_both_auto_id_and_prefix_in_form_kwargs_does_not_raise forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_with_form_kwargs_auto_id_does_not_raise_and_uses_formset_auto_id forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_with_form_kwargs_prefix_does_not_override forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_no_type_error_with_all_overlapping_keys_present
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.StartAppParentReference._make_base admin_scripts.tests_llm.StartAppParentReference.test_deep_nested_parent_refs_resolve_to_valid_basename admin_scripts.tests_llm.StartAppParentReference.test_multiple_trailing_separators_after_parent_ref admin_scripts.tests_llm.StartAppParentReference.test_parent_and_multiple_parent_refs admin_scripts.tests_llm.StartAppParentReference.test_parent_reference_absolute_no_trailing_slash admin_scripts.tests_llm.StartAppParentReference.test_parent_reference_absolute_with_trailing_slash admin_scripts.tests_llm.StartAppParentReference.test_parent_reference_relative_no_trailing_slash admin_scripts.tests_llm.StartAppParentReference.test_parent_reference_relative_with_trailing_slash admin_scripts.tests_llm.StartAppParentReference.test_parent_reference_with_dot_segments_and_trailing_slash admin_scripts.tests_llm.StartAppParentReference.test_single_dot_relative admin_scripts.tests_llm.StartAppParentReference.test_single_dot_relative_with_trailing_slash
+coverage json -o coverage.json
+: '>>>>> End Test Output'

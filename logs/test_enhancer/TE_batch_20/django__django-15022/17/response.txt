@@ -1,0 +1,197 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise ModelAdmin.get_search_results for multi-term and multi-field searches (including related lookups and lookup prefixes). They verify that multi-term searches are combined correctly (each search term must match at least one of the search fields — i.e. terms are ANDed together while lookups for a single term are ORed). The tests will fail on an incorrect implementation that builds the combined Q object incorrectly (as in the candidate patch) but pass with the gold patch.
+test_code: |
+  from django.test import TestCase, RequestFactory
+  from django.contrib.auth.models import User
+  from django.contrib import admin
+  from django.contrib.admin.sites import AdminSite
+  from types import SimpleNamespace
+  
+  # Import the models and admin classes from the existing test app
+  from .admin import DynamicSearchFieldsChildAdmin, ParentAdminTwoSearchFields, site as test_site
+  from .models import Child, Parent
+  
+  
+  class ModelAdminSearchTests(TestCase):
+      def setUp(self):
+          # Create a superuser for the request.user when needed
+          self.user = User.objects.create_user('admin', 'admin@example.com', 'password')
+          self.user.is_staff = True
+          self.user.is_superuser = True
+          self.user.save()
+          self.factory = RequestFactory()
+  
+      def _get_request(self):
+          req = self.factory.get('/')
+          req.user = self.user
+          return req
+  
+      def test_single_term_search_on_child_name(self):
+          """
+          Searching for a single term should return matches in the 'name' field.
+          """
+          parent = Parent.objects.create(name='ParentA')
+          c1 = Child.objects.create(name='John Smith', age=30, parent=parent)
+          c2 = Child.objects.create(name='Alice Jones', age=25, parent=parent)
+  
+          ma = DynamicSearchFieldsChildAdmin(Child, test_site)
+          request = self._get_request()
+          # DynamicSearchFieldsChildAdmin.get_search_fields adds 'age' to ('name',)
+          queryset, may_have_duplicates = ma.get_search_results(request, Child.objects.all(), 'John')
+  
+          results = list(queryset)
+          self.assertIn(c1, results)
+          self.assertNotIn(c2, results)
+          self.assertFalse(may_have_duplicates)
+  
+      def test_multi_term_search_on_same_instance(self):
+          """
+          Multi-term search where both terms match the same instance should return it.
+          Terms are ANDed; a single instance that matches both terms should be returned.
+          """
+          parent = Parent.objects.create(name='ParentB')
+          c = Child.objects.create(name='John Doe', age=42, parent=parent)
+          Child.objects.create(name='John Smith', age=21, parent=parent)
+  
+          ma = DynamicSearchFieldsChildAdmin(Child, test_site)
+          request = self._get_request()
+          queryset, _ = ma.get_search_results(request, Child.objects.all(), 'John 42')
+  
+          results = list(queryset)
+          self.assertIn(c, results)
+          # Ensure only the instance matching both terms is returned
+          self.assertEqual(results.count(c), 1)
+  
+      def test_multi_term_search_terms_must_both_match_same_record(self):
+          """
+          Ensure that multi-term searches do not match when different records satisfy
+          different terms. Both terms must be satisfied by the same row (AND semantics).
+          """
+          parent = Parent.objects.create(name='ParentC')
+          # One child matches first term (name), another matches second term (age)
+          c1 = Child.objects.create(name='Alpha', age=99, parent=parent)
+          c2 = Child.objects.create(name='Beta 123', age=1, parent=parent)
+  
+          ma = DynamicSearchFieldsChildAdmin(Child, test_site)
+          request = self._get_request()
+          # Searching for "Alpha 1" should NOT return either child because no single
+          # child matches both terms.
+          queryset, _ = ma.get_search_results(request, Child.objects.all(), 'Alpha 1')
+          results = list(queryset)
+          self.assertNotIn(c1, results)
+          self.assertNotIn(c2, results)
+  
+      def test_quoted_phrase_search(self):
+          """
+          Quoted phrases should be treated as a single search term.
+          """
+          parent = Parent.objects.create(name='ParentD')
+          c = Child.objects.create(name='The "Quoted" Person', age=10, parent=parent)
+          Child.objects.create(name='Quoted Person', age=10, parent=parent)
+  
+          ma = DynamicSearchFieldsChildAdmin(Child, test_site)
+          request = self._get_request()
+          # search term should preserve the quoted phrase as a single token
+          queryset, _ = ma.get_search_results(request, Child.objects.all(), '"Quoted"')
+          results = list(queryset)
+          # Both may match depending on implementation, ensure at least the exact quoted one matches
+          self.assertIn(c, results)
+  
+      def test_prefix_and_exact_lookup_prefixes(self):
+          """
+          Test special lookup prefixes (^ for istartswith, = for iexact) are honored.
+          """
+          parent = Parent.objects.create(name='ParentE')
+          c1 = Child.objects.create(name='StartMatch', age=50, parent=parent)
+          c2 = Child.objects.create(name='startmatch', age=50, parent=parent)
+          c3 = Child.objects.create(name='NoMatch', age=50, parent=parent)
+  
+          # Create an admin that uses explicit lookup prefixes
+          class CustomSearchAdmin(admin.ModelAdmin):
+              search_fields = ('^name', '=age')  # name startswith, age exact
+  
+          ma = CustomSearchAdmin(Child, test_site)
+          request = self._get_request()
+          # '^name' should match both c1 and c2 (case-insensitive startswith)
+          queryset_name, _ = ma.get_search_results(request, Child.objects.all(), 'Start')
+          results_name = list(queryset_name)
+          self.assertIn(c1, results_name)
+          # Ensure that a numeric '=' lookup matches exact ages
+          queryset_age, _ = ma.get_search_results(request, Child.objects.all(), '50')
+          results_age = list(queryset_age)
+          self.assertIn(c1, results_age)
+          self.assertIn(c2, results_age)
+          self.assertIn(c3, results_age)
+  
+      def test_pk_lookup_works_with_pk_token(self):
+          """
+          Searching for 'pk' should be mapped to the actual primary key name and return the row.
+          """
+          parent = Parent.objects.create(name='ParentF')
+          c = Child.objects.create(name='UniqueName', age=7, parent=parent)
+  
+          class PkSearchAdmin(admin.ModelAdmin):
+              search_fields = ('pk', 'name')
+  
+          ma = PkSearchAdmin(Child, test_site)
+          request = self._get_request()
+          queryset, _ = ma.get_search_results(request, Child.objects.all(), str(c.pk))
+          results = list(queryset)
+          self.assertIn(c, results)
+  
+      def test_related_lookup_multi_term_and_or_behavior(self):
+          """
+          Test multi-term search across related (reverse) fields (e.g. parent__name).
+          Both terms must match (AND across terms); lookups for a single term are ORed.
+          """
+          # ParentTwoSearchFields admin declared in admin.py uses ['child__name', 'child__age']
+          p1 = Parent.objects.create(name='ParentG')
+          p2 = Parent.objects.create(name='ParentH')
+          # p1 has one child matching both terms
+          Child.objects.create(name='MatchThis', age=11, parent=p1)
+          # p2 has two children where one matches first term and another matches second term
+          Child.objects.create(name='MatchThis', age=99, parent=p2)
+          Child.objects.create(name='Other', age=11, parent=p2)
+  
+          ma = ParentAdminTwoSearchFields(Parent, test_site)
+          request = self._get_request()
+          # Searching for 'MatchThis 11' should return p1 but NOT p2 because p2 does not have a single child
+          # matching both terms.
+          queryset, _ = ma.get_search_results(request, Parent.objects.all(), 'MatchThis 11')
+          results = list(queryset)
+          self.assertIn(p1, results)
+          self.assertNotIn(p2, results)
+  
+      def test_search_terms_with_non_alphanumeric_characters(self):
+          """
+          Ensure special characters in search terms are handled and do not break the query.
+          """
+          parent = Parent.objects.create(name='ParentI')
+          c = Child.objects.create(name="Mr. O'Neil", age=33, parent=parent)
+  
+          ma = DynamicSearchFieldsChildAdmin(Child, test_site)
+          request = self._get_request()
+          queryset, _ = ma.get_search_results(request, Child.objects.all(), "O'Neil 33")
+          results = list(queryset)
+          self.assertIn(c, results)
+  
+      def test_multiple_terms_with_overlapping_lookups(self):
+          """
+          Complex scenario: multiple terms, multiple lookups where terms should be ANDed
+          and lookups ORed. Ensure correct rows are returned.
+          """
+          parent = Parent.objects.create(name='ParentJ')
+          # Create children where only one child matches both terms
+          c_good = Child.objects.create(name='Alpha Bravo', age=77, parent=parent)
+          Child.objects.create(name='Alpha', age=12, parent=parent)
+          Child.objects.create(name='Bravo', age=99, parent=parent)
+  
+          ma = DynamicSearchFieldsChildAdmin(Child, test_site)
+          request = self._get_request()
+          queryset, _ = ma.get_search_results(request, Child.objects.all(), 'Alpha Bravo 77')
+          results = list(queryset)
+          # Only the child that contains both tokens and the age should match
+          self.assertIn(c_good, results)
+new_imports_code: |
+  # No additional imports required beyond what is included in the test_code block.

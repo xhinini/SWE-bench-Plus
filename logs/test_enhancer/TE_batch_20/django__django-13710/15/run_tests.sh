@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_inlines.tests_llm.VerboseNamePluralGenerationTests._make_inline_and_get_plural admin_inlines.tests_llm.VerboseNamePluralGenerationTests.test_cactus_irregular_plural admin_inlines.tests_llm.VerboseNamePluralGenerationTests.test_child_irregular_plural admin_inlines.tests_llm.VerboseNamePluralGenerationTests.test_foot_irregular_plural admin_inlines.tests_llm.VerboseNamePluralGenerationTests.test_goose_irregular_plural admin_inlines.tests_llm.VerboseNamePluralGenerationTests.test_man_irregular_plural admin_inlines.tests_llm.VerboseNamePluralGenerationTests.test_mouse_irregular_plural admin_inlines.tests_llm.VerboseNamePluralGenerationTests.test_ox_irregular_plural admin_inlines.tests_llm.VerboseNamePluralGenerationTests.test_person_irregular_plural admin_inlines.tests_llm.VerboseNamePluralGenerationTests.test_tooth_irregular_plural admin_inlines.tests_llm.VerboseNamePluralGenerationTests.test_woman_irregular_plural admin_inlines.tests_llm._DummyMeta.__init__ admin_inlines.tests_llm._admin_site_stub.is_registered admin_inlines.tests_llm.make_dummy_model
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,203 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that deserialize_db_from_string disables constraint checks while deserializing, calls check_constraints afterwards, and invokes the serializer with the expected arguments. They assert that the constraint_checks_disabled context manager is entered/exited and that check_constraints is called exactly once and after all object saves. The tests would fail for an implementation that omits calling check_constraints or omits using the constraint_checks_disabled context manager (as in the candidate model patch), and pass for the corrected implementation (gold patch).
+test_code: |
+  from io import StringIO
+  from unittest import mock
+  
+  from django.test import SimpleTestCase
+  from django.db import connection
+  
+  
+  class TestDeserializeDbFromStringRegression(SimpleTestCase):
+      """
+      Regression tests to ensure deserialize_db_from_string uses the
+      constraint_checks_disabled context manager and calls check_constraints
+      after saving deserialized objects.
+      """
+  
+      def _make_cm(self, calls, name='constraint'):
+          class DummyCM:
+              def __enter__(self_non):
+                  calls.append(f'{name}_enter')
+              def __exit__(self_non, exc_type, exc, tb):
+                  calls.append(f'{name}_exit')
+          return DummyCM()
+  
+      def test_check_constraints_called_after_multiple_saves(self):
+          calls = []
+  
+          def fake_deserialize(format, stream, using=None):
+              # ensure the serializer is called with the right 'using' alias
+              self.assertEqual(format, 'json')
+              self.assertEqual(using, connection.alias)
+              def gen():
+                  o1 = mock.Mock()
+                  o1.save.side_effect = lambda: calls.append('save1')
+                  yield o1
+                  o2 = mock.Mock()
+                  o2.save.side_effect = lambda: calls.append('save2')
+                  yield o2
+              return gen()
+  
+          with mock.patch('django.core.serializers.deserialize', side_effect=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', return_value=self._make_cm(calls)):
+                  with mock.patch.object(connection, 'check_constraints', side_effect=lambda: calls.append('check')):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          # Ensure ordering: enter -> saves -> exit -> check
+          self.assertEqual(calls, ['constraint_enter', 'save1', 'save2', 'constraint_exit', 'check'])
+  
+      def test_check_constraints_called_with_empty_deserialization(self):
+          calls = []
+  
+          def fake_deserialize(format, stream, using=None):
+              self.assertEqual(format, 'json')
+              self.assertEqual(using, connection.alias)
+              return iter(())
+  
+          with mock.patch('django.core.serializers.deserialize', side_effect=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', return_value=self._make_cm(calls)):
+                  mocked_check = mock.Mock(side_effect=lambda: calls.append('check'))
+                  with mock.patch.object(connection, 'check_constraints', mocked_check):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          # Even with no objects, constraint context should be entered/exited
+          # and check_constraints should be called once.
+          self.assertEqual(calls, ['constraint_enter', 'constraint_exit', 'check'])
+          mocked_check.assert_called_once()
+  
+      def test_constraint_context_entered_and_exited(self):
+          calls = []
+  
+          def fake_deserialize(format, stream, using=None):
+              o = mock.Mock()
+              o.save.side_effect = lambda: calls.append('save')
+              return iter((o,))
+  
+          with mock.patch('django.core.serializers.deserialize', side_effect=fake_deserialize):
+              cm = self._make_cm(calls, name='C')
+              with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm):
+                  with mock.patch.object(connection, 'check_constraints', side_effect=lambda: calls.append('check')):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          # Check that our custom-named context manager entries appear
+          self.assertIn('C_enter', calls)
+          self.assertIn('C_exit', calls)
+          # Ensure check runs after exiting the context
+          self.assertTrue(calls.index('check') > calls.index('C_exit'))
+  
+      def test_serializers_called_with_json_and_using(self):
+          # Validate that the serializer is invoked with 'json' and using=connection.alias
+          def fake_deserialize(format, stream, using=None):
+              self.assertEqual(format, 'json')
+              self.assertEqual(using, connection.alias)
+              return iter(())
+  
+          with mock.patch('django.core.serializers.deserialize', side_effect=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', return_value=self._make_cm([], name='x')):
+                  with mock.patch.object(connection, 'check_constraints', lambda: None):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+      def test_stream_is_stringio_passed_to_serializer(self):
+          # Ensure the stream parameter passed to serializers.deserialize is a StringIO.
+          def fake_deserialize(format, stream, using=None):
+              self.assertIsInstance(stream, StringIO)
+              return iter(())
+  
+          with mock.patch('django.core.serializers.deserialize', side_effect=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', return_value=self._make_cm([], name='x')):
+                  with mock.patch.object(connection, 'check_constraints', lambda: None):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+      def test_multiple_saves_and_single_check_constraints_call(self):
+          calls = []
+  
+          def fake_deserialize(format, stream, using=None):
+              def gen():
+                  for i in range(5):
+                      o = mock.Mock()
+                      o.save.side_effect = lambda i=i: calls.append(f'save{i}')
+                      yield o
+              return gen()
+  
+          with mock.patch('django.core.serializers.deserialize', side_effect=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', return_value=self._make_cm(calls)):
+                  mocked_check = mock.Mock(side_effect=lambda: calls.append('check'))
+                  with mock.patch.object(connection, 'check_constraints', mocked_check):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          # Expect five saves and one check_constraints call
+          save_calls = [c for c in calls if c.startswith('save')]
+          self.assertEqual(len(save_calls), 5)
+          mocked_check.assert_called_once()
+          # Ensure check is after all saves and after context exit
+          self.assertTrue(calls.index('check') > calls.index('constraint_exit'))
+  
+      def test_deserialize_accepts_generator_from_serializer(self):
+          calls = []
+  
+          def generator_deserialize(format, stream, using=None):
+              # Return a generator created with a generator function
+              def inner_gen():
+                  o = mock.Mock()
+                  o.save.side_effect = lambda: calls.append('save_gen')
+                  yield o
+              return inner_gen()
+  
+          with mock.patch('django.core.serializers.deserialize', side_effect=generator_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', return_value=self._make_cm(calls)):
+                  with mock.patch.object(connection, 'check_constraints', side_effect=lambda: calls.append('check')):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          self.assertEqual(calls, ['constraint_enter', 'save_gen', 'constraint_exit', 'check'])
+  
+      def test_check_constraints_called_exactly_once_even_with_many_objects(self):
+          # Ensure check_constraints gets called exactly once
+          def fake_deserialize(format, stream, using=None):
+              def gen():
+                  for _ in range(3):
+                      o = mock.Mock()
+                      o.save.return_value = None
+                      yield o
+              return gen()
+  
+          with mock.patch('django.core.serializers.deserialize', side_effect=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', return_value=self._make_cm([], name='z')):
+                  mocked_check = mock.Mock()
+                  with mock.patch.object(connection, 'check_constraints', mocked_check):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          mocked_check.assert_called_once()
+  
+      def test_ordering_of_save_and_check_with_no_objects(self):
+          # Even when no objects are yielded, check_constraints must be called after exiting context
+          calls = []
+  
+          def fake_deserialize(format, stream, using=None):
+              return iter(())
+  
+          with mock.patch('django.core.serializers.deserialize', side_effect=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', return_value=self._make_cm(calls)):
+                  with mock.patch.object(connection, 'check_constraints', side_effect=lambda: calls.append('check')):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          # If no saves, ordering should still be enter -> exit -> check
+          self.assertEqual(calls, ['constraint_enter', 'constraint_exit', 'check'])
+  
+      def test_deserializer_called_with_provided_data_stream(self):
+          # Ensure the passed-in data string is wrapped into a stream and provided to serializer
+          def fake_deserialize(format, stream, using=None):
+              # Read from the stream to ensure it's a proper file-like object
+              content = stream.read()
+              self.assertTrue(content.strip().startswith('['))
+              return iter(())
+  
+          data = '[{"model": "x.y", "pk": 1, "fields": {}}]'
+          with mock.patch('django.core.serializers.deserialize', side_effect=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', return_value=self._make_cm([], name='s')):
+                  with mock.patch.object(connection, 'check_constraints', lambda: None):
+                      connection.creation.deserialize_db_from_string(data)
+new_imports_code: |
+  from io import StringIO
+  from unittest import mock

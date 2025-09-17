@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroEdgeCaseTests.test_p_zero_negative_value template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroEdgeCaseTests.test_p_zero_no_grouping_by_default template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroEdgeCaseTests.test_p_zero_preserves_sign_and_no_decimal_for_zero_like_inputs template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroEdgeCaseTests.test_p_zero_string_with_g_suffix_and_existing_decimal_zeros template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroEdgeCaseTests.test_p_zero_with_decimal template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroEdgeCaseTests.test_p_zero_with_float template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroEdgeCaseTests.test_p_zero_with_g_suffix_applies_grouping template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroEdgeCaseTests.test_p_zero_with_gu_suffix_force_grouping_unlocalized template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroEdgeCaseTests.test_p_zero_with_int template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroEdgeCaseTests.test_p_zero_with_string_value
+coverage json -o coverage.json
+: '>>>>> End Test Output'

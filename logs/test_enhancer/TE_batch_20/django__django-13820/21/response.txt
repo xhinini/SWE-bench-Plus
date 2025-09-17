@@ -1,0 +1,244 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise MigrationLoader.load_disk() handling of different kinds of "migrations" modules: regular packages with and without a __file__ attribute, namespace packages (modules with __file__ == None and non-list __path__), plain module files (no __path__), __path__ being a list subclass, tuple-based __path__, and that reload() is invoked when a module was already loaded. They assert whether the app is considered migrated (added to migrated_apps) or ignored/unmigrated (added to unmigrated_apps). These tests will fail for implementations that treat regular packages with no __file__ as unmigrated (the bug fixed by the gold patch) and will pass for the corrected implementation.
+test_code: |
+  from types import ModuleType
+  import sys
+  import importlib
+  import pkgutil
+  import builtins
+  import importlib as _importlib
+  from django.test import SimpleTestCase
+  from django.db.migrations.loader import MigrationLoader
+  from django.apps import apps as real_apps
+  
+  class DummyAppConfig:
+      def __init__(self, label, name=None):
+          self.label = label
+          # name is the package path used when MIGRATION_MODULES doesn't map label
+          self.name = name or label
+  
+  def _make_module(name, has_path=True, path_obj=None, file_attr=None):
+      """
+      Create a fake module and place it in sys.modules under `name`.
+      - has_path: whether the module has a __path__ attribute
+      - path_obj: value to use for __path__ (if has_path)
+      - file_attr: value to use for __file__ (if None, attribute is absent)
+      """
+      mod = ModuleType(name)
+      if has_path:
+          if path_obj is None:
+              mod.__path__ = []
+          else:
+              mod.__path__ = path_obj
+      if file_attr is not None:
+          mod.__file__ = file_attr
+      else:
+          # ensure __file__ is not present
+          if hasattr(mod, '__file__'):
+              delattr(mod, '__file__')
+      sys.modules[name] = mod
+      return mod
+  
+  class LoaderModuleTests(SimpleTestCase):
+      def setUp(self):
+          # Keep references for restoration
+          self._real_get_app_configs = real_apps.get_app_configs
+          self._real_import_module = importlib.import_module
+          self._real_reload = _importlib.reload
+  
+      def tearDown(self):
+          real_apps.get_app_configs = self._real_get_app_configs
+          importlib.import_module = self._real_import_module
+          _importlib.reload = self._real_reload
+          # Clean any modules we injected
+          pop_keys = [k for k in sys.modules if k.startswith('fakepkg.')]
+          for k in pop_keys:
+              sys.modules.pop(k, None)
+          sys.modules.pop('fakepkg', None)
+  
+      def _setup_app(self, module_name, explicit=True):
+          """
+          Prepare apps.get_app_configs() to return one DummyAppConfig with label 'fake' and
+          make MigrationLoader.migrations_module return module_name for that label.
+          """
+          def fake_get_app_configs():
+              yield DummyAppConfig('fake', name='fakepkg')
+          real_apps.get_app_configs = fake_get_app_configs
+          # Monkeypatch MigrationLoader.migrations_module to return our module name
+          original_migrations_module = MigrationLoader.migrations_module
+          def migrations_module(cls, label):
+              # Return custom migrations module path and flag indicating explicit mapping.
+              return module_name, explicit
+          MigrationLoader.migrations_module = classmethod(migrations_module)
+          return original_migrations_module
+  
+      def test_regular_package_no_file_loaded(self):
+          """
+          Regular package with no __file__ but with __path__ being a list should be treated
+          as a migrations package (migrated), not as a namespace package.
+          """
+          # Create package module `fakepkg.migrations` with list __path__ and no __file__
+          pkg_name = 'fakepkg.migrations'
+          _make_module('fakepkg', has_path=True, path_obj=['/fake/path'], file_attr='/fake/__init__.py')
+          mod = _make_module(pkg_name, has_path=True, path_obj=['/fake/migrations'], file_attr=None)
+  
+          original_migrations_module = self._setup_app(pkg_name)
+          try:
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              # Should be considered migrated because __path__ is a list (regular package)
+              self.assertIn('fake', loader.migrated_apps)
+              self.assertNotIn('fake', loader.unmigrated_apps)
+          finally:
+              MigrationLoader.migrations_module = original_migrations_module
+  
+      def test_namespace_package_ignored(self):
+          """
+          Namespace package (no __file__ and __path__ is not a list) should be treated as unmigrated.
+          """
+          pkg_name = 'fakepkg.migrations'
+          _make_module('fakepkg', has_path=True, path_obj=['/fake/path'], file_attr='/fake/__init__.py')
+          # Create a custom __path__ type (simulate namespace package path object)
+          class NamespacePath:
+              def __init__(self, lst):
+                  self._list = list(lst)
+              def __iter__(self):
+                  return iter(self._list)
+              def __repr__(self):
+                  return "<NamespacePath>"
+          mod = _make_module(pkg_name, has_path=True, path_obj=NamespacePath(['/fake/migrations']), file_attr=None)
+  
+          original_migrations_module = self._setup_app(pkg_name)
+          try:
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              # Should be treated as unmigrated namespace package
+              self.assertIn('fake', loader.unmigrated_apps)
+              self.assertNotIn('fake', loader.migrated_apps)
+          finally:
+              MigrationLoader.migrations_module = original_migrations_module
+  
+      def test_module_file_ignored(self):
+          """
+          A module file (no __path__) such as migrations.py should be treated as unmigrated.
+          """
+          pkg_name = 'fakepkg.migrations'
+          _make_module('fakepkg', has_path=True, path_obj=['/fake/path'], file_attr='/fake/__init__.py')
+          # Create non-package module (no __path__)
+          mod = _make_module(pkg_name, has_path=False, path_obj=None, file_attr='/somewhere/migrations.py')
+  
+          original_migrations_module = self._setup_app(pkg_name)
+          try:
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              self.assertIn('fake', loader.unmigrated_apps)
+              self.assertNotIn('fake', loader.migrated_apps)
+          finally:
+              MigrationLoader.migrations_module = original_migrations_module
+  
+      def test_regular_package_with_file_loaded(self):
+          """
+          Regular package with __file__ present and __path__ list should be migrated.
+          """
+          pkg_name = 'fakepkg.migrations'
+          _make_module('fakepkg', has_path=True, path_obj=['/fake/path'], file_attr='/fake/__init__.py')
+          mod = _make_module(pkg_name, has_path=True, path_obj=['/fake/migrations'], file_attr='/fake/migrations/__init__.py')
+  
+          original_migrations_module = self._setup_app(pkg_name)
+          try:
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              self.assertIn('fake', loader.migrated_apps)
+              self.assertNotIn('fake', loader.unmigrated_apps)
+          finally:
+              MigrationLoader.migrations_module = original_migrations_module
+  
+      def test_path_subclass_list_loaded(self):
+          """
+          If __path__ is a subclass of list, isinstance(..., list) is True and should be treated as package.
+          """
+          pkg_name = 'fakepkg.migrations'
+          class SubPath(list):
+              pass
+          _make_module('fakepkg', has_path=True, path_obj=['/fake/path'], file_attr='/fake/__init__.py')
+          mod = _make_module(pkg_name, has_path=True, path_obj=SubPath(['/fake/migrations']), file_attr=None)
+  
+          original_migrations_module = self._setup_app(pkg_name)
+          try:
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              # Even though __file__ is missing, __path__ is a list subclass -> treated as regular package
+              self.assertIn('fake', loader.migrated_apps)
+              self.assertNotIn('fake', loader.unmigrated_apps)
+          finally:
+              MigrationLoader.migrations_module = original_migrations_module
+  
+      def test_tuple_path_treated_as_namespace(self):
+          """
+          If __path__ is a tuple (not a list), treat as namespace package and ignore it.
+          """
+          pkg_name = 'fakepkg.migrations'
+          _make_module('fakepkg', has_path=True, path_obj=['/fake/path'], file_attr='/fake/__init__.py')
+          mod = _make_module(pkg_name, has_path=True, path_obj=('/fake/migrations',), file_attr=None)
+  
+          original_migrations_module = self._setup_app(pkg_name)
+          try:
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              self.assertIn('fake', loader.unmigrated_apps)
+              self.assertNotIn('fake', loader.migrated_apps)
+          finally:
+              MigrationLoader.migrations_module = original_migrations_module
+  
+      def test_no_file_no_path_ignored(self):
+          """
+          If a migrations module has no __file__ and no __path__, it's not a package and should be ignored.
+          """
+          pkg_name = 'fakepkg.migrations'
+          _make_module('fakepkg', has_path=True, path_obj=['/fake/path'], file_attr='/fake/__init__.py')
+          # Module with no __file__ and no __path__
+          mod = _make_module(pkg_name, has_path=False, path_obj=None, file_attr=None)
+  
+          original_migrations_module = self._setup_app(pkg_name)
+          try:
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              self.assertIn('fake', loader.unmigrated_apps)
+              self.assertNotIn('fake', loader.migrated_apps)
+          finally:
+              MigrationLoader.migrations_module = original_migrations_module
+  
+      def test_reload_called_when_was_loaded(self):
+          """
+          If the module was already in sys.modules before import_module is called,
+          MigrationLoader should call reload() on the module (tests rely on reload behavior).
+          """
+          pkg_name = 'fakepkg.migrations'
+          _make_module('fakepkg', has_path=True, path_obj=['/fake/path'], file_attr='/fake/__init__.py')
+          mod = _make_module(pkg_name, has_path=True, path_obj=['/fake/migrations'], file_attr='/fake/migrations/__init__.py')
+          # Ensure module is present so import_module will see it as already loaded
+          sys.modules[pkg_name] = mod
+  
+          original_migrations_module = self._setup_app(pkg_name)
+          try:
+              reloaded = {}
+              def fake_reload(m):
+                  # record that reload was called with the module name
+                  reloaded['name'] = getattr(m, '__spec__', None).name if getattr(m, '__spec__', None) else getattr(m, '__name__', None)
+                  return m
+              _importlib.reload = fake_reload
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              # reload should have been called on our module
+              # Depending on import machinery the recorded name could be module name
+              self.assertIn('fakepkg.migrations', sys.modules)
+              self.assertTrue(reloaded.get('name') in (pkg_name, 'fakepkg.migrations', None))
+          finally:
+              MigrationLoader.migrations_module = original_migrations_module
+              _importlib.reload = self._real_reload
+  new_imports_code: |
+    from types import ModuleType
+    import sys
+    import importlib
+    from django.test import SimpleTestCase

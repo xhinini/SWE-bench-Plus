@@ -1,0 +1,82 @@
+# Add import of the internal functions under test
+from pylint.lint.run import _query_cpu, _cpu_count
+# Additional regression tests for fractional CPU quota handling.
+import pytest
+from unittest.mock import mock_open, patch, MagicMock
+from pylint.lint.run import _query_cpu, _cpu_count
+
+# Paths used by the implementation to query cgroup CPU allocation.
+QUOTA_PATH = "/sys/fs/cgroup/cpu/cpu.cfs_quota_us"
+PERIOD_PATH = "/sys/fs/cgroup/cpu/cpu.cfs_period_us"
+
+def _make_mock_open(quota_value: str, period_value: str):
+    """
+    Return a function suitable for patching builtins.open that will return
+    quota_value for QUOTA_PATH and period_value for PERIOD_PATH.
+    """
+    def _mock(path, *args, **kwargs):
+        if path == QUOTA_PATH:
+            return mock_open(read_data=str(quota_value))()
+        if path == PERIOD_PATH:
+            return mock_open(read_data=str(period_value))()
+        # For any other path, raise so tests catch unexpected accesses.
+        raise FileNotFoundError(path)
+    return _mock
+
+class _DummyPath:
+    """
+    Dummy replacement for pathlib.Path used by pylint.lint.run.Path.
+    It reports existence (is_file) for the quota and period paths only.
+    """
+    def __init__(self, path):
+        self._path = path
+
+    def is_file(self):
+        return self._path in (QUOTA_PATH, PERIOD_PATH)
+
+@pytest.mark.parametrize(
+    "quota,period",
+    [
+        ("50000", "100000"),   # 0.5 -> int division yields 0
+        ("99999", "100000"),   # fractional < 1 -> 0
+        ("1", "100000"),       # tiny quota -> 0
+        ("1023", "1000000"),   # fractional -> 0
+        ("100", "1000"),       # 0.1 -> 0
+    ],
+)
+def test_query_cpu_quota_fraction_always_at_least_one(quota, period):
+    """
+    _query_cpu should return 1 when the cfs_quota/cfs_period integer division
+    would otherwise yield 0 (fractional CPU allotment).
+    """
+    mock_open_fn = _make_mock_open(quota, period)
+    with patch("builtins.open", mock_open_fn):
+        with patch("pylint.lint.run.Path", _DummyPath):
+            result = _query_cpu()
+    assert result == 1, f"_query_cpu returned {result} for quota={quota}, period={period}"
+
+@pytest.mark.parametrize(
+    "quota,period",
+    [
+        ("50000", "100000"),
+        ("99999", "100000"),
+        ("1", "100000"),
+        ("1023", "1000000"),
+        ("100", "1000"),
+    ],
+)
+def test_cpu_count_with_sched_getaffinity_and_fractional_quota_returns_one(quota, period):
+    """
+    _cpu_count should use sched_getaffinity when available, and when _query_cpu
+    reports a fractional CPU (which should be normalized to 1), _cpu_count must
+    return at least 1 (min of cpu_share and affinity size).
+    """
+    mock_open_fn = _make_mock_open(quota, period)
+    # Simulate a system with 4 CPUs available via sched_getaffinity.
+    fake_affinity = {0, 1, 2, 3}
+    with patch("builtins.open", mock_open_fn):
+        with patch("pylint.lint.run.Path", _DummyPath):
+            with patch("os.sched_getaffinity", lambda _: fake_affinity):
+                result = _cpu_count()
+    # cpu_share should be normalized to 1, so min(1, 4) == 1
+    assert result == 1, f"_cpu_count returned {result} for quota={quota}, period={period}"

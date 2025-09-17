@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.test_admin_llm.SearchTermQueriesTests._pks admin_changelist.test_admin_llm.SearchTermQueriesTests.setUp admin_changelist.test_admin_llm.SearchTermQueriesTests.test_dynamic_search_fields_includes_age admin_changelist.test_admin_llm.SearchTermQueriesTests.test_multi_term_matching_multiple_parents admin_changelist.test_admin_llm.SearchTermQueriesTests.test_multi_token_no_match admin_changelist.test_admin_llm.SearchTermQueriesTests.test_partial_and_exact_mixture admin_changelist.test_admin_llm.SearchTermQueriesTests.test_quoted_term_with_space admin_changelist.test_admin_llm.SearchTermQueriesTests.test_single_term_search_child_name admin_changelist.test_admin_llm.SearchTermQueriesTests.test_three_term_search_all_must_match admin_changelist.test_admin_llm.SearchTermQueriesTests.test_two_terms_do_not_cross_match_different_related_rows admin_changelist.test_admin_llm.SearchTermQueriesTests.test_two_terms_name_and_age_match_same_child admin_changelist.test_admin_llm.SearchTermQueriesTests.test_two_terms_name_and_age_order_irrelevant
+coverage json -o coverage.json
+: '>>>>> End Test Output'

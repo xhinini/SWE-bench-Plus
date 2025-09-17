@@ -1,0 +1,226 @@
+from django.test import SimpleTestCase
+from django.core.serializers import base
+
+
+class DummyDoesNotExist(Exception):
+    pass
+
+
+def make_model_class(
+    *,
+    pk_attname="id",
+    pk_to_python=lambda x: x,
+    manager_return_pk=None,
+    manager_raises=False,
+    natural_key_func=None,
+):
+    """
+    Create a minimal dummy "Model" class compatible with build_instance.
+    """
+
+    class DefaultManager:
+        def __init__(self):
+            self.last_db = None
+
+        def db_manager(self, db):
+            # record the db used and return self to allow chaining
+            self.last_db = db
+            return self
+
+        def get_by_natural_key(self, *args):
+            if manager_raises:
+                raise DummyDoesNotExist()
+            o = type("O", (), {})()
+            o.pk = manager_return_pk
+            return o
+
+    class PKField:
+        def __init__(self, attname, to_python_func):
+            self.attname = attname
+            self._to_python = to_python_func
+
+        def to_python(self, value):
+            return self._to_python(value)
+
+    class Meta:
+        pass
+
+    class Model:
+        DoesNotExist = DummyDoesNotExist
+        _meta = Meta()
+        _meta.pk = PKField(pk_attname, pk_to_python)
+        _meta.default_manager = DefaultManager()
+
+        def __init__(self, **kwargs):
+            # set attributes from data
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+            # mimic Django's _state
+            self._state = type("S", (), {"db": None})()
+
+        # Provide a natural_key if requested, otherwise not present
+        if natural_key_func is not None:
+            def natural_key(self):
+                return natural_key_func(self)
+
+    return Model
+
+
+class BuildInstanceTests(SimpleTestCase):
+    def test_pk_present_no_manager_call(self):
+        Model = make_model_class(manager_return_pk=999, manager_raises=True)
+        data = {"id": 5, "name": "x"}
+        inst = base.build_instance(Model, data, db="anydb")
+        # Should respect provided pk and not attempt get_by_natural_key
+        self.assertEqual(inst.id, 5)
+
+    def test_pk_none_calls_get_by_natural_key_with_db_and_sets_pk(self):
+        # manager will return '42' and pk.to_python will convert to int 42
+        Model = make_model_class(
+            pk_attname="id",
+            pk_to_python=lambda v: int(v),
+            manager_return_pk="42",
+            manager_raises=False,
+            natural_key_func=lambda self: (self.name,),
+        )
+        data = {"name": "natural-name"}  # no id provided
+        inst = base.build_instance(Model, data, db="other_db")
+        # Manager should have been asked using the provided db
+        self.assertEqual(Model._meta.default_manager.last_db, "other_db")
+        # The returned instance should have the pk converted via to_python
+        self.assertEqual(inst.id, 42)
+
+    def test_manager_raises_doesnotexist_no_error_pk_remains_none(self):
+        Model = make_model_class(
+            pk_attname="id",
+            pk_to_python=lambda v: int(v),
+            manager_return_pk=None,
+            manager_raises=True,
+            natural_key_func=lambda self: (self.name,),
+        )
+        data = {"name": "missing"}
+        inst = base.build_instance(Model, data, db="some_db")
+        # Should silently handle DoesNotExist and leave pk unset
+        self.assertFalse(hasattr(inst, "id") and inst.id is not None)
+
+    def test_natural_key_uses_related_field_from_data(self):
+        """
+        The natural_key depends on a relational attribute (e.g., author_id).
+        The gold patch builds the instance with all data before calling
+        natural_key, so natural_key can access author_id. The candidate patch
+        that skips setting relational attributes would cause natural_key to
+        raise AttributeError and the pk would not be set.
+        """
+        def nk(self):
+            # natural key derived from a relational attname set in data
+            return (self.author_id,)
+
+        Model = make_model_class(
+            pk_attname="id",
+            pk_to_python=lambda v: int(v),
+            manager_return_pk="7",
+            manager_raises=False,
+            natural_key_func=nk,
+        )
+        data = {"author_id": "author-nk"}
+        inst = base.build_instance(Model, data, db="dbX")
+        # Ensure pk was resolved via natural key that used author_id from data
+        self.assertEqual(inst.id, 7)
+
+    def test_data_is_mutated_with_added_pk(self):
+        Model = make_model_class(
+            pk_attname="id",
+            pk_to_python=lambda v: int(v),
+            manager_return_pk="123",
+            manager_raises=False,
+            natural_key_func=lambda self: (self.name,),
+        )
+        data = {"name": "setme"}
+        original = data.copy()
+        inst = base.build_instance(Model, data, db="the_db")
+        # build_instance will add the pk to the passed-in data dict
+        self.assertIn(Model._meta.pk.attname, data)
+        self.assertNotEqual(data, original)
+        self.assertEqual(int(data[Model._meta.pk.attname]), 123)
+
+    def test_no_get_by_natural_key_attribute(self):
+        # Create a manager without get_by_natural_key attribute
+        class ManagerNoNK:
+            pass
+
+        class PKField:
+            def __init__(self, attname):
+                self.attname = attname
+
+            def to_python(self, v):
+                return v
+
+        class Meta:
+            pass
+
+        class ModelNoNK:
+            _meta = Meta()
+            _meta.pk = PKField("id")
+            _meta.default_manager = ManagerNoNK()
+
+            def __init__(self, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+                self._state = type("S", (), {"db": None})()
+
+        data = {"name": "no-nk"}
+        inst = base.build_instance(ModelNoNK, data, db="db")
+        # Should just return a constructed instance without errors
+        self.assertEqual(inst.name, "no-nk")
+
+    def test_model_without_natural_key_method(self):
+        # If Model has no natural_key, nothing special should happen.
+        Model = make_model_class(
+            pk_attname="id",
+            pk_to_python=lambda v: v,
+            manager_return_pk="999",
+            manager_raises=False,
+            natural_key_func=None,
+        )
+        data = {"foo": "bar"}
+        inst = base.build_instance(Model, data, db="db")
+        # natural_key not present so pk should remain unset
+        self.assertFalse(hasattr(inst, "id") and inst.id is not None)
+
+    def test_pk_to_python_called_on_retrieved_pk(self):
+        called = {}
+
+        def to_python(v):
+            called['was_called_with'] = v
+            return int(v) + 1
+
+        Model = make_model_class(
+            pk_attname="id",
+            pk_to_python=to_python,
+            manager_return_pk="10",
+            manager_raises=False,
+            natural_key_func=lambda self: ("nk",),
+        )
+        data = {"some": "thing"}
+        inst = base.build_instance(Model, data, db="d")
+        # Ensure to_python was invoked with the raw manager pk and its return used
+        self.assertEqual(called['was_called_with'], "10")
+        self.assertEqual(inst.id, 11)
+
+    def test_original_data_preserved_except_pk_addition(self):
+        # Ensure that existing fields remain untouched except the pk added.
+        Model = make_model_class(
+            pk_attname="id",
+            pk_to_python=lambda v: int(v),
+            manager_return_pk="77",
+            manager_raises=False,
+            natural_key_func=lambda self: (self.username,),
+        )
+        data = {"username": "user1", "email": "e@test"}
+        copy_before = data.copy()
+        inst = base.build_instance(Model, data, db="dbz")
+        # other fields preserved
+        self.assertEqual(data["username"], copy_before["username"])
+        self.assertEqual(data["email"], copy_before["email"])
+        # pk added
+        self.assertEqual(int(data["id"]), 77)

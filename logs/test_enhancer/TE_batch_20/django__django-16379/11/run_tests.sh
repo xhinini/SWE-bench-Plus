@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 cache.tests_llm.FileBasedCacheHasKeyRaceTests.setUp cache.tests_llm.FileBasedCacheHasKeyRaceTests.tearDown cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_called_with_expected_filename_and_mode cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_open_called_once_under_race cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_propagates_other_os_errors cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_returns_false_after_real_file_removed_race cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_returns_false_for_key_with_special_chars_when_open_raises_filenotfound cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_returns_false_for_long_key_when_open_raises_filenotfound cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_returns_false_for_unicode_key_when_open_raises_filenotfound cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_returns_false_when_open_raises_filenotfound cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_returns_false_when_open_raises_filenotfound_with_version cache.tests_llm.FileBasedCacheHasKeyRaceTests.test_has_key_with_explicit_none_version_behaves_same_under_race
+coverage json -o coverage.json
+: '>>>>> End Test Output'

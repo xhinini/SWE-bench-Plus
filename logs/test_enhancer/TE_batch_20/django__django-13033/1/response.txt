@@ -1,0 +1,169 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify the behavior of SQLCompiler.find_ordering_name with respect to how it treats the last piece of a dotted ordering name (pieces[-1]) versus the whole name. The bug fixed in the gold patch compares the field.attname against the last piece (pieces[-1]) rather than the entire name; the candidate patch omitted that change and instead added unrelated behavior for names ending with "_id". The tests monkeypatch SQLCompiler._setup_joins to return controlled values and assert that when the field.attname equals the last piece, the method returns OrderBy expressions built from the provided transform_function. These tests would fail under the candidate patch (which does not implement the pieces[-1] comparison) but pass with the gold patch.
+test_code: |
+  from django.test import SimpleTestCase
+  from django.db.models.sql.compiler import SQLCompiler
+  from django.db.models.expressions import OrderBy, RawSQL
+  from types import SimpleNamespace
+
+  class DummyQuery:
+      # Only trim_joins is required by the tests below.
+      def __init__(self, targets):
+          self._targets = targets
+      def trim_joins(self, targets, joins, path):
+          # Return the targets unchanged and a fake alias.
+          return (targets, 'alias', None)
+
+  class DummyConnection:
+      vendor = 'default'
+      ops = SimpleNamespace()
+      features = SimpleNamespace()
+
+  class DummyField:
+      def __init__(self, is_relation=True, attname=None):
+          self.is_relation = is_relation
+          self.attname = attname
+
+  class FindOrderingNameTests(SimpleTestCase):
+      def make_compiler_with_setup(self, field_attname, returned_targets, transform_sql_prefix):
+          """
+          Create an SQLCompiler instance and monkeypatch its _setup_joins to return
+          a predictable tuple that find_ordering_name will use.
+          """
+          query = DummyQuery(returned_targets)
+          compiler = SQLCompiler(query=query, connection=DummyConnection(), using='default')
+
+          # Prepare objects to be returned by the fake _setup_joins
+          field = DummyField(is_relation=True, attname=field_attname)
+          targets = returned_targets[:]  # copy
+          alias = 'some_alias'
+          joins = ['a', 'b']
+          path = ['a', 'b']
+          # opts needs an 'ordering' attribute that is truthy for the relation-branch
+          opts = SimpleNamespace(ordering=('some_order',))
+
+          # transform_function returns different RawSQL per target to assert mapping
+          def transform_function(target, passed_alias):
+              # Return a RawSQL that encodes the target and alias so that tests can assert
+              return RawSQL(f"{transform_sql_prefix}_{str(target)}_{passed_alias}", [])
+
+          # Monkeypatch the instance method _setup_joins
+          def _setup_joins(pieces, passed_opts, passed_alias):
+              return (field, targets, alias, joins, path, opts, transform_function)
+
+          compiler._setup_joins = _setup_joins
+          # Ensure that compiler.query.trim_joins returns the targets and an alias
+          compiler.query = query
+          return compiler, transform_sql_prefix
+
+      def assert_orderbys_from_transform(self, result, expected_targets, transform_sql_prefix):
+          # result is list of tuples (OrderBy, False)
+          self.assertEqual(len(result), len(expected_targets))
+          for idx, (orderby, is_ref) in enumerate(result):
+              self.assertIsInstance(orderby, OrderBy)
+              # The source expression of the OrderBy is what transform_function returned.
+              src = orderby.get_source_expressions()[0]
+              self.assertIsInstance(src, RawSQL)
+              sql, params = src.as_sql(compiler=None, connection=None) if hasattr(src, 'as_sql') else src
+              # Because in our transform_function we constructed the SQL string directly,
+              # ensure its prefix matches and includes the target string and alias marker.
+              expected_prefix = f"{transform_sql_prefix}_{str(expected_targets[idx])}_alias"
+              self.assertEqual(sql, expected_prefix)
+
+      def test_simple_last_piece_match(self):
+          compiler, prefix = self.make_compiler_with_setup(
+              field_attname='b',
+              returned_targets=['T1', 'T2'],
+              transform_sql_prefix='X'
+          )
+          # name with two pieces; pieces[-1] == 'b' equals field.attname
+          result = compiler.find_ordering_name('a__b', opts=None)
+          self.assert_orderbys_from_transform(result, ['T1', 'T2'], prefix)
+
+      def test_simple_last_piece_match_with_minus_prefix(self):
+          compiler, prefix = self.make_compiler_with_setup(
+              field_attname='final',
+              returned_targets=['A'],
+              transform_sql_prefix='P'
+          )
+          # Passing a descending ordering; get_order_dir will normalize it.
+          result = compiler.find_ordering_name('-start__final', opts=None)
+          # Should still produce OrderBy for the transform of the target.
+          self.assert_orderbys_from_transform(result, ['A'], prefix)
+          # And the OrderBy should reflect the descending flag.
+          orderby = result[0][0]
+          self.assertTrue(orderby.descending)
+
+      def test_nested_last_piece_match_three_levels(self):
+          compiler, prefix = self.make_compiler_with_setup(
+              field_attname='z',
+              returned_targets=['X1', 'X2', 'X3'],
+              transform_sql_prefix='N'
+          )
+          result = compiler.find_ordering_name('a__b__z', opts=None)
+          self.assert_orderbys_from_transform(result, ['X1', 'X2', 'X3'], prefix)
+
+      def test_alias_passed_to_transform(self):
+          compiler, prefix = self.make_compiler_with_setup(
+              field_attname='item',
+              returned_targets=['one'],
+              transform_sql_prefix='ALIASCHK'
+          )
+          # Call with explicit alias argument to find_ordering_name
+          result = compiler.find_ordering_name('foo__item', opts=None, alias='explicit_alias')
+          # transform_function in our fake ignores the passed alias when returning but
+          # the trim_joins in compiler will supply 'alias', so assert that works.
+          self.assert_orderbys_from_transform(result, ['one'], prefix)
+
+      def test_single_piece_last_equals_attname(self):
+          compiler, prefix = self.make_compiler_with_setup(
+              field_attname='single',
+              returned_targets=['S'],
+              transform_sql_prefix='SINGLE'
+          )
+          # Ordering name with a single piece that matches attname
+          result = compiler.find_ordering_name('single', opts=None)
+          self.assert_orderbys_from_transform(result, ['S'], prefix)
+
+      def test_different_target_objects(self):
+          compiler, prefix = self.make_compiler_with_setup(
+              field_attname='z',
+              returned_targets=[123, ('t',), 'special'],
+              transform_sql_prefix='MIX'
+          )
+          result = compiler.find_ordering_name('x__z', opts=None)
+          self.assert_orderbys_from_transform(result, [123, ('t',), 'special'], prefix)
+
+      def test_last_piece_match_with_complex_target_names(self):
+          compiler, prefix = self.make_compiler_with_setup(
+              field_attname='end',
+              returned_targets=['alpha.beta', 'gamma-delta'],
+              transform_sql_prefix='COMPLEX'
+          )
+          result = compiler.find_ordering_name('start__end', opts=None)
+          self.assert_orderbys_from_transform(result, ['alpha.beta', 'gamma-delta'], prefix)
+
+      def test_descending_with_multiple_targets(self):
+          compiler, prefix = self.make_compiler_with_setup(
+              field_attname='last',
+              returned_targets=['t1', 't2'],
+              transform_sql_prefix='DESC'
+          )
+          # Leading '-' should be respected for descending
+          result = compiler.find_ordering_name('-mid__last', opts=None)
+          self.assert_orderbys_from_transform(result, ['t1', 't2'], prefix)
+          self.assertTrue(all(ob.descending for ob, _ in [result[0]]))
+
+      def test_attname_matches_even_with_unrelated_opts_passed(self):
+          compiler, prefix = self.make_compiler_with_setup(
+              field_attname='finalfield',
+              returned_targets=['X'],
+              transform_sql_prefix='OPT'
+          )
+          # Provide a non-None opts; our _setup_joins ignores it and returns the prepared opts.
+          fake_opts = SimpleNamespace(ordering=('irrelevant',))
+          result = compiler.find_ordering_name('a__finalfield', opts=fake_opts)
+          self.assert_orderbys_from_transform(result, ['X'], prefix)
+new_imports_code: |
+  from django.db.models.expressions import RawSQL, OrderBy

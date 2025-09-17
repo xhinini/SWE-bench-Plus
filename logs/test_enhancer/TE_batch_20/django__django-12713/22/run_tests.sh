@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_widgets.tests_llm.ManyToManyAutocompleteCallTests._unwrap_widget admin_widgets.tests_llm.ManyToManyAutocompleteCallTests.test_m2m_formfield_overrides_widget_and_direct_widget_prefers_direct_and_no_autocomplete_call admin_widgets.tests_llm.ManyToManyAutocompleteCallTests.test_m2m_widget_in_formfield_overrides_checkbox_instance_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyAutocompleteCallTests.test_m2m_widget_in_formfield_overrides_select_instance_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyAutocompleteCallTests.test_m2m_widget_in_formfield_overrides_using_class_instance_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyAutocompleteCallTests.test_m2m_widget_in_formfield_overrides_widget_instance_preserved_and_no_autocomplete_call admin_widgets.tests_llm.ManyToManyAutocompleteCallTests.test_m2m_widget_in_kwargs_checkbox_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyAutocompleteCallTests.test_m2m_widget_in_kwargs_select_multiple_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyAutocompleteCallTests.test_m2m_widget_kw_select_multiple_preserves_attrs_and_no_autocomplete_call admin_widgets.tests_llm.ManyToManyAutocompleteCallTests.test_m2m_widget_passed_directly_and_formfield_overrides_present_still_uses_direct_widget
+coverage json -o coverage.json
+: '>>>>> End Test Output'

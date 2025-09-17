@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 view_tests.tests.test_static_llm.StaticRegexEdgeCaseTests.assertFileContentEqual view_tests.tests.test_static_llm.StaticRegexEdgeCaseTests.test_serve_handles_leading_semicolon_header view_tests.tests.test_static_llm.StaticRegexEdgeCaseTests.test_serve_handles_non_digit_length_header view_tests.tests.test_static_llm.StaticRegexEdgeCaseTests.test_serve_handles_unexpected_param_header view_tests.tests.test_static_llm.StaticRegexEdgeCaseTests.test_serve_with_length_mismatch_header_returns_file view_tests.tests.test_static_llm.StaticRegexEdgeCaseTests.test_serve_with_multiple_semicolons_header_returns_file view_tests.tests.test_static_llm.StaticRegexEdgeCaseTests.test_was_modified_since_leading_semicolon_returns_true view_tests.tests.test_static_llm.StaticRegexEdgeCaseTests.test_was_modified_since_length_mismatch_returns_true view_tests.tests.test_static_llm.StaticRegexEdgeCaseTests.test_was_modified_since_matching_length_and_not_modified_returns_false view_tests.tests.test_static_llm.StaticRegexEdgeCaseTests.test_was_modified_since_non_digit_length_returns_true view_tests.tests.test_static_llm.StaticRegexEdgeCaseTests.test_was_modified_since_unexpected_param_returns_true
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,158 @@
+import numpy as np
+import pytest
+from sklearn.preprocessing import KBinsDiscretizer
+import sklearn.cluster
+
+import numpy as np
+import pytest
+import scipy.sparse as sp
+
+from sklearn.preprocessing import KBinsDiscretizer, OneHotEncoder
+import sklearn.cluster
+
+# Helper fake KMeans that returns deliberately unsorted centers
+class FakeKMeans:
+    def __init__(self, n_clusters=3, init=None, n_init=None):
+        self.n_clusters = n_clusters
+
+    def fit(self, X):
+        # create deterministically spaced centers then permute to be unsorted
+        col_min, col_max = X.min(), X.max()
+        centers = np.linspace(col_min, col_max, self.n_clusters)
+        if self.n_clusters >= 3:
+            # produce an unsorted permutation for the first three centers
+            perm = list(range(self.n_clusters))
+            perm[:3] = [2, 0, 1]
+            centers = centers[perm]
+        else:
+            # for 2 clusters reverse them to ensure unsorted
+            centers = centers[::-1]
+        # cluster_centers_ mimics sklearn's shape (n_clusters, n_features)
+        self.cluster_centers_ = centers.reshape(self.n_clusters, 1)
+        return self
+
+def _expected_transform_from_centers(X, centers):
+    # compute bin_edges from sorted centers (the intended behavior)
+    centers_sorted = np.sort(centers)
+    col_min, col_max = centers_sorted[0], centers_sorted[-1]
+    # For KBinsDiscretizer, bin_edges are computed from centers as midpoints with col_min and col_max
+    mids = (centers_sorted[1:] + centers_sorted[:-1]) * 0.5 if centers_sorted.size > 1 else np.array([])
+    # full bin edges including min and max
+    bin_edges = np.r_[col_min, mids, col_max]
+    # follow transform logic: eps and np.digitize against bin_edges[1:]
+    rtol = 1.e-5
+    atol = 1.e-8
+    eps = atol + rtol * np.abs(X.ravel())
+    # digitize uses bin_edges[1:] as bins
+    Xt = np.digitize(X.ravel() + eps, bin_edges[1:])
+    # clip to valid range
+    Xt = np.clip(Xt, 0, centers_sorted.size - 1)
+    return Xt.reshape(-1, 1), bin_edges
+
+@pytest.fixture(autouse=True)
+def patch_kmeans(monkeypatch):
+    # Replace sklearn.cluster.KMeans with our fake implementation for tests
+    monkeypatch.setattr(sklearn.cluster, "KMeans", FakeKMeans)
+    yield
+
+def test_kmeans_sorts_centers_monotonic_bin_edges_single_feature():
+    X = np.array([0.0, 0.5, 2.0, 3.0, 9.0, 10.0]).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+    est.fit(X)
+    # Bin edges must be strictly increasing (monotonic)
+    edges = est.bin_edges_[0]
+    assert np.all(np.diff(edges) > 0), "bin_edges_ must be strictly increasing"
+
+def test_kmeans_transform_matches_sorted_centers_manual_expected():
+    X = np.array([0.0, 0.5, 2.0, 3.0, 9.0, 10.0]).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+    est.fit(X)
+    Xt = est.transform(X)
+    # Compute expected transform using the same fake KMeans center-generation logic
+    # Note: FakeKMeans generation depends only on data min/max and n_clusters
+    # generate "unsorted" centers as FakeKMeans would
+    centers = np.linspace(X.min(), X.max(), 3)
+    centers = centers[[2, 0, 1]]
+    expected_Xt, expected_edges = _expected_transform_from_centers(X, centers)
+    assert np.array_equal(Xt, expected_Xt), "Transform must be computed from sorted centers"
+
+def test_inverse_transform_uses_sorted_centers():
+    X = np.array([0.0, 0.5, 2.0, 3.0, 9.0, 10.0]).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+    est.fit(X)
+    Xt = est.transform(X)
+    Xinv = est.inverse_transform(Xt)
+    # Compute expected bin centers from sorted centers
+    centers = np.linspace(X.min(), X.max(), 3)
+    centers = centers[[2, 0, 1]]
+    centers_sorted = np.sort(centers)
+    bin_centers = (np.r_[centers_sorted[0], (centers_sorted[1:] + centers_sorted[:-1]) * 0.5, centers_sorted[-1]][1:] +
+                   np.r_[centers_sorted[0], (centers_sorted[1:] + centers_sorted[:-1]) * 0.5, centers_sorted[-1]][:-1]) * 0.5
+    # For ordinal encode, inverse_transform maps indices to bin_centers
+    # bin_centers length equals n_bins, so select according to Xt
+    reconstructed = bin_centers[np.int_(Xt.ravel())].reshape(-1, 1)
+    assert np.allclose(Xinv, reconstructed)
+
+def test_onehot_encode_and_inverse_transform_roundtrip_when_kmeans_centers_unsorted():
+    X = np.array([0.0, 0.5, 2.0, 3.0, 9.0, 10.0]).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='onehot')
+    Xt = est.fit_transform(X)
+    # Should be sparse
+    assert sp.issparse(Xt)
+    # round-trip: inverse_transform should reproduce ordinal representation and then transform back
+    Xinv = est.inverse_transform(Xt)
+    Xt2 = est.transform(Xinv)
+    assert np.array_equal(Xt.todense(), Xt2.todense())
+
+def test_kmeans_with_constant_feature_and_unsorted_centers_other_feature():
+    # First column constant, second column varying (kmeans applies to second)
+    X = np.array([[1.0, 0.0],
+                  [1.0, 0.5],
+                  [1.0, 2.0],
+                  [1.0, 3.0],
+                  [1.0, 9.0],
+                  [1.0, 10.0]])
+    est = KBinsDiscretizer(n_bins=[1, 3], strategy='kmeans', encode='ordinal')
+    # Force n_bins array uses 1 for constant feature; still kmeans must handle second
+    est.fit(X)
+    # First feature bin_edges_ should be [-inf, inf] as in code when constant
+    assert est.n_bins_[0] == 1
+    assert np.all(np.isinf(est.bin_edges_[0])) or (est.bin_edges_[0].size == 2)
+    # Second feature edges must be increasing
+    assert np.all(np.diff(est.bin_edges_[1]) > 0)
+
+def test_kbins_with_n_bins_array_and_kmeans_feature_shape_and_bins():
+    X = np.array([[0.0, 0.1],
+                  [0.5, 0.2],
+                  [2.0, 0.3],
+                  [3.0, 0.4]])
+    # Specify n_bins array where second feature uses kmeans with 2 bins
+    est = KBinsDiscretizer(n_bins=[2, 2], strategy='kmeans', encode='ordinal')
+    est.fit(X)
+    assert est.bin_edges_.shape[0] == 2
+    for be, nb in zip(est.bin_edges_, est.n_bins_):
+        assert be.shape == (nb + 1, )
+
+def test_transform_outside_fit_range_with_kmeans_fake_clips():
+    X = np.array([0.0, 1.0, 2.0, 3.0]).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=4, strategy='kmeans', encode='ordinal')
+    est.fit(X)
+    # transform values outside the range
+    X2 = np.array([-100.0, 1000.0]).reshape(-1, 1)
+    X2t = est.transform(X2)
+    # min should be 0 and max should be n_bins-1
+    assert X2t.min() == 0
+    assert X2t.max() == est.n_bins_[0] - 1
+
+def test_overwrite_and_feature_count_validation_with_kmeans_fake():
+    X = np.array([0.0, 1.0, 2.0, 3.0]).reshape(-1, 1)
+    X_before = X.copy()
+    est = KBinsDiscretizer(n_bins=3, encode="ordinal", strategy='kmeans')
+    Xt = est.fit_transform(X)
+    # original X must not be overwritten
+    assert_array_equal = np.testing.assert_array_equal
+    assert_array_equal(X, X_before)
+    # inverse_transform/transform should validate feature count
+    X_bad = np.arange(6).reshape(3, 2)
+    with pytest.raises(ValueError):
+        est.transform(X_bad)

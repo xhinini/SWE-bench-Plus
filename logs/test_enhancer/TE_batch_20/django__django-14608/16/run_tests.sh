@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests._valid_choice_data forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_append_and_str_after_nonform_error forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_cached_after_explicit_full_clean forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_cached_instance_bound_valid forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_cached_instance_unbound forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_mutation_persists_bound_valid forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_mutation_persists_unbound forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_returns_configured_errorlist_type_bound_valid forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_returns_configured_errorlist_type_unbound forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_str_contains_nonform_for_empty
+coverage json -o coverage.json
+: '>>>>> End Test Output'

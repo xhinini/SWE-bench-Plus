@@ -1,0 +1,245 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests assert that deserialize_db_from_string uses a transaction and disables constraint checks during deserialization, and that connection.check_constraints() is called afterwards. They detect the absence of calls to constraint_checks_disabled and check_constraints (which the model patch omitted).
+test_code: |
+  import importlib
+  from unittest import mock
+
+  from django.db import connection
+  from django.test import SimpleTestCase
+
+  # Reuse the circular fixture used elsewhere in the test module.
+  CIRCULAR_DATA = """
+  [
+      {
+          "model": "backends.object",
+          "pk": 1,
+          "fields": {"obj_ref": 1, "related_objects": []}
+      },
+      {
+          "model": "backends.objectreference",
+          "pk": 1,
+          "fields": {"obj": 1}
+      }
+  ]
+  """
+
+  class TestDeserializeDbFromStringRegression(SimpleTestCase):
+      databases = {'default'}
+
+      def _install_wrappers(self):
+          """
+          Wrap atomic, constraint_checks_disabled and check_constraints to record
+          calls and preserve original behaviour.
+          Returns a dict with control objects and a restore function.
+          """
+          creation_mod = importlib.import_module('django.db.backends.base.creation')
+          djtrans = importlib.import_module('django.db.transaction')
+
+          # Save originals
+          orig_constraint_ctx = connection.constraint_checks_disabled
+          orig_check_constraints = connection.check_constraints
+          orig_dj_atomic = djtrans.atomic
+          orig_creation_atomic = getattr(creation_mod, 'atomic', None)
+
+          order = []
+          flags = {'atomic_entered': 0, 'constraint_entered': 0, 'constraint_exited': 0, 'check_constraints_called': 0, 'using_args': []}
+
+          # Wrap constraint_checks_disabled to preserve original behaviour but record enter/exit
+          def constraint_wrapper():
+              orig_cm = orig_constraint_ctx()
+              class CM:
+                  def __enter__(self_inner):
+                      order.append('constraint_enter')
+                      flags['constraint_entered'] += 1
+                      return orig_cm.__enter__()
+                  def __exit__(self_inner, exc_type, exc, tb):
+                      order.append('constraint_exit')
+                      flags['constraint_exited'] += 1
+                      return orig_cm.__exit__(exc_type, exc, tb)
+              return CM()
+          connection.constraint_checks_disabled = constraint_wrapper
+
+          # Wrap check_constraints to record and call original
+          def wrapped_check_constraints():
+              order.append('check_constraints')
+              flags['check_constraints_called'] += 1
+              return orig_check_constraints()
+          connection.check_constraints = wrapped_check_constraints
+
+          # Wrap atomic so we can assert 'using' passed and record order
+          def make_atomic_wrapper(orig_atomic):
+              def atomic_wrapper(*a, **kw):
+                  cm = orig_atomic(*a, **kw)
+                  class CM:
+                      def __enter__(self_inner):
+                          order.append('atomic_enter')
+                          flags['atomic_entered'] += 1
+                          flags['using_args'].append(kw.get('using'))
+                          return cm.__enter__()
+                      def __exit__(self_inner, exc_type, exc, tb):
+                          order.append('atomic_exit')
+                          return cm.__exit__(exc_type, exc, tb)
+                  return CM()
+              return atomic_wrapper
+
+          # Patch both the global transaction.atomic and the module-level name if present.
+          djtrans.atomic = make_atomic_wrapper(orig_dj_atomic)
+          if orig_creation_atomic is not None:
+              creation_mod.atomic = make_atomic_wrapper(orig_creation_atomic)
+
+          def restore():
+              # Restore everything
+              connection.constraint_checks_disabled = orig_constraint_ctx
+              connection.check_constraints = orig_check_constraints
+              djtrans.atomic = orig_dj_atomic
+              if orig_creation_atomic is not None:
+                  creation_mod.atomic = orig_creation_atomic
+
+          return {
+              'order': order,
+              'flags': flags,
+              'restore': restore,
+              'creation_mod': creation_mod,
+              'orig_creation_atomic_present': orig_creation_atomic is not None,
+          }
+
+      def test_constraint_checks_and_check_constraints_called(self):
+          control = self._install_wrappers()
+          try:
+              connection.creation.deserialize_db_from_string(CIRCULAR_DATA)
+              # Ensure the constraint context was entered and exited and check_constraints called.
+              self.assertGreater(control['flags']['constraint_entered'], 0)
+              self.assertGreater(control['flags']['check_constraints_called'], 0)
+          finally:
+              control['restore']()
+
+      def test_atomic_used_with_correct_using_argument(self):
+          control = self._install_wrappers()
+          try:
+              connection.creation.deserialize_db_from_string(CIRCULAR_DATA)
+              # atomic should be entered and 'using' argument should be the connection alias
+              self.assertGreater(control['flags']['atomic_entered'], 0)
+              self.assertIn(connection.alias, control['flags']['using_args'])
+          finally:
+              control['restore']()
+
+      def test_constraint_enter_exit_and_check_constraints_sequence(self):
+          control = self._install_wrappers()
+          try:
+              connection.creation.deserialize_db_from_string(CIRCULAR_DATA)
+              # Expected sequence: atomic_enter, constraint_enter, constraint_exit, check_constraints, atomic_exit
+              seq = control['order']
+              # Find indices of relevant events
+              try:
+                  idx_atomic_enter = seq.index('atomic_enter')
+                  idx_constraint_enter = seq.index('constraint_enter')
+                  idx_constraint_exit = seq.index('constraint_exit')
+                  idx_check_constraints = seq.index('check_constraints')
+                  idx_atomic_exit = seq.index('atomic_exit')
+              except ValueError as e:
+                  self.fail("Expected sequence elements not found: %s. Order: %s" % (e, seq))
+              self.assertTrue(idx_atomic_enter < idx_constraint_enter < idx_constraint_exit < idx_check_constraints < idx_atomic_exit)
+          finally:
+              control['restore']()
+
+      def test_deserialize_restores_circular_data(self):
+          # Ensure data is actually restored into DB (behavior assert, not just wrappers).
+          control = self._install_wrappers()
+          try:
+              connection.creation.deserialize_db_from_string(CIRCULAR_DATA)
+              from ..models import Object, ObjectReference
+              obj = Object.objects.get()
+              obj_ref = ObjectReference.objects.get()
+              self.assertEqual(obj.obj_ref, obj_ref)
+              self.assertEqual(obj_ref.obj, obj)
+          finally:
+              control['restore']()
+
+      def test_check_constraints_called_on_empty_data(self):
+          control = self._install_wrappers()
+          try:
+              connection.creation.deserialize_db_from_string('[]')
+              self.assertGreater(control['flags']['check_constraints_called'], 0)
+              # Even with no objects, atomic/context managers should be used.
+              self.assertGreater(control['flags']['atomic_entered'], 0)
+              self.assertGreater(control['flags']['constraint_entered'], 0)
+          finally:
+              control['restore']()
+
+      def test_check_constraints_called_multiple_times(self):
+          control = self._install_wrappers()
+          try:
+              connection.creation.deserialize_db_from_string(CIRCULAR_DATA)
+              connection.creation.deserialize_db_from_string(CIRCULAR_DATA)
+              # check_constraints should have been called twice
+              self.assertEqual(control['flags']['check_constraints_called'], 2)
+              self.assertEqual(control['flags']['constraint_entered'], 2)
+              self.assertEqual(control['flags']['atomic_entered'], 2)
+          finally:
+              control['restore']()
+
+      def test_atomic_enter_exit_called_each_time(self):
+          control = self._install_wrappers()
+          try:
+              for _ in range(3):
+                  connection.creation.deserialize_db_from_string(CIRCULAR_DATA)
+              self.assertEqual(control['flags']['atomic_entered'], 3)
+              # There should be 3 atomic exits as well in the order list
+              self.assertEqual(control['order'].count('atomic_exit'), 3)
+          finally:
+              control['restore']()
+
+      def test_wrappers_restored_after_test(self):
+          # Ensure that the helper's restore truly restores original attributes.
+          creation_mod = importlib.import_module('django.db.backends.base.creation')
+          djtrans = importlib.import_module('django.db.transaction')
+          # Capture originals first
+          orig_constraint = connection.constraint_checks_disabled
+          orig_check = connection.check_constraints
+          orig_dj_atomic = djtrans.atomic
+          orig_creation_atomic = getattr(creation_mod, 'atomic', None)
+
+          control = self._install_wrappers()
+          # Do a call to use wrappers
+          try:
+              connection.creation.deserialize_db_from_string(CIRCULAR_DATA)
+          finally:
+              control['restore']()
+
+          # After restore they should equal the originals captured above
+          self.assertIs(connection.constraint_checks_disabled, orig_constraint)
+          self.assertIs(connection.check_constraints, orig_check)
+          self.assertIs(djtrans.atomic, orig_dj_atomic)
+          if orig_creation_atomic is not None:
+              self.assertIs(creation_mod.atomic, orig_creation_atomic)
+
+      def test_reversed_circular_data_still_restores(self):
+          # Reverse the order of the two entries to ensure forward refs are handled.
+          reversed_data = """
+          [
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              },
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              }
+          ]
+          """
+          control = self._install_wrappers()
+          try:
+              connection.creation.deserialize_db_from_string(reversed_data)
+              from ..models import Object, ObjectReference
+              obj = Object.objects.get()
+              obj_ref = ObjectReference.objects.get()
+              self.assertEqual(obj.obj_ref, obj_ref)
+              self.assertEqual(obj_ref.obj, obj)
+          finally:
+              control['restore']()
+new_imports_code: |
+  import importlib
+  from unittest import mock

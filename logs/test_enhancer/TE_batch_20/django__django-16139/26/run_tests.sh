@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.UserChangeFormPasswordLinkRegressionTests.test_admin_get_form_with_to_field_uses_pk_in_link auth_tests.test_forms_llm.UserChangeFormPasswordLinkRegressionTests.test_custom_user_model_changeform_uses_pk auth_tests.test_forms_llm.UserChangeFormPasswordLinkRegressionTests.test_format_placeholder_replaced_fully auth_tests.test_forms_llm.UserChangeFormPasswordLinkRegressionTests.test_helptext_contains_instance_pk auth_tests.test_forms_llm.UserChangeFormPasswordLinkRegressionTests.test_helptext_href_exact auth_tests.test_forms_llm.UserChangeFormPasswordLinkRegressionTests.test_helptext_no_double_slashes_and_exact_match auth_tests.test_forms_llm.UserChangeFormPasswordLinkRegressionTests.test_link_resolves_correctly_via_urljoin_when_to_field_used auth_tests.test_forms_llm.UserChangeFormPasswordLinkRegressionTests.test_no_buggy_short_path_fragment_present auth_tests.test_forms_llm.UserChangeFormPasswordLinkRegressionTests.test_password_field_missing_no_exception_and_not_in_fields auth_tests.test_forms_llm.UserChangeFormPasswordLinkRegressionTests.test_unsaved_instance_formats_none_pk
+coverage json -o coverage.json
+: '>>>>> End Test Output'

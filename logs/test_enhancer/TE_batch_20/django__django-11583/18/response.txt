@@ -1,0 +1,143 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that iter_modules_and_files() swallows ValueError raised when resolving paths (for various ValueError messages and sources: extra_files provided as strings or Path instances, module origins) and continues processing, returning the expected results and caching behavior. They would fail against an incorrect change that re-raises ValueError for messages other than 'embedded null byte'.
+test_code: |
+  from pathlib import Path
+  import tempfile
+  import os
+  from types import SimpleNamespace, ModuleType
+  from unittest import mock
+
+  from django.test import SimpleTestCase
+  from django.utils import autoreload
+
+  class IterModulesAndFilesValueErrorTests(SimpleTestCase):
+      def setUp(self):
+          # Ensure cache is cleared before every test
+          autoreload.iter_modules_and_files.cache_clear()
+          # Temporary file for valid-path tests
+          self.tmpdir = tempfile.TemporaryDirectory()
+          self.valid_file = Path(self.tmpdir.name) / "valid.py"
+          self.valid_file.touch()
+          # Create a dummy module template
+          self.module_template = ModuleType("testmod")
+
+      def tearDown(self):
+          self.tmpdir.cleanup()
+          autoreload.iter_modules_and_files.cache_clear()
+
+      def test_ignores_valueerror_from_extra_file_string(self):
+          # Path.resolve raises a ValueError with an arbitrary message.
+          def fake_resolve(self, *args, **kwargs):
+              raise ValueError("network filesystem returned invalid path")
+
+          with mock.patch.object(Path, "resolve", side_effect=fake_resolve):
+              # Pass a string filename in extra_files
+              result = autoreload.iter_modules_and_files((), frozenset(["/some/bad/path"]))
+          self.assertEqual(result, frozenset())
+
+      def test_ignores_valueerror_from_extra_file_path(self):
+          def fake_resolve(self, *args, **kwargs):
+              raise ValueError("something went wrong resolving path")
+
+          with mock.patch.object(Path, "resolve", side_effect=fake_resolve):
+              bad_path = Path("/another/bad/path")
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+          self.assertEqual(result, frozenset())
+
+      def test_ignores_valueerror_from_module_origin(self):
+          # Simulate a module with a spec that points to an origin that can't be resolved.
+          def fake_resolve(self, *args, **kwargs):
+              raise ValueError("network error while resolving module origin")
+
+          spec = SimpleNamespace(has_location=True, origin="/mod/origin.py", loader=object())
+          mod = ModuleType("mymod")
+          mod.__spec__ = spec
+          with mock.patch.object(Path, "resolve", side_effect=fake_resolve):
+              result = autoreload.iter_modules_and_files((mod,), frozenset())
+          self.assertEqual(result, frozenset())
+
+      def test_ignores_embedded_null_byte_valueerror(self):
+          # Explicitly simulate the embedded null byte ValueError message.
+          def fake_resolve(self, *args, **kwargs):
+              raise ValueError("embedded null byte")
+
+          with mock.patch.object(Path, "resolve", side_effect=fake_resolve):
+              result = autoreload.iter_modules_and_files((), frozenset(["embedded_null\x00.py"]))
+          self.assertEqual(result, frozenset())
+
+      def test_returns_valid_path_when_resolvable(self):
+          # If resolve works, the path should be included in the results.
+          # Let Path.resolve behave normally by not patching it.
+          result = autoreload.iter_modules_and_files((), frozenset([self.valid_file]))
+          resolved = Path(self.valid_file).resolve().absolute()
+          self.assertIn(resolved, result)
+
+      def test_mixed_valid_and_valueerror_only_returns_valid(self):
+          # First call to resolve raises, second call returns a valid Path.
+          calls = {"count": 0}
+          real_resolved = Path(self.valid_file).resolve()
+
+          def fake_resolve(self, *args, **kwargs):
+              # On first call raise, then return a real Path on subsequent calls.
+              if calls["count"] == 0:
+                  calls["count"] += 1
+                  raise ValueError("transient network error")
+              return real_resolved
+
+          bad = Path("/bad/path.py")
+          with mock.patch.object(Path, "resolve", side_effect=fake_resolve):
+              result = autoreload.iter_modules_and_files((), frozenset([bad, self.valid_file]))
+          # Only the valid resolved path should be present.
+          self.assertEqual(result, frozenset({real_resolved.absolute()}))
+
+      def test_caches_result_after_valueerror(self):
+          # If the first call returns an empty frozenset due to swallowed ValueError,
+          # it should be cached. Subsequent changes to Path.resolve should not change
+          # the returned (cached) result until cache is cleared.
+          def fake_resolve_raise(self, *args, **kwargs):
+              raise ValueError("initial failure")
+
+          with mock.patch.object(Path, "resolve", side_effect=fake_resolve_raise):
+              first = autoreload.iter_modules_and_files((), frozenset(["/bad1"]))
+
+          # Now let resolve succeed for a valid file, but the cached result should still be used.
+          with mock.patch.object(Path, "resolve", return_value=Path(self.valid_file)):
+              second = autoreload.iter_modules_and_files((), frozenset([self.valid_file]))
+          # first was an empty frozenset (cached), second call used the cache (same result)
+          self.assertEqual(first, second)
+          self.assertEqual(first, frozenset())
+
+      def test_handles_multiple_extra_files_with_some_valueerrors(self):
+          # Simulate resolve raising for some files, but succeeding for others.
+          def fake_resolve(self, *args, **kwargs):
+              if "badfile" in str(self):
+                  raise ValueError("bad path")
+              return Path(self.valid_file)
+
+          bad1 = Path("/some/badfile1.py")
+          good = self.valid_file
+          bad2 = Path("/some/badfile2.py")
+          with mock.patch.object(Path, "resolve", side_effect=fake_resolve):
+              result = autoreload.iter_modules_and_files((), frozenset([bad1, good, bad2]))
+          self.assertEqual(result, frozenset({Path(self.valid_file).absolute()}))
+
+      def test_skips_empty_filename_entries(self):
+          # The implementation should skip falsy filenames from extra_files.
+          # Ensure no exception is raised for empty string or None entries.
+          result = autoreload.iter_modules_and_files((), frozenset(["", None]))
+          self.assertEqual(result, frozenset())
+
+      def test_valueerror_with_varied_message_is_swallowed(self):
+          # Ensure ValueError is swallowed regardless of its message.
+          def fake_resolve(self, *args, **kwargs):
+              raise ValueError("a different message than 'embedded null byte'")
+
+          with mock.patch.object(Path, "resolve", side_effect=fake_resolve):
+              result = autoreload.iter_modules_and_files((), frozenset(["/weird/path"]))
+          self.assertEqual(result, frozenset())
+new_imports_code: |
+  from unittest import mock
+  from pathlib import Path
+  import tempfile
+  from types import SimpleNamespace, ModuleType

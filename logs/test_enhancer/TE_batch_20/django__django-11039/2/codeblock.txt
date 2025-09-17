@@ -1,0 +1,209 @@
+import io
+from types import SimpleNamespace
+from unittest import mock
+from django.core.management import call_command, CommandError
+from django.test import TestCase
+
+import io
+from types import SimpleNamespace
+from unittest import mock
+
+from django.core.management import call_command, CommandError
+from django.test import TestCase
+
+class SqlMigrateTransactionTests(TestCase):
+    """
+    Tests for sqlmigrate transaction wrapper behavior depending on
+    migration.atomic and connection.features.can_rollback_ddl.
+    """
+
+    def _make_conn(self, can_rollback_ddl):
+        """
+        Return a simple fake connection object with the features and ops
+        expected by BaseCommand when adding transaction wrappers.
+        """
+        ops = SimpleNamespace(
+            start_transaction_sql=lambda: "BEGIN",
+            end_transaction_sql=lambda: "COMMIT"
+        )
+        features = SimpleNamespace(can_rollback_ddl=can_rollback_ddl)
+        return SimpleNamespace(ops=ops, features=features)
+
+    def _make_executor_class(self, atomic):
+        """
+        Factory to create a fake MigrationExecutor class that returns a
+        loader with the expected attributes and a collect_sql method
+        returning a simple SQL operation.
+        """
+        class FakeExecutor:
+            def __init__(self, connection):
+                # loader must provide migrated_apps, get_migration_by_prefix and graph.nodes
+                self.loader = SimpleNamespace()
+                # Expose that the 'migrations' app has migrations or not depending on test usage.
+                self.loader.migrated_apps = {'migrations'}
+                # get_migration_by_prefix should return an object with .name and .atomic
+                def get_migration_by_prefix(app_label, migration_name):
+                    # Accept both '0001' and '0001_initial' as callers might pass either.
+                    if migration_name not in ('0001', '0001_initial'):
+                        raise KeyError
+                    return SimpleNamespace(name='0001_initial', atomic=atomic)
+                self.loader.get_migration_by_prefix = get_migration_by_prefix
+                # graph.nodes should contain the key used by the command
+                self.loader.graph = SimpleNamespace(nodes={('migrations', '0001_initial'): 'node'})
+            def collect_sql(self, plan):
+                # The command expects a list of SQL fragments (without BEGIN/COMMIT).
+                return ['-- operation: create something']
+        return FakeExecutor
+
+    def test_atomic_true_and_db_supports_transactions_shows_wrappers(self):
+        default_conn = self._make_conn(can_rollback_ddl=True)
+        other_conn = self._make_conn(can_rollback_ddl=False)
+        FakeExecutor = self._make_executor_class(atomic=True)
+        with mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor', new=FakeExecutor):
+            # Patch both the module's local connections and django.db.connections so
+            # BaseCommand uses the same fake connection when adding wrappers.
+            with mock.patch('django.core.management.commands.sqlmigrate.connections', new={'default': default_conn, 'other': other_conn}):
+                with mock.patch('django.db.connections', new={'default': default_conn, 'other': other_conn}):
+                    out = io.StringIO()
+                    call_command('sqlmigrate', 'migrations', '0001', stdout=out, no_color=True)
+                    val = out.getvalue()
+                    self.assertIn('BEGIN', val)
+                    self.assertIn('COMMIT', val)
+                    self.assertIn('-- operation: create something', val)
+
+    def test_atomic_true_and_db_does_not_support_transactions_hides_wrappers(self):
+        default_conn = self._make_conn(can_rollback_ddl=False)
+        FakeExecutor = self._make_executor_class(atomic=True)
+        with mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor', new=FakeExecutor):
+            with mock.patch('django.core.management.commands.sqlmigrate.connections', new={'default': default_conn}):
+                with mock.patch('django.db.connections', new={'default': default_conn}):
+                    out = io.StringIO()
+                    call_command('sqlmigrate', 'migrations', '0001', stdout=out, no_color=True)
+                    val = out.getvalue()
+                    # BEGIN/COMMIT should not be present when the DB doesn't support transactional DDL.
+                    self.assertNotIn('BEGIN', val)
+                    self.assertNotIn('COMMIT', val)
+                    self.assertIn('-- operation: create something', val)
+
+    def test_atomic_false_even_if_db_supports_transactions_hides_wrappers(self):
+        default_conn = self._make_conn(can_rollback_ddl=True)
+        FakeExecutor = self._make_executor_class(atomic=False)
+        with mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor', new=FakeExecutor):
+            with mock.patch('django.core.management.commands.sqlmigrate.connections', new={'default': default_conn}):
+                with mock.patch('django.db.connections', new={'default': default_conn}):
+                    out = io.StringIO()
+                    call_command('sqlmigrate', 'migrations', '0001', stdout=out, no_color=True)
+                    val = out.getvalue()
+                    # Even though DB supports transactional DDL, migration.atomic is False.
+                    self.assertNotIn('BEGIN', val)
+                    self.assertNotIn('COMMIT', val)
+                    self.assertIn('-- operation: create something', val)
+
+    def test_database_option_uses_selected_connection_for_wrappers(self):
+        default_conn = self._make_conn(can_rollback_ddl=False)
+        other_conn = self._make_conn(can_rollback_ddl=True)
+        FakeExecutor = self._make_executor_class(atomic=True)
+        with mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor', new=FakeExecutor):
+            with mock.patch('django.core.management.commands.sqlmigrate.connections', new={'default': default_conn, 'other': other_conn}):
+                with mock.patch('django.db.connections', new={'default': default_conn, 'other': other_conn}):
+                    # Using the 'other' database should show BEGIN/COMMIT (other supports it).
+                    out = io.StringIO()
+                    call_command('sqlmigrate', 'migrations', '0001', database='other', stdout=out, no_color=True)
+                    val = out.getvalue()
+                    self.assertIn('BEGIN', val)
+                    self.assertIn('COMMIT', val)
+                    # Using the default database should hide them.
+                    out2 = io.StringIO()
+                    call_command('sqlmigrate', 'migrations', '0001', database='default', stdout=out2, no_color=True)
+                    val2 = out2.getvalue()
+                    self.assertNotIn('BEGIN', val2)
+                    self.assertNotIn('COMMIT', val2)
+
+    def test_execute_forces_no_color_true(self):
+        """
+        Ensure Command.execute sets options['no_color'] = True before calling
+        BaseCommand.execute (so BEGIN/COMMIT added by output_transaction are not colored).
+        """
+        default_conn = self._make_conn(can_rollback_ddl=True)
+        FakeExecutor = self._make_executor_class(atomic=True)
+        with mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor', new=FakeExecutor):
+            with mock.patch('django.core.management.commands.sqlmigrate.connections', new={'default': default_conn}):
+                with mock.patch('django.db.connections', new={'default': default_conn}):
+                    # Patch BaseCommand.execute to capture the options it gets called with.
+                    import django.core.management.base as base_mod
+                    with mock.patch.object(base_mod.BaseCommand, 'execute', autospec=True) as mock_base_execute:
+                        # Let the patched BaseCommand.execute return None to stop further processing.
+                        mock_base_execute.return_value = None
+                        # Call command with no_color explicitly False; execute() on the command
+                        # implementation should override it to True before delegating.
+                        call_command('sqlmigrate', 'migrations', '0001', no_color=False)
+                        # The first arg to BaseCommand.execute is the command instance; options is the last arg.
+                        # Inspect the call args to get the options dict passed through.
+                        self.assertTrue(mock_base_execute.called)
+                        # Extract the options dict argument (it's the 3rd positional arg in this binding).
+                        _, called_self, *called_args = mock_base_execute.call_args[0]
+                        # The options dict is in kwargs of call, not positionally here; check call_args[1]
+                        called_kwargs = mock_base_execute.call_args[1]
+                        # Confirm no_color was set to True.
+                        self.assertIn('no_color', called_kwargs)
+                        self.assertTrue(called_kwargs['no_color'])
+
+    def test_backwards_option_respects_db_transaction_support(self):
+        """
+        Ensure reverse SQL output uses the same logic for transaction wrappers.
+        """
+        default_conn = self._make_conn(can_rollback_ddl=False)
+        FakeExecutor = self._make_executor_class(atomic=True)
+        with mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor', new=FakeExecutor):
+            with mock.patch('django.core.management.commands.sqlmigrate.connections', new={'default': default_conn}):
+                with mock.patch('django.db.connections', new={'default': default_conn}):
+                    out = io.StringIO()
+                    call_command('sqlmigrate', 'migrations', '0001', backwards=True, stdout=out, no_color=True)
+                    val = out.getvalue()
+                    self.assertNotIn('BEGIN', val)
+                    self.assertNotIn('COMMIT', val)
+
+    def test_app_without_migrations_raises_commanderror(self):
+        """
+        If the executor.loader.migrated_apps does not include the app label,
+        a CommandError should be raised indicating the app has no migrations.
+        """
+        # Create an executor class that reports no migrated apps.
+        class NoMigrationsExecutor:
+            def __init__(self, connection):
+                self.loader = SimpleNamespace()
+                self.loader.migrated_apps = set()
+                def get_migration_by_prefix(app_label, migration_name):
+                    raise KeyError
+                self.loader.get_migration_by_prefix = get_migration_by_prefix
+                self.loader.graph = SimpleNamespace(nodes={})
+            def collect_sql(self, plan):
+                return []
+        default_conn = self._make_conn(can_rollback_ddl=True)
+        with mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor', new=NoMigrationsExecutor):
+            with mock.patch('django.core.management.commands.sqlmigrate.connections', new={'default': default_conn}):
+                with mock.patch('django.db.connections', new={'default': default_conn}):
+                    msg = "App 'migrations' does not have migrations"
+                    with self.assertRaisesMessage(CommandError, "App 'migrations' does not have migrations"):
+                        call_command('sqlmigrate', 'migrations', '0001')
+
+    def test_unknown_migration_prefix_raises_commanderror(self):
+        """
+        If get_migration_by_prefix raises KeyError, a helpful CommandError is raised.
+        """
+        class BadPrefixExecutor:
+            def __init__(self, connection):
+                self.loader = SimpleNamespace()
+                self.loader.migrated_apps = {'migrations'}
+                def get_migration_by_prefix(app_label, migration_name):
+                    raise KeyError
+                self.loader.get_migration_by_prefix = get_migration_by_prefix
+                self.loader.graph = SimpleNamespace(nodes={})
+            def collect_sql(self, plan):
+                return []
+        default_conn = self._make_conn(can_rollback_ddl=True)
+        with mock.patch('django.core.management.commands.sqlmigrate.MigrationExecutor', new=BadPrefixExecutor):
+            with mock.patch('django.core.management.commands.sqlmigrate.connections', new={'default': default_conn}):
+                with mock.patch('django.db.connections', new={'default': default_conn}):
+                    with self.assertRaisesMessage(CommandError, "Cannot find a migration matching 'nonexistent' from app 'migrations'"):
+                        call_command('sqlmigrate', 'migrations', 'nonexistent')

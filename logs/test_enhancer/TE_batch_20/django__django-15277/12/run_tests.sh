@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 expressions.tests_llm.CharFieldValidatorsTests.test_charfield_clean_with_none_max_length_accepts_value expressions.tests_llm.CharFieldValidatorsTests.test_charfield_deconstruct_omits_max_length_when_none expressions.tests_llm.CharFieldValidatorsTests.test_charfield_formfield_returns_forms_charfield expressions.tests_llm.CharFieldValidatorsTests.test_charfield_with_max_length_has_maxlength_validator expressions.tests_llm.CharFieldValidatorsTests.test_charfield_without_max_length_no_maxlength_validator expressions.tests_llm.CharFieldValidatorsTests.test_instance_validator_is_isolated expressions.tests_llm.CharFieldValidatorsTests.test_slugfield_default_has_maxlength_validator expressions.tests_llm.CharFieldValidatorsTests.test_textfield_with_db_collation_no_maxlength_validator expressions.tests_llm.CharFieldValidatorsTests.test_textfield_without_max_length_no_maxlength_validator expressions.tests_llm.CharFieldValidatorsTests.test_value_resolve_output_field_charfield_clean_does_not_raise
+coverage json -o coverage.json
+: '>>>>> End Test Output'

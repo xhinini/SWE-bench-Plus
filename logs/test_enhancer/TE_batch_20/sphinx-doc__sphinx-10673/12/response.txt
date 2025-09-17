@@ -1,0 +1,200 @@
+language: Python
+number_of_tests: 10
+test_behavior: These unit tests exercise TocTreeCollector.assign_figure_numbers to ensure that "generated" documents (those listed in the std domain's initial_data['labels']) are skipped during figure-number assignment. The "model patch" fails to skip such generated docs and will therefore call env.get_doctree on them (or otherwise process them); these tests detect such behavior by recording/get_doctree-call assertions and by checking that fignumbers and rewrite notifications are only produced for non-generated docs.
+test_code: |
+  import pytest
+  from types import SimpleNamespace
+  from docutils import nodes
+  from sphinx import addnodes
+  from sphinx.environment.collectors.toctree import TocTreeCollector
+  
+  class DummyDomain:
+      def __init__(self, labels):
+          # labels: mapping label -> (docname, labelid, title)
+          self.initial_data = {'labels': labels}
+          self.name = 'std'
+  
+      def get_enumerable_node_type(self, node):
+          # treat docutils.figure nodes as enumerable figure nodes
+          return 'figure' if isinstance(node, nodes.figure) else None
+  
+      def get_numfig_title(self, node):
+          # say all figures have titles (so they are numbered)
+          return True
+  
+  def make_env(labels_map, doctrees, old_fignumbers=None, numfig=True):
+      """
+      labels_map: dict of generated label -> (docname, labelid, title)
+      doctrees: dict docname -> root node (nodes.Element) that will be returned by get_doctree
+      old_fignumbers: initial env.toc_fignumbers (or None)
+      """
+      calls = []
+      def get_doctree(name):
+          calls.append(name)
+          if name in doctrees:
+              return doctrees[name]
+          raise AssertionError(f"get_doctree was called for unexpected doc: {name}")
+  
+      env = SimpleNamespace()
+      env.domains = {'std': DummyDomain(labels_map)}
+      env.config = SimpleNamespace(numfig=numfig, numfig_secnum_depth=10, root_doc='index')
+      env.toc_fignumbers = {} if old_fignumbers is None else old_fignumbers
+      env.toc_secnumbers = {}
+      env.tocs = {}  # not needed for these tests
+      env.get_doctree = get_doctree
+      return env, calls
+  
+  def make_toctree_with_entries(entries):
+      """Create an addnodes.toctree node with the given list of (title, ref) entries."""
+      t = addnodes.toctree()
+      t['entries'] = entries
+      t['includefiles'] = [ref for (_t, ref) in entries if not (ref and ref.startswith('http'))]
+      return t
+  
+  def make_index_with_toctree(entries):
+      root = nodes.Element()
+      root += make_toctree_with_entries(entries)
+      return root
+  
+  def make_doc_with_figure(fig_id):
+      root = nodes.Element()
+      # create a figure node that has ids set
+      fig = nodes.figure('', ids=[fig_id])
+      root += fig
+      return root
+  
+  @pytest.mark.unit
+  def test_skip_generated_simple():
+      # index references a generated label 'genref' -> should be skipped
+      labels = {'genref': ('some_doc', 'lbl', 'Generated Section')}
+      index = make_index_with_toctree([(None, 'genref')])
+      env, calls = make_env(labels, {'index': index})
+      collector = TocTreeCollector()
+  
+      result = collector.assign_figure_numbers(env)
+  
+      # only 'index' should have been requested (root), 'genref' should be skipped
+      assert calls == ['index']
+      assert result == []  # no fignumbers assigned
+  
+  @pytest.mark.unit
+  def test_process_non_generated_child_assigns_fignumbers_and_rewrites():
+      # index references a non-generated child -> should be processed
+      labels = {}
+      index = make_index_with_toctree([(None, 'child')])
+      child = make_doc_with_figure('fig1')
+      env, calls = make_env(labels, {'index': index, 'child': child})
+      collector = TocTreeCollector()
+  
+      result = collector.assign_figure_numbers(env)
+  
+      # both index and child should have been requested
+      assert 'index' in calls and 'child' in calls
+      # child should have an assigned figure number
+      assert 'child' in env.toc_fignumbers
+      assert 'figure' in env.toc_fignumbers['child']
+      assert 'fig1' in env.toc_fignumbers['child']['figure']
+      # child should be reported as needing rewrite (new fignums)
+      assert 'child' in result
+  
+  @pytest.mark.unit
+  def test_multiple_generated_skipped():
+      labels = {'g1': ('d','l','t1'), 'g2': ('d','l','t2')}
+      index = make_index_with_toctree([(None, 'g1'), (None, 'g2')])
+      env, calls = make_env(labels, {'index': index})
+      collector = TocTreeCollector()
+  
+      collector.assign_figure_numbers(env)
+      # only index (root) processed, both generated ones skipped
+      assert calls == ['index']
+  
+  @pytest.mark.unit
+  def test_generated_present_in_env_tocs_but_still_skipped_due_to_labels():
+      # even if env.tocs has an entry for the generated ref, label mapping should make it skipped
+      labels = {'gen': ('d','l','t')}
+      index = make_index_with_toctree([(None, 'gen')])
+      # simulate that env.tocs contains a value (should not force processing)
+      env, calls = make_env(labels, {'index': index})
+      env.tocs['gen'] = nodes.bullet_list()
+      collector = TocTreeCollector()
+  
+      collector.assign_figure_numbers(env)
+      assert calls == ['index']
+  
+  @pytest.mark.unit
+  def test_nested_mid_toctree_skips_generated():
+      # index -> mid -> genref ; genref is generated, should be skipped
+      labels = {'genref': ('d','l','t')}
+      index = make_index_with_toctree([(None, 'mid')])
+      mid = make_index_with_toctree([(None, 'genref')])
+      env, calls = make_env(labels, {'index': index, 'mid': mid})
+      collector = TocTreeCollector()
+  
+      collector.assign_figure_numbers(env)
+      # index and mid called, but genref skipped
+      assert calls == ['index', 'mid']
+  
+  @pytest.mark.unit
+  def test_rewrite_needed_only_for_processed_docs():
+      # non-generated child -> rewrite_needed should include child
+      labels = {}
+      index = make_index_with_toctree([(None, 'child')])
+      child = make_doc_with_figure('fig1')
+      env, calls = make_env(labels, {'index': index, 'child': child})
+      # give old fignumbers empty so we detect a change
+      env.toc_fignumbers = {}
+      collector = TocTreeCollector()
+  
+      result = collector.assign_figure_numbers(env)
+      assert result == ['child']
+  
+  @pytest.mark.unit
+  def test_old_fignumbers_for_generated_do_not_cause_processing():
+      # if old fignumbers mention a generated doc, the collector should not try to regenerate it
+      labels = {'g1': ('d','l','t')}
+      index = make_index_with_toctree([(None, 'g1')])
+      # old fignumbers contains g1, but since it's generated, it should be left alone and not reprocessed
+      old = {'g1': {'figure': {'fig1': (1,)}}}
+      env, calls = make_env(labels, {'index': index}, old_fignumbers=old)
+      collector = TocTreeCollector()
+  
+      result = collector.assign_figure_numbers(env)
+      # gen doc skipped: not requested
+      assert calls == ['index']
+      # new toc_fignumbers should not re-add g1
+      assert 'g1' not in env.toc_fignumbers
+      assert result == []
+  
+  @pytest.mark.unit
+  def test_duplicate_entries_processed_once():
+      # index contains the same child twice; assigned set should prevent duplicate processing
+      labels = {}
+      index = make_index_with_toctree([(None, 'child'), (None, 'child')])
+      child = make_doc_with_figure('fig1')
+      env, calls = make_env(labels, {'index': index, 'child': child})
+      collector = TocTreeCollector()
+  
+      collector.assign_figure_numbers(env)
+      # calls should include 'child' only once (besides 'index')
+      assert calls.count('child') == 1
+  
+  @pytest.mark.unit
+  def test_non_generated_in_nested_chain_processed():
+      # index -> a -> b, where b has a figure; none are generated so b must be processed
+      labels = {}
+      index = make_index_with_toctree([(None, 'a')])
+      a = make_index_with_toctree([(None, 'b')])
+      b = make_doc_with_figure('fig-b')
+      env, calls = make_env(labels, {'index': index, 'a': a, 'b': b})
+      collector = TocTreeCollector()
+  
+      result = collector.assign_figure_numbers(env)
+      # ensure b was processed and rewrite noted
+      assert 'b' in calls
+      assert 'b' in env.toc_fignumbers
+      assert result == ['b']
+new_imports_code: |
+  from types import SimpleNamespace
+  from docutils import nodes
+  from sphinx import addnodes
+  from sphinx.environment.collectors.toctree import TocTreeCollector

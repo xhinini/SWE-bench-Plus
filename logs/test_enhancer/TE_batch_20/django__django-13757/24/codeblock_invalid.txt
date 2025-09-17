@@ -1,0 +1,192 @@
+from types import SimpleNamespace
+from unittest import mock
+
+from django.test import SimpleTestCase
+
+from django.db.models.fields.json import HasKey, KeyTransform, KeyTransformIsNull
+
+
+class _DummyCompiler:
+    def __init__(self, lhs_sql='"col"', lhs_params=None):
+        self.lhs_sql = lhs_sql
+        self.lhs_params = lhs_params or ['lhs_param']
+
+    def compile(self, expr):
+        # Return a tuple (sql, params) like a real compiler would.
+        # Keep it simple: the "previous" expression compiles to lhs_sql and lhs_params.
+        return self.lhs_sql, list(self.lhs_params)
+
+
+class KeyTransformIsNullUnitTests(SimpleTestCase):
+    def test_oracle_isnull_true_appends_lhs_params(self):
+        """
+        For Oracle and isnull=True, the SQL should include an IS NULL condition
+        on the left-hand expression and the params should include the lhs params
+        appended to the HasKey params.
+        """
+        compiler = _DummyCompiler(lhs_sql='"col"', lhs_params=['lhs_param'])
+        connection = SimpleNamespace(vendor='oracle')
+
+        # Mock HasKey.as_oracle to return a predictable SQL and params.
+        with mock.patch.object(HasKey, 'as_oracle', return_value=('HASK_SQL', ('hk',))) as mock_hk:
+            expr = KeyTransformIsNull(KeyTransform('k', 'value'), True)
+            sql, params = expr.as_oracle(compiler, connection)
+
+            # The SQL should include an IS NULL check for the lhs SQL fragment.
+            self.assertIn('IS NULL', sql)
+            self.assertIn('"col"', sql)
+            # The params should be a tuple combining HasKey params and lhs params.
+            self.assertEqual(params, ('hk', 'lhs_param'))
+            mock_hk.assert_called_once()
+
+    def test_oracle_isnull_false_delegates_to_haskey(self):
+        """
+        For Oracle and isnull=False, KeyTransformIsNull should simply delegate
+        to HasKey.as_oracle and return its SQL and params unchanged.
+        """
+        compiler = _DummyCompiler(lhs_sql='"col"', lhs_params=['lhs_param'])
+        connection = SimpleNamespace(vendor='oracle')
+
+        with mock.patch.object(HasKey, 'as_oracle', return_value=('HASK_SQL_FALSE', ('hpf',))) as mock_hk:
+            expr = KeyTransformIsNull(KeyTransform('k', 'value'), False)
+            sql, params = expr.as_oracle(compiler, connection)
+            self.assertEqual(sql, 'HASK_SQL_FALSE')
+            self.assertEqual(params, ('hpf',))
+            mock_hk.assert_called_once()
+
+    def test_oracle_isnull_true_with_no_haskey_params_uses_only_lhs_params(self):
+        """
+        If HasKey.as_oracle returns no params, the Oracle isnull=True case still
+        must include the lhs params as the final params tuple.
+        """
+        compiler = _DummyCompiler(lhs_sql='"col"', lhs_params=['p1'])
+        connection = SimpleNamespace(vendor='oracle')
+
+        # Simulate HasKey returning empty params.
+        with mock.patch.object(HasKey, 'as_oracle', return_value=('HASK_EMPTY', ())) as mock_hk:
+            expr = KeyTransformIsNull(KeyTransform('k', 'value'), True)
+            sql, params = expr.as_oracle(compiler, connection)
+            self.assertIn('IS NULL', sql)
+            # Only lhs params should be present.
+            self.assertEqual(params, ('p1',))
+            mock_hk.assert_called_once()
+
+    def test_oracle_isnull_true_preserves_param_order(self):
+        """
+        When HasKey returns some params and preprocess_lhs provides multiple lhs params,
+        the final params should preserve order: HasKey params first, then lhs params.
+        """
+        compiler = _DummyCompiler(lhs_sql='"col"', lhs_params=['l1', 'l2'])
+        connection = SimpleNamespace(vendor='oracle')
+
+        with mock.patch.object(HasKey, 'as_oracle', return_value=('HASKSQL', ('h1', 'h2'))) as mock_hk:
+            expr = KeyTransformIsNull(KeyTransform('k', 'value'), True)
+            sql, params = expr.as_oracle(compiler, connection)
+            self.assertEqual(params, ('h1', 'h2', 'l1', 'l2'))
+            mock_hk.assert_called_once()
+
+    def test_sqlite_isnull_true_uses_is_null_template(self):
+        """
+        For SQLite and isnull=True, HasKey.as_sql should be called with the
+        'IS NULL' template rather than 'IS NOT NULL'.
+        """
+        compiler = _DummyCompiler(lhs_sql='"col"', lhs_params=['lhs_param'])
+        connection = SimpleNamespace(vendor='sqlite')
+
+        captured = {}
+
+        def fake_as_sql(self, compiler_arg, connection_arg, template=None):
+            # Capture the template passed into HasKey.as_sql.
+            captured['template'] = template
+            return ('FAKE_SQL', ('hp',))
+
+        with mock.patch.object(HasKey, 'as_sql', new=fake_as_sql):
+            expr = KeyTransformIsNull(KeyTransform('k', 'value'), True)
+            sql, params = expr.as_sqlite(compiler, connection)
+
+            # Ensure HasKey.as_sql was invoked with the IS NULL template.
+            self.assertIn('IS NULL', captured['template'])
+            self.assertEqual(sql, 'FAKE_SQL')
+            self.assertEqual(params, ('hp',))
+
+    def test_sqlite_isnull_false_uses_is_not_null_template(self):
+        """
+        For SQLite and isnull=False, HasKey.as_sql should be called with the
+        'IS NOT NULL' template.
+        """
+        compiler = _DummyCompiler(lhs_sql='"col"', lhs_params=['lhs_param'])
+        connection = SimpleNamespace(vendor='sqlite')
+
+        captured = {}
+
+        def fake_as_sql(self, compiler_arg, connection_arg, template=None):
+            captured['template'] = template
+            return ('FAKE_SQL2', ('hp2',))
+
+        with mock.patch.object(HasKey, 'as_sql', new=fake_as_sql):
+            expr = KeyTransformIsNull(KeyTransform('k', 'value'), False)
+            sql, params = expr.as_sqlite(compiler, connection)
+
+            self.assertIn('IS NOT NULL', captured['template'])
+            self.assertEqual(sql, 'FAKE_SQL2')
+            self.assertEqual(params, ('hp2',))
+
+    def test_sqlite_isnull_true_returns_haskey_sql_unmodified(self):
+        """
+        Ensure that for SQLite and isnull=True, KeyTransformIsNull returns
+        the SQL returned by HasKey.as_sql (i.e., doesn't wrap it in 'NOT (...)').
+        """
+        compiler = _DummyCompiler(lhs_sql='"col"', lhs_params=['lhs_param'])
+        connection = SimpleNamespace(vendor='sqlite')
+
+        # Make HasKey.as_sql produce an obvious SQL string we can assert was returned.
+        def fake_as_sql(self, compiler_arg, connection_arg, template=None):
+            return (f"TEMPLATE_USED:{template}", ('hp',))
+
+        with mock.patch.object(HasKey, 'as_sql', new=fake_as_sql):
+            expr = KeyTransformIsNull(KeyTransform('k', 'value'), True)
+            sql, params = expr.as_sqlite(compiler, connection)
+
+            # The returned SQL should match exactly what HasKey.as_sql returned.
+            self.assertTrue(sql.startswith('TEMPLATE_USED:'))
+            self.assertEqual(params, ('hp',))
+
+    def test_sqlite_isnull_false_returns_haskey_sql_unmodified(self):
+        """
+        Ensure that for SQLite and isnull=False, KeyTransformIsNull returns
+        the SQL returned by HasKey.as_sql without modification.
+        """
+        compiler = _DummyCompiler(lhs_sql='"col"', lhs_params=['lhs_param'])
+        connection = SimpleNamespace(vendor='sqlite')
+
+        def fake_as_sql(self, compiler_arg, connection_arg, template=None):
+            return ('UNMOD_SQL', ('pX',))
+
+        with mock.patch.object(HasKey, 'as_sql', new=fake_as_sql):
+            expr = KeyTransformIsNull(KeyTransform('k', 'value'), False)
+            sql, params = expr.as_sqlite(compiler, connection)
+            self.assertEqual(sql, 'UNMOD_SQL')
+            self.assertEqual(params, ('pX',))
+
+    def test_oracle_isnull_true_includes_lhs_in_sql(self):
+        """
+        Ensure that the returned SQL for Oracle isnull=True contains the lhs SQL
+        fragment (the left-hand expression), which is required for the 'IS NULL'
+        check to reference the correct expression.
+        """
+        compiler = _DummyCompiler(lhs_sql='COMPILED_LHS', lhs_params=['lp'])
+        connection = SimpleNamespace(vendor='oracle')
+
+        with mock.patch.object(HasKey, 'as_oracle', return_value=('HASKY', ('hpx',))) as mock_hk:
+            expr = KeyTransformIsNull(KeyTransform('k', 'value'), True)
+            sql, params = expr.as_oracle(compiler, connection)
+
+            # The SQL must contain the compiled lhs SQL fragment.
+            self.assertIn('COMPILED_LHS', sql)
+            # And include IS NULL as part of the expression.
+            self.assertIn('IS NULL', sql)
+            # params include HasKey params first, then lhs params.
+            self.assertEqual(params, ('hpx', 'lp'))
+            mock_hk.assert_called_once()
+new_imports_code: |
+  # No module-level import changes required; tests perform local imports.

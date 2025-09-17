@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_optimizer_llm.AlterFieldReduceTests.assertOptimizesTo migrations.test_optimizer_llm.AlterFieldReduceTests.test_addfield_then_multiple_alterfields_results_in_single_add_with_final_field migrations.test_optimizer_llm.AlterFieldReduceTests.test_alterfield_then_removefield_results_in_remove migrations.test_optimizer_llm.AlterFieldReduceTests.test_alterfield_then_renamefield_db_column_none_adds_post_alter migrations.test_optimizer_llm.AlterFieldReduceTests.test_alterfield_then_renamefield_with_db_column_preserves_only_rename migrations.test_optimizer_llm.AlterFieldReduceTests.test_case_insensitive_model_and_field_names_for_alterfield_reduction migrations.test_optimizer_llm.AlterFieldReduceTests.test_consecutive_alterfield_collapses_to_last migrations.test_optimizer_llm.AlterFieldReduceTests.test_removefield_then_alterfield_keeps_remove migrations.test_optimizer_llm.AlterFieldReduceTests.test_rename_between_alterfields_uses_final_alter migrations.test_optimizer_llm.AlterFieldReduceTests.test_three_alterfields_keep_last migrations.test_optimizer_llm.optimize migrations.test_optimizer_llm.serialize
+coverage json -o coverage.json
+: '>>>>> End Test Output'

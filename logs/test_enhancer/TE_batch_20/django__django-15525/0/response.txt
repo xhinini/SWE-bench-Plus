@@ -1,0 +1,184 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that build_instance correctly sets the instance _state.db before calling natural_key, and that it handles various scenarios (pk present, manager without get_by_natural_key, missing natural_key method, DoesNotExist from manager, to_python conversion, etc.). The candidate (incorrect) patch that fails to set obj._state.db (or improperly constructs the instance) will trigger assertion errors or different behavior; the corrected (gold) patch sets obj._state.db prior to calling natural_key, so all tests will pass.
+test_code: |
+  import unittest
+  from types import SimpleNamespace
+  from django.core.serializers import base
+  from django.core.serializers.base import build_instance
+
+  class DummyManager:
+      def __init__(self, pk_value=None, raise_dne=False):
+          self._pk_value = pk_value
+          self.raise_dne = raise_dne
+          self.last_db = None
+
+      def db_manager(self, db):
+          # return self to allow chaining .get_by_natural_key
+          self.last_db = db
+          return self
+
+      def get_by_natural_key(self, *args):
+          if self.raise_dne:
+              raise DummyModel.DoesNotExist()
+          return SimpleNamespace(pk=self._pk_value)
+
+  class DummyPK:
+      def __init__(self, attname, to_python=lambda x: x):
+          self.attname = attname
+          self.to_python = to_python
+
+  class DummyModel:
+      # placeholder DoesNotExist exception class
+      class DoesNotExist(Exception):
+          pass
+
+      def __init__(self, **kwargs):
+          # emulate Django model _state
+          self._state = SimpleNamespace(db=None)
+          # set attributes provided in kwargs
+          for k, v in kwargs.items():
+              setattr(self, k, v)
+
+      @classmethod
+      def _make_meta(cls, pk_field, default_manager):
+          cls._meta = SimpleNamespace(pk=pk_field, default_manager=default_manager)
+
+  def make_model_with_natural_key(expected_db, natural_key_value, manager):
+      """
+      Create a DummyModel subclass where natural_key asserts that _state.db
+      equals expected_db (to ensure build_instance sets it) and returns natural_key_value.
+      """
+      class M(DummyModel):
+          def natural_key(self):
+              # Ensure that the instance _state.db is set to expected_db when natural_key is called.
+              if self._state.db != expected_db:
+                  raise AssertionError("instance _state.db was not set to expected db")
+              # natural_key may rely on attributes set via kwargs; return provided value
+              return natural_key_value
+
+      M.DoesNotExist = DummyModel.DoesNotExist
+      M._make_meta(DummyPK("id", to_python=lambda x: x), manager)
+      return M
+
+  class BuildInstanceTests(unittest.TestCase):
+      def test_sets_state_db_for_natural_key_resolution(self):
+          # Manager returns pk value 42; natural_key should see _state.db == "other"
+          manager = DummyManager(pk_value=42)
+          Model = make_model_with_natural_key(expected_db="other", natural_key_value=("nk",), manager=manager)
+          data = {}  # no pk present
+          inst = build_instance(Model, data, db="other")
+          # build_instance should populate data['id'] via manager and return a Model(**data)
+          self.assertEqual(getattr(inst, "id"), 42)
+
+      def test_uses_provided_db_name(self):
+          manager = DummyManager(pk_value=7)
+          Model = make_model_with_natural_key(expected_db="custom_db", natural_key_value=("nk",), manager=manager)
+          data = {}
+          inst = build_instance(Model, data, db="custom_db")
+          self.assertEqual(getattr(inst, "id"), 7)
+          # Ensure manager.db_manager was called with provided db
+          self.assertEqual(manager.last_db, "custom_db")
+
+      def test_multiple_different_db_names(self):
+          # Repeat with different db names to ensure correctness across names
+          for db_name, pk in (("db1", 1), ("db2", 2), ("other", 99)):
+              manager = DummyManager(pk_value=pk)
+              Model = make_model_with_natural_key(expected_db=db_name, natural_key_value=("nk",), manager=manager)
+              data = {}
+              inst = build_instance(Model, data, db=db_name)
+              self.assertEqual(getattr(inst, "id"), pk)
+
+      def test_does_not_call_natural_key_when_pk_provided(self):
+          # If pk present, natural_key should not be called. Provide a natural_key that would raise if called.
+          manager = DummyManager(pk_value=123)
+          class M(DummyModel):
+              def natural_key(self):
+                  raise AssertionError("natural_key must not be called when pk present")
+          M.DoesNotExist = DummyModel.DoesNotExist
+          M._make_meta(DummyPK("id", to_python=lambda x: x), manager)
+          data = {"id": 55}
+          inst = build_instance(M, data, db="other")
+          self.assertEqual(getattr(inst, "id"), 55)
+
+      def test_ignores_missing_get_by_natural_key(self):
+          # If default_manager has no get_by_natural_key, build_instance should not attempt resolution
+          class ManagerWithoutNK:
+              pass
+          class M(DummyModel):
+              def natural_key(self):
+                  raise AssertionError("natural_key must not be called if manager lacks get_by_natural_key")
+          M.DoesNotExist = DummyModel.DoesNotExist
+          M._make_meta(DummyPK("id", to_python=lambda x: x), ManagerWithoutNK())
+          data = {}
+          inst = build_instance(M, data, db="other")
+          # No id set since resolution didn't happen
+          self.assertFalse(hasattr(inst, "id"))
+
+      def test_ignores_missing_natural_key_method(self):
+          # If Model has no natural_key method, do nothing
+          manager = DummyManager(pk_value=100)
+          class M(DummyModel):
+              pass
+          M.DoesNotExist = DummyModel.DoesNotExist
+          M._make_meta(DummyPK("id", to_python=lambda x: x), manager)
+          data = {}
+          inst = build_instance(M, data, db="other")
+          self.assertFalse(hasattr(inst, "id"))
+
+      def test_handles_does_not_exist_from_manager(self):
+          # If manager.get_by_natural_key raises DoesNotExist, build_instance should swallow and return instance without id
+          manager = DummyManager(pk_value=None, raise_dne=True)
+          Model = make_model_with_natural_key(expected_db="other", natural_key_value=("nk",), manager=manager)
+          data = {}
+          inst = build_instance(Model, data, db="other")
+          self.assertFalse(hasattr(inst, "id"))
+
+      def test_applies_pk_to_python_conversion(self):
+          # Ensure Model._meta.pk.to_python is used to convert the pk returned by manager
+          manager = DummyManager(pk_value="123")
+          pk_field = DummyPK("id", to_python=lambda x: int(x))
+          class M(DummyModel):
+              def natural_key(self):
+                  if self._state.db != "other":
+                      raise AssertionError("instance _state.db was not set to other")
+                  return ("nk",)
+          M.DoesNotExist = DummyModel.DoesNotExist
+          M._make_meta(pk_field, manager)
+          data = {}
+          inst = build_instance(M, data, db="other")
+          self.assertEqual(getattr(inst, "id"), 123)
+          self.assertIsInstance(getattr(inst, "id"), int)
+
+      def test_natural_key_can_use_instance_attributes(self):
+          # natural_key returns a tuple that is built from instance attributes passed via data
+          manager = DummyManager(pk_value=321)
+          class M(DummyModel):
+              def natural_key(self):
+                  # natural_key uses an attribute set from kwargs; ensure _state.db has been set
+                  if self._state.db != "other":
+                      raise AssertionError("_state.db not set")
+                  return (getattr(self, "username", "no-user"),)
+          M.DoesNotExist = DummyModel.DoesNotExist
+          M._make_meta(DummyPK("id", to_python=lambda x: x), manager)
+          data = {"username": "alice"}
+          inst = build_instance(M, data, db="other")
+          # manager returned 321 -> id set
+          self.assertEqual(getattr(inst, "id"), 321)
+
+      def test_returned_instance_fields_populated_from_data(self):
+          # The final returned Model(**data) should have the fields from data set on it
+          manager = DummyManager(pk_value=77)
+          Model = make_model_with_natural_key(expected_db="other", natural_key_value=("nk",), manager=manager)
+          data = {"title": "Hamlet"}
+          inst = build_instance(Model, data, db="other")
+          self.assertEqual(getattr(inst, "title"), "Hamlet")
+          # id should be set via manager resolution
+          self.assertEqual(getattr(inst, "id"), 77)
+
+  if __name__ == "__main__":
+      unittest.main()
+new_imports_code: |
+  from types import SimpleNamespace
+  from django.core.serializers import base
+  from django.core.serializers.base import build_instance

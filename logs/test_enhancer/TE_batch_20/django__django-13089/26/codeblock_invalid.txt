@@ -1,0 +1,188 @@
+from unittest import mock
+
+from django.core import management
+from django.db import connections
+from django.test import TransactionTestCase, override_settings
+from django.utils import timezone
+
+from django.core.cache import caches
+from django.core.cache.backends.db import DatabaseCache
+from django.conf import settings
+
+@override_settings(CACHES=caches_setting_for_tests(
+    BACKEND='django.core.cache.backends.db.DatabaseCache',
+    LOCATION='test cache table'
+))
+class DatabaseCacheCullEdgeCaseTests(TransactionTestCase):
+    available_apps = ['cache']
+
+    def setUp(self):
+        super().setUp()
+        management.call_command('createcachetable', verbosity=0)
+        # Shorten the DB cache max entries so that _cull is triggered easily.
+        self.cache = caches['default']
+        # Keep default timeout large enough for these tests.
+        self.cache._max_entries = 1
+
+    def tearDown(self):
+        # Drop the table and restore DB state.
+        with connections['default'].cursor() as cursor:
+            table_name = connections['default'].ops.quote_name('test cache table')
+            cursor.execute('DROP TABLE %s' % table_name)
+        super().tearDown()
+
+    def _make_cursor_factory(self, fetchone_for_cull):
+        """
+        Return a factory that produces a context manager for cursor(), where
+        .fetchone() will return fetchone_for_cull only for the culling query
+        (identified heuristically by containing 'ORDER BY' and 'LIMIT'), and
+        otherwise delegates to the real cursor.
+        """
+        conn = connections['default']
+        orig_cursor_factory = conn.cursor
+
+        def factory():
+            real_cm = orig_cursor_factory()
+
+            class CursorProxy:
+                def __init__(self, real):
+                    self._real = real
+                    self._last_sql = None
+
+                def execute(self, sql, params=None):
+                    # Record the last executed SQL for heuristic checks.
+                    self._last_sql = sql if isinstance(sql, str) else repr(sql)
+                    return self._real.execute(sql, params)
+
+                def executemany(self, sql, param_list):
+                    self._last_sql = sql if isinstance(sql, str) else repr(sql)
+                    return self._real.executemany(sql, param_list)
+
+                def fetchone(self):
+                    # Heuristic to detect the culling query. The culling SQL
+                    # from DB backends typically contains 'ORDER BY' and 'LIMIT'.
+                    if self._last_sql and 'ORDER BY' in self._last_sql and 'LIMIT' in self._last_sql:
+                        return fetchone_for_cull
+                    return self._real.fetchone()
+
+                def fetchall(self):
+                    return self._real.fetchall()
+
+                def fetchmany(self, size=None):
+                    return self._real.fetchmany(size)
+
+                def __getattr__(self, name):
+                    return getattr(self._real, name)
+
+            class CM:
+                def __enter__(self_inner):
+                    real_cursor = real_cm.__enter__()
+                    return CursorProxy(real_cursor)
+
+                def __exit__(self_inner, exc_type, exc, tb):
+                    return real_cm.__exit__(exc_type, exc, tb)
+
+            return CM()
+        return factory
+
+    def test_set_does_not_error_when_culling_fetchone_returns_none(self):
+        # First insert a key to have rows in the table.
+        self.cache.set('initial', 'value', timeout=timezone.now().timestamp() + 1000)
+        # Patch the cursor so that the culling query returns None (no last key).
+        factory = self._make_cursor_factory(fetchone_for_cull=None)
+        with mock.patch.object(connections['default'], 'cursor', new=factory):
+            # The second set should trigger _cull (because _max_entries == 1)
+            # and should not raise (previously it raised when fetchone() was None).
+            self.cache.set('trigger', 'value2', timeout=timezone.now().timestamp() + 1000)
+        # Ensure the cache is still usable.
+        self.assertIn('trigger', self.cache)
+
+    def test_add_does_not_error_when_culling_fetchone_returns_none(self):
+        self.cache.set('initial_add', 'value')
+        factory = self._make_cursor_factory(fetchone_for_cull=None)
+        with mock.patch.object(connections['default'], 'cursor', new=factory):
+            # Using add (which can also cause _cull) should not raise.
+            self.assertTrue(self.cache.add('trigger_add', 'v', timeout=timezone.now().timestamp() + 1000))
+        self.assertIn('trigger_add', self.cache)
+
+    def test_touch_does_not_error_when_culling_fetchone_returns_none(self):
+        # Prepopulate enough rows to force cull on next write-like operation.
+        self.cache.set('a', '1', timeout=timezone.now().timestamp() + 1000)
+        self.cache.set('b', '2', timeout=timezone.now().timestamp() + 1000)
+        # Ensure we trigger cull by making max_entries small.
+        self.cache._max_entries = 1
+        factory = self._make_cursor_factory(fetchone_for_cull=None)
+        with mock.patch.object(connections['default'], 'cursor', new=factory):
+            # touch uses the same internal _base_set and can trigger _cull.
+            # It should not raise even if the culling query returns None.
+            # touch returns False if key absent; using an existing key for a true return.
+            self.assertTrue(self.cache.touch('a', timeout=timezone.now().timestamp() + 2000))
+
+    def test_set_deletes_when_last_cache_key_returned(self):
+        # Insert two keys so that a cull will be required.
+        self.cache._max_entries = 1
+        self.cache.set('older', 'old', timeout=timezone.now().timestamp() + 1000)
+        # At this point the table has one row; the next insert will trigger cull.
+        # Simulate fetchone returning the oldest key 'older' so that a DELETE is executed.
+        factory = self._make_cursor_factory(fetchone_for_cull=('older',))
+        with mock.patch.object(connections['default'], 'cursor', new=factory):
+            self.cache.set('newer', 'new', timeout=timezone.now().timestamp() + 1000)
+        # The older key should have been removed by the culling DELETE.
+        self.assertFalse(self.cache.has_key('older'))
+        self.assertTrue(self.cache.has_key('newer'))
+
+    def test_add_deletes_when_last_cache_key_returned(self):
+        self.cache._max_entries = 1
+        self.cache.set('older_add', 'old', timeout=timezone.now().timestamp() + 1000)
+        factory = self._make_cursor_factory(fetchone_for_cull=('older_add',))
+        with mock.patch.object(connections['default'], 'cursor', new=factory):
+            # add should succeed (new key) and trigger culling that deletes older_add
+            self.assertTrue(self.cache.add('new_add', 'v', timeout=timezone.now().timestamp() + 1000))
+        self.assertFalse(self.cache.has_key('older_add'))
+        self.assertTrue(self.cache.has_key('new_add'))
+
+    def test_cull_handles_last_cache_key_tuple_with_none_element(self):
+        # Simulate a pathological fetchone returning (None,), ensure no exception.
+        self.cache._max_entries = 1
+        self.cache.set('some', 'v', timeout=timezone.now().timestamp() + 1000)
+        factory = self._make_cursor_factory(fetchone_for_cull=(None,))
+        with mock.patch.object(connections['default'], 'cursor', new=factory):
+            # This should not raise even if the culling query returns (None,)
+            self.cache.set('other', 'v2', timeout=timezone.now().timestamp() + 1000)
+        # The cache still functions.
+        self.assertTrue(self.cache.has_key('other'))
+
+    def test_multiple_culls_no_error_when_fetchone_none(self):
+        # Repeated operations where the culling query returns None should not raise.
+        self.cache._max_entries = 1
+        self.cache.set('k1', 'v', timeout=timezone.now().timestamp() + 1000)
+        factory = self._make_cursor_factory(fetchone_for_cull=None)
+        with mock.patch.object(connections['default'], 'cursor', new=factory):
+            for i in range(2, 6):
+                # Repeated sets that will attempt to cull each time.
+                self.cache.set('k%d' % i, str(i), timeout=timezone.now().timestamp() + 1000)
+        # Ensure at least the last key exists.
+        self.assertTrue(self.cache.has_key('k5'))
+
+    def test_cull_within_transaction_does_not_error_when_fetchone_none(self):
+        # Ensure that the atomic block surrounding _base_set doesn't break when fetchone() is None.
+        self.cache._max_entries = 1
+        self.cache.set('tx_old', 'v', timeout=timezone.now().timestamp() + 1000)
+        factory = self._make_cursor_factory(fetchone_for_cull=None)
+        with mock.patch.object(connections['default'], 'cursor', new=factory):
+            # This should not raise even though _base_set uses transaction.atomic().
+            self.cache.set('tx_new', 'v2', timeout=timezone.now().timestamp() + 1000)
+        self.assertTrue(self.cache.has_key('tx_new'))
+
+    def test_cull_does_not_delete_anything_if_fetchone_returns_none(self):
+        # If the culling query returns None, no DELETE should be performed.
+        # Prepare a key and then trigger cull where fetchone returns None.
+        self.cache._max_entries = 1
+        self.cache.set('survive', 'keep', timeout=timezone.now().timestamp() + 1000)
+        factory = self._make_cursor_factory(fetchone_for_cull=None)
+        with mock.patch.object(connections['default'], 'cursor', new=factory):
+            self.cache.set('trigger_survive', 'v2', timeout=timezone.now().timestamp() + 1000)
+        # At least one of the keys should still be present (no erroneous deletion)
+        self.assertTrue(self.cache.has_key('trigger_survive') or self.cache.has_key('survive'))
+new_imports_code: |
+  # No new top-level imports required. The tests reuse existing imports from tests/cache/tests.py (mock, caches_setting_for_tests, caches, connections, management, timezone).

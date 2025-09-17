@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_writer_llm.ImportSortingRegressionTests._extract_imports_block migrations.test_writer_llm.ImportSortingRegressionTests._make_writer_for_imports migrations.test_writer_llm.ImportSortingRegressionTests.assertFromLinesInOrder migrations.test_writer_llm.ImportSortingRegressionTests.test_from_same_module_preserve_insertion_order_simple migrations.test_writer_llm.ImportSortingRegressionTests.test_from_same_module_with_alias_preserve_order migrations.test_writer_llm.ImportSortingRegressionTests.test_from_same_module_with_multi_import_preserve_order migrations.test_writer_llm.ImportSortingRegressionTests.test_from_with_duplicate_and_combined_preserve_order migrations.test_writer_llm.ImportSortingRegressionTests.test_from_with_numeric_and_alpha_preserve_order migrations.test_writer_llm.ImportSortingRegressionTests.test_from_with_underscore_names_preserve_order migrations.test_writer_llm.ImportSortingRegressionTests.test_many_from_same_module_preserve_sequence migrations.test_writer_llm.ImportSortingRegressionTests.test_mixed_import_and_from_grouping_and_order migrations.test_writer_llm.ImportSortingRegressionTests.test_multiple_modules_and_same_module_stability migrations.test_writer_llm.ImportSortingRegressionTests.test_preserve_order_when_from_lines_have_commas_and_spaces migrations.test_writer_llm.__init__'] (migrations.test_writer_llm.ImportSortingRegressionTests.['GenericType) migrations.test_writer_llm.deconstruct'] (migrations.test_writer_llm.ImportSortingRegressionTests.['DummyOp.__init__', 'DummyOp) migrations.test_writer_llm.serialize'] (migrations.test_writer_llm.ImportSortingRegressionTests.['GenericSerializer)
+coverage json -o coverage.json
+: '>>>>> End Test Output'

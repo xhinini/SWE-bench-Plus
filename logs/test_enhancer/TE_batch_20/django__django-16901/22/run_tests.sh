@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 xor_lookups.tests_llm.XorLookupsRegressionTests._expected_by_tests xor_lookups.tests_llm.XorLookupsRegressionTests.setUpTestData xor_lookups.tests_llm.XorLookupsRegressionTests.test_regression_empty_in_three_operands xor_lookups.tests_llm.XorLookupsRegressionTests.test_regression_exclude_three_operands xor_lookups.tests_llm.XorLookupsRegressionTests.test_regression_mixed_true_false_operands xor_lookups.tests_llm.XorLookupsRegressionTests.test_regression_negated_whole_xor xor_lookups.tests_llm.XorLookupsRegressionTests.test_regression_pk_three_operands xor_lookups.tests_llm.XorLookupsRegressionTests.test_regression_values_list_three_operands xor_lookups.tests_llm.XorLookupsRegressionTests.test_regression_xor_five_operands_with_negations xor_lookups.tests_llm.XorLookupsRegressionTests.test_regression_xor_four_operands xor_lookups.tests_llm.XorLookupsRegressionTests.test_regression_xor_three_operands xor_lookups.tests_llm.XorLookupsRegressionTests.test_regression_xor_two_operands_no_mod_needed
+coverage json -o coverage.json
+: '>>>>> End Test Output'

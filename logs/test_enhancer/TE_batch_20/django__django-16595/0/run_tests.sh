@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_optimizer_llm.AlterFieldReduceRegressionTests.assertOptimizesTo migrations.test_optimizer_llm.AlterFieldReduceRegressionTests.optimize migrations.test_optimizer_llm.AlterFieldReduceRegressionTests.test_addfield_then_alter_case_insensitive_model_name migrations.test_optimizer_llm.AlterFieldReduceRegressionTests.test_alter_alter_different_fields_remain migrations.test_optimizer_llm.AlterFieldReduceRegressionTests.test_alter_alter_different_models_no_collapse migrations.test_optimizer_llm.AlterFieldReduceRegressionTests.test_alter_alter_same_field_collapses migrations.test_optimizer_llm.AlterFieldReduceRegressionTests.test_alter_alter_same_field_collapses_case_insensitive migrations.test_optimizer_llm.AlterFieldReduceRegressionTests.test_alter_alter_single_iteration migrations.test_optimizer_llm.AlterFieldReduceRegressionTests.test_alter_then_rename_with_db_column_none_appends_alter migrations.test_optimizer_llm.AlterFieldReduceRegressionTests.test_alter_then_rename_with_db_column_set_does_not_append_alter migrations.test_optimizer_llm.AlterFieldReduceRegressionTests.test_rename_field_references_old_and_new
+coverage json -o coverage.json
+: '>>>>> End Test Output'

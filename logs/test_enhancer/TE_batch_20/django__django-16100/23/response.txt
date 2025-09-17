@@ -1,0 +1,168 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  A set of regression tests that verify list_editable bulk-edit operations are atomic
+  on the correct database when a router directs reads/writes to a non-default alias.
+  Each test forces an exception during part of the bulk-save process (log_change,
+  save_model, save_related, construct_change_message, etc.) and asserts that no
+  partial updates were committed to the routed database. These tests would fail
+  against the candidate patch (which uses transaction.atomic() without specifying
+  the DB alias returned by the router) and pass against the gold patch.
+test_code: |
+  from django.test import override_settings, skipUnlessDBFeature
+  from django.urls import reverse
+  from django.db import router
+  from django.db import DatabaseError
+  from unittest import mock
+
+  @override_settings(ROOT_URLCONF="admin_changelist.urls")
+  @skipUnlessDBFeature("supports_transactions")
+  class MultiDBListEditableAtomicityTests(TestCase):
+      """
+      Ensure list_editable bulk edits are atomic on the DB returned by router.db_for_write()
+      (i.e. no partial commits on the routed DB when exceptions occur).
+      """
+
+      def setUp(self):
+          # Create a superuser for admin requests
+          self.superuser = User.objects.create_superuser(
+              username="multidb_super", email="md@local", password="pwd"
+          )
+          self.client.force_login(self.superuser)
+          self.changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+
+      def _create_two_swallow_on_other(self):
+          # Create two Swallow instances explicitly on the non-default DB alias.
+          a = Swallow.objects.using("other").create(origin="Swallow A", load=4, speed=1)
+          b = Swallow.objects.using("other").create(origin="Swallow B", load=2, speed=2)
+          return a, b
+
+      def _build_post_data_for_two(self, a, b, a_load="9.0", a_speed="3.0", b_load="5.0", b_speed="1.0"):
+          return {
+              "form-TOTAL_FORMS": "2",
+              "form-INITIAL_FORMS": "2",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(a.pk),
+              "form-1-uuid": str(b.pk),
+              "form-0-load": a_load,
+              "form-0-speed": a_speed,
+              "form-1-load": b_load,
+              "form-1-speed": b_speed,
+              "_save": "Save",
+          }
+
+      def _assert_unchanged_on_other(self, a, b):
+          a.refresh_from_db(using="other")
+          b.refresh_from_db(using="other")
+          self.assertEqual(a.load, 4)
+          self.assertEqual(a.speed, 1)
+          self.assertEqual(b.load, 2)
+          self.assertEqual(b.speed, 2)
+
+      def _patch_router_to_other(self):
+          """
+          Patch router.db_for_read and router.db_for_write to return the 'other' alias.
+          This makes the admin operations target the non-default DB.
+          """
+          return mock.patch.multiple(
+              "django.db.router",
+              db_for_read=mock.Mock(return_value="other"),
+              db_for_write=mock.Mock(return_value="other"),
+          )
+
+      def test_atomicity_when_log_change_raises(self):
+          a, b = self._create_two_swallow_on_other()
+          data = self._build_post_data_for_two(a, b)
+          with self._patch_router_to_other():
+              with mock.patch.object(admin.ModelAdmin, "log_change", side_effect=DatabaseError):
+                  with self.assertRaises(DatabaseError):
+                      self.client.post(self.changelist_url, data)
+          # Ensure no partial updates on the routed DB.
+          self._assert_unchanged_on_other(a, b)
+
+      def test_atomicity_when_log_change_second_call_raises(self):
+          a, b = self._create_two_swallow_on_other()
+          data = self._build_post_data_for_two(a, b)
+          # log_change succeeds for the first saved object, then fails for the second.
+          with self._patch_router_to_other():
+              with mock.patch.object(admin.ModelAdmin, "log_change", side_effect=[None, DatabaseError]):
+                  with self.assertRaises(DatabaseError):
+                      self.client.post(self.changelist_url, data)
+          self._assert_unchanged_on_other(a, b)
+
+      def test_atomicity_when_save_model_raises(self):
+          a, b = self._create_two_swallow_on_other()
+          data = self._build_post_data_for_two(a, b)
+          with self._patch_router_to_other():
+              with mock.patch.object(admin.ModelAdmin, "save_model", side_effect=DatabaseError):
+                  with self.assertRaises(DatabaseError):
+                      self.client.post(self.changelist_url, data)
+          self._assert_unchanged_on_other(a, b)
+
+      def test_atomicity_when_save_related_raises(self):
+          a, b = self._create_two_swallow_on_other()
+          data = self._build_post_data_for_two(a, b)
+          with self._patch_router_to_other():
+              with mock.patch.object(admin.ModelAdmin, "save_related", side_effect=DatabaseError):
+                  with self.assertRaises(DatabaseError):
+                      self.client.post(self.changelist_url, data)
+          self._assert_unchanged_on_other(a, b)
+
+      def test_atomicity_when_construct_change_message_raises(self):
+          a, b = self._create_two_swallow_on_other()
+          data = self._build_post_data_for_two(a, b)
+          with self._patch_router_to_other():
+              with mock.patch.object(admin.ModelAdmin, "construct_change_message", side_effect=DatabaseError):
+                  with self.assertRaises(DatabaseError):
+                      self.client.post(self.changelist_url, data)
+          self._assert_unchanged_on_other(a, b)
+
+      def test_atomicity_when_save_model_fails_only_for_second_form(self):
+          a, b = self._create_two_swallow_on_other()
+          data = self._build_post_data_for_two(a, b)
+          # First save_model call succeeds, second raises -> expect full rollback.
+          with self._patch_router_to_other():
+              with mock.patch.object(
+                  admin.ModelAdmin, "save_model", side_effect=[None, DatabaseError]
+              ):
+                  with self.assertRaises(DatabaseError):
+                      self.client.post(self.changelist_url, data)
+          self._assert_unchanged_on_other(a, b)
+
+      def test_atomicity_when_log_change_and_save_model_combination(self):
+          a, b = self._create_two_swallow_on_other()
+          data = self._build_post_data_for_two(a, b)
+          # save_model succeeds, but log_change raises on first call.
+          with self._patch_router_to_other():
+              with mock.patch.object(admin.ModelAdmin, "save_model", return_value=None):
+                  with mock.patch.object(admin.ModelAdmin, "log_change", side_effect=DatabaseError):
+                      with self.assertRaises(DatabaseError):
+                          self.client.post(self.changelist_url, data)
+          self._assert_unchanged_on_other(a, b)
+
+      def test_atomicity_when_save_related_fails_for_second_form(self):
+          a, b = self._create_two_swallow_on_other()
+          data = self._build_post_data_for_two(a, b)
+          # save_related works for the first, then fails for the second.
+          with self._patch_router_to_other():
+              with mock.patch.object(
+                  admin.ModelAdmin, "save_related", side_effect=[None, DatabaseError]
+              ):
+                  with self.assertRaises(DatabaseError):
+                      self.client.post(self.changelist_url, data)
+          self._assert_unchanged_on_other(a, b)
+
+      def test_atomicity_when_construct_change_message_fails_after_some_saves(self):
+          a, b = self._create_two_swallow_on_other()
+          data = self._build_post_data_for_two(a, b)
+          # construct_change_message returns None for first saved object, raises for the second.
+          with self._patch_router_to_other():
+              with mock.patch.object(
+                  admin.ModelAdmin, "construct_change_message", side_effect=[None, DatabaseError]
+              ):
+                  with self.assertRaises(DatabaseError):
+                      self.client.post(self.changelist_url, data)
+          self._assert_unchanged_on_other(a, b)
+new_imports_code: |
+  # No additional imports required; tests reuse imports at top of file.

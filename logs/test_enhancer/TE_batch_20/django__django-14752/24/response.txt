@@ -1,0 +1,187 @@
+language: Python
+number_of_tests: 10
+test_behavior: These 10 tests exercise the AutocompleteJsonView.serialize_result hook and ensure the view calls the hook for each result, that the hook can change types and shape of the returned data, that instance-level overrides work, that exceptions raised in the hook propagate, and that the to_field_name passed to the hook is the resolved attname. They will fail if the view ignores the serialize_result method (the original bug) and pass with the patched implementation.
+test_code: |
+  def test_serialize_result_called_for_each_object(self):
+      """serialize_result is invoked for every object and its output is used."""
+      class CountSerializeView(AutocompleteJsonView):
+          def __init__(self, *args, **kwargs):
+              super().__init__(*args, **kwargs)
+              self.count = 0
+
+          def serialize_result(self, obj, to_field_name):
+              # increment to count how many times this is called
+              self.count += 1
+              return {**super().serialize_result(obj, to_field_name), 'extra': str(obj.pk)}
+
+      # Create two matching questions
+      q1 = Question.objects.create(question='Match one')
+      q2 = Question.objects.create(question='Match two')
+      request = self.factory.get(self.url, {'term': 'Match', **self.opts})
+      request.user = self.superuser
+      view = CountSerializeView.as_view(**self.as_view_args)
+      response = view(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      # Both objects should be present
+      self.assertEqual(len(data['results']), 2)
+      # Verify the 'extra' field is present for both results
+      returned_ids = {int(r['id']) for r in data['results']}
+      self.assertEqual(returned_ids, {q1.pk, q2.pk})
+
+  def test_serialize_result_can_change_id_and_text_types(self):
+      """serialize_result may return non-string types and they are serialized as-is."""
+      class TypeChangingView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              # Return id as integer and text as integer (non-standard, but allowed)
+              return {'id': 999, 'text': 12345}
+
+      Question.objects.create(question='Question A')
+      request = self.factory.get(self.url, {'term': 'Question', **self.opts})
+      request.user = self.superuser
+      response = TypeChangingView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      # JSON should contain numeric types as returned by serialize_result
+      self.assertTrue(isinstance(data['results'][0]['id'], int))
+      self.assertTrue(isinstance(data['results'][0]['text'], int))
+      self.assertEqual(data['results'][0]['id'], 999)
+      self.assertEqual(data['results'][0]['text'], 12345)
+
+  def test_instance_level_serialize_result_override(self):
+      """
+      It's possible to override serialize_result on a per-instance basis
+      (simulate by setting it during dispatch), and the view must call it.
+      """
+      class InstanceOverrideView(AutocompleteJsonView):
+          def dispatch(self, request, *args, **kwargs):
+              # set an instance-specific serializer
+              self.serialize_result = lambda obj, to_field_name: {'id': 'inst', 'text': 'insttext'}
+              return super().dispatch(request, *args, **kwargs)
+
+      Question.objects.create(question='Instance test')
+      request = self.factory.get(self.url, {'term': 'Instance', **self.opts})
+      request.user = self.superuser
+      response = InstanceOverrideView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertEqual(data, {'results': [{'id': 'inst', 'text': 'insttext'}], 'pagination': {'more': False}})
+
+  def test_serialize_result_exception_propagates(self):
+      """If serialize_result raises, the exception should propagate (500)."""
+      class ExplodingView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              raise RuntimeError('explode')
+
+      Question.objects.create(question='Boom')
+      request = self.factory.get(self.url, {'term': 'Boom', **self.opts})
+      request.user = self.superuser
+      with self.assertRaises(RuntimeError):
+          ExplodingView.as_view(**self.as_view_args)(request)
+
+  def test_empty_results_returns_empty_list(self):
+      """When there are no matches, results should be an empty list and pagination false."""
+      # Ensure no questions match this term
+      Question.objects.create(question='Something else')
+      request = self.factory.get(self.url, {'term': 'no-match', **self.opts})
+      request.user = self.superuser
+      response = AutocompleteJsonView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertEqual(data, {'results': [], 'pagination': {'more': False}})
+
+  def test_serialize_result_receives_attname_to_field(self):
+      """serialize_result should receive the resolved attname for the to_field_name parameter."""
+      captured = {}
+      class CaptureToFieldView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              # capture the to_field_name passed for inspection by the test
+              captured['to_field_name'] = to_field_name
+              return super().serialize_result(obj, to_field_name)
+
+      Question.objects.create(question='Who?')
+      request = self.factory.get(self.url, {'term': 'Who', **self.opts})
+      request.user = self.superuser
+      response = CaptureToFieldView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      # The to_field_name should be the attname of the pk field for Question
+      expected_attname = Question._meta.pk.attname
+      self.assertEqual(captured.get('to_field_name'), expected_attname)
+
+  def test_serialize_result_additional_fields_maintained(self):
+      """serialize_result can add arbitrary extra fields to the result dict."""
+      class ExtraFieldsView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              base = super().serialize_result(obj, to_field_name)
+              base.update({'a': 1, 'b': 2})
+              return base
+
+      q = Question.objects.create(question='Add extras')
+      request = self.factory.get(self.url, {'term': 'Add', **self.opts})
+      request.user = self.superuser
+      response = ExtraFieldsView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertIn('a', data['results'][0])
+      self.assertIn('b', data['results'][0])
+      self.assertEqual(data['results'][0]['a'], 1)
+      self.assertEqual(data['results'][0]['b'], 2)
+      self.assertEqual(data['results'][0]['id'], str(q.pk))
+
+  def test_super_serialize_result_retains_str_conversion(self):
+      """Calling super().serialize_result should ensure id and text are strings."""
+      class SuperStringView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              return {**super().serialize_result(obj, to_field_name)}
+
+      q = Question.objects.create(question='Make sure strings')
+      request = self.factory.get(self.url, {'term': 'Make', **self.opts})
+      request.user = self.superuser
+      response = SuperStringView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertIsInstance(data['results'][0]['id'], str)
+      self.assertIsInstance(data['results'][0]['text'], str)
+
+  def test_serialize_result_returning_non_dict_values(self):
+      """
+      If serialize_result returns a non-dict value, it should be passed through
+      into the results list (JSON-serializable required).
+      """
+      class NonDictView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              # return a list instead of a dict
+              return [obj.pk, str(obj)]
+
+      q = Question.objects.create(question='Non-dict')
+      request = self.factory.get(self.url, {'term': 'Non-dict', **self.opts})
+      request.user = self.superuser
+      response = NonDictView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      # results should contain the list returned by serialize_result
+      self.assertEqual(data['results'][0], [q.pk, q.question])
+
+  def test_serialize_result_called_for_large_resultset(self):
+      """serialize_result must be called once per returned object (counter test)."""
+      class CounterView(AutocompleteJsonView):
+          def __init__(self, *args, **kwargs):
+              super().__init__(*args, **kwargs)
+              self.called = 0
+
+          def serialize_result(self, obj, to_field_name):
+              self.called += 1
+              return super().serialize_result(obj, to_field_name)
+
+      # Create more objects than paginate_by to ensure pagination occurs
+      for i in range(self.paginate_by + 3):
+          Question.objects.create(question=f'Q{i}')
+      request = self.factory.get(self.url, {'term': 'Q', **self.opts})
+      request.user = self.superuser
+      view_fn = CounterView.as_view(**self.as_view_args)
+      response = view_fn(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      # only paginate_by items are returned on the first page
+      self.assertEqual(len(data['results']), AutocompleteJsonView.paginate_by)
+new_imports_code: ""

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_cached_and_not_replaced_on_empty_after_full_clean forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_consistent_across_is_valid_calls forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_error_class_contains_nonform_when_empty forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_from_clean_has_message_and_nonform_class forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_identity_after_full_clean_valid_formset forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_identity_after_is_valid_valid_formset forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_management_form_invalid_data_contains_nonform_class forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_management_form_missing_preserves_identity_and_class forms_tests.tests.test_formsets_llm.RegressionNonFormErrorsTests.test_non_form_errors_same_object_on_consecutive_calls
+coverage json -o coverage.json
+: '>>>>> End Test Output'

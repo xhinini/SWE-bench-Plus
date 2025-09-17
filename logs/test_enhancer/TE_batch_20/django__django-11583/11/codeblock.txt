@@ -1,0 +1,122 @@
+from pathlib import Path
+import tempfile
+import types
+import sys
+import os
+from unittest import mock
+from django.test import SimpleTestCase
+from django.test.utils import extend_sys_path
+from django.utils import autoreload
+
+class TestValueErrorPathHandling(SimpleTestCase):
+    def setUp(self):
+        # Temporary directory and valid file used in several tests.
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.valid_dir = Path(self._tmpdir.name).resolve().absolute()
+        self.valid_file = self.valid_dir / 'good.py'
+        self.valid_file.parent.mkdir(parents=True, exist_ok=True)
+        self.valid_file.write_text("# good")
+
+    def _make_side_effect(self, bad_indicators):
+        """
+        Return a side effect for Path.resolve that raises ValueError for paths
+        containing any of the bad_indicators, otherwise calls the original.
+        """
+        orig_resolve = Path.resolve
+
+        def side_effect(self, *args, **kwargs):
+            text = str(self)
+            for bad in bad_indicators:
+                if bad in text:
+                    raise ValueError("simulated resolver error for test")
+            return orig_resolve(self, *args, **kwargs)
+
+        return side_effect
+
+    def test_iter_modules_and_files_ignores_value_error_for_extra_file_string(self):
+        bad_path = '/nonexistent/contains_bad_marker_badpath'
+        with mock.patch.object(Path, 'resolve', side_effect=self._make_side_effect(['badpath'])):
+            # Should not raise and should simply skip the bad path.
+            result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+            self.assertIsInstance(result, frozenset)
+            self.assertNotIn(Path(bad_path), result)
+
+    def test_iter_modules_and_files_ignores_value_error_for_extra_file_path(self):
+        bad_path = self.valid_dir / 'also_bad_marker_file'
+        with mock.patch.object(Path, 'resolve', side_effect=self._make_side_effect(['also_bad_marker'])):
+            result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+            self.assertIsInstance(result, frozenset)
+            self.assertNotIn(Path(bad_path), result)
+
+    def test_iter_modules_and_files_ignores_value_error_for_module_origin(self):
+        bad_origin = '/some/path/with_bad_module_origin_marker'
+        module = types.ModuleType('fake_module')
+        # Create a fake __spec__ with a loader that has an origin attribute.
+        module.__spec__ = types.SimpleNamespace(has_location=True, loader=types.SimpleNamespace(origin=bad_origin))
+        with mock.patch.object(Path, 'resolve', side_effect=self._make_side_effect(['bad_module_origin_marker'])):
+            # The origin does not contain our marker, so it won't raise.
+            # Now force it to raise by using the marker.
+            with mock.patch.object(Path, 'resolve', side_effect=self._make_side_effect(['bad_module_origin'])):
+                result = autoreload.iter_modules_and_files((module,), frozenset())
+                self.assertIsInstance(result, frozenset)
+                self.assertNotIn(Path(bad_origin), result)
+
+    def test_iter_modules_and_files_ignores_value_error_for_main_module_file(self):
+        bad_main = str(self.valid_dir / 'main_bad_marker.py')
+        main_module = types.ModuleType('__main__')
+        main_module.__file__ = bad_main
+        # __main__ handling uses module.__file__, ensure a ValueError there is swallowed.
+        with mock.patch.object(Path, 'resolve', side_effect=self._make_side_effect(['main_bad_marker'])):
+            result = autoreload.iter_modules_and_files((main_module,), frozenset())
+            self.assertIsInstance(result, frozenset)
+            self.assertNotIn(Path(bad_main), result)
+
+    def test_iter_all_python_module_files_ignores_value_error_from_sys_modules(self):
+        bad_origin = str(self.valid_dir / 'mod_bad_marker.py')
+        module = types.ModuleType('test_mod_bad')
+        module.__spec__ = types.SimpleNamespace(has_location=True, loader=types.SimpleNamespace(origin=bad_origin))
+        # Inject into sys.modules temporarily.
+        with mock.patch.dict(sys.modules, {'test_mod_bad': module}):
+            with mock.patch.object(Path, 'resolve', side_effect=self._make_side_effect(['mod_bad_marker'])):
+                # Should not raise; bad module paths are skipped.
+                list(autoreload.iter_all_python_module_files())
+
+    def test_iter_modules_and_files_keeps_good_and_skips_bad(self):
+        # Include one valid path and one bad path. The valid path should be present.
+        bad_path = '/tmp/skip_this_bad_marker.py'
+        with mock.patch.object(Path, 'resolve', side_effect=self._make_side_effect(['bad_marker'])):
+            result = autoreload.iter_modules_and_files((), frozenset([str(self.valid_file), bad_path]))
+            # The valid file should resolve and be included, the bad one skipped.
+            self.assertIn(self.valid_file.resolve(), result)
+            self.assertNotIn(Path(bad_path), result)
+
+    def test_sys_path_directories_ignores_value_error_for_sys_path_entry(self):
+        bad_entry = '/some/sys/path/with_bad_syspath_marker'
+        self.addCleanup(lambda: sys.path.remove(bad_entry) if bad_entry in sys.path else None)
+        sys.path.append(bad_entry)
+        with mock.patch.object(Path, 'resolve', side_effect=self._make_side_effect(['bad_syspath_marker'])):
+            # Should not raise and should skip the bad sys.path entry.
+            dirs = list(autoreload.sys_path_directories())
+            self.assertNotIn(Path(bad_entry), dirs)
+
+    def test_sys_path_directories_with_mixed_entries(self):
+        bad_entry = '/another/bad_syspath_marker'
+        good_entry = str(self.valid_dir)
+        self.addCleanup(lambda: sys.path.remove(bad_entry) if bad_entry in sys.path else None)
+        sys.path.extend([bad_entry, good_entry])
+        with mock.patch.object(Path, 'resolve', side_effect=self._make_side_effect(['bad_syspath_marker'])):
+            dirs = list(autoreload.sys_path_directories())
+            # The good entry should be present and resolved, bad entry skipped.
+            self.assertIn(self.valid_dir, dirs)
+            self.assertNotIn(Path(bad_entry), dirs)
+
+    def test_iter_modules_and_files_handles_mixed_module_and_extra_files(self):
+        # A mix of a module with a bad origin and a valid extra file should return the valid file only.
+        bad_origin = '/mixed/bad_origin_marker.py'
+        module = types.ModuleType('mixed_mod')
+        module.__spec__ = types.SimpleNamespace(has_location=True, loader=types.SimpleNamespace(origin=bad_origin))
+        with mock.patch.object(Path, 'resolve', side_effect=self._make_side_effect(['bad_origin_marker'])):
+            result = autoreload.iter_modules_and_files((module,), frozenset([str(self.valid_file)]))
+            self.assertIn(self.valid_file.resolve(), result)
+            self.assertNotIn(Path(bad_origin), result)

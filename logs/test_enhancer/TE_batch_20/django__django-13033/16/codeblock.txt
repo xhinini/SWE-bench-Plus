@@ -1,0 +1,128 @@
+# No extra imports needed beyond those in test_code.
+from django.test import TestCase
+from django.db import connection
+from django.db.models import F, OrderBy
+from django.db.models.constants import LOOKUP_SEP
+from django.db import connections
+
+from tests.ordering.models import (
+    Author, Article, OrderedByAuthorArticle, OrderedByFArticle, Reference
+)
+
+class CompilerOrderingTests(TestCase):
+    def setUp(self):
+        # Create some minimal data to make QuerySets meaningful
+        a1 = Author.objects.create(name='A', editor=None)
+        a2 = Author.objects.create(name='B', editor=a1)
+        Article.objects.create(author=a1, second_author=a2, headline='h1', pub_date='2000-01-01')
+        Article.objects.create(author=a2, second_author=a1, headline='h2', pub_date='2001-01-01')
+        # Reference uses OrderedByAuthorArticle proxy
+        ref_article = OrderedByAuthorArticle.objects.first()
+        Reference.objects.create(article=ref_article)
+
+    def _get_order_by_clause(self, qs):
+        """
+        Compile the queryset and return the ORDER BY clause string (right-hand side).
+        If no ORDER BY in SQL, return empty string.
+        """
+        compiler = qs.query.get_compiler(using=qs.db, connection=connection)
+        sql, params = compiler.as_sql()
+        sql_upper = sql.upper()
+        if 'ORDER BY' not in sql_upper:
+            return ''
+        # Find ORDER BY (case-insensitive)
+        idx = sql_upper.rfind('ORDER BY')
+        return sql[idx + len('ORDER BY'):].strip()
+
+    def test_order_by_relation_expands_to_related_default_ordering(self):
+        # OrderedByAuthorArticle (proxy) has ordering = ('author', 'second_author')
+        qs = Reference.objects.order_by('article')
+        ob = self._get_order_by_clause(qs)
+        # Should include ordering on the related model's author and second_author columns
+        self.assertIn('article', ob)  # the FK appears as part of ordering expression(s)
+        # The related ordering should reference author and second_author columns (as quoted names)
+        self.assertIn('author_id', ob)  # author id used in ordering on related model
+        self.assertIn('second_author_id', ob)
+
+    def test_order_by_relation_id_does_not_expand_to_related_default_ordering(self):
+        qs = Reference.objects.order_by('article_id')
+        ob = self._get_order_by_clause(qs)
+        # Ensure we only order by the local article_id column (and do not expand to related model defaults)
+        self.assertIn('article_id', ob)
+        # The related model's author/second_author should NOT be present when ordering by article_id
+        self.assertNotIn('author_id', ob)
+        self.assertNotIn('second_author_id', ob)
+
+    def test_descending_order_by_relation_expands(self):
+        qs = Reference.objects.order_by('-article')
+        ob = self._get_order_by_clause(qs)
+        # ordering should include descending indicators (e.g., "DESC")
+        self.assertIn('DESC', ob.upper())
+        # related author/second_author should be included
+        self.assertIn('author_id', ob)
+        self.assertIn('second_author_id', ob)
+
+    def test_mixed_ordering_with_relation_and_field(self):
+        qs = Reference.objects.order_by('article', 'id')
+        ob = self._get_order_by_clause(qs)
+        # Should include both the expanded related ordering and the local id ordering
+        self.assertIn('author_id', ob)
+        self.assertIn('second_author_id', ob)
+        self.assertIn('id', ob)
+
+    def test_order_by_annotation_reference_is_handled(self):
+        # Annotate with a value and order by the annotation ref
+        qs = Reference.objects.annotate(a_val=F('article__id')).order_by('a_val')
+        ob = self._get_order_by_clause(qs)
+        # ordering should reference the annotation (Col or alias), but not expand to related model ordering
+        # We check it doesn't include related model default ordering columns
+        self.assertNotIn('author_id', ob)
+        self.assertNotIn('second_author_id', ob)
+
+    def test_order_by_field_on_related_model_expands_to_related_default_ordering(self):
+        # If ordering by the related object itself (not its attname), it should expand to
+        # the related model's default ordering.
+        qs = Reference.objects.order_by('article__author')
+        ob = self._get_order_by_clause(qs)
+        # Because article__author is a relation, the related model's ordering should be applied
+        # Here, ordering by article__author should eventually include author_id or nested ordering.
+        self.assertTrue(ob)  # at least some ORDER BY present
+        # It should include a reference to author id column somewhere
+        self.assertIn('author_id', ob)
+
+    def test_order_by_field_on_related_model_attname_does_not_expand(self):
+        # Ordering by the attname 'article__author_id' should NOT expand to author model defaults.
+        qs = Reference.objects.order_by('article__author_id')
+        ob = self._get_order_by_clause(qs)
+        # Should only order by the column representing the FK to author from article (i.e., article.author_id)
+        # Make sure nested author/second_author defaults are not injected
+        self.assertIn('author_id', ob)
+        # But should NOT include second_author_id from the related model's defaults
+        self.assertNotIn('second_author_id', ob)
+
+    def test_order_by_f_expression_respects_default_ordering(self):
+        # OrderedByFArticle has ordering (models.F('author').asc(nulls_first=True), 'id')
+        qs = OrderedByFArticle.objects.order_by('author')
+        ob = self._get_order_by_clause(qs)
+        # The ordering should include author reference and id (from proxy default)
+        self.assertIn('author_id', ob)
+        self.assertIn('id', ob)
+
+    def test_order_by_callable_ordering_via_orderby_f(self):
+        # Confirm that explicit OrderBy expression is respected and does not cause expansion
+        qs = Article.objects.order_by(OrderBy(F('second_author__name')))
+        ob = self._get_order_by_clause(qs)
+        # Should reference the second_author name expression rather than expanding to defaults
+        # It should not unexpectedly include second_author_id as a separate default expansion
+        self.assertIn('second_author', ob)
+        self.assertNotIn('second_author_id, second_author_id', ob)  # duplicated default shouldn't be present
+
+    def test_multiple_ordering_items_deduplicated(self):
+        # Multiple equivalent ordering terms should be deduplicated by SQLCompiler.get_order_by
+        qs = Reference.objects.order_by('article', 'article__author', 'article')
+        ob = self._get_order_by_clause(qs)
+        # author_id should appear only once
+        self.assertEqual(ob.count('author_id'), 1)
+
+# The tests focus on the SQL produced by the compiler; they will fail if the logic that decides
+# when to expand an ordering to a related model's default ordering is incorrect.

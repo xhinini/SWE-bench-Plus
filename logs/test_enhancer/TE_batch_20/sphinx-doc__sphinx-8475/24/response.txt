@@ -1,0 +1,289 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise the linkcheck builder's fallback from HEAD to GET when HEAD requests fail with TooManyRedirects (or when HEAD is not allowed), ensuring that: (1) the GET fallback is attempted and considered successful when appropriate; (2) request headers are preserved for the GET fallback; (3) redirect history codes are correctly captured after the GET fallback; (4) missing anchors are detected after GET fallback; and (5) excessive redirects on GET are treated as broken. The tests use the existing http_server/https_server helpers and Sphinx app fixtures consistent with the existing test suite.
+test_code: |
+  import http.server
+  import json
+  import textwrap
+  
+  import pytest
+  
+  from .utils import http_server, https_server
+  
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_to_get_fallback_basic(app):
+      """If HEAD causes TooManyRedirects, GET should be attempted and succeed."""
+      class InfiniteRedirectOnHeadHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              # cause TooManyRedirects when requests tries to follow redirects
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              # GET succeeds
+              self.send_response(200, "OK")
+              self.end_headers()
+              self.wfile.write(b"ok\n")
+  
+      with http_server(InfiniteRedirectOnHeadHandler):
+          app.builder.build_all()
+  
+      with open(app.outdir / 'output.json') as fp:
+          content = json.load(fp)
+      # Expect link to be reported as working after GET fallback
+      assert content["status"] == "working"
+      assert content["uri"] == "http://localhost:7777/"
+  
+  
+  @pytest.mark.sphinx(
+      'linkcheck', testroot='linkcheck-localserver', freshenv=True,
+      confoverrides={'linkcheck_request_headers': {
+          "http://localhost:7777/": {"X-Secret": "open sesami"},
+      }})
+  def test_head_to_get_fallback_preserves_request_headers(app, capsys):
+      """Headers configured for the URL should be sent on the GET fallback."""
+      class HeadInfinitePrintHeadersHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              # HEAD will redirect to itself causing TooManyRedirects
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              # GET will print received headers and succeed
+              self.send_response(200, "OK")
+              self.end_headers()
+              print(self.headers.as_string())
+  
+      with http_server(HeadInfinitePrintHeadersHandler):
+          app.builder.build_all()
+  
+      stdout, _stderr = capsys.readouterr()
+      # Ensure configured header appears in the received headers printed by the server
+      assert "X-Secret: open sesami\n" in stdout
+  
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_infinite_get_redirects_history_code(app):
+      """
+      If HEAD causes TooManyRedirects but GET follows a redirect chain,
+      the redirected entry should include the code from the last redirect in history.
+      """
+      class HeadInfiniteGetRedirectHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              # HEAD infinite redirect (TooManyRedirects)
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              # mimic a redirect chain: initial 302 then final 204
+              if self.path == "/?redirected=1":
+                  self.send_response(204, "No content")
+              else:
+                  self.send_response(302, "Found")
+                  self.send_header("Location", "http://localhost:7777/?redirected=1")
+              self.end_headers()
+  
+          def log_date_time_string(self):
+              return ""
+  
+      with http_server(HeadInfiniteGetRedirectHandler):
+          app.builder.build_all()
+  
+      # The textual output should indicate a redirect "with Found"
+      content = (app.outdir / 'output.txt').read_text()
+      assert "redirected with Found" in content
+      # The json output should indicate redirected and include the "to" url
+      rows = [json.loads(x) for x in (app.outdir / 'output.json').read_text().splitlines()]
+      # find the row for our localhost URL
+      found = [r for r in rows if r["uri"].startswith("http://localhost:7777/")]
+      assert found, "no localhost row found"
+      row = found[0]
+      # history should have produced code 302 for the redirect step
+      assert row["status"] == "redirected"
+  
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver-anchor', freshenv=True)
+  def test_head_to_get_fallback_detects_missing_anchor(app):
+      """
+      If the link has an anchor and HEAD causes TooManyRedirects the GET fallback
+      should be used to check the anchor; a missing anchor should be reported.
+      """
+      class HeadInfiniteNoAnchorHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              # cause TooManyRedirects on HEAD
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              # return content without the requested anchor
+              self.send_response(200, "OK")
+              self.end_headers()
+              self.wfile.write(b"<html><body><h1>No anchors here</h1></body></html>\n")
+  
+      with http_server(HeadInfiniteNoAnchorHandler):
+          app.builder.build_all()
+  
+      # The output text file should contain the anchor-not-found message
+      content = (app.outdir / 'output.txt').read_text()
+      assert "Anchor 'anchor' not found" in content
+  
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_get_too_many_redirects_is_reported_broken(app):
+      """If both HEAD and GET cause TooManyRedirects, the link should be broken."""
+      class BothInfiniteHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              # also infinite for GET; follow to itself
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+      with http_server(BothInfiniteHandler):
+          app.builder.build_all()
+  
+      # When GET also fails with TooManyRedirects it should end up marked broken
+      rows = (app.outdir / 'output.json').read_text().splitlines()
+      # There may be multiple rows; find one for our localhost url
+      parsed = [json.loads(r) for r in rows]
+      localhost_rows = [r for r in parsed if r["uri"].startswith("http://localhost:7777/")]
+      assert localhost_rows, "no localhost row present"
+      # Expect the status to be broken because GET failed with TooManyRedirects
+      assert any(r["status"] == "broken" for r in localhost_rows)
+  
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_405_then_get_redirects(app, capsys):
+      """When HEAD returns 405, GET should be used and redirects followed."""
+      class Head405ThenGetRedirect(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              # server does not support HEAD
+              self.send_response(405, "Method Not Allowed")
+              self.end_headers()
+  
+          def do_GET(self):
+              if self.path == "/?redirected=1":
+                  self.send_response(204, "No content")
+              else:
+                  self.send_response(302, "Found")
+                  self.send_header("Location", "http://localhost:7777/?redirected=1")
+              self.end_headers()
+  
+          def log_date_time_string(self):
+              return ""
+  
+      with http_server(Head405ThenGetRedirect):
+          app.builder.build_all()
+  
+      stdout, stderr = capsys.readouterr()
+      # The server should have logged both the HEAD 405 and subsequent GETs
+      assert "405" in stderr
+      content = (app.outdir / 'output.txt').read_text()
+      assert "redirected with Found" in content
+  
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver-https', freshenv=True)
+  def test_head_infinite_https_get_fallback_with_tls_verify_false(app):
+      """
+      Ensure GET fallback works over HTTPS when TLS verification is disabled.
+      This uses https_server to run an HTTPS server that supports GET but
+      HEAD will be made to loop.
+      """
+      class HTTPSHeadInfiniteHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              self.send_response(302, "Found")
+              self.send_header("Location", "https://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              self.send_response(200, "OK")
+              self.end_headers()
+              self.wfile.write(b"ok\n")
+  
+      # disable TLS verification so requests to the test server succeed
+      app.config.tls_verify = False
+      with https_server(HTTPSHeadInfiniteHandler):
+          app.builder.build_all()
+  
+      with open(app.outdir / 'output.json') as fp:
+          content = json.load(fp)
+      assert content["status"] == "working"
+      assert content["uri"].startswith("https://localhost:7777/")
+  
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_multiple_uris_with_head_infinite_are_processed(app):
+      """
+      Ensure multiple URIs in the document are still processed correctly
+      even when the first causes TooManyRedirects on HEAD (GET fallback works).
+      """
+      class FirstInfiniteThenOkHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              # first request (root) will infinite redirect to itself
+              if self.path == "/":
+                  self.send_response(302, "Found")
+                  self.send_header("Location", "http://localhost:7777/")
+                  self.end_headers()
+              else:
+                  # other paths respond OK to HEAD
+                  self.send_response(200, "OK")
+                  self.end_headers()
+  
+          def do_GET(self):
+              # GET for root will succeed
+              if self.path == "/":
+                  self.send_response(200, "OK")
+                  self.end_headers()
+                  self.wfile.write(b"ok\n")
+              else:
+                  self.send_response(200, "OK")
+                  self.end_headers()
+                  self.wfile.write(b"ok\n")
+  
+      with http_server(FirstInfiniteThenOkHandler):
+          app.builder.build_all()
+  
+      # At least one row for localhost should be present and working
+      rows = [json.loads(x) for x in (app.outdir / 'output.json').read_text().splitlines()]
+      localhost_rows = [r for r in rows if r["uri"].startswith("http://localhost:7777/")]
+      assert localhost_rows
+      assert any(r["status"] == "working" for r in localhost_rows)
+  
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_get_fallback_respects_request_headers_default_star(app, capsys):
+      """
+      If a specific host key isn't matched but "*" is provided, that header should
+      still be sent on the GET fallback.
+      """
+      class HeadInfiniteWithStarHeader(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              self.send_response(200, "OK")
+              self.end_headers()
+              print(self.headers.as_string())
+  
+      # configure only the wildcard headers
+      app.config.linkcheck_request_headers = {"*": {"X-Global": "present"}}
+  
+      with http_server(HeadInfiniteWithStarHeader):
+          app.builder.build_all()
+  
+      stdout, _stderr = capsys.readouterr()
+      assert "X-Global: present\n" in stdout
+new_imports_code: |
+  import pytest
+  from .utils import http_server, https_server

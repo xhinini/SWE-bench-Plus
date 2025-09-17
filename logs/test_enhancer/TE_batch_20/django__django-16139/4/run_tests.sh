@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.PasswordHelpTextLinkTests.test_anchor_href_is_relative_pk_path auth_tests.test_forms_llm.PasswordHelpTextLinkTests.test_help_text_with_to_field_anchor_is_relative_pk_path auth_tests.test_forms_llm.PasswordHelpTextLinkTests.test_helptext_anchor_is_valid_html auth_tests.test_forms_llm.PasswordHelpTextLinkTests.test_helptext_contains_relative_pk_path_default auth_tests.test_forms_llm.PasswordHelpTextLinkTests.test_helptext_rendered_in_form_html_contains_anchor auth_tests.test_forms_llm.PasswordHelpTextLinkTests.test_joined_url_equals_password_change_url_default auth_tests.test_forms_llm.PasswordHelpTextLinkTests.test_multiple_calls_do_not_share_state_between_forms auth_tests.test_forms_llm.PasswordHelpTextLinkTests.test_multiple_instances_have_different_links auth_tests.test_forms_llm.PasswordHelpTextLinkTests.test_no_placeholder_remaining_after_formatting auth_tests.test_forms_llm.PasswordHelpTextLinkTests.test_unsaved_instance_helptext_contains_None_pk
+coverage json -o coverage.json
+: '>>>>> End Test Output'

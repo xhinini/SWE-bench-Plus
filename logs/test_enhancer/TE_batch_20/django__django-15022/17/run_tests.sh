@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.test_admin_llm.ModelAdminSearchTests._get_request admin_changelist.test_admin_llm.ModelAdminSearchTests.setUp admin_changelist.test_admin_llm.ModelAdminSearchTests.test_multi_term_search_on_same_instance admin_changelist.test_admin_llm.ModelAdminSearchTests.test_multi_term_search_terms_must_both_match_same_record admin_changelist.test_admin_llm.ModelAdminSearchTests.test_multiple_terms_with_overlapping_lookups admin_changelist.test_admin_llm.ModelAdminSearchTests.test_pk_lookup_works_with_pk_token admin_changelist.test_admin_llm.ModelAdminSearchTests.test_prefix_and_exact_lookup_prefixes admin_changelist.test_admin_llm.ModelAdminSearchTests.test_quoted_phrase_search admin_changelist.test_admin_llm.ModelAdminSearchTests.test_related_lookup_multi_term_and_or_behavior admin_changelist.test_admin_llm.ModelAdminSearchTests.test_search_terms_with_non_alphanumeric_characters admin_changelist.test_admin_llm.ModelAdminSearchTests.test_single_term_search_on_child_name
+coverage json -o coverage.json
+: '>>>>> End Test Output'

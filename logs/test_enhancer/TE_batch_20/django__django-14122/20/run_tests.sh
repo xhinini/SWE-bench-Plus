@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 ordering.tests_llm.GroupByCompilerTests.setUpTestData ordering.tests_llm.GroupByCompilerTests.test_annotation_ordering_outside_selection_still_added_to_group_by ordering.tests_llm.GroupByCompilerTests.test_explicit_order_by_contributes_to_group_by_when_no_meta_ordering ordering.tests_llm.GroupByCompilerTests.test_meta_ordering_does_not_contribute_to_group_by ordering.tests_llm.GroupByCompilerTests.test_meta_ordering_ignored_even_if_values_reference_same_field ordering.tests_llm.GroupByCompilerTests.test_order_by_annotation_reference_in_select_becomes_group_by ordering.tests_llm.GroupByCompilerTests.test_order_by_expression_from_related_model_resolved_into_group_by ordering.tests_llm.GroupByCompilerTests.test_order_by_using_function_expression_added_when_explicit ordering.tests_llm.GroupByCompilerTests.test_random_ordering_does_not_affect_group_by ordering.tests_llm.GroupByCompilerTests.test_values_of_ordering_field_still_grouped_once ordering.tests_llm._group_by_fragment
+coverage json -o coverage.json
+: '>>>>> End Test Output'

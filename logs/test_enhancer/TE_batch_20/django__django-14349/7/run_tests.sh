@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 validators.tests_llm.TestURLValidatorUnsafeChars.test_class_unsafe_chars_blocks_exclamation_in_fragment validators.tests_llm.TestURLValidatorUnsafeChars.test_class_unsafe_chars_blocks_exclamation_in_path validators.tests_llm.TestURLValidatorUnsafeChars.test_class_unsafe_chars_blocks_exclamation_in_query validators.tests_llm.TestURLValidatorUnsafeChars.test_has_unsafe_chars_attribute_default validators.tests_llm.TestURLValidatorUnsafeChars.test_instance_unsafe_chars_blocks_exclamation_in_fragment validators.tests_llm.TestURLValidatorUnsafeChars.test_instance_unsafe_chars_blocks_exclamation_in_path validators.tests_llm.TestURLValidatorUnsafeChars.test_instance_unsafe_chars_blocks_exclamation_in_query validators.tests_llm.TestURLValidatorUnsafeChars.test_subclass_override_blocks_exclamation_in_fragment validators.tests_llm.TestURLValidatorUnsafeChars.test_subclass_override_blocks_exclamation_in_path validators.tests_llm.TestURLValidatorUnsafeChars.test_subclass_override_blocks_exclamation_in_query
+coverage json -o coverage.json
+: '>>>>> End Test Output'

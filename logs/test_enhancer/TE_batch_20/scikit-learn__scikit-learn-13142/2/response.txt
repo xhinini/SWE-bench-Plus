@@ -1,0 +1,202 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests create a minimal subclass of BaseMixture that intentionally produces a better set of parameters in an earlier initialization and a worse set in the last initialization. The original bug (final E-step performed before setting the best parameters) can cause fit_predict to return labels inconsistent with the model parameters (predict / predict_proba). Each test asserts that the labels returned by fit_predict are consistent with the fitted model (predict or predict_proba). These tests would fail on the buggy implementation and pass when the final e-step is performed after _set_parameters (the provided patch).
+test_code: |
+  import numpy as np
+  import pytest
+  from sklearn.utils.testing import assert_array_equal
+  from sklearn.mixture.base import BaseMixture
+  from sklearn.utils import check_random_state
+
+  class DummyMixture(BaseMixture):
+      """
+      Minimal deterministic mixture to simulate the bug:
+      - First initialization sets good means aligning with data clusters.
+      - Second (and later) initialization sets poor means.
+      The best parameters should come from the first init (higher lower bound).
+      """
+      def __init__(self, n_components=2, n_init=2, max_iter=1,
+                   warm_start=False, random_state=None):
+          super().__init__(
+              n_components=n_components,
+              tol=1e-6,
+              reg_covar=0.,
+              max_iter=max_iter,
+              n_init=n_init,
+              init_params='random',
+              random_state=random_state,
+              warm_start=warm_start,
+              verbose=0,
+              verbose_interval=1
+          )
+          self._init_counter = 0
+          self.covariance_type = 'full'
+
+      def _check_parameters(self, X):
+          # Nothing extra to check
+          pass
+
+      def _initialize(self, X, resp):
+          # Called by BaseMixture._initialize_parameters.
+          # Increment init counter and set parameters differently per init.
+          self._init_counter += 1
+          # Good initialization: place means near true cluster centers
+          if self._init_counter == 1:
+              # We assume X is two well-separated clusters at roughly centers c0 and c1
+              # pick two means matching those centers
+              means = np.array([X[: X.shape[0] // 2].mean(axis=0),
+                                X[X.shape[0] // 2:].mean(axis=0)])
+          else:
+              # Bad initialization: place both means at the same location so they
+              # perform poorly
+              means = np.tile(X.mean(axis=0), (self.n_components, 1))
+          self.means_ = means
+          # simple equal weights
+          self.weights_ = np.ones(self.n_components) / self.n_components
+          # covariances for compatibility
+          n_features = X.shape[1]
+          # For 'full' covariance create identity-like covariances
+          self.covariances_ = np.array([np.eye(n_features) for _ in range(self.n_components)])
+          # Required attributes for other methods
+          self.precisions_ = np.array([np.eye(n_features) for _ in range(self.n_components)])
+
+      def _e_step(self, X):
+          # Hard assignments based on current means_. Return (log_prob_norm, log_resp)
+          # Compute squared distances and assign cluster with minimal distance.
+          dists = np.array([np.sum((X - m) ** 2, axis=1) for m in self.means_]).T
+          labels = np.argmin(dists, axis=1)
+          # Construct log_resp: 0 for assigned cluster, -inf for others
+          n_samples = X.shape[0]
+          log_resp = -np.inf * np.ones((n_samples, self.n_components))
+          log_resp[np.arange(n_samples), labels] = 0.0
+          # store last X and labels for use in _compute_lower_bound
+          self._last_X = X
+          self._last_labels = labels
+          # For log_prob_norm return an array (per-sample) compatible with BaseMixture
+          log_prob_norm = np.zeros(n_samples)
+          return log_prob_norm, log_resp
+
+      def _m_step(self, X, log_resp):
+          # We perform no updates during M-step; our initialization already sets
+          # the means and others. This keeps behavior deterministic.
+          pass
+
+      def _compute_lower_bound(self, log_resp, log_prob_norm):
+          # Define lower bound as negative sum of within-cluster squared distances
+          # (higher is better -> less negative). This makes good init have higher
+          # lower bound than a bad init.
+          X = getattr(self, "_last_X", None)
+          labels = getattr(self, "_last_labels", None)
+          if X is None or labels is None:
+              return -np.inf
+          total = 0.0
+          for k in range(self.n_components):
+              members = (labels == k)
+              if np.any(members):
+                  total -= np.sum(np.sum((X[members] - self.means_[k]) ** 2, axis=1))
+          return total
+
+      def _check_is_fitted(self):
+          # Consider fitted if means_ attribute exists
+          if not hasattr(self, "means_"):
+              raise ValueError("This DummyMixture instance is not fitted yet.")
+
+      def _get_parameters(self):
+          # Return the minimal set of parameters we use
+          return {"means_": self.means_.copy(), "weights_": self.weights_.copy(),
+                  "covariances_": self.covariances_.copy()}
+
+      def _set_parameters(self, params):
+          self.means_ = params["means_"].copy()
+          self.weights_ = params["weights_"].copy()
+          self.covariances_ = params["covariances_"].copy()
+          # ensure precisions_ updated for predict path
+          n_features = self.means_.shape[1]
+          self.precisions_ = np.array([np.eye(n_features) for _ in range(self.n_components)])
+
+      def _estimate_log_weights(self):
+          return np.log(self.weights_)
+
+      def _estimate_log_prob(self, X):
+          # Return component-wise log-probabilities proportional to negative squared distance
+          dists = np.array([ -np.sum((X - m) ** 2, axis=1) for m in self.means_]).T
+          return dists
+
+  def make_two_cluster_data(n_samples=200, n_features=2, separation=5.0, seed=0):
+      rng = check_random_state(seed)
+      n_half = n_samples // 2
+      c0 = np.zeros(n_features)
+      c1 = np.ones(n_features) * separation
+      X0 = rng.randn(n_half, n_features) + c0
+      X1 = rng.randn(n_samples - n_half, n_features) + c1
+      X = np.vstack([X0, X1])
+      return X
+
+  def assert_fitpredict_consistent(dm, X):
+      # fit_predict returns labels; predict should be consistent with the fitted model
+      labels_fp = dm.fit_predict(X)
+      labels_pred = dm.predict(X)
+      assert_array_equal(labels_fp, labels_pred)
+      # predict_proba argmax should also agree
+      labels_proba = dm.predict_proba(X).argmax(axis=1)
+      assert_array_equal(labels_fp, labels_proba)
+
+  def test_fit_predict_consistency_n_init_2():
+      X = make_two_cluster_data(n_samples=200, n_features=2, separation=6.0, seed=0)
+      dm = DummyMixture(n_components=2, n_init=2, max_iter=1, random_state=0)
+      assert_fitpredict_consistent(dm, X)
+
+  def test_fit_predict_consistency_n_init_3():
+      X = make_two_cluster_data(n_samples=300, n_features=2, separation=7.0, seed=1)
+      dm = DummyMixture(n_components=2, n_init=3, max_iter=1, random_state=1)
+      assert_fitpredict_consistent(dm, X)
+
+  def test_fit_predict_consistency_warm_start_repeated_calls():
+      X = make_two_cluster_data(n_samples=200, n_features=2, separation=5.5, seed=2)
+      dm = DummyMixture(n_components=2, n_init=2, max_iter=1, warm_start=True, random_state=2)
+      # First call
+      labels_first = dm.fit_predict(X)
+      # Second call: warm_start should avoid full reinitialization and still be consistent
+      labels_second = dm.fit_predict(X)
+      assert_array_equal(labels_second, dm.predict(X))
+      # Also check first call's labels are consistent with model after first fit
+      assert_array_equal(labels_first, labels_second)
+
+  def test_fit_predict_consistency_different_random_state():
+      X = make_two_cluster_data(n_samples=220, n_features=2, separation=8.0, seed=3)
+      dm = DummyMixture(n_components=2, n_init=2, max_iter=1, random_state=42)
+      assert_fitpredict_consistent(dm, X)
+
+  def test_fit_predict_consistency_1d_data():
+      X = make_two_cluster_data(n_samples=150, n_features=1, separation=4.0, seed=4)
+      dm = DummyMixture(n_components=2, n_init=2, max_iter=1, random_state=4)
+      assert_fitpredict_consistent(dm, X)
+
+  def test_fit_predict_consistency_many_inits():
+      X = make_two_cluster_data(n_samples=400, n_features=2, separation=10.0, seed=5)
+      dm = DummyMixture(n_components=2, n_init=5, max_iter=1, random_state=5)
+      assert_fitpredict_consistent(dm, X)
+
+  def test_fit_predict_consistency_small_sample():
+      X = make_two_cluster_data(n_samples=10, n_features=2, separation=6.0, seed=6)
+      dm = DummyMixture(n_components=2, n_init=2, max_iter=1, random_state=6)
+      assert_fitpredict_consistent(dm, X)
+
+  def test_fit_predict_consistency_nonconverged_warning_path():
+      # Force small max_iter so algorithm likely not to "converge" (converged_ stays False)
+      X = make_two_cluster_data(n_samples=200, n_features=2, separation=6.0, seed=7)
+      dm = DummyMixture(n_components=2, n_init=2, max_iter=1, random_state=7)
+      # This also checks labels consistency when a warning would be emitted in the
+      # non-patched flow
+      assert_fitpredict_consistent(dm, X)
+
+  def test_fit_predict_after_fit_consistency():
+      # Ensure predict after fit gives the same labels as fit_predict returned
+      X = make_two_cluster_data(n_samples=250, n_features=2, separation=6.5, seed=8)
+      dm = DummyMixture(n_components=2, n_init=2, max_iter=1, random_state=8)
+      labels_fp = dm.fit_predict(X)
+      labels_after_fit = dm.predict(X)
+      assert_array_equal(labels_fp, labels_after_fit)
+new_imports_code: |
+  from sklearn.mixture.base import BaseMixture
+  from sklearn.utils import check_random_state

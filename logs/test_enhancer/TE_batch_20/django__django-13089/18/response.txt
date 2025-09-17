@@ -1,0 +1,182 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests create a dedicated DatabaseCache table and then manipulate cache internals (_max_entries and _cull_frequency) to force a culling scenario where cull_num becomes zero (num // _cull_frequency == 0). In the buggy implementation, that caused cursor.fetchone()[0] to be accessed when fetchone() returned None, raising an exception. Each test performs a different cache operation (set, add, touch, set_many) or key type (unicode, versioned, prefixed) to ensure the code path is exercised across common variations and that no exception is raised and keys remain present as expected.
+new_imports_code: |
+  # No new imports required; tests reuse imports available in tests/cache/tests.py
+test_code: |
+  @override_settings(CACHES=caches_setting_for_tests(
+      BACKEND='django.core.cache.backends.db.DatabaseCache',
+      LOCATION='test cache table'
+  ))
+  class CullFetchoneNoneTests(TransactionTestCase):
+      """
+      Regression tests to ensure _cull() handles the case where the
+      cache_key_culling_sql returns no rows (cursor.fetchone() is None).
+      This used to raise TypeError on cursor.fetchone()[0].
+      """
+      available_apps = ['cache']
+  
+      def setUp(self):
+          super().setUp()
+          # Create the cache table used by DatabaseCache tests.
+          management.call_command('createcachetable', verbosity=0)
+  
+      def tearDown(self):
+          # Drop the cache table to clean up.
+          super().tearDown()
+          with connection.cursor() as cursor:
+              table_name = connection.ops.quote_name('test cache table')
+              cursor.execute('DROP TABLE %s' % table_name)
+  
+      def _configure_cache_for_zero_cull(self, cache_obj, max_entries=4, cull_frequency=10):
+          """
+          Helper to set cache internals so that num > max_entries but
+          (num // cull_frequency) == 0, which will make the culling SQL
+          return no rows.
+          """
+          # Save and restore in the caller.
+          cache_obj._max_entries = max_entries
+          cache_obj._cull_frequency = cull_frequency
+  
+      def test_set_triggers_cull_with_cull_num_zero(self):
+          c = caches['cull']
+          old_max, old_freq = c._max_entries, c._cull_frequency
+          try:
+              self._configure_cache_for_zero_cull(c, max_entries=4, cull_frequency=10)
+              # Insert 5 keys so num == 5 > max_entries (4) but cull_num == 5 // 10 == 0
+              for i in range(1, 6):
+                  c.set('cull_test_set_%s' % i, 'value', 1000)
+              # Ensure the keys are still present and no exception occurred.
+              present = sum(1 for i in range(1, 6) if c.has_key('cull_test_set_%s' % i))
+              self.assertEqual(present, 5)
+          finally:
+              c._max_entries, c._cull_frequency = old_max, old_freq
+  
+      def test_add_triggers_cull_with_cull_num_zero(self):
+          c = caches['cull']
+          old_max, old_freq = c._max_entries, c._cull_frequency
+          try:
+              self._configure_cache_for_zero_cull(c, max_entries=4, cull_frequency=10)
+              for i in range(1, 6):
+                  # add returns True on insert if key is not present
+                  self.assertIs(c.add('cull_test_add_%s' % i, 'value', 1000), True)
+              present = sum(1 for i in range(1, 6) if c.has_key('cull_test_add_%s' % i))
+              self.assertEqual(present, 5)
+          finally:
+              c._max_entries, c._cull_frequency = old_max, old_freq
+  
+      def test_touch_triggers_cull_with_cull_num_zero(self):
+          c = caches['cull']
+          old_max, old_freq = c._max_entries, c._cull_frequency
+          try:
+              # Prepopulate 5 keys so num > max_entries
+              self._configure_cache_for_zero_cull(c, max_entries=4, cull_frequency=10)
+              for i in range(1, 6):
+                  c.set('cull_test_touch_%s' % i, 'value', 1000)
+              # Touch an existing key; touch will call _base_set and thus _cull.
+              # The important thing is that no exception is raised.
+              self.assertIs(c.touch('cull_test_touch_1', timeout=2000), True)
+              present = sum(1 for i in range(1, 6) if c.has_key('cull_test_touch_%s' % i))
+              self.assertEqual(present, 5)
+          finally:
+              c._max_entries, c._cull_frequency = old_max, old_freq
+  
+      def test_set_many_triggers_cull_with_cull_num_zero(self):
+          c = caches['cull']
+          old_max, old_freq = c._max_entries, c._cull_frequency
+          try:
+              self._configure_cache_for_zero_cull(c, max_entries=4, cull_frequency=10)
+              # set_many followed by another set to trigger the cull path
+              mapping = {'cull_test_setmany_%d' % i: 'v' for i in range(1, 5)}
+              c.set_many(mapping)
+              # Now insert a 5th key which will trigger _cull
+              c.set('cull_test_setmany_5', 'v', 1000)
+              present = sum(1 for i in range(1, 6) if c.has_key('cull_test_setmany_%s' % i))
+              self.assertEqual(present, 5)
+          finally:
+              c._max_entries, c._cull_frequency = old_max, old_freq
+  
+      def test_unicode_keys_cull_num_zero(self):
+          c = caches['cull']
+          old_max, old_freq = c._max_entries, c._cull_frequency
+          try:
+              self._configure_cache_for_zero_cull(c, max_entries=4, cull_frequency=10)
+              # Use unicode keys to ensure quoting/encoding doesn't affect the behavior.
+              keys = ['unicode-键-%s' % i for i in range(1, 6)]
+              for k in keys:
+                  c.set(k, 'value', 1000)
+              present = sum(1 for k in keys if c.has_key(k))
+              self.assertEqual(present, 5)
+          finally:
+              c._max_entries, c._cull_frequency = old_max, old_freq
+  
+      def test_versioned_keys_cull_num_zero(self):
+          c = caches['cull']
+          old_max, old_freq = c._max_entries, c._cull_frequency
+          try:
+              self._configure_cache_for_zero_cull(c, max_entries=4, cull_frequency=10)
+              # Store the same logical key with different versions to ensure versioned
+              # cache_key handling doesn't trigger the bug.
+              for version in (1, 2, 3, 4, 5):
+                  c.set('versioned_key', 'v%s' % version, version=version)
+              present = sum(1 for version in (1, 2, 3, 4, 5) if c.has_key('versioned_key', version=version))
+              self.assertEqual(present, 5)
+          finally:
+              c._max_entries, c._cull_frequency = old_max, old_freq
+  
+      def test_prefixed_cache_cull_num_zero(self):
+          # Ensure prefixed caches share the same underlying table and that
+          # culling behavior for cull_num == 0 doesn't raise when different
+          # key prefixes are used.
+          c = caches['cull']
+          p = caches['prefix']
+          old_max_c, old_freq_c = c._max_entries, c._cull_frequency
+          old_max_p, old_freq_p = p._max_entries, p._cull_frequency
+          try:
+              # Configure both to the same culling regime.
+              self._configure_cache_for_zero_cull(c, max_entries=4, cull_frequency=10)
+              self._configure_cache_for_zero_cull(p, max_entries=4, cull_frequency=10)
+              # Populate entries via the prefixed cache.
+              for i in range(1, 6):
+                  p.set('prefixed_key_%s' % i, 'v', 1000)
+              present_prefixed = sum(1 for i in range(1, 6) if p.has_key('prefixed_key_%s' % i))
+              self.assertEqual(present_prefixed, 5)
+          finally:
+              c._max_entries, c._cull_frequency = old_max_c, old_freq_c
+              p._max_entries, p._cull_frequency = old_max_p, old_freq_p
+  
+      def test_preserve_entries_when_cull_num_zero(self):
+          c = caches['cull']
+          old_max, old_freq = c._max_entries, c._cull_frequency
+          try:
+              # Ensure that when cull_num == 0, no deletion occurs and entries remain.
+              self._configure_cache_for_zero_cull(c, max_entries=4, cull_frequency=10)
+              for i in range(1, 6):
+                  c.set('preserve_key_%s' % i, 'v', 1000)
+              # cull_num == 0 should not remove entries; they should all still exist.
+              present = sum(1 for i in range(1, 6) if c.has_key('preserve_key_%s' % i))
+              self.assertEqual(present, 5)
+          finally:
+              c._max_entries, c._cull_frequency = old_max, old_freq
+  
+      def test_repeated_operations_do_not_raise_on_cull_num_zero(self):
+          """
+          Repeated operations (set/add/set_many/touch) should never raise
+          the cursor.fetchone()[0] TypeError when the culling SQL returns no rows.
+          """
+          c = caches['cull']
+          old_max, old_freq = c._max_entries, c._cull_frequency
+          try:
+              self._configure_cache_for_zero_cull(c, max_entries=4, cull_frequency=10)
+              # Perform a variety of operations that could trigger _cull.
+              c.set('ops_key_1', 'a', 1000)
+              c.add('ops_key_2', 'b', 1000)
+              c.set_many({'ops_key_3': 'c', 'ops_key_4': 'd'})
+              # Insert a 5th key to ensure num > _max_entries and cull_num == 0.
+              c.set('ops_key_5', 'e', 1000)
+              # Touch one key as well.
+              self.assertIs(c.touch('ops_key_1', timeout=2000), True)
+              present = sum(1 for i in range(1, 6) if c.has_key('ops_key_%s' % i))
+              self.assertEqual(present, 5)
+          finally:
+              c._max_entries, c._cull_frequency = old_max, old_freq

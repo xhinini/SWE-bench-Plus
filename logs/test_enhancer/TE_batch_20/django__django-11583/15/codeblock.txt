@@ -1,0 +1,201 @@
+import tempfile
+import types
+import sys
+from pathlib import Path
+from unittest import mock
+from django.test import SimpleTestCase
+from django.utils import autoreload
+
+class ValueErrorHandlingTests(SimpleTestCase):
+    def setUp(self):
+        # Ensure cached results do not interfere across tests.
+        autoreload.iter_modules_and_files.cache_clear()
+
+    def _make_bad_resolve(self, original_resolve, bad_substring, message='some network error'):
+        """
+        Return a side_effect function for Path.resolve that raises ValueError
+        for Path instances containing bad_substring, otherwise delegates to
+        the original resolve.
+        """
+        def side_effect(self, strict=True):
+            if bad_substring in str(self):
+                raise ValueError(message)
+            return original_resolve(self, strict=strict)
+        return side_effect
+
+    def test_iter_modules_and_files_ignores_valueerror_from_extra_files(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            good_file = Path(tmpdir) / 'good.py'
+            good_file.touch()
+            bad_file = Path(tmpdir) / 'bad-raise.py'
+
+            original_resolve = Path.resolve
+            with mock.patch.object(Path, 'resolve', side_effect=self._make_bad_resolve(original_resolve, 'bad-raise', 'network fs error')):
+                # extra_files contains a bad path and a good path
+                result = autoreload.iter_modules_and_files((), frozenset([bad_file, good_file]))
+            # Only the good_file should be present and no exception should be raised.
+            self.assertIn(good_file.resolve(), result)
+            self.assertNotIn(bad_file.resolve(), result)
+        finally:
+            try:
+                import shutil
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    def test_iter_modules_and_files_ignores_valueerror_from_module_origin(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            good_file = Path(tmpdir) / 'good_mod.py'
+            good_file.touch()
+            bad_origin = Path(tmpdir) / 'module_bad_origin.py'
+
+            # Create two fake modules: one with a bad origin, one good.
+            good_module = types.ModuleType('good_module')
+            good_spec = types.SimpleNamespace(has_location=True, origin=str(good_file), loader=object())
+            good_module.__spec__ = good_spec
+
+            bad_module = types.ModuleType('bad_module')
+            bad_spec = types.SimpleNamespace(has_location=True, origin=str(bad_origin), loader=object())
+            bad_module.__spec__ = bad_spec
+
+            original_resolve = Path.resolve
+            with mock.patch.object(Path, 'resolve', side_effect=self._make_bad_resolve(original_resolve, 'module_bad_origin', 'device error')):
+                result = autoreload.iter_modules_and_files((good_module, bad_module), frozenset())
+            self.assertIn(good_file.resolve(), result)
+            self.assertNotIn(bad_origin.resolve(), result)
+        finally:
+            try:
+                import shutil
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    def test_sys_path_directories_ignores_valueerror_and_includes_good(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            good_dir = Path(tmpdir).resolve()
+            bad_path_str = str(Path(tmpdir) / 'bad-entry')
+            # Insert bad and good entries into sys.path temporarily.
+            with mock.patch.object(sys, 'path', new=list(sys.path) + [bad_path_str, str(good_dir)]):
+                original_resolve = Path.resolve
+                with mock.patch.object(Path, 'resolve', side_effect=self._make_bad_resolve(original_resolve, 'bad-entry', 'unexpected value')):
+                    dirs = list(autoreload.sys_path_directories())
+            # Ensure the good directory appears and bad entry is ignored.
+            self.assertIn(good_dir, dirs)
+            self.assertTrue(all(isinstance(p, Path) for p in dirs))
+            self.assertFalse(any('bad-entry' in str(p) for p in dirs))
+        finally:
+            try:
+                import shutil
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    def test_iter_modules_and_files_swallows_various_valueerror_messages(self):
+        # Ensure that ValueError with a non "embedded null byte" message is swallowed.
+        tmpdir = tempfile.mkdtemp()
+        try:
+            bad_file = Path(tmpdir) / 'very-bad.py'
+            bad_file.touch()
+            original_resolve = Path.resolve
+            with mock.patch.object(Path, 'resolve', side_effect=self._make_bad_resolve(original_resolve, 'very-bad', 'different error message')):
+                # Should not raise, should skip bad_file
+                result = autoreload.iter_modules_and_files((), frozenset([bad_file]))
+            self.assertEqual(result, frozenset())
+        finally:
+            try:
+                import shutil
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    def test_sys_path_directories_swallows_various_valueerror_messages(self):
+        # Similar to above for sys_path_directories with odd ValueError message.
+        tmpdir = tempfile.mkdtemp()
+        try:
+            bad_path_str = str(Path(tmpdir) / 'weird-bad')
+            good_dir = Path(tmpdir)
+            with mock.patch.object(sys, 'path', new=[bad_path_str, str(good_dir)]):
+                original_resolve = Path.resolve
+                with mock.patch.object(Path, 'resolve', side_effect=self._make_bad_resolve(original_resolve, 'weird-bad', 'another message')):
+                    dirs = list(autoreload.sys_path_directories())
+            self.assertIn(good_dir.resolve(), dirs)
+            self.assertFalse(any('weird-bad' in str(p) for p in dirs))
+        finally:
+            try:
+                import shutil
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    def test_iter_modules_and_files_skips_bad_zip_loader_origin(self):
+        # Simulate a module loaded from a zipimporter but whose origin resolution raises ValueError.
+        tmpdir = tempfile.mkdtemp()
+        try:
+            good_zip = Path(tmpdir) / 'good.zip'
+            good_zip.touch()
+
+            good_module = types.ModuleType('zip_good')
+            good_spec = types.SimpleNamespace(has_location=True, origin=str(good_zip), loader=mock.Mock(spec=zipimporter))
+            good_module.__spec__ = good_spec
+
+            bad_zip = Path(tmpdir) / 'bad.zip'
+            bad_module = types.ModuleType('zip_bad')
+            bad_spec = types.SimpleNamespace(has_location=True, origin=str(bad_zip), loader=mock.Mock(spec=zipimporter))
+            bad_module.__spec__ = bad_spec
+
+            original_resolve = Path.resolve
+            with mock.patch.object(Path, 'resolve', side_effect=self._make_bad_resolve(original_resolve, 'bad.zip', 'zip error')):
+                result = autoreload.iter_modules_and_files((good_module, bad_module), frozenset())
+            self.assertIn(good_zip.resolve(), result)
+            self.assertNotIn(bad_zip.resolve(), result)
+        finally:
+            try:
+                import shutil
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    def test_iter_modules_and_files_does_not_propagate_valueerror_when_multiple_files(self):
+        # Mixed set where one path raises ValueError and others are valid.
+        tmpdir = tempfile.mkdtemp()
+        try:
+            good1 = Path(tmpdir) / 'good1.py'
+            good2 = Path(tmpdir) / 'good2.py'
+            bad = Path(tmpdir) / 'bad_multiple.py'
+            good1.touch()
+            good2.touch()
+
+            original_resolve = Path.resolve
+            with mock.patch.object(Path, 'resolve', side_effect=self._make_bad_resolve(original_resolve, 'bad_multiple', 'oops')):
+                result = autoreload.iter_modules_and_files((), frozenset([good1, bad, good2]))
+            self.assertIn(good1.resolve(), result)
+            self.assertIn(good2.resolve(), result)
+            self.assertNotIn(bad.resolve(), result)
+        finally:
+            try:
+                import shutil
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass
+
+    def test_sys_path_directories_with_mixed_entries_only_yields_valid(self):
+        tmpdir = tempfile.mkdtemp()
+        try:
+            good_dir = Path(tmpdir) / 'okdir'
+            good_dir.mkdir()
+            bad_path = str(Path(tmpdir) / 'bad-entry-2')
+            with mock.patch.object(sys, 'path', new=[bad_path, str(good_dir)]):
+                original_resolve = Path.resolve
+                with mock.patch.object(Path, 'resolve', side_effect=self._make_bad_resolve(original_resolve, 'bad-entry-2', 'weird')):
+                    dirs = list(autoreload.sys_path_directories())
+            self.assertIn(good_dir.resolve(), dirs)
+            self.assertFalse(any('bad-entry-2' in str(d) for d in dirs))
+        finally:
+            try:
+                import shutil
+                shutil.rmtree(tmpdir)
+            except Exception:
+                pass

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_checks.tests_llm.ReadonlyFieldMessageTests.test_readonly_full_checks_error_object_equality admin_checks.tests_llm.ReadonlyFieldMessageTests.test_readonly_nonexistent_class_name_in_message admin_checks.tests_llm.ReadonlyFieldMessageTests.test_readonly_nonexistent_field_with_special_chars_includes_field_name admin_checks.tests_llm.ReadonlyFieldMessageTests.test_readonly_nonexistent_large_index_includes_correct_index admin_checks.tests_llm.ReadonlyFieldMessageTests.test_readonly_nonexistent_message_includes_field_name_index_1 admin_checks.tests_llm.ReadonlyFieldMessageTests.test_readonly_nonexistent_message_includes_field_name_index_3 admin_checks.tests_llm.ReadonlyFieldMessageTests.test_readonly_nonexistent_model_label_in_message admin_checks.tests_llm.ReadonlyFieldMessageTests.test_readonly_nonexistent_on_inline_dynamic_admin_name admin_checks.tests_llm.ReadonlyFieldMessageTests.test_readonly_nonexistent_on_stacked_inline_includes_field_name admin_checks.tests_llm.ReadonlyFieldMessageTests.test_readonly_nonexistent_on_tabular_inline_includes_field_name
+coverage json -o coverage.json
+: '>>>>> End Test Output'

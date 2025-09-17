@@ -1,0 +1,195 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise ModelAdmin.get_search_results to ensure the constructed Q object (passed to queryset.filter) has the expected structure: top-level connector is AND, the number of children matches the number of search terms, each per-term child uses an OR connector (when multiple lookups) or contains a single lookup tuple, and there are no empty Q children introduced. They will fail for the candidate patch which builds a Q starting from an empty Q() and ANDs into it (introducing an empty child), but pass with the gold patch that builds term_queries and combines them with models.Q(*term_queries).
+test_code: |
+  import unittest
+  from types import SimpleNamespace
+  from django.contrib.admin.options import ModelAdmin
+  from django.contrib.admin.sites import AdminSite
+  from django.core.exceptions import FieldDoesNotExist
+  from django.db import models
+  
+  # Minimal dummy field/opts/model to satisfy construct_search's get_field usage.
+  class DummyField:
+      def __init__(self, name, path_infos=None, primary_key=False):
+          self.name = name
+          self.path_infos = path_infos
+          self.primary_key = primary_key
+  
+      def get_lookup(self, lookup):
+          # Simplified: pretend transforms don't exist.
+          return None
+  
+  class DummyOpts:
+      def __init__(self, available_fields=None, pk_name='id'):
+          if available_fields is None:
+              available_fields = {'name', 'other', 'contact'}
+          self._available = set(available_fields)
+          self.pk = SimpleNamespace(name=pk_name, attname=pk_name)
+  
+      def get_field(self, name):
+          # emulate 'pk' alias to pk.name handled by construct_search, but keep simple here
+          if name in self._available:
+              return DummyField(name)
+          raise FieldDoesNotExist(name)
+  
+  class DummyModel:
+      def __init__(self, available_fields=None, pk_name='id'):
+          self._meta = DummyOpts(available_fields=available_fields, pk_name=pk_name)
+  
+  # Dummy queryset that records the Q passed to filter() and returns itself.
+  class DummyQuerySet:
+      def __init__(self, model):
+          self.model = model
+          self.filtered_q = None
+      def filter(self, *args, **kwargs):
+          # Record single Q argument if provided
+          if args:
+              # If filter is called with multiple args, prefer the first for our tests.
+              self.filtered_q = args[0]
+          elif kwargs:
+              # Not expected in these tests, but record a dict for completeness.
+              self.filtered_q = kwargs
+          return self
+  
+  class GetSearchResultsQTests(unittest.TestCase):
+      def setUp(self):
+          self.site = AdminSite()
+  
+      def _run_search(self, search_fields, search_term, available_fields=None):
+          model = DummyModel(available_fields=available_fields)
+          admin = ModelAdmin(model.__class__, self.site)
+          # Override get_search_fields to return our fields
+          admin.search_fields = list(search_fields)
+          qs = DummyQuerySet(model)
+          # request isn't used by get_search_fields (we override), so None is fine.
+          result_qs, may_have_duplicates = admin.get_search_results(None, qs, search_term)
+          return qs.filtered_q, may_have_duplicates
+  
+      def _assert_top_level_and_children(self, q, expected_children_count):
+          # q is expected to be a django.db.models.Q object
+          self.assertIsNotNone(q, "No Q object was passed to filter()")
+          # Top-level connector should be AND (default)
+          self.assertEqual(q.connector, models.Q.AND)
+          # Children count equals number of search terms (ANDed groups)
+          self.assertEqual(len(q.children), expected_children_count)
+          # No child should be an empty Q (i.e., with no children)
+          for child in q.children:
+              # children may be Q objects or tuples depending on internals;
+              # normalize to Q object check where possible.
+              if isinstance(child, models.Q):
+                  self.assertTrue(child.children or isinstance(child.children, list) or len(child.children) >= 0)
+                  # Ensure it's not an empty Q used as a placeholder (no children)
+                  self.assertNotEqual(len(child.children), 0, "Found an empty Q child (likely introduced by incorrect in-place AND)")
+  
+      def test_single_term_single_field(self):
+          q, _ = self._run_search(['name'], 'alpha')
+          # One term => one top-level child
+          self._assert_top_level_and_children(q, 1)
+          # The single child's lookup should target name__icontains
+          child = q.children[0]
+          # If child is a Q, inspect its children; if a tuple, that's the lookup
+          if isinstance(child, models.Q):
+              lookup = child.children[0]
+          else:
+              lookup = child
+          self.assertEqual(lookup[0], 'name__icontains')
+          self.assertEqual(lookup[1], 'alpha')
+  
+      def test_two_terms_single_field(self):
+          q, _ = self._run_search(['name'], 'alpha beta')
+          # Two terms => two top-level children (AND between them)
+          self._assert_top_level_and_children(q, 2)
+          # Each child should be an OR-group with a single lookup (since single search_field)
+          for child in q.children:
+              # child may be Q or tuple
+              if isinstance(child, models.Q):
+                  # connector should be OR
+                  self.assertEqual(child.connector, models.Q.OR)
+                  self.assertEqual(len(child.children), 1)
+              else:
+                  # single lookup tuple, okay
+                  pass
+  
+      def test_two_terms_two_fields(self):
+          q, _ = self._run_search(['name', 'other'], 'alpha beta')
+          # Two terms => two ANDed children
+          self._assert_top_level_and_children(q, 2)
+          # Each child must be an OR group combining both lookups (name__icontains and other__icontains)
+          for child in q.children:
+              self.assertIsInstance(child, models.Q)
+              self.assertEqual(child.connector, models.Q.OR)
+              self.assertEqual(len(child.children), 2)
+              lookups = {child.children[0][0], child.children[1][0]}
+              self.assertEqual(lookups, {'name__icontains', 'other__icontains'})
+  
+      def test_quoted_term_with_space(self):
+          q, _ = self._run_search(['name'], '"a b"')
+          # Single quoted phrase counts as one term
+          self._assert_top_level_and_children(q, 1)
+          child = q.children[0]
+          if isinstance(child, models.Q):
+              lookup = child.children[0]
+          else:
+              lookup = child
+          self.assertEqual(lookup[1], 'a b')
+  
+      def test_equals_prefix_lookup(self):
+          q, _ = self._run_search(['=name'], 'exactvalue')
+          # PREFIX '=' should produce iexact lookup
+          self._assert_top_level_and_children(q, 1)
+          child = q.children[0]
+          if isinstance(child, models.Q):
+              lookup = child.children[0]
+          else:
+              lookup = child
+          self.assertEqual(lookup[0], 'name__iexact')
+  
+      def test_startswith_prefix_lookup(self):
+          q, _ = self._run_search(['^name'], 'start')
+          # '^' prefix should produce istartswith
+          self._assert_top_level_and_children(q, 1)
+          child = q.children[0]
+          if isinstance(child, models.Q):
+              lookup = child.children[0]
+          else:
+              lookup = child
+          self.assertEqual(lookup[0], 'name__istartswith')
+  
+      def test_at_prefix_search_lookup(self):
+          q, _ = self._run_search(['@name'], 'searchterm')
+          # '@' should produce __search lookup
+          self._assert_top_level_and_children(q, 1)
+          child = q.children[0]
+          if isinstance(child, models.Q):
+              lookup = child.children[0]
+          else:
+              lookup = child
+          self.assertEqual(lookup[0], 'name__search')
+  
+      def test_pk_alias_in_search_fields(self):
+          # Use pk alias in search_fields; construct_search should resolve 'pk' to pk.name ('id')
+          q, _ = self._run_search(['pk'], '42')
+          self._assert_top_level_and_children(q, 1)
+          child = q.children[0]
+          if isinstance(child, models.Q):
+              lookup = child.children[0]
+          else:
+              lookup = child
+          # pk should have been translated to id
+          self.assertTrue(lookup[0].startswith('id__'))
+  
+      def test_multiple_spaces_and_quotes_mix(self):
+          # Mixed input: one quoted phrase and one plain word -> two terms
+          q, _ = self._run_search(['name', 'other'], '"foo bar" baz')
+          self._assert_top_level_and_children(q, 2)
+          # Ensure no empty Q child and OR-groups are present
+          for child in q.children:
+              self.assertIsInstance(child, models.Q)
+              self.assertEqual(child.connector, models.Q.OR)
+              self.assertTrue(len(child.children) >= 1)
+  
+  if __name__ == '__main__':
+      unittest.main()
+new_imports_code: |
+  from django.db import models

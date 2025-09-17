@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.ManageRunserverAddressTests.setUp admin_scripts.tests_llm.ManageRunserverAddressTests.test_ambiguous_beef_hostname_not_treated_as_ipv6 admin_scripts.tests_llm.ManageRunserverAddressTests.test_custom_default_addr_and_port_printed_and_run_called admin_scripts.tests_llm.ManageRunserverAddressTests.test_custom_default_addr_ipv6_value_prints_bracketed admin_scripts.tests_llm.ManageRunserverAddressTests.test_default_ipv6_prints_bracketed_and_run_called admin_scripts.tests_llm.ManageRunserverAddressTests.test_explicit_bracketed_ipv6_literal_printed_and_run_called admin_scripts.tests_llm.ManageRunserverAddressTests.test_explicit_bracketed_ipv6_without_use_ipv6_detected_as_raw_ipv6 admin_scripts.tests_llm.ManageRunserverAddressTests.test_hostname_prints_without_brackets_and_run_called admin_scripts.tests_llm.ManageRunserverAddressTests.test_use_ipv6_with_fqdn_sets_ipv6_flag_but_no_brackets admin_scripts.tests_llm.ManageRunserverAddressTests.test_zero_address_printed_as_0dot0dot0dot0_and_run_called admin_scripts.tests_llm.RunserverAddressFormattingTests._call_and_get_run_call
+coverage json -o coverage.json
+: '>>>>> End Test Output'

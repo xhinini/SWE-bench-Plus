@@ -1,0 +1,218 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise DatabaseCache._cull() directly with a mocked cursor that returns controlled values from fetchone(). They verify that when the culling SQL returns no pivot row (None), _cull does not raise and does not attempt a deletion; when fetchone() returns a tuple containing None, _cull will attempt the DELETE with None as the parameter (this is allowed but should not raise); when a valid pivot key is returned, _cull performs the expected DELETE. Additional cases verify behavior when num <= _max_entries (no culling) and when _cull_frequency == 0 triggers clear(). The tests would detect incorrect handling of a missing fetchone() result (which used to cause an IndexError) and ensure correct, robust behavior.
+new_imports_code: |
+  from django.test import override_settings, TransactionTestCase
+  from django.core import management
+  from django.core.cache import caches
+  from django.db import connections
+  from django.utils import timezone
+  from django.conf import settings
+  from unittest import mock
+test_code: |
+  @override_settings(CACHES={
+      'default': {
+          'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
+          'LOCATION': 'test cache table'
+      }
+  })
+  class DBCullRegressionTests(TransactionTestCase):
+      """
+      Regression tests for DatabaseCache._cull to ensure it handles cases where
+      cursor.fetchone() after the culling SQL returns None or other edge values
+      without raising exceptions and behaves as expected.
+      """
+      available_apps = ['cache']
+  
+      def setUp(self):
+          # Create the cache table used by DatabaseCache
+          management.call_command('createcachetable', verbosity=0)
+          self.cache = caches['default']
+  
+      def tearDown(self):
+          # Drop the cache table to leave a clean state.
+          with connections['default'].cursor() as cursor:
+              table_name = connections['default'].ops.quote_name(self.cache._table)
+              try:
+                  cursor.execute('DROP TABLE %s' % table_name)
+              except Exception:
+                  # Ignore errors during teardown
+                  pass
+  
+      class DummyCursor:
+          """
+          A dummy cursor that simulates a real DB cursor. `fetchone_results`
+          is a list of values that fetchone() will pop from on each call.
+          """
+          def __init__(self, fetchone_results):
+              self.fetchone_results = list(fetchone_results)
+              self.executed = []
+              self.rowcount = 0
+  
+          def execute(self, sql, params=None):
+              # record the SQL and params for assertions
+              self.executed.append((sql, params))
+              # emulate behavior: if a DELETE is executed, set rowcount to 1
+              if sql.strip().upper().startswith('DELETE'):
+                  self.rowcount = 1
+              else:
+                  self.rowcount = 0
+  
+          def fetchone(self):
+              if not self.fetchone_results:
+                  return None
+              return self.fetchone_results.pop(0)
+  
+          def __enter__(self):
+              return self
+  
+          def __exit__(self, exc_type, exc_val, exc_tb):
+              return False
+  
+      def test_cull_handles_no_last_cache_key_none(self):
+          """
+          If the culling SQL returns None from fetchone(), _cull should not
+          attempt the subsequent DELETE and should not raise.
+          """
+          # Prepare: simulate SELECT COUNT(*) -> returns (100,)
+          # then cache_key_culling_sql -> returns None
+          dummy = self.DummyCursor(fetchone_results=[(100,), None])
+          # Ensure cache will think it's over the max entries
+          self.cache._max_entries = 10
+          # Call _cull and ensure no exception is raised.
+          now = timezone.now().replace(microsecond=0)
+          # Use db name 'default'
+          self.cache._cull('default', dummy, now)
+          # The last execute should NOT be a DELETE for cache_key < ...
+          executed_sqls = [sql for sql, _ in dummy.executed]
+          # The final DELETE for cache_key < ... should not be present
+          self.assertFalse(any('WHERE cache_key <' in sql for sql in executed_sqls))
+  
+      def test_cull_handles_no_last_cache_key_tuple_with_none(self):
+          """
+          If fetchone() returns a tuple with None, i.e. (None,), the code path
+          should attempt the DELETE with None as parameter but not raise.
+          """
+          dummy = self.DummyCursor(fetchone_results=[(100,), (None,)])
+          self.cache._max_entries = 10
+          now = timezone.now().replace(microsecond=0)
+          # Should not raise
+          self.cache._cull('default', dummy, now)
+          executed = dummy.executed
+          # The last execute call should be a DELETE with params [None]
+          self.assertTrue(any(
+              sql.strip().upper().startswith('DELETE FROM') and params == [None]
+              for sql, params in executed
+          ))
+  
+      def test_cull_deletes_when_last_cache_key_present(self):
+          """
+          When fetchone() returns a valid pivot key, _cull should perform
+          a DELETE using that pivot key.
+          """
+          pivot_key = 'pivot-key'
+          dummy = self.DummyCursor(fetchone_results=[(100,), (pivot_key,)])
+          self.cache._max_entries = 10
+          now = timezone.now().replace(microsecond=0)
+          self.cache._cull('default', dummy, now)
+          # Ensure a DELETE was executed with the pivot key as parameter
+          self.assertTrue(any(
+              'WHERE cache_key <' in sql and params == [pivot_key]
+              for sql, params in dummy.executed
+          ))
+  
+      def test_cull_noop_when_count_leq_max_entries(self):
+          """
+          If the number of rows is less than or equal to _max_entries,
+          culling SQL should not be executed.
+          """
+          dummy = self.DummyCursor(fetchone_results=[(5,)])
+          self.cache._max_entries = 10
+          now = timezone.now().replace(microsecond=0)
+          self.cache._cull('default', dummy, now)
+          # Only the initial DELETE expires and SELECT COUNT(*) should run,
+          # but cache_key_culling_sql should not be executed.
+          executed_sqls = [sql for sql, _ in dummy.executed]
+          # Look for the cache_key_culling_sql pattern (implementation-specific)
+          self.assertFalse(any('cache_key_culling' in (sql or '') for sql in executed_sqls))
+  
+      def test_cull_calls_clear_when_cull_frequency_zero(self):
+          """
+          If _cull_frequency == 0, clear() should be called instead of
+          performing culling SQL. We patch the clear method to detect the call.
+          """
+          dummy = self.DummyCursor(fetchone_results=[])
+          self.cache._cull_frequency = 0
+          called = {'clear': False}
+  
+          def fake_clear():
+              called['clear'] = True
+  
+          with mock.patch.object(self.cache, 'clear', fake_clear):
+              now = timezone.now().replace(microsecond=0)
+              self.cache._cull('default', dummy, now)
+          self.assertTrue(called['clear'])
+  
+      def test_cull_handles_zero_cull_num(self):
+          """
+          If cull_num calculates to zero (num // frequency == 0), the culling
+          SQL may still be executed; ensure that a None result from fetchone()
+          is handled gracefully.
+          """
+          dummy = self.DummyCursor(fetchone_results=[(1,), None])
+          # Set max_entries below num to trigger cull code path but create cull_num 0
+          # by setting _cull_frequency large.
+          self.cache._max_entries = 0
+          self.cache._cull_frequency = 9999
+          now = timezone.now().replace(microsecond=0)
+          # Should not raise
+          self.cache._cull('default', dummy, now)
+          # Ensure function completed and did not attempt to call fetchone()[0] on None
+          executed_sqls = [sql for sql, _ in dummy.executed]
+          self.assertTrue(any(sql.strip().upper().startswith('SELECT COUNT(*)') for sql in executed_sqls))
+  
+      def test_cull_multiple_fetchone_calls_sequence(self):
+          """
+          Simulate multiple fetchone() calls in sequence to ensure the fetchone
+          popping mechanism is handled (first for COUNT, second for culling pivot).
+          """
+          pivot_key = 'abc'
+          dummy = self.DummyCursor(fetchone_results=[(42,), (pivot_key,)])
+          self.cache._max_entries = 10
+          now = timezone.now().replace(microsecond=0)
+          self.cache._cull('default', dummy, now)
+          # Ensure both fetchone results were consumed
+          self.assertEqual(dummy.fetchone_results, [])
+          # Ensure the pivot-based DELETE was issued
+          self.assertTrue(any('WHERE cache_key <' in sql for sql, _ in dummy.executed))
+  
+      def test_cull_ignores_absence_of_pivot_row(self):
+          """
+          If the pivot SQL returns no rows (fetchone returns None), ensure
+          _cull simply does not attempt the final DELETE and returns normally.
+          """
+          dummy = self.DummyCursor(fetchone_results=[(20,), None])
+          self.cache._max_entries = 1
+          now = timezone.now().replace(microsecond=0)
+          # Should not raise
+          self.cache._cull('default', dummy, now)
+          # The final DELETE for cache_key < ... should not be present
+          executed_sqls = [sql for sql, _ in dummy.executed]
+          self.assertFalse(any('WHERE cache_key <' in sql for sql in executed_sqls))
+  
+      def test_cull_deletion_sql_parameter_is_used(self):
+          """
+          Ensure that when a valid pivot is returned the parameter used by the
+          DELETE statement is exactly the pivot value returned by fetchone().
+          """
+          pivot_key = 'ZKEY'
+          dummy = self.DummyCursor(fetchone_results=[(200,), (pivot_key,)])
+          self.cache._max_entries = 10
+          now = timezone.now().replace(microsecond=0)
+          self.cache._cull('default', dummy, now)
+          # Find the DELETE statement and check params
+          delete_calls = [(sql, params) for sql, params in dummy.executed if sql.strip().upper().startswith('DELETE FROM')]
+          self.assertTrue(delete_calls, 'Expected a DELETE FROM call to have been executed')
+          # The params for the delete should match the pivot key
+          found = any(params == [pivot_key] for _, params in delete_calls)
+          self.assertTrue(found, "DELETE was not called with the expected pivot key parameter")

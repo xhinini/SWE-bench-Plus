@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 async.tests_llm.AdditionalViewTests.setUp async.tests_llm.AdditionalViewTests.test_allowed_methods_exclude_head_when_called_on_unsetup_instance async.tests_llm.AdditionalViewTests.test_allowed_methods_include_head_when_setup_run async.tests_llm.AdditionalViewTests.test_allowed_methods_uppercase_and_order async.tests_llm.AdditionalViewTests.test_dispatch_uses_http_method_not_allowed_for_unallowed_methods_and_respects_async async.tests_llm.AdditionalViewTests.test_http_method_not_allowed_async_returns_coroutine_and_awaited_response_type async.tests_llm.AdditionalViewTests.test_http_method_not_allowed_is_coroutine_for_class_with_only_async_post_instance_method async.tests_llm.AdditionalViewTests.test_http_method_not_allowed_is_coroutine_for_class_with_only_async_post_via_as_view async.tests_llm.AdditionalViewTests.test_http_method_not_allowed_returns_405_status_sync_and_async async.tests_llm.AdditionalViewTests.test_options_headers_set_for_async_views async.tests_llm.GetOnlyAsync.get async.tests_llm.GetOnlySync.get async.tests_llm.GetPostSync.get async.tests_llm.GetPostSync.post async.tests_llm.OnlyPostAsync.post
+coverage json -o coverage.json
+: '>>>>> End Test Output'

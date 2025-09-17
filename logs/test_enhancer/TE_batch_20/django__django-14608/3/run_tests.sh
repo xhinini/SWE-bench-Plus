@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_appending_to_custom_non_form_errors_persists forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_appending_to_non_form_errors_mutates_internal_state forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_identity_after_validate_max_generates_nonform_error forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_modifying_non_form_errors_after_validate_max_persists forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_multiple_calls_return_same_object forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_non_form_errors_identity_with_custom_errorlist_class forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_non_form_errors_is_errorlist_instance forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_non_form_errors_keeps_nonform_class_on_html_after_mutation forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_non_form_errors_returns_internal_instance_default
+coverage json -o coverage.json
+: '>>>>> End Test Output'

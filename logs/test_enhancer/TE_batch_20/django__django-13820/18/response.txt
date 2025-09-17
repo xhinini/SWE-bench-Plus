@@ -1,0 +1,245 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests validate MigrationLoader's handling of packages with and without a __file__ attribute and various __path__ types (regular package vs namespace package), ensure reload() is invoked for already-loaded modules, and verify prefix lookup and ImportError handling. They target the logic change that treats modules with no __file__ but a list __path__ as regular packages (i.e. migrations should be loaded), while modules with no __file__ and a non-list __path__ should be treated as namespace packages and ignored.
+test_code: |
+  from importlib import import_module as real_import_module
+  import sys
+  import types
+  from unittest import mock
+
+  from django.test import TestCase, override_settings
+  from django.db import connection
+  from django.db.migrations.loader import MigrationLoader
+  from django.db.migrations.exceptions import AmbiguityError
+
+  import pkgutil
+
+  class RegressionLoaderTests(TestCase):
+      """
+      Regression tests for the migration loader distinguishing regular packages
+      (which may lack a __file__ in frozen environments) from namespace
+      packages (which also lack __file__ but have a non-list __path__).
+      """
+
+      def make_migration_module(self, full_name, fields=None):
+          """
+          Create a fake migration module with a Migration class that accepts
+          (name, app_label) in its constructor.
+          """
+          mod = types.ModuleType(full_name)
+          class Migration:
+              def __init__(self, name, app_label):
+                  self.name = name
+                  self.app_label = app_label
+                  self.dependencies = []
+                  self.run_before = []
+                  self.replaces = []
+                  self.atomic = False
+              def __repr__(self):
+                  return "<Migration %s>" % self.name
+          mod.Migration = Migration
+          sys.modules[full_name] = mod
+          return mod
+
+      def make_package(self, pkg_name, migration_names, file_present, path_is_list=True):
+          """
+          Create a fake package module at pkg_name (e.g. 'migrations.fake_pkg') and
+          fake the submodules for migrations. Return tuple (pkg_module, list_of_migration_fullnames)
+          """
+          pkg = types.ModuleType(pkg_name)
+          # Set __path__ as list or custom iterable to simulate namespace package
+          if path_is_list:
+              pkg.__path__ = ['/fake/path/for/%s' % pkg_name]
+          else:
+              # custom iterable, not a list
+              class CustomPath:
+                  def __init__(self, paths):
+                      self._paths = list(paths)
+                  def __iter__(self):
+                      return iter(self._paths)
+                  def __repr__(self):
+                      return "CustomPath(%r)" % (self._paths,)
+              pkg.__path__ = CustomPath(['/fake/path/for/%s' % pkg_name])
+          if file_present:
+              pkg.__file__ = '/fake/file/for/%s/__init__.py' % pkg_name
+          # Ensure import_module will return it
+          sys.modules[pkg_name] = pkg
+          migration_fullnames = []
+          for name in migration_names:
+              full = '%s.%s' % (pkg_name, name)
+              self.make_migration_module(full)
+              migration_fullnames.append(full)
+          return pkg, migration_fullnames
+
+      def tearDown(self):
+          # Clean up any fake modules we added under 'migrations.fake_pkg*'
+          to_delete = [k for k in sys.modules.keys() if k.startswith('migrations.fake_pkg')]
+          for k in to_delete:
+              del sys.modules[k]
+
+      @override_settings(MIGRATION_MODULES={'migrations': 'migrations.fake_pkg'}, INSTALLED_APPS=['migrations'])
+      def test_regular_package_no_file_with_list_path_loads(self):
+          """
+          Regular package lacking __file__ but with __path__ as a list should be
+          treated as a real package and its migrations loaded.
+          """
+          pkg_name = 'migrations.fake_pkg'
+          # No __file__ and __path__ is a list -> should load
+          pkg, _ = self.make_package(pkg_name, ['0001_initial'], file_present=False, path_is_list=True)
+
+          # Fake pkgutil.iter_modules to return our migration module name
+          with mock.patch('pkgutil.iter_modules', return_value=[(None, '0001_initial', False)]):
+              # Avoid reload side-effects by patching reload used in the loader module
+              with mock.patch('django.db.migrations.loader.reload', side_effect=lambda m: m):
+                  loader = MigrationLoader(connection)
+          # The migration should be loaded
+          migrations = [name for app, name in loader.disk_migrations if app == 'migrations']
+          self.assertIn('0001_initial', migrations)
+          self.assertIn('migrations', loader.migrated_apps)
+          self.assertNotIn('migrations', loader.unmigrated_apps)
+
+      @override_settings(MIGRATION_MODULES={'migrations': 'migrations.fake_pkg'}, INSTALLED_APPS=['migrations'])
+      def test_namespace_package_no_file_custom_path_ignored(self):
+          """
+          Namespace package lacking __file__ and with a non-list __path__ should
+          be treated as an empty namespace and ignored (unmigrated).
+          """
+          pkg_name = 'migrations.fake_pkg'
+          pkg, _ = self.make_package(pkg_name, ['0001_initial'], file_present=False, path_is_list=False)
+          with mock.patch('pkgutil.iter_modules', return_value=[(None, '0001_initial', False)]):
+              with mock.patch('django.db.migrations.loader.reload', side_effect=lambda m: m):
+                  loader = MigrationLoader(connection)
+          # The package should be treated as unmigrated (namespace)
+          self.assertIn('migrations', loader.unmigrated_apps)
+          migrations = [name for app, name in loader.disk_migrations if app == 'migrations']
+          self.assertEqual(migrations, [])
+
+      @override_settings(MIGRATION_MODULES={'migrations': 'migrations.fake_pkg'}, INSTALLED_APPS=['migrations'])
+      def test_module_without_path_is_not_package_and_ignored(self):
+          """
+          If the migrations module is a regular module (no __path__), the app
+          should be marked unmigrated.
+          """
+          # Create a simple module without __path__
+          mod_name = 'migrations.fake_pkg'
+          mod = types.ModuleType(mod_name)
+          # Ensure no __path__ attribute
+          if hasattr(mod, '__path__'):
+              delattr(mod, '__path__')
+          sys.modules[mod_name] = mod
+          # No iteration should occur because loader will skip non-packages
+          with mock.patch('django.db.migrations.loader.reload', side_effect=lambda m: m):
+              loader = MigrationLoader(connection)
+          self.assertIn('migrations', loader.unmigrated_apps)
+          self.assertEqual(list(loader.disk_migrations.keys()), [])
+
+      @override_settings(MIGRATION_MODULES={'migrations': 'migrations.fake_pkg'}, INSTALLED_APPS=['migrations'])
+      def test_package_with_file_and_list_path_loads(self):
+          """
+          Package with a __file__ and list __path__ should load migrations.
+          """
+          pkg_name = 'migrations.fake_pkg'
+          pkg, _ = self.make_package(pkg_name, ['0001_initial', '0002_second'], file_present=True, path_is_list=True)
+          with mock.patch('pkgutil.iter_modules', return_value=[(None, '0001_initial', False), (None, '0002_second', False)]):
+              with mock.patch('django.db.migrations.loader.reload', side_effect=lambda m: m):
+                  loader = MigrationLoader(connection)
+          migrations = sorted([name for app, name in loader.disk_migrations if app == 'migrations'])
+          self.assertCountEqual(migrations, ['0001_initial', '0002_second'])
+          self.assertIn('migrations', loader.migrated_apps)
+
+      @override_settings(MIGRATION_MODULES={'migrations': 'migrations.fake_pkg'}, INSTALLED_APPS=['migrations'])
+      def test_package_with_file_and_custom_path_loads(self):
+          """
+          Even if __path__ is a custom iterable (non-list), having a __file__
+          should allow the package to be treated as migrated.
+          """
+          pkg_name = 'migrations.fake_pkg'
+          pkg, _ = self.make_package(pkg_name, ['0001_initial'], file_present=True, path_is_list=False)
+          with mock.patch('pkgutil.iter_modules', return_value=[(None, '0001_initial', False)]):
+              with mock.patch('django.db.migrations.loader.reload', side_effect=lambda m: m):
+                  loader = MigrationLoader(connection)
+          # Since __file__ is present, the package is acceptable
+          migrations = [name for app, name in loader.disk_migrations if app == 'migrations']
+          self.assertIn('0001_initial', migrations)
+          self.assertIn('migrations', loader.migrated_apps)
+
+      @override_settings(MIGRATION_MODULES={'migrations': 'migrations.fake_pkg'}, INSTALLED_APPS=['migrations'])
+      def test_reload_called_for_already_loaded_module(self):
+          """
+          If the migration module is already present in sys.modules, the loader
+          should call reload() on it.
+          """
+          pkg_name = 'migrations.fake_pkg'
+          pkg, _ = self.make_package(pkg_name, ['0001_initial'], file_present=True, path_is_list=True)
+          called = {}
+          def fake_reload(module):
+              called['reloaded'] = module.__name__
+              return module
+          with mock.patch('pkgutil.iter_modules', return_value=[(None, '0001_initial', False)]):
+              with mock.patch('django.db.migrations.loader.reload', side_effect=fake_reload):
+                  loader = MigrationLoader(connection)
+          # reload should have been called for our package
+          self.assertEqual(called.get('reloaded'), pkg_name)
+
+      @override_settings(MIGRATION_MODULES={'migrations': 'migrations.fake_pkg'}, INSTALLED_APPS=['migrations'])
+      def test_get_migration_by_prefix_ambiguity_and_missing(self):
+          """
+          Ensure get_migration_by_prefix raises AmbiguityError when multiple
+          migrations match a prefix, and KeyError when none match.
+          """
+          pkg_name = 'migrations.fake_pkg'
+          pkg, _ = self.make_package(pkg_name, ['0001_initial', '0001_other'], file_present=True, path_is_list=True)
+          with mock.patch('pkgutil.iter_modules', return_value=[(None, '0001_initial', False), (None, '0001_other', False)]):
+              with mock.patch('django.db.migrations.loader.reload', side_effect=lambda m: m):
+                  loader = MigrationLoader(connection)
+          # Ambiguous prefix
+          with self.assertRaises(AmbiguityError):
+              loader.get_migration_by_prefix('migrations', '0001')
+          # Non-existent prefix
+          with self.assertRaises(KeyError):
+              loader.get_migration_by_prefix('migrations', 'nope')
+
+      @override_settings(MIGRATION_MODULES={'migrations': 'migrations.fake_pkg'}, INSTALLED_APPS=['migrations'])
+      def test_ignore_hidden_and_temp_files(self):
+          """
+          Files prefixed with underscore or tilde should be ignored by loader.
+          """
+          pkg_name = 'migrations.fake_pkg'
+          # create two migration modules but one has prefix '_' and should be ignored
+          pkg, _ = self.make_package(pkg_name, ['_ignore_me', '0001_initial'], file_present=True, path_is_list=True)
+          # pkgutil.iter_modules should present both, but loader filters names
+          with mock.patch('pkgutil.iter_modules', return_value=[(None, '_ignore_me', False), (None, '0001_initial', False)]):
+              with mock.patch('django.db.migrations.loader.reload', side_effect=lambda m: m):
+                  loader = MigrationLoader(connection)
+          migrations = [name for app, name in loader.disk_migrations if app == 'migrations']
+          self.assertEqual(migrations, ['0001_initial'])
+
+      @override_settings(MIGRATION_MODULES={'migrations': 'migrations.fake_pkg'}, INSTALLED_APPS=['migrations'])
+      def test_bad_magic_number_import_raises_helpful_error(self):
+          """
+          If importing a migration raises an ImportError with 'bad magic number',
+          the loader should reraise a helpful ImportError about stale .pyc.
+          """
+          pkg_name = 'migrations.fake_pkg'
+          # Make the package but do not put the migration module into sys.modules;
+          # instead, simulate import_module raising for that specific migration.
+          pkg = types.ModuleType(pkg_name)
+          pkg.__path__ = ['/fake/path/for/%s' % pkg_name]
+          sys.modules[pkg_name] = pkg
+
+          # pkgutil reports one migration 'bad'
+          with mock.patch('pkgutil.iter_modules', return_value=[(None, 'bad', False)]):
+              # Patch the import_module used by the loader to raise only for the migration
+              original = sys.modules.get('__import__')  # not used, safe to read
+              def import_side_effect(name, *args, **kwargs):
+                  if name == '%s.bad' % pkg_name:
+                      raise ImportError("bad magic number in %s" % name)
+                  return real_import_module(name, *args, **kwargs)
+              with mock.patch('django.db.migrations.loader.import_module', side_effect=import_side_effect):
+                  with mock.patch('django.db.migrations.loader.reload', side_effect=lambda m: m):
+                      with self.assertRaisesRegex(ImportError, r"Couldn't import 'migrations\.fake_pkg\.bad' as it appears to be a stale \.pyc file\."):
+                          MigrationLoader(connection)
+new_imports_code: |
+  import types
+  import sys
+  from unittest import mock

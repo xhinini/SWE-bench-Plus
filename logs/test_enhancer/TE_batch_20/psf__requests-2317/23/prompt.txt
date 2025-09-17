@@ -1,0 +1,2362 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `requests/sessions.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 # -*- coding: utf-8 -*-
+2 
+3 """
+4 requests.session
+5 ~~~~~~~~~~~~~~~~
+6 
+7 This module provides a Session object to manage and persist settings across
+8 requests (cookies, auth, proxies).
+9 
+10 """
+11 import os
+12 from collections import Mapping
+13 from datetime import datetime
+14 
+15 from .auth import _basic_auth_str
+16 from .compat import cookielib, OrderedDict, urljoin, urlparse
+17 from .cookies import (
+18     cookiejar_from_dict, extract_cookies_to_jar, RequestsCookieJar, merge_cookies)
+19 from .models import Request, PreparedRequest, DEFAULT_REDIRECT_LIMIT
+20 from .hooks import default_hooks, dispatch_hook
+21 from .utils import to_key_val_list, default_headers, to_native_string
+22 from .exceptions import (
+23     TooManyRedirects, InvalidSchema, ChunkedEncodingError, ContentDecodingError)
+24 from .structures import CaseInsensitiveDict
+25 
+26 from .adapters import HTTPAdapter
+27 
+28 from .utils import (
+29     requote_uri, get_environ_proxies, get_netrc_auth, should_bypass_proxies,
+30     get_auth_from_url
+31 )
+32 
+33 from .status_codes import codes
+34 
+35 # formerly defined here, reexposed here for backward compatibility
+36 from .models import REDIRECT_STATI
+37 
+38 
+39 def merge_setting(request_setting, session_setting, dict_class=OrderedDict):
+40     """
+41     Determines appropriate setting for a given request, taking into account the
+42     explicit setting on that request, and the setting in the session. If a
+43     setting is a dictionary, they will be merged together using `dict_class`
+44     """
+45 
+46     if session_setting is None:
+47         return request_setting
+48 
+49     if request_setting is None:
+50         return session_setting
+51 
+52     # Bypass if not a dictionary (e.g. verify)
+53     if not (
+54             isinstance(session_setting, Mapping) and
+55             isinstance(request_setting, Mapping)
+56     ):
+57         return request_setting
+58 
+59     merged_setting = dict_class(to_key_val_list(session_setting))
+60     merged_setting.update(to_key_val_list(request_setting))
+61 
+62     # Remove keys that are set to None.
+63     for (k, v) in request_setting.items():
+64         if v is None:
+65             del merged_setting[k]
+66 
+67     merged_setting = dict((k, v) for (k, v) in merged_setting.items() if v is not None)
+68 
+69     return merged_setting
+70 
+71 
+72 def merge_hooks(request_hooks, session_hooks, dict_class=OrderedDict):
+73     """
+74     Properly merges both requests and session hooks.
+75 
+76     This is necessary because when request_hooks == {'response': []}, the
+77     merge breaks Session hooks entirely.
+78     """
+79     if session_hooks is None or session_hooks.get('response') == []:
+80         return request_hooks
+81 
+82     if request_hooks is None or request_hooks.get('response') == []:
+83         return session_hooks
+84 
+85     return merge_setting(request_hooks, session_hooks, dict_class)
+86 
+87 
+88 class SessionRedirectMixin(object):
+89     def resolve_redirects(self, resp, req, stream=False, timeout=None,
+90                           verify=True, cert=None, proxies=None):
+91         """Receives a Response. Returns a generator of Responses."""
+92 
+93         i = 0
+94         hist = [] # keep track of history
+95 
+96         while resp.is_redirect:
+97             prepared_request = req.copy()
+98 
+99             if i > 0:
+100                 # Update history and keep track of redirects.
+101                 hist.append(resp)
+102                 new_hist = list(hist)
+103                 resp.history = new_hist
+104 
+105             try:
+106                 resp.content  # Consume socket so it can be released
+107             except (ChunkedEncodingError, ContentDecodingError, RuntimeError):
+108                 resp.raw.read(decode_content=False)
+109 
+110             if i >= self.max_redirects:
+111                 raise TooManyRedirects('Exceeded %s redirects.' % self.max_redirects)
+112 
+113             # Release the connection back into the pool.
+114             resp.close()
+115 
+116             url = resp.headers['location']
+117             method = req.method
+118 
+119             # Handle redirection without scheme (see: RFC 1808 Section 4)
+120             if url.startswith('//'):
+121                 parsed_rurl = urlparse(resp.url)
+122                 url = '%s:%s' % (parsed_rurl.scheme, url)
+123 
+124             # The scheme should be lower case...
+125             parsed = urlparse(url)
+126             url = parsed.geturl()
+127 
+128             # Facilitate relative 'location' headers, as allowed by RFC 7231.
+129             # (e.g. '/path/to/resource' instead of 'http://domain.tld/path/to/resource')
+130             # Compliant with RFC3986, we percent encode the url.
+131             if not urlparse(url).netloc:
+132                 url = urljoin(resp.url, requote_uri(url))
+133             else:
+134                 url = requote_uri(url)
+135 
+136             prepared_request.url = to_native_string(url)
+137             # Cache the url, unless it redirects to itself.
+138             if resp.is_permanent_redirect and req.url != prepared_request.url:
+139                 self.redirect_cache[req.url] = prepared_request.url
+140 
+141             # http://tools.ietf.org/html/rfc7231#section-6.4.4
+142             if (resp.status_code == codes.see_other and
+143                     method != 'HEAD'):
+144                 method = 'GET'
+145 
+146             # Do what the browsers do, despite standards...
+147             # First, turn 302s into GETs.
+148             if resp.status_code == codes.found and method != 'HEAD':
+149                 method = 'GET'
+150 
+151             # Second, if a POST is responded to with a 301, turn it into a GET.
+152             # This bizarre behaviour is explained in Issue 1704.
+153             if resp.status_code == codes.moved and method == 'POST':
+154                 method = 'GET'
+155 
+156             prepared_request.method = method
+157 
+158             # https://github.com/kennethreitz/requests/issues/1084
+159             if resp.status_code not in (codes.temporary_redirect, codes.permanent_redirect):
+160                 if 'Content-Length' in prepared_request.headers:
+161                     del prepared_request.headers['Content-Length']
+162 
+163                 prepared_request.body = None
+164 
+165             headers = prepared_request.headers
+166             try:
+167                 del headers['Cookie']
+168             except KeyError:
+169                 pass
+170 
+171             extract_cookies_to_jar(prepared_request._cookies, prepared_request, resp.raw)
+172             prepared_request._cookies.update(self.cookies)
+173             prepared_request.prepare_cookies(prepared_request._cookies)
+174 
+175             # Rebuild auth and proxy information.
+176             proxies = self.rebuild_proxies(prepared_request, proxies)
+177             self.rebuild_auth(prepared_request, resp)
+178 
+179             # Override the original request.
+180             req = prepared_request
+181 
+182             resp = self.send(
+183                 req,
+184                 stream=stream,
+185                 timeout=timeout,
+186                 verify=verify,
+187                 cert=cert,
+188                 proxies=proxies,
+189                 allow_redirects=False,
+190             )
+191 
+192             extract_cookies_to_jar(self.cookies, prepared_request, resp.raw)
+193 
+194             i += 1
+195             yield resp
+196 
+197     def rebuild_auth(self, prepared_request, response):
+198         """
+199         When being redirected we may want to strip authentication from the
+200         request to avoid leaking credentials. This method intelligently removes
+201         and reapplies authentication where possible to avoid credential loss.
+202         """
+203         headers = prepared_request.headers
+204         url = prepared_request.url
+205 
+206         if 'Authorization' in headers:
+207             # If we get redirected to a new host, we should strip out any
+208             # authentication headers.
+209             original_parsed = urlparse(response.request.url)
+210             redirect_parsed = urlparse(url)
+211 
+212             if (original_parsed.hostname != redirect_parsed.hostname):
+213                 del headers['Authorization']
+214 
+215         # .netrc might have more auth for us on our new host.
+216         new_auth = get_netrc_auth(url) if self.trust_env else None
+217         if new_auth is not None:
+218             prepared_request.prepare_auth(new_auth)
+219 
+220         return
+221 
+222     def rebuild_proxies(self, prepared_request, proxies):
+223         """
+224         This method re-evaluates the proxy configuration by considering the
+225         environment variables. If we are redirected to a URL covered by
+226         NO_PROXY, we strip the proxy configuration. Otherwise, we set missing
+227         proxy keys for this URL (in case they were stripped by a previous
+228         redirect).
+229 
+230         This method also replaces the Proxy-Authorization header where
+231         necessary.
+232         """
+233         headers = prepared_request.headers
+234         url = prepared_request.url
+235         scheme = urlparse(url).scheme
+236         new_proxies = proxies.copy() if proxies is not None else {}
+237 
+238         if self.trust_env and not should_bypass_proxies(url):
+239             environ_proxies = get_environ_proxies(url)
+240 
+241             proxy = environ_proxies.get(scheme)
+242 
+243             if proxy:
+244                 new_proxies.setdefault(scheme, environ_proxies[scheme])
+245 
+246         if 'Proxy-Authorization' in headers:
+247             del headers['Proxy-Authorization']
+248 
+249         try:
+250             username, password = get_auth_from_url(new_proxies[scheme])
+251         except KeyError:
+252             username, password = None, None
+253 
+254         if username and password:
+255             headers['Proxy-Authorization'] = _basic_auth_str(username, password)
+256 
+257         return new_proxies
+258 
+259 
+260 class Session(SessionRedirectMixin):
+261     """A Requests session.
+262 
+263     Provides cookie persistence, connection-pooling, and configuration.
+264 
+265     Basic Usage::
+266 
+267       >>> import requests
+268       >>> s = requests.Session()
+269       >>> s.get('http://httpbin.org/get')
+270       200
+271     """
+272 
+273     __attrs__ = [
+274         'headers', 'cookies', 'auth', 'proxies', 'hooks', 'params', 'verify',
+275         'cert', 'prefetch', 'adapters', 'stream', 'trust_env',
+276         'max_redirects', 'redirect_cache'
+277     ]
+278 
+279     def __init__(self):
+280 
+281         #: A case-insensitive dictionary of headers to be sent on each
+282         #: :class:`Request <Request>` sent from this
+283         #: :class:`Session <Session>`.
+284         self.headers = default_headers()
+285 
+286         #: Default Authentication tuple or object to attach to
+287         #: :class:`Request <Request>`.
+288         self.auth = None
+289 
+290         #: Dictionary mapping protocol to the URL of the proxy (e.g.
+291         #: {'http': 'foo.bar:3128'}) to be used on each
+292         #: :class:`Request <Request>`.
+293         self.proxies = {}
+294 
+295         #: Event-handling hooks.
+296         self.hooks = default_hooks()
+297 
+298         #: Dictionary of querystring data to attach to each
+299         #: :class:`Request <Request>`. The dictionary values may be lists for
+300         #: representing multivalued query parameters.
+301         self.params = {}
+302 
+303         #: Stream response content default.
+304         self.stream = False
+305 
+306         #: SSL Verification default.
+307         self.verify = True
+308 
+309         #: SSL certificate default.
+310         self.cert = None
+311 
+312         #: Maximum number of redirects allowed. If the request exceeds this
+313         #: limit, a :class:`TooManyRedirects` exception is raised.
+314         self.max_redirects = DEFAULT_REDIRECT_LIMIT
+315 
+316         #: Should we trust the environment?
+317         self.trust_env = True
+318 
+319         #: A CookieJar containing all currently outstanding cookies set on this
+320         #: session. By default it is a
+321         #: :class:`RequestsCookieJar <requests.cookies.RequestsCookieJar>`, but
+322         #: may be any other ``cookielib.CookieJar`` compatible object.
+323         self.cookies = cookiejar_from_dict({})
+324 
+325         # Default connection adapters.
+326         self.adapters = OrderedDict()
+327         self.mount('https://', HTTPAdapter())
+328         self.mount('http://', HTTPAdapter())
+329 
+330         self.redirect_cache = {}
+331 
+332     def __enter__(self):
+333         return self
+334 
+335     def __exit__(self, *args):
+336         self.close()
+337 
+338     def prepare_request(self, request):
+339         """Constructs a :class:`PreparedRequest <PreparedRequest>` for
+340         transmission and returns it. The :class:`PreparedRequest` has settings
+341         merged from the :class:`Request <Request>` instance and those of the
+342         :class:`Session`.
+343 
+344         :param request: :class:`Request` instance to prepare with this
+345             session's settings.
+346         """
+347         cookies = request.cookies or {}
+348 
+349         # Bootstrap CookieJar.
+350         if not isinstance(cookies, cookielib.CookieJar):
+351             cookies = cookiejar_from_dict(cookies)
+352 
+353         # Merge with session cookies
+354         merged_cookies = merge_cookies(
+355             merge_cookies(RequestsCookieJar(), self.cookies), cookies)
+356 
+357 
+358         # Set environment's basic authentication if not explicitly set.
+359         auth = request.auth
+360         if self.trust_env and not auth and not self.auth:
+361             auth = get_netrc_auth(request.url)
+362 
+363         p = PreparedRequest()
+364         p.prepare(
+365             method=request.method.upper(),
+366             url=request.url,
+367             files=request.files,
+368             data=request.data,
+369             json=request.json,
+370             headers=merge_setting(request.headers, self.headers, dict_class=CaseInsensitiveDict),
+371             params=merge_setting(request.params, self.params),
+372             auth=merge_setting(auth, self.auth),
+373             cookies=merged_cookies,
+374             hooks=merge_hooks(request.hooks, self.hooks),
+375         )
+376         return p
+377 
+378     def request(self, method, url,
+379         params=None,
+380         data=None,
+381         headers=None,
+382         cookies=None,
+383         files=None,
+384         auth=None,
+385         timeout=None,
+386         allow_redirects=True,
+387         proxies=None,
+388         hooks=None,
+389         stream=None,
+390         verify=None,
+391         cert=None,
+392         json=None):
+393         """Constructs a :class:`Request <Request>`, prepares it and sends it.
+394         Returns :class:`Response <Response>` object.
+395 
+396         :param method: method for the new :class:`Request` object.
+397         :param url: URL for the new :class:`Request` object.
+398         :param params: (optional) Dictionary or bytes to be sent in the query
+399             string for the :class:`Request`.
+400         :param data: (optional) Dictionary or bytes to send in the body of the
+401             :class:`Request`.
+402         :param json: (optional) json to send in the body of the
+403             :class:`Request`.
+404         :param headers: (optional) Dictionary of HTTP Headers to send with the
+405             :class:`Request`.
+406         :param cookies: (optional) Dict or CookieJar object to send with the
+407             :class:`Request`.
+408         :param files: (optional) Dictionary of ``'filename': file-like-objects``
+409             for multipart encoding upload.
+410         :param auth: (optional) Auth tuple or callable to enable
+411             Basic/Digest/Custom HTTP Auth.
+412         :param timeout: (optional) How long to wait for the server to send
+413             data before giving up, as a float, or a (`connect timeout, read
+414             timeout <user/advanced.html#timeouts>`_) tuple.
+415         :type timeout: float or tuple
+416         :param allow_redirects: (optional) Set to True by default.
+417         :type allow_redirects: bool
+418         :param proxies: (optional) Dictionary mapping protocol to the URL of
+419             the proxy.
+420         :param stream: (optional) whether to immediately download the response
+421             content. Defaults to ``False``.
+422         :param verify: (optional) if ``True``, the SSL cert will be verified.
+423             A CA_BUNDLE path can also be provided.
+424         :param cert: (optional) if String, path to ssl client cert file (.pem).
+425             If Tuple, ('cert', 'key') pair.
+426         """
+427 
+428         method = to_native_string(method)
+429 
+430         # Create the Request.
+431         req = Request(
+432             method = method.upper(),
+433             url = url,
+434             headers = headers,
+435             files = files,
+436             data = data or {},
+437             json = json,
+438             params = params or {},
+439             auth = auth,
+440             cookies = cookies,
+441             hooks = hooks,
+442         )
+443         prep = self.prepare_request(req)
+444 
+445         proxies = proxies or {}
+446 
+447         settings = self.merge_environment_settings(
+448             prep.url, proxies, stream, verify, cert
+449         )
+450 
+451         # Send the request.
+452         send_kwargs = {
+453             'timeout': timeout,
+454             'allow_redirects': allow_redirects,
+455         }
+456         send_kwargs.update(settings)
+457         resp = self.send(prep, **send_kwargs)
+458 
+459         return resp
+460 
+461     def get(self, url, **kwargs):
+462         """Sends a GET request. Returns :class:`Response` object.
+463 
+464         :param url: URL for the new :class:`Request` object.
+465         :param \*\*kwargs: Optional arguments that ``request`` takes.
+466         """
+467 
+468         kwargs.setdefault('allow_redirects', True)
+469         return self.request('GET', url, **kwargs)
+470 
+471     def options(self, url, **kwargs):
+472         """Sends a OPTIONS request. Returns :class:`Response` object.
+473 
+474         :param url: URL for the new :class:`Request` object.
+475         :param \*\*kwargs: Optional arguments that ``request`` takes.
+476         """
+477 
+478         kwargs.setdefault('allow_redirects', True)
+479         return self.request('OPTIONS', url, **kwargs)
+480 
+481     def head(self, url, **kwargs):
+482         """Sends a HEAD request. Returns :class:`Response` object.
+483 
+484         :param url: URL for the new :class:`Request` object.
+485         :param \*\*kwargs: Optional arguments that ``request`` takes.
+486         """
+487 
+488         kwargs.setdefault('allow_redirects', False)
+489         return self.request('HEAD', url, **kwargs)
+490 
+491     def post(self, url, data=None, json=None, **kwargs):
+492         """Sends a POST request. Returns :class:`Response` object.
+493 
+494         :param url: URL for the new :class:`Request` object.
+495         :param data: (optional) Dictionary, bytes, or file-like object to send in the body of the :class:`Request`.
+496         :param json: (optional) json to send in the body of the :class:`Request`.
+497         :param \*\*kwargs: Optional arguments that ``request`` takes.
+498         """
+499 
+500         return self.request('POST', url, data=data, json=json, **kwargs)
+501 
+502     def put(self, url, data=None, **kwargs):
+503         """Sends a PUT request. Returns :class:`Response` object.
+504 
+505         :param url: URL for the new :class:`Request` object.
+506         :param data: (optional) Dictionary, bytes, or file-like object to send in the body of the :class:`Request`.
+507         :param \*\*kwargs: Optional arguments that ``request`` takes.
+508         """
+509 
+510         return self.request('PUT', url, data=data, **kwargs)
+511 
+512     def patch(self, url, data=None, **kwargs):
+513         """Sends a PATCH request. Returns :class:`Response` object.
+514 
+515         :param url: URL for the new :class:`Request` object.
+516         :param data: (optional) Dictionary, bytes, or file-like object to send in the body of the :class:`Request`.
+517         :param \*\*kwargs: Optional arguments that ``request`` takes.
+518         """
+519 
+520         return self.request('PATCH', url,  data=data, **kwargs)
+521 
+522     def delete(self, url, **kwargs):
+523         """Sends a DELETE request. Returns :class:`Response` object.
+524 
+525         :param url: URL for the new :class:`Request` object.
+526         :param \*\*kwargs: Optional arguments that ``request`` takes.
+527         """
+528 
+529         return self.request('DELETE', url, **kwargs)
+530 
+531     def send(self, request, **kwargs):
+532         """Send a given PreparedRequest."""
+533         # Set defaults that the hooks can utilize to ensure they always have
+534         # the correct parameters to reproduce the previous request.
+535         kwargs.setdefault('stream', self.stream)
+536         kwargs.setdefault('verify', self.verify)
+537         kwargs.setdefault('cert', self.cert)
+538         kwargs.setdefault('proxies', self.proxies)
+539 
+540         # It's possible that users might accidentally send a Request object.
+541         # Guard against that specific failure case.
+542         if not isinstance(request, PreparedRequest):
+543             raise ValueError('You can only send PreparedRequests.')
+544 
+545         checked_urls = set()
+546         while request.url in self.redirect_cache:
+547             checked_urls.add(request.url)
+548             new_url = self.redirect_cache.get(request.url)
+549             if new_url in checked_urls:
+550                 break
+551             request.url = new_url
+552 
+553         # Set up variables needed for resolve_redirects and dispatching of hooks
+554         allow_redirects = kwargs.pop('allow_redirects', True)
+555         stream = kwargs.get('stream')
+556         timeout = kwargs.get('timeout')
+557         verify = kwargs.get('verify')
+558         cert = kwargs.get('cert')
+559         proxies = kwargs.get('proxies')
+560         hooks = request.hooks
+561 
+562         # Get the appropriate adapter to use
+563         adapter = self.get_adapter(url=request.url)
+564 
+565         # Start time (approximately) of the request
+566         start = datetime.utcnow()
+567 
+568         # Send the request
+569         r = adapter.send(request, **kwargs)
+570 
+571         # Total elapsed time of the request (approximately)
+572         r.elapsed = datetime.utcnow() - start
+573 
+574         # Response manipulation hooks
+575         r = dispatch_hook('response', hooks, r, **kwargs)
+576 
+577         # Persist cookies
+578         if r.history:
+579 
+580             # If the hooks create history then we want those cookies too
+581             for resp in r.history:
+582                 extract_cookies_to_jar(self.cookies, resp.request, resp.raw)
+583 
+584         extract_cookies_to_jar(self.cookies, request, r.raw)
+585 
+586         # Redirect resolving generator.
+587         gen = self.resolve_redirects(r, request,
+588             stream=stream,
+589             timeout=timeout,
+590             verify=verify,
+591             cert=cert,
+592             proxies=proxies)
+593 
+594         # Resolve redirects if allowed.
+595         history = [resp for resp in gen] if allow_redirects else []
+596 
+597         # Shuffle things around if there's history.
+598         if history:
+599             # Insert the first (original) request at the start
+600             history.insert(0, r)
+601             # Get the last request made
+602             r = history.pop()
+603             r.history = history
+604 
+605         if not stream:
+606             r.content
+607 
+608         return r
+609 
+610     def merge_environment_settings(self, url, proxies, stream, verify, cert):
+611         """Check the environment and merge it with some settings."""
+612         # Gather clues from the surrounding environment.
+613         if self.trust_env:
+614             # Set environment's proxies.
+615             env_proxies = get_environ_proxies(url) or {}
+616             for (k, v) in env_proxies.items():
+617                 proxies.setdefault(k, v)
+618 
+619             # Look for requests environment configuration and be compatible
+620             # with cURL.
+621             if verify is True or verify is None:
+622                 verify = (os.environ.get('REQUESTS_CA_BUNDLE') or
+623                           os.environ.get('CURL_CA_BUNDLE'))
+624 
+625         # Merge all the kwargs.
+626         proxies = merge_setting(proxies, self.proxies)
+627         stream = merge_setting(stream, self.stream)
+628         verify = merge_setting(verify, self.verify)
+629         cert = merge_setting(cert, self.cert)
+630 
+631         return {'verify': verify, 'proxies': proxies, 'stream': stream,
+632                 'cert': cert}
+633 
+634     def get_adapter(self, url):
+635         """Returns the appropriate connnection adapter for the given URL."""
+636         for (prefix, adapter) in self.adapters.items():
+637 
+638             if url.lower().startswith(prefix):
+639                 return adapter
+640 
+641         # Nothing matches :-/
+642         raise InvalidSchema("No connection adapters were found for '%s'" % url)
+643 
+644     def close(self):
+645         """Closes all adapters and as such the session"""
+646         for v in self.adapters.values():
+647             v.close()
+648 
+649     def mount(self, prefix, adapter):
+650         """Registers a connection adapter to a prefix.
+651 
+652         Adapters are sorted in descending order by key length."""
+653 
+654         self.adapters[prefix] = adapter
+655         keys_to_move = [k for k in self.adapters if len(k) < len(prefix)]
+656 
+657         for key in keys_to_move:
+658             self.adapters[key] = self.adapters.pop(key)
+659 
+660     def __getstate__(self):
+661         return dict((attr, getattr(self, attr, None)) for attr in self.__attrs__)
+662 
+663     def __setstate__(self, state):
+664         for attr, value in state.items():
+665             setattr(self, attr, value)
+666 
+667 
+668 def session():
+669     """Returns a :class:`Session` for context-management."""
+670 
+671     return Session()
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `requests/sessions.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/requests/sessions.py b/requests/sessions.py
+--- a/requests/sessions.py
++++ b/requests/sessions.py
+@@ -13,7 +13,7 @@
+ from datetime import datetime
+ 
+ from .auth import _basic_auth_str
+-from .compat import cookielib, OrderedDict, urljoin, urlparse, builtin_str
++from .compat import cookielib, OrderedDict, urljoin, urlparse
+ from .cookies import (
+     cookiejar_from_dict, extract_cookies_to_jar, RequestsCookieJar, merge_cookies)
+ from .models import Request, PreparedRequest, DEFAULT_REDIRECT_LIMIT
+@@ -425,7 +425,7 @@ def request(self, method, url,
+             If Tuple, ('cert', 'key') pair.
+         """
+ 
+-        method = builtin_str(method)
++        method = to_native_string(method)
+ 
+         # Create the Request.
+         req = Request(
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/reproduce.py b/reproduce.py
+new file mode 100644
+index 00000000..c38740f1
+--- /dev/null
++++ b/reproduce.py
+@@ -0,0 +1,12 @@
++import requests
++
++# Create a session
++s = requests.Session()
++
++# Simulate what neutronclient does - convert method to bytes
++method = b'GET'
++
++# This will fail because method gets converted to "b'GET'" string
++response = s.request(method=method, url='http://httpbin.org/get')
++print(f"Method used: {method}")
++print(f"Response status: {response.status_code}")
+\ No newline at end of file
+diff --git a/requests/sessions.py b/requests/sessions.py
+index d701ff2e..adcfbac7 100644
+--- a/requests/sessions.py
++++ b/requests/sessions.py
+@@ -425,7 +425,7 @@ class Session(SessionRedirectMixin):
+             If Tuple, ('cert', 'key') pair.
+         """
+ 
+-        method = builtin_str(method)
++        method = to_native_string(method)
+ 
+         # Create the Request.
+         req = Request(
+diff --git a/test_edge_cases.py b/test_edge_cases.py
+new file mode 100644
+index 00000000..38a6e97b
+--- /dev/null
++++ b/test_edge_cases.py
+@@ -0,0 +1,35 @@
++import requests
++
++# Create a session
++s = requests.Session()
++
++# Test case 1: Regular string method
++print("\nTest case 1: Regular string method")
++response = s.request(method="GET", url='http://httpbin.org/get')
++print(f"Response status: {response.status_code}")
++
++# Test case 2: Bytes method
++print("\nTest case 2: Bytes method")
++response = s.request(method=b'GET', url='http://httpbin.org/get')
++print(f"Response status: {response.status_code}")
++
++# Test case 3: Unicode string method
++print("\nTest case 3: Unicode string method")
++response = s.request(method=u'GET', url='http://httpbin.org/get')
++print(f"Response status: {response.status_code}")
++
++# Test case 4: Bytes method with non-ASCII characters
++print("\nTest case 4: Bytes method with non-ASCII characters")
++try:
++    response = s.request(method=b'G\xc3\x89T', url='http://httpbin.org/get')
++    print(f"Response status: {response.status_code}")
++except Exception as e:
++    print(f"Error (expected): {e}")
++
++# Test case 5: Method with whitespace
++print("\nTest case 5: Method with whitespace")
++try:
++    response = s.request(method=b'  GET  ', url='http://httpbin.org/get')
++    print(f"Response status: {response.status_code}")
++except Exception as e:
++    print(f"Error (expected): {e}")
+\ No newline at end of file
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `test_requests.py` that contains the existing tests.
+-----------------------------------------------------------
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""Tests for Requests."""
+
+from __future__ import division
+import json
+import os
+import pickle
+import unittest
+import collections
+
+import io
+import requests
+import pytest
+from requests.adapters import HTTPAdapter
+from requests.auth import HTTPDigestAuth, _basic_auth_str
+from requests.compat import (
+    Morsel, cookielib, getproxies, str, urljoin, urlparse, is_py3, builtin_str)
+from requests.cookies import cookiejar_from_dict, morsel_to_cookie
+from requests.exceptions import (ConnectionError, ConnectTimeout,
+                                 InvalidSchema, InvalidURL, MissingSchema,
+                                 ReadTimeout, Timeout)
+from requests.models import PreparedRequest
+from requests.structures import CaseInsensitiveDict
+from requests.sessions import SessionRedirectMixin
+from requests.models import urlencode
+from requests.hooks import default_hooks
+
+try:
+    import StringIO
+except ImportError:
+    import io as StringIO
+
+if is_py3:
+    def u(s):
+        return s
+else:
+    def u(s):
+        return s.decode('unicode-escape')
+
+
+# Requests to this URL should always fail with a connection timeout (nothing
+# listening on that port)
+TARPIT = "http://10.255.255.1"
+HTTPBIN = os.environ.get('HTTPBIN_URL', 'http://httpbin.org/')
+# Issue #1483: Make sure the URL always has a trailing slash
+HTTPBIN = HTTPBIN.rstrip('/') + '/'
+
+
+def httpbin(*suffix):
+    """Returns url for HTTPBIN resource."""
+    return urljoin(HTTPBIN, '/'.join(suffix))
+
+
+class RequestsTestCase(unittest.TestCase):
+
+    _multiprocess_can_split_ = True
+
+    def setUp(self):
+        """Create simple data set with headers."""
+        pass
+
+    def tearDown(self):
+        """Teardown."""
+        pass
+
+    def test_entry_points(self):
+
+        requests.session
+        requests.session().get
+        requests.session().head
+        requests.get
+        requests.head
+        requests.put
+        requests.patch
+        requests.post
+
+    def test_invalid_url(self):
+        with pytest.raises(MissingSchema):
+            requests.get('hiwpefhipowhefopw')
+        with pytest.raises(InvalidSchema):
+            requests.get('localhost:3128')
+        with pytest.raises(InvalidSchema):
+            requests.get('localhost.localdomain:3128/')
+        with pytest.raises(InvalidSchema):
+            requests.get('10.122.1.1:3128/')
+        with pytest.raises(InvalidURL):
+            requests.get('http://')
+
+    def test_basic_building(self):
+        req = requests.Request()
+        req.url = 'http://kennethreitz.org/'
+        req.data = {'life': '42'}
+
+        pr = req.prepare()
+        assert pr.url == req.url
+        assert pr.body == 'life=42'
+
+    def test_no_content_length(self):
+        get_req = requests.Request('GET', httpbin('get')).prepare()
+        assert 'Content-Length' not in get_req.headers
+        head_req = requests.Request('HEAD', httpbin('head')).prepare()
+        assert 'Content-Length' not in head_req.headers
+
+    def test_path_is_not_double_encoded(self):
+        request = requests.Request('GET', "http://0.0.0.0/get/test case").prepare()
+
+        assert request.path_url == '/get/test%20case'
+
+    def test_params_are_added_before_fragment(self):
+        request = requests.Request('GET',
+            "http://example.com/path#fragment", params={"a": "b"}).prepare()
+        assert request.url == "http://example.com/path?a=b#fragment"
+        request = requests.Request('GET',
+            "http://example.com/path?key=value#fragment", params={"a": "b"}).prepare()
+        assert request.url == "http://example.com/path?key=value&a=b#fragment"
+
+    def test_mixed_case_scheme_acceptable(self):
+        s = requests.Session()
+        s.proxies = getproxies()
+        parts = urlparse(httpbin('get'))
+        schemes = ['http://', 'HTTP://', 'hTTp://', 'HttP://',
+                   'https://', 'HTTPS://', 'hTTps://', 'HttPs://']
+        for scheme in schemes:
+            url = scheme + parts.netloc + parts.path
+            r = requests.Request('GET', url)
+            r = s.send(r.prepare())
+            assert r.status_code == 200, 'failed for scheme {0}'.format(scheme)
+
+    def test_HTTP_200_OK_GET_ALTERNATIVE(self):
+        r = requests.Request('GET', httpbin('get'))
+        s = requests.Session()
+        s.proxies = getproxies()
+
+        r = s.send(r.prepare())
+
+        assert r.status_code == 200
+
+    def test_HTTP_302_ALLOW_REDIRECT_GET(self):
+        r = requests.get(httpbin('redirect', '1'))
+        assert r.status_code == 200
+        assert r.history[0].status_code == 302
+        assert r.history[0].is_redirect
+
+    # def test_HTTP_302_ALLOW_REDIRECT_POST(self):
+    #     r = requests.post(httpbin('status', '302'), data={'some': 'data'})
+    #     self.assertEqual(r.status_code, 200)
+
+    def test_HTTP_200_OK_GET_WITH_PARAMS(self):
+        heads = {'User-agent': 'Mozilla/5.0'}
+
+        r = requests.get(httpbin('user-agent'), headers=heads)
+
+        assert heads['User-agent'] in r.text
+        assert r.status_code == 200
+
+    def test_HTTP_200_OK_GET_WITH_MIXED_PARAMS(self):
+        heads = {'User-agent': 'Mozilla/5.0'}
+
+        r = requests.get(httpbin('get') + '?test=true', params={'q': 'test'}, headers=heads)
+        assert r.status_code == 200
+
+    def test_set_cookie_on_301(self):
+        s = requests.session()
+        url = httpbin('cookies/set?foo=bar')
+        s.get(url)
+        assert s.cookies['foo'] == 'bar'
+
+    def test_cookie_sent_on_redirect(self):
+        s = requests.session()
+        s.get(httpbin('cookies/set?foo=bar'))
+        r = s.get(httpbin('redirect/1'))  # redirects to httpbin('get')
+        assert 'Cookie' in r.json()['headers']
+
+    def test_cookie_removed_on_expire(self):
+        s = requests.session()
+        s.get(httpbin('cookies/set?foo=bar'))
+        assert s.cookies['foo'] == 'bar'
+        s.get(
+            httpbin('response-headers'),
+            params={
+                'Set-Cookie':
+                    'foo=deleted; expires=Thu, 01-Jan-1970 00:00:01 GMT'
+            }
+        )
+        assert 'foo' not in s.cookies
+
+    def test_cookie_quote_wrapped(self):
+        s = requests.session()
+        s.get(httpbin('cookies/set?foo="bar:baz"'))
+        assert s.cookies['foo'] == '"bar:baz"'
+
+    def test_cookie_persists_via_api(self):
+        s = requests.session()
+        r = s.get(httpbin('redirect/1'), cookies={'foo': 'bar'})
+        assert 'foo' in r.request.headers['Cookie']
+        assert 'foo' in r.history[0].request.headers['Cookie']
+
+    def test_request_cookie_overrides_session_cookie(self):
+        s = requests.session()
+        s.cookies['foo'] = 'bar'
+        r = s.get(httpbin('cookies'), cookies={'foo': 'baz'})
+        assert r.json()['cookies']['foo'] == 'baz'
+        # Session cookie should not be modified
+        assert s.cookies['foo'] == 'bar'
+
+    def test_request_cookies_not_persisted(self):
+        s = requests.session()
+        s.get(httpbin('cookies'), cookies={'foo': 'baz'})
+        # Sending a request with cookies should not add cookies to the session
+        assert not s.cookies
+
+    def test_generic_cookiejar_works(self):
+        cj = cookielib.CookieJar()
+        cookiejar_from_dict({'foo': 'bar'}, cj)
+        s = requests.session()
+        s.cookies = cj
+        r = s.get(httpbin('cookies'))
+        # Make sure the cookie was sent
+        assert r.json()['cookies']['foo'] == 'bar'
+        # Make sure the session cj is still the custom one
+        assert s.cookies is cj
+
+    def test_param_cookiejar_works(self):
+        cj = cookielib.CookieJar()
+        cookiejar_from_dict({'foo': 'bar'}, cj)
+        s = requests.session()
+        r = s.get(httpbin('cookies'), cookies=cj)
+        # Make sure the cookie was sent
+        assert r.json()['cookies']['foo'] == 'bar'
+
+    def test_requests_in_history_are_not_overridden(self):
+        resp = requests.get(httpbin('redirect/3'))
+        urls = [r.url for r in resp.history]
+        req_urls = [r.request.url for r in resp.history]
+        assert urls == req_urls
+
+    def test_history_is_always_a_list(self):
+        """
+        Show that even with redirects, Response.history is always a list.
+        """
+        resp = requests.get(httpbin('get'))
+        assert isinstance(resp.history, list)
+        resp = requests.get(httpbin('redirect/1'))
+        assert isinstance(resp.history, list)
+        assert not isinstance(resp.history, tuple)
+
+    def test_headers_on_session_with_None_are_not_sent(self):
+        """Do not send headers in Session.headers with None values."""
+        ses = requests.Session()
+        ses.headers['Accept-Encoding'] = None
+        req = requests.Request('GET', 'http://httpbin.org/get')
+        prep = ses.prepare_request(req)
+        assert 'Accept-Encoding' not in prep.headers
+
+    def test_user_agent_transfers(self):
+
+        heads = {
+            'User-agent': 'Mozilla/5.0 (github.com/kennethreitz/requests)'
+        }
+
+        r = requests.get(httpbin('user-agent'), headers=heads)
+        assert heads['User-agent'] in r.text
+
+        heads = {
+            'user-agent': 'Mozilla/5.0 (github.com/kennethreitz/requests)'
+        }
+
+        r = requests.get(httpbin('user-agent'), headers=heads)
+        assert heads['user-agent'] in r.text
+
+    def test_HTTP_200_OK_HEAD(self):
+        r = requests.head(httpbin('get'))
+        assert r.status_code == 200
+
+    def test_HTTP_200_OK_PUT(self):
+        r = requests.put(httpbin('put'))
+        assert r.status_code == 200
+
+    def test_BASICAUTH_TUPLE_HTTP_200_OK_GET(self):
+        auth = ('user', 'pass')
+        url = httpbin('basic-auth', 'user', 'pass')
+
+        r = requests.get(url, auth=auth)
+        assert r.status_code == 200
+
+        r = requests.get(url)
+        assert r.status_code == 401
+
+        s = requests.session()
+        s.auth = auth
+        r = s.get(url)
+        assert r.status_code == 200
+
+    def test_connection_error(self):
+        """Connecting to an unknown domain should raise a ConnectionError"""
+        with pytest.raises(ConnectionError):
+            requests.get("http://fooobarbangbazbing.httpbin.org")
+
+        with pytest.raises(ConnectionError):
+            requests.get("http://httpbin.org:1")
+
+    def test_basicauth_with_netrc(self):
+        auth = ('user', 'pass')
+        wrong_auth = ('wronguser', 'wrongpass')
+        url = httpbin('basic-auth', 'user', 'pass')
+
+        def get_netrc_auth_mock(url):
+            return auth
+        requests.sessions.get_netrc_auth = get_netrc_auth_mock
+
+        # Should use netrc and work.
+        r = requests.get(url)
+        assert r.status_code == 200
+
+        # Given auth should override and fail.
+        r = requests.get(url, auth=wrong_auth)
+        assert r.status_code == 401
+
+        s = requests.session()
+
+        # Should use netrc and work.
+        r = s.get(url)
+        assert r.status_code == 200
+
+        # Given auth should override and fail.
+        s.auth = wrong_auth
+        r = s.get(url)
+        assert r.status_code == 401
+
+    def test_DIGEST_HTTP_200_OK_GET(self):
+
+        auth = HTTPDigestAuth('user', 'pass')
+        url = httpbin('digest-auth', 'auth', 'user', 'pass')
+
+        r = requests.get(url, auth=auth)
+        assert r.status_code == 200
+
+        r = requests.get(url)
+        assert r.status_code == 401
+
+        s = requests.session()
+        s.auth = HTTPDigestAuth('user', 'pass')
+        r = s.get(url)
+        assert r.status_code == 200
+
+    def test_DIGEST_AUTH_RETURNS_COOKIE(self):
+        url = httpbin('digest-auth', 'auth', 'user', 'pass')
+        auth = HTTPDigestAuth('user', 'pass')
+        r = requests.get(url)
+        assert r.cookies['fake'] == 'fake_value'
+
+        r = requests.get(url, auth=auth)
+        assert r.status_code == 200
+
+    def test_DIGEST_AUTH_SETS_SESSION_COOKIES(self):
+        url = httpbin('digest-auth', 'auth', 'user', 'pass')
+        auth = HTTPDigestAuth('user', 'pass')
+        s = requests.Session()
+        s.get(url, auth=auth)
+        assert s.cookies['fake'] == 'fake_value'
+
+    def test_DIGEST_STREAM(self):
+
+        auth = HTTPDigestAuth('user', 'pass')
+        url = httpbin('digest-auth', 'auth', 'user', 'pass')
+
+        r = requests.get(url, auth=auth, stream=True)
+        assert r.raw.read() != b''
+
+        r = requests.get(url, auth=auth, stream=False)
+        assert r.raw.read() == b''
+
+    def test_DIGESTAUTH_WRONG_HTTP_401_GET(self):
+
+        auth = HTTPDigestAuth('user', 'wrongpass')
+        url = httpbin('digest-auth', 'auth', 'user', 'pass')
+
+        r = requests.get(url, auth=auth)
+        assert r.status_code == 401
+
+        r = requests.get(url)
+        assert r.status_code == 401
+
+        s = requests.session()
+        s.auth = auth
+        r = s.get(url)
+        assert r.status_code == 401
+
+    def test_DIGESTAUTH_QUOTES_QOP_VALUE(self):
+
+        auth = HTTPDigestAuth('user', 'pass')
+        url = httpbin('digest-auth', 'auth', 'user', 'pass')
+
+        r = requests.get(url, auth=auth)
+        assert '"auth"' in r.request.headers['Authorization']
+
+    def test_POSTBIN_GET_POST_FILES(self):
+
+        url = httpbin('post')
+        post1 = requests.post(url).raise_for_status()
+
+        post1 = requests.post(url, data={'some': 'data'})
+        assert post1.status_code == 200
+
+        with open('requirements.txt') as f:
+            post2 = requests.post(url, files={'some': f})
+        assert post2.status_code == 200
+
+        post4 = requests.post(url, data='[{"some": "json"}]')
+        assert post4.status_code == 200
+
+        with pytest.raises(ValueError):
+            requests.post(url, files=['bad file data'])
+
+    def test_POSTBIN_GET_POST_FILES_WITH_DATA(self):
+
+        url = httpbin('post')
+        post1 = requests.post(url).raise_for_status()
+
+        post1 = requests.post(url, data={'some': 'data'})
+        assert post1.status_code == 200
+
+        with open('requirements.txt') as f:
+            post2 = requests.post(url,
+                data={'some': 'data'}, files={'some': f})
+        assert post2.status_code == 200
+
+        post4 = requests.post(url, data='[{"some": "json"}]')
+        assert post4.status_code == 200
+
+        with pytest.raises(ValueError):
+            requests.post(url, files=['bad file data'])
+
+    def test_conflicting_post_params(self):
+        url = httpbin('post')
+        with open('requirements.txt') as f:
+            pytest.raises(ValueError, "requests.post(url, data='[{\"some\": \"data\"}]', files={'some': f})")
+            pytest.raises(ValueError, "requests.post(url, data=u('[{\"some\": \"data\"}]'), files={'some': f})")
+
+    def test_request_ok_set(self):
+        r = requests.get(httpbin('status', '404'))
+        assert not r.ok
+
+    def test_status_raising(self):
+        r = requests.get(httpbin('status', '404'))
+        with pytest.raises(requests.exceptions.HTTPError):
+            r.raise_for_status()
+
+        r = requests.get(httpbin('status', '500'))
+        assert not r.ok
+
+    def test_decompress_gzip(self):
+        r = requests.get(httpbin('gzip'))
+        r.content.decode('ascii')
+
+    def test_unicode_get(self):
+        url = httpbin('/get')
+        requests.get(url, params={'foo': 'føø'})
+        requests.get(url, params={'føø': 'føø'})
+        requests.get(url, params={'føø': 'føø'})
+        requests.get(url, params={'foo': 'foo'})
+        requests.get(httpbin('ø'), params={'foo': 'foo'})
+
+    def test_unicode_header_name(self):
+        requests.put(
+            httpbin('put'),
+            headers={str('Content-Type'): 'application/octet-stream'},
+            data='\xff')  # compat.str is unicode.
+
+    def test_pyopenssl_redirect(self):
+        requests.get('https://httpbin.org/status/301')
+
+    def test_urlencoded_get_query_multivalued_param(self):
+
+        r = requests.get(httpbin('get'), params=dict(test=['foo', 'baz']))
+        assert r.status_code == 200
+        assert r.url == httpbin('get?test=foo&test=baz')
+
+    def test_different_encodings_dont_break_post(self):
+        r = requests.post(httpbin('post'),
+            data={'stuff': json.dumps({'a': 123})},
+            params={'blah': 'asdf1234'},
+            files={'file': ('test_requests.py', open(__file__, 'rb'))})
+        assert r.status_code == 200
+
+    def test_unicode_multipart_post(self):
+        r = requests.post(httpbin('post'),
+            data={'stuff': u('ëlïxr')},
+            files={'file': ('test_requests.py', open(__file__, 'rb'))})
+        assert r.status_code == 200
+
+        r = requests.post(httpbin('post'),
+            data={'stuff': u('ëlïxr').encode('utf-8')},
+            files={'file': ('test_requests.py', open(__file__, 'rb'))})
+        assert r.status_code == 200
+
+        r = requests.post(httpbin('post'),
+            data={'stuff': 'elixr'},
+            files={'file': ('test_requests.py', open(__file__, 'rb'))})
+        assert r.status_code == 200
+
+        r = requests.post(httpbin('post'),
+            data={'stuff': 'elixr'.encode('utf-8')},
+            files={'file': ('test_requests.py', open(__file__, 'rb'))})
+        assert r.status_code == 200
+
+    def test_unicode_multipart_post_fieldnames(self):
+        filename = os.path.splitext(__file__)[0] + '.py'
+        r = requests.Request(method='POST',
+                             url=httpbin('post'),
+                             data={'stuff'.encode('utf-8'): 'elixr'},
+                             files={'file': ('test_requests.py',
+                                             open(filename, 'rb'))})
+        prep = r.prepare()
+        assert b'name="stuff"' in prep.body
+        assert b'name="b\'stuff\'"' not in prep.body
+
+    def test_unicode_method_name(self):
+        files = {'file': open('test_requests.py', 'rb')}
+        r = requests.request(
+            method=u('POST'), url=httpbin('post'), files=files)
+        assert r.status_code == 200
+
+    def test_custom_content_type(self):
+        r = requests.post(
+            httpbin('post'),
+            data={'stuff': json.dumps({'a': 123})},
+            files={'file1': ('test_requests.py', open(__file__, 'rb')),
+                   'file2': ('test_requests', open(__file__, 'rb'),
+                             'text/py-content-type')})
+        assert r.status_code == 200
+        assert b"text/py-content-type" in r.request.body
+
+    def test_hook_receives_request_arguments(self):
+        def hook(resp, **kwargs):
+            assert resp is not None
+            assert kwargs != {}
+
+        requests.Request('GET', HTTPBIN, hooks={'response': hook})
+
+    def test_session_hooks_are_used_with_no_request_hooks(self):
+        hook = lambda x, *args, **kwargs: x
+        s = requests.Session()
+        s.hooks['response'].append(hook)
+        r = requests.Request('GET', HTTPBIN)
+        prep = s.prepare_request(r)
+        assert prep.hooks['response'] != []
+        assert prep.hooks['response'] == [hook]
+
+    def test_session_hooks_are_overriden_by_request_hooks(self):
+        hook1 = lambda x, *args, **kwargs: x
+        hook2 = lambda x, *args, **kwargs: x
+        assert hook1 is not hook2
+        s = requests.Session()
+        s.hooks['response'].append(hook2)
+        r = requests.Request('GET', HTTPBIN, hooks={'response': [hook1]})
+        prep = s.prepare_request(r)
+        assert prep.hooks['response'] == [hook1]
+
+    def test_prepared_request_hook(self):
+        def hook(resp, **kwargs):
+            resp.hook_working = True
+            return resp
+
+        req = requests.Request('GET', HTTPBIN, hooks={'response': hook})
+        prep = req.prepare()
+
+        s = requests.Session()
+        s.proxies = getproxies()
+        resp = s.send(prep)
+
+        assert hasattr(resp, 'hook_working')
+
+    def test_prepared_from_session(self):
+        class DummyAuth(requests.auth.AuthBase):
+            def __call__(self, r):
+                r.headers['Dummy-Auth-Test'] = 'dummy-auth-test-ok'
+                return r
+
+        req = requests.Request('GET', httpbin('headers'))
+        assert not req.auth
+
+        s = requests.Session()
+        s.auth = DummyAuth()
+
+        prep = s.prepare_request(req)
+        resp = s.send(prep)
+
+        assert resp.json()['headers'][
+            'Dummy-Auth-Test'] == 'dummy-auth-test-ok'
+
+    def test_prepare_request_with_bytestring_url(self):
+        req = requests.Request('GET', b'https://httpbin.org/')
+        s = requests.Session()
+        prep = s.prepare_request(req)
+        assert prep.url == "https://httpbin.org/"
+
+    def test_links(self):
+        r = requests.Response()
+        r.headers = {
+            'cache-control': 'public, max-age=60, s-maxage=60',
+            'connection': 'keep-alive',
+            'content-encoding': 'gzip',
+            'content-type': 'application/json; charset=utf-8',
+            'date': 'Sat, 26 Jan 2013 16:47:56 GMT',
+            'etag': '"6ff6a73c0e446c1f61614769e3ceb778"',
+            'last-modified': 'Sat, 26 Jan 2013 16:22:39 GMT',
+            'link': ('<https://api.github.com/users/kennethreitz/repos?'
+                     'page=2&per_page=10>; rel="next", <https://api.github.'
+                     'com/users/kennethreitz/repos?page=7&per_page=10>; '
+                     ' rel="last"'),
+            'server': 'GitHub.com',
+            'status': '200 OK',
+            'vary': 'Accept',
+            'x-content-type-options': 'nosniff',
+            'x-github-media-type': 'github.beta',
+            'x-ratelimit-limit': '60',
+            'x-ratelimit-remaining': '57'
+        }
+        assert r.links['next']['rel'] == 'next'
+
+    def test_cookie_parameters(self):
+        key = 'some_cookie'
+        value = 'some_value'
+        secure = True
+        domain = 'test.com'
+        rest = {'HttpOnly': True}
+
+        jar = requests.cookies.RequestsCookieJar()
+        jar.set(key, value, secure=secure, domain=domain, rest=rest)
+
+        assert len(jar) == 1
+        assert 'some_cookie' in jar
+
+        cookie = list(jar)[0]
+        assert cookie.secure == secure
+        assert cookie.domain == domain
+        assert cookie._rest['HttpOnly'] == rest['HttpOnly']
+
+    def test_cookie_as_dict_keeps_len(self):
+        key = 'some_cookie'
+        value = 'some_value'
+
+        key1 = 'some_cookie1'
+        value1 = 'some_value1'
+
+        jar = requests.cookies.RequestsCookieJar()
+        jar.set(key, value)
+        jar.set(key1, value1)
+
+        d1 = dict(jar)
+        d2 = dict(jar.iteritems())
+        d3 = dict(jar.items())
+
+        assert len(jar) == 2
+        assert len(d1) == 2
+        assert len(d2) == 2
+        assert len(d3) == 2
+
+    def test_cookie_as_dict_keeps_items(self):
+        key = 'some_cookie'
+        value = 'some_value'
+
+        key1 = 'some_cookie1'
+        value1 = 'some_value1'
+
+        jar = requests.cookies.RequestsCookieJar()
+        jar.set(key, value)
+        jar.set(key1, value1)
+
+        d1 = dict(jar)
+        d2 = dict(jar.iteritems())
+        d3 = dict(jar.items())
+
+        assert d1['some_cookie'] == 'some_value'
+        assert d2['some_cookie'] == 'some_value'
+        assert d3['some_cookie1'] == 'some_value1'
+
+    def test_cookie_as_dict_keys(self):
+        key = 'some_cookie'
+        value = 'some_value'
+
+        key1 = 'some_cookie1'
+        value1 = 'some_value1'
+
+        jar = requests.cookies.RequestsCookieJar()
+        jar.set(key, value)
+        jar.set(key1, value1)
+
+        keys = jar.keys()
+        assert keys == list(keys)
+        # make sure one can use keys multiple times
+        assert list(keys) == list(keys)
+
+    def test_cookie_as_dict_values(self):
+        key = 'some_cookie'
+        value = 'some_value'
+
+        key1 = 'some_cookie1'
+        value1 = 'some_value1'
+
+        jar = requests.cookies.RequestsCookieJar()
+        jar.set(key, value)
+        jar.set(key1, value1)
+
+        values = jar.values()
+        assert values == list(values)
+        # make sure one can use values multiple times
+        assert list(values) == list(values)
+
+    def test_cookie_as_dict_items(self):
+        key = 'some_cookie'
+        value = 'some_value'
+
+        key1 = 'some_cookie1'
+        value1 = 'some_value1'
+
+        jar = requests.cookies.RequestsCookieJar()
+        jar.set(key, value)
+        jar.set(key1, value1)
+
+        items = jar.items()
+        assert items == list(items)
+        # make sure one can use items multiple times
+        assert list(items) == list(items)
+
+    def test_time_elapsed_blank(self):
+        r = requests.get(httpbin('get'))
+        td = r.elapsed
+        total_seconds = ((td.microseconds + (td.seconds + td.days * 24 * 3600)
+                         * 10**6) / 10**6)
+        assert total_seconds > 0.0
+
+    def test_response_is_iterable(self):
+        r = requests.Response()
+        io = StringIO.StringIO('abc')
+        read_ = io.read
+
+        def read_mock(amt, decode_content=None):
+            return read_(amt)
+        setattr(io, 'read', read_mock)
+        r.raw = io
+        assert next(iter(r))
+        io.close()
+
+    def test_response_decode_unicode(self):
+        """
+        When called with decode_unicode, Response.iter_content should always
+        return unicode.
+        """
+        r = requests.Response()
+        r._content_consumed = True
+        r._content = b'the content'
+        r.encoding = 'ascii'
+
+        chunks = r.iter_content(decode_unicode=True)
+        assert all(isinstance(chunk, str) for chunk in chunks)
+
+        # also for streaming
+        r = requests.Response()
+        r.raw = io.BytesIO(b'the content')
+        r.encoding = 'ascii'
+        chunks = r.iter_content(decode_unicode=True)
+        assert all(isinstance(chunk, str) for chunk in chunks)
+
+    def test_request_and_response_are_pickleable(self):
+        r = requests.get(httpbin('get'))
+
+        # verify we can pickle the original request
+        assert pickle.loads(pickle.dumps(r.request))
+
+        # verify we can pickle the response and that we have access to
+        # the original request.
+        pr = pickle.loads(pickle.dumps(r))
+        assert r.request.url == pr.request.url
+        assert r.request.headers == pr.request.headers
+
+    def test_get_auth_from_url(self):
+        url = 'http://user:pass@complex.url.com/path?query=yes'
+        assert ('user', 'pass') == requests.utils.get_auth_from_url(url)
+
+    def test_get_auth_from_url_encoded_spaces(self):
+        url = 'http://user:pass%20pass@complex.url.com/path?query=yes'
+        assert ('user', 'pass pass') == requests.utils.get_auth_from_url(url)
+
+    def test_get_auth_from_url_not_encoded_spaces(self):
+        url = 'http://user:pass pass@complex.url.com/path?query=yes'
+        assert ('user', 'pass pass') == requests.utils.get_auth_from_url(url)
+
+    def test_get_auth_from_url_percent_chars(self):
+        url = 'http://user%25user:pass@complex.url.com/path?query=yes'
+        assert ('user%user', 'pass') == requests.utils.get_auth_from_url(url)
+
+    def test_get_auth_from_url_encoded_hashes(self):
+        url = 'http://user:pass%23pass@complex.url.com/path?query=yes'
+        assert ('user', 'pass#pass') == requests.utils.get_auth_from_url(url)
+
+    def test_cannot_send_unprepared_requests(self):
+        r = requests.Request(url=HTTPBIN)
+        with pytest.raises(ValueError):
+            requests.Session().send(r)
+
+    def test_http_error(self):
+        error = requests.exceptions.HTTPError()
+        assert not error.response
+        response = requests.Response()
+        error = requests.exceptions.HTTPError(response=response)
+        assert error.response == response
+        error = requests.exceptions.HTTPError('message', response=response)
+        assert str(error) == 'message'
+        assert error.response == response
+
+    def test_session_pickling(self):
+        r = requests.Request('GET', httpbin('get'))
+        s = requests.Session()
+
+        s = pickle.loads(pickle.dumps(s))
+        s.proxies = getproxies()
+
+        r = s.send(r.prepare())
+        assert r.status_code == 200
+
+    def test_fixes_1329(self):
+        """
+        Ensure that header updates are done case-insensitively.
+        """
+        s = requests.Session()
+        s.headers.update({'ACCEPT': 'BOGUS'})
+        s.headers.update({'accept': 'application/json'})
+        r = s.get(httpbin('get'))
+        headers = r.request.headers
+        assert headers['accept'] == 'application/json'
+        assert headers['Accept'] == 'application/json'
+        assert headers['ACCEPT'] == 'application/json'
+
+    def test_uppercase_scheme_redirect(self):
+        parts = urlparse(httpbin('html'))
+        url = "HTTP://" + parts.netloc + parts.path
+        r = requests.get(httpbin('redirect-to'), params={'url': url})
+        assert r.status_code == 200
+        assert r.url.lower() == url.lower()
+
+    def test_transport_adapter_ordering(self):
+        s = requests.Session()
+        order = ['https://', 'http://']
+        assert order == list(s.adapters)
+        s.mount('http://git', HTTPAdapter())
+        s.mount('http://github', HTTPAdapter())
+        s.mount('http://github.com', HTTPAdapter())
+        s.mount('http://github.com/about/', HTTPAdapter())
+        order = [
+            'http://github.com/about/',
+            'http://github.com',
+            'http://github',
+            'http://git',
+            'https://',
+            'http://',
+        ]
+        assert order == list(s.adapters)
+        s.mount('http://gittip', HTTPAdapter())
+        s.mount('http://gittip.com', HTTPAdapter())
+        s.mount('http://gittip.com/about/', HTTPAdapter())
+        order = [
+            'http://github.com/about/',
+            'http://gittip.com/about/',
+            'http://github.com',
+            'http://gittip.com',
+            'http://github',
+            'http://gittip',
+            'http://git',
+            'https://',
+            'http://',
+        ]
+        assert order == list(s.adapters)
+        s2 = requests.Session()
+        s2.adapters = {'http://': HTTPAdapter()}
+        s2.mount('https://', HTTPAdapter())
+        assert 'http://' in s2.adapters
+        assert 'https://' in s2.adapters
+
+    def test_header_remove_is_case_insensitive(self):
+        # From issue #1321
+        s = requests.Session()
+        s.headers['foo'] = 'bar'
+        r = s.get(httpbin('get'), headers={'FOO': None})
+        assert 'foo' not in r.request.headers
+
+    def test_params_are_merged_case_sensitive(self):
+        s = requests.Session()
+        s.params['foo'] = 'bar'
+        r = s.get(httpbin('get'), params={'FOO': 'bar'})
+        assert r.json()['args'] == {'foo': 'bar', 'FOO': 'bar'}
+
+    def test_long_authinfo_in_url(self):
+        url = 'http://{0}:{1}@{2}:9000/path?query#frag'.format(
+            'E8A3BE87-9E3F-4620-8858-95478E385B5B',
+            'EA770032-DA4D-4D84-8CE9-29C6D910BF1E',
+            'exactly-------------sixty-----------three------------characters',
+        )
+        r = requests.Request('GET', url).prepare()
+        assert r.url == url
+
+    def test_header_keys_are_native(self):
+        headers = {u('unicode'): 'blah', 'byte'.encode('ascii'): 'blah'}
+        r = requests.Request('GET', httpbin('get'), headers=headers)
+        p = r.prepare()
+
+        # This is testing that they are builtin strings. A bit weird, but there
+        # we go.
+        assert 'unicode' in p.headers.keys()
+        assert 'byte' in p.headers.keys()
+
+    def test_can_send_nonstring_objects_with_files(self):
+        data = {'a': 0.0}
+        files = {'b': 'foo'}
+        r = requests.Request('POST', httpbin('post'), data=data, files=files)
+        p = r.prepare()
+
+        assert 'multipart/form-data' in p.headers['Content-Type']
+
+    def test_autoset_header_values_are_native(self):
+        data = 'this is a string'
+        length = '16'
+        req = requests.Request('POST', httpbin('post'), data=data)
+        p = req.prepare()
+
+        assert p.headers['Content-Length'] == length
+
+    def test_nonhttp_schemes_dont_check_URLs(self):
+        test_urls = (
+            'data:image/gif;base64,R0lGODlhAQABAHAAACH5BAUAAAAALAAAAAABAAEAAAICRAEAOw==',
+            'file:///etc/passwd',
+            'magnet:?xt=urn:btih:be08f00302bc2d1d3cfa3af02024fa647a271431',
+        )
+        for test_url in test_urls:
+            req = requests.Request('GET', test_url)
+            preq = req.prepare()
+            assert test_url == preq.url
+
+    def test_auth_is_stripped_on_redirect_off_host(self):
+        r = requests.get(
+            httpbin('redirect-to'),
+            params={'url': 'http://www.google.co.uk'},
+            auth=('user', 'pass'),
+        )
+        assert r.history[0].request.headers['Authorization']
+        assert not r.request.headers.get('Authorization', '')
+
+    def test_auth_is_retained_for_redirect_on_host(self):
+        r = requests.get(httpbin('redirect/1'), auth=('user', 'pass'))
+        h1 = r.history[0].request.headers['Authorization']
+        h2 = r.request.headers['Authorization']
+
+        assert h1 == h2
+
+    def test_manual_redirect_with_partial_body_read(self):
+        s = requests.Session()
+        r1 = s.get(httpbin('redirect/2'), allow_redirects=False, stream=True)
+        assert r1.is_redirect
+        rg = s.resolve_redirects(r1, r1.request, stream=True)
+
+        # read only the first eight bytes of the response body,
+        # then follow the redirect
+        r1.iter_content(8)
+        r2 = next(rg)
+        assert r2.is_redirect
+
+        # read all of the response via iter_content,
+        # then follow the redirect
+        for _ in r2.iter_content():
+            pass
+        r3 = next(rg)
+        assert not r3.is_redirect
+
+    def _patch_adapter_gzipped_redirect(self, session, url):
+        adapter = session.get_adapter(url=url)
+        org_build_response = adapter.build_response
+        self._patched_response = False
+
+        def build_response(*args, **kwargs):
+            resp = org_build_response(*args, **kwargs)
+            if not self._patched_response:
+                resp.raw.headers['content-encoding'] = 'gzip'
+                self._patched_response = True
+            return resp
+
+        adapter.build_response = build_response
+
+    def test_redirect_with_wrong_gzipped_header(self):
+        s = requests.Session()
+        url = httpbin('redirect/1')
+        self._patch_adapter_gzipped_redirect(s, url)
+        s.get(url)
+
+    def test_basic_auth_str_is_always_native(self):
+        s = _basic_auth_str("test", "test")
+        assert isinstance(s, builtin_str)
+        assert s == "Basic dGVzdDp0ZXN0"
+
+    def test_requests_history_is_saved(self):
+        r = requests.get('https://httpbin.org/redirect/5')
+        total = r.history[-1].history
+        i = 0
+        for item in r.history:
+            assert item.history == total[0:i]
+            i=i+1
+
+    def test_json_param_post_content_type_works(self):
+        r = requests.post(
+            httpbin('post'),
+            json={'life': 42}
+        )
+        assert r.status_code == 200
+        assert 'application/json' in r.request.headers['Content-Type']
+        assert {'life': 42} == r.json()['json']
+
+
+class TestContentEncodingDetection(unittest.TestCase):
+
+    def test_none(self):
+        encodings = requests.utils.get_encodings_from_content('')
+        assert not len(encodings)
+
+    def test_html_charset(self):
+        """HTML5 meta charset attribute"""
+        content = '<meta charset="UTF-8">'
+        encodings = requests.utils.get_encodings_from_content(content)
+        assert len(encodings) == 1
+        assert encodings[0] == 'UTF-8'
+
+    def test_html4_pragma(self):
+        """HTML4 pragma directive"""
+        content = '<meta http-equiv="Content-type" content="text/html;charset=UTF-8">'
+        encodings = requests.utils.get_encodings_from_content(content)
+        assert len(encodings) == 1
+        assert encodings[0] == 'UTF-8'
+
+    def test_xhtml_pragma(self):
+        """XHTML 1.x served with text/html MIME type"""
+        content = '<meta http-equiv="Content-type" content="text/html;charset=UTF-8" />'
+        encodings = requests.utils.get_encodings_from_content(content)
+        assert len(encodings) == 1
+        assert encodings[0] == 'UTF-8'
+
+    def test_xml(self):
+        """XHTML 1.x served as XML"""
+        content = '<?xml version="1.0" encoding="UTF-8"?>'
+        encodings = requests.utils.get_encodings_from_content(content)
+        assert len(encodings) == 1
+        assert encodings[0] == 'UTF-8'
+
+    def test_precedence(self):
+        content = '''
+        <?xml version="1.0" encoding="XML"?>
+        <meta charset="HTML5">
+        <meta http-equiv="Content-type" content="text/html;charset=HTML4" />
+        '''.strip()
+        encodings = requests.utils.get_encodings_from_content(content)
+        assert encodings == ['HTML5', 'HTML4', 'XML']
+
+
+class TestCaseInsensitiveDict(unittest.TestCase):
+
+    def test_mapping_init(self):
+        cid = CaseInsensitiveDict({'Foo': 'foo', 'BAr': 'bar'})
+        assert len(cid) == 2
+        assert 'foo' in cid
+        assert 'bar' in cid
+
+    def test_iterable_init(self):
+        cid = CaseInsensitiveDict([('Foo', 'foo'), ('BAr', 'bar')])
+        assert len(cid) == 2
+        assert 'foo' in cid
+        assert 'bar' in cid
+
+    def test_kwargs_init(self):
+        cid = CaseInsensitiveDict(FOO='foo', BAr='bar')
+        assert len(cid) == 2
+        assert 'foo' in cid
+        assert 'bar' in cid
+
+    def test_docstring_example(self):
+        cid = CaseInsensitiveDict()
+        cid['Accept'] = 'application/json'
+        assert cid['aCCEPT'] == 'application/json'
+        assert list(cid) == ['Accept']
+
+    def test_len(self):
+        cid = CaseInsensitiveDict({'a': 'a', 'b': 'b'})
+        cid['A'] = 'a'
+        assert len(cid) == 2
+
+    def test_getitem(self):
+        cid = CaseInsensitiveDict({'Spam': 'blueval'})
+        assert cid['spam'] == 'blueval'
+        assert cid['SPAM'] == 'blueval'
+
+    def test_fixes_649(self):
+        """__setitem__ should behave case-insensitively."""
+        cid = CaseInsensitiveDict()
+        cid['spam'] = 'oneval'
+        cid['Spam'] = 'twoval'
+        cid['sPAM'] = 'redval'
+        cid['SPAM'] = 'blueval'
+        assert cid['spam'] == 'blueval'
+        assert cid['SPAM'] == 'blueval'
+        assert list(cid.keys()) == ['SPAM']
+
+    def test_delitem(self):
+        cid = CaseInsensitiveDict()
+        cid['Spam'] = 'someval'
+        del cid['sPam']
+        assert 'spam' not in cid
+        assert len(cid) == 0
+
+    def test_contains(self):
+        cid = CaseInsensitiveDict()
+        cid['Spam'] = 'someval'
+        assert 'Spam' in cid
+        assert 'spam' in cid
+        assert 'SPAM' in cid
+        assert 'sPam' in cid
+        assert 'notspam' not in cid
+
+    def test_get(self):
+        cid = CaseInsensitiveDict()
+        cid['spam'] = 'oneval'
+        cid['SPAM'] = 'blueval'
+        assert cid.get('spam') == 'blueval'
+        assert cid.get('SPAM') == 'blueval'
+        assert cid.get('sPam') == 'blueval'
+        assert cid.get('notspam', 'default') == 'default'
+
+    def test_update(self):
+        cid = CaseInsensitiveDict()
+        cid['spam'] = 'blueval'
+        cid.update({'sPam': 'notblueval'})
+        assert cid['spam'] == 'notblueval'
+        cid = CaseInsensitiveDict({'Foo': 'foo', 'BAr': 'bar'})
+        cid.update({'fOO': 'anotherfoo', 'bAR': 'anotherbar'})
+        assert len(cid) == 2
+        assert cid['foo'] == 'anotherfoo'
+        assert cid['bar'] == 'anotherbar'
+
+    def test_update_retains_unchanged(self):
+        cid = CaseInsensitiveDict({'foo': 'foo', 'bar': 'bar'})
+        cid.update({'foo': 'newfoo'})
+        assert cid['bar'] == 'bar'
+
+    def test_iter(self):
+        cid = CaseInsensitiveDict({'Spam': 'spam', 'Eggs': 'eggs'})
+        keys = frozenset(['Spam', 'Eggs'])
+        assert frozenset(iter(cid)) == keys
+
+    def test_equality(self):
+        cid = CaseInsensitiveDict({'SPAM': 'blueval', 'Eggs': 'redval'})
+        othercid = CaseInsensitiveDict({'spam': 'blueval', 'eggs': 'redval'})
+        assert cid == othercid
+        del othercid['spam']
+        assert cid != othercid
+        assert cid == {'spam': 'blueval', 'eggs': 'redval'}
+
+    def test_setdefault(self):
+        cid = CaseInsensitiveDict({'Spam': 'blueval'})
+        assert cid.setdefault('spam', 'notblueval') == 'blueval'
+        assert cid.setdefault('notspam', 'notblueval') == 'notblueval'
+
+    def test_lower_items(self):
+        cid = CaseInsensitiveDict({
+            'Accept': 'application/json',
+            'user-Agent': 'requests',
+        })
+        keyset = frozenset(lowerkey for lowerkey, v in cid.lower_items())
+        lowerkeyset = frozenset(['accept', 'user-agent'])
+        assert keyset == lowerkeyset
+
+    def test_preserve_key_case(self):
+        cid = CaseInsensitiveDict({
+            'Accept': 'application/json',
+            'user-Agent': 'requests',
+        })
+        keyset = frozenset(['Accept', 'user-Agent'])
+        assert frozenset(i[0] for i in cid.items()) == keyset
+        assert frozenset(cid.keys()) == keyset
+        assert frozenset(cid) == keyset
+
+    def test_preserve_last_key_case(self):
+        cid = CaseInsensitiveDict({
+            'Accept': 'application/json',
+            'user-Agent': 'requests',
+        })
+        cid.update({'ACCEPT': 'application/json'})
+        cid['USER-AGENT'] = 'requests'
+        keyset = frozenset(['ACCEPT', 'USER-AGENT'])
+        assert frozenset(i[0] for i in cid.items()) == keyset
+        assert frozenset(cid.keys()) == keyset
+        assert frozenset(cid) == keyset
+
+
+class UtilsTestCase(unittest.TestCase):
+
+    def test_super_len_io_streams(self):
+        """ Ensures that we properly deal with different kinds of IO streams. """
+        # uses StringIO or io.StringIO (see import above)
+        from io import BytesIO
+        from requests.utils import super_len
+
+        assert super_len(StringIO.StringIO()) == 0
+        assert super_len(
+            StringIO.StringIO('with so much drama in the LBC')) == 29
+
+        assert super_len(BytesIO()) == 0
+        assert super_len(
+            BytesIO(b"it's kinda hard bein' snoop d-o-double-g")) == 40
+
+        try:
+            import cStringIO
+        except ImportError:
+            pass
+        else:
+            assert super_len(
+                cStringIO.StringIO('but some how, some way...')) == 25
+
+    def test_get_environ_proxies_ip_ranges(self):
+        """Ensures that IP addresses are correctly matches with ranges
+        in no_proxy variable."""
+        from requests.utils import get_environ_proxies
+        os.environ['no_proxy'] = "192.168.0.0/24,127.0.0.1,localhost.localdomain,172.16.1.1"
+        assert get_environ_proxies('http://192.168.0.1:5000/') == {}
+        assert get_environ_proxies('http://192.168.0.1/') == {}
+        assert get_environ_proxies('http://172.16.1.1/') == {}
+        assert get_environ_proxies('http://172.16.1.1:5000/') == {}
+        assert get_environ_proxies('http://192.168.1.1:5000/') != {}
+        assert get_environ_proxies('http://192.168.1.1/') != {}
+
+    def test_get_environ_proxies(self):
+        """Ensures that IP addresses are correctly matches with ranges
+        in no_proxy variable."""
+        from requests.utils import get_environ_proxies
+        os.environ['no_proxy'] = "127.0.0.1,localhost.localdomain,192.168.0.0/24,172.16.1.1"
+        assert get_environ_proxies(
+            'http://localhost.localdomain:5000/v1.0/') == {}
+        assert get_environ_proxies('http://www.requests.com/') != {}
+
+    def test_is_ipv4_address(self):
+        from requests.utils import is_ipv4_address
+        assert is_ipv4_address('8.8.8.8')
+        assert not is_ipv4_address('8.8.8.8.8')
+        assert not is_ipv4_address('localhost.localdomain')
+
+    def test_is_valid_cidr(self):
+        from requests.utils import is_valid_cidr
+        assert not is_valid_cidr('8.8.8.8')
+        assert is_valid_cidr('192.168.1.0/24')
+
+    def test_dotted_netmask(self):
+        from requests.utils import dotted_netmask
+        assert dotted_netmask(8) == '255.0.0.0'
+        assert dotted_netmask(24) == '255.255.255.0'
+        assert dotted_netmask(25) == '255.255.255.128'
+
+    def test_address_in_network(self):
+        from requests.utils import address_in_network
+        assert address_in_network('192.168.1.1', '192.168.1.0/24')
+        assert not address_in_network('172.16.0.1', '192.168.1.0/24')
+
+    def test_get_auth_from_url(self):
+        """Ensures that username and password in well-encoded URI as per
+        RFC 3986 are correclty extracted."""
+        from requests.utils import get_auth_from_url
+        from requests.compat import quote
+        percent_encoding_test_chars = "%!*'();:@&=+$,/?#[] "
+        url_address = "request.com/url.html#test"
+        url = "http://" + quote(
+            percent_encoding_test_chars, '') + ':' + quote(
+            percent_encoding_test_chars, '') + '@' + url_address
+        (username, password) = get_auth_from_url(url)
+        assert username == percent_encoding_test_chars
+        assert password == percent_encoding_test_chars
+
+
+class TestMorselToCookieExpires(unittest.TestCase):
+
+    """Tests for morsel_to_cookie when morsel contains expires."""
+
+    def test_expires_valid_str(self):
+        """Test case where we convert expires from string time."""
+
+        morsel = Morsel()
+        morsel['expires'] = 'Thu, 01-Jan-1970 00:00:01 GMT'
+        cookie = morsel_to_cookie(morsel)
+        assert cookie.expires == 1
+
+    def test_expires_invalid_int(self):
+        """Test case where an invalid type is passed for expires."""
+
+        morsel = Morsel()
+        morsel['expires'] = 100
+        with pytest.raises(TypeError):
+            morsel_to_cookie(morsel)
+
+    def test_expires_invalid_str(self):
+        """Test case where an invalid string is input."""
+
+        morsel = Morsel()
+        morsel['expires'] = 'woops'
+        with pytest.raises(ValueError):
+            morsel_to_cookie(morsel)
+
+    def test_expires_none(self):
+        """Test case where expires is None."""
+
+        morsel = Morsel()
+        morsel['expires'] = None
+        cookie = morsel_to_cookie(morsel)
+        assert cookie.expires is None
+
+
+class TestMorselToCookieMaxAge(unittest.TestCase):
+
+    """Tests for morsel_to_cookie when morsel contains max-age."""
+
+    def test_max_age_valid_int(self):
+        """Test case where a valid max age in seconds is passed."""
+
+        morsel = Morsel()
+        morsel['max-age'] = 60
+        cookie = morsel_to_cookie(morsel)
+        assert isinstance(cookie.expires, int)
+
+    def test_max_age_invalid_str(self):
+        """Test case where a invalid max age is passed."""
+
+        morsel = Morsel()
+        morsel['max-age'] = 'woops'
+        with pytest.raises(TypeError):
+            morsel_to_cookie(morsel)
+
+
+class TestTimeout:
+    def test_stream_timeout(self):
+        try:
+            requests.get('https://httpbin.org/delay/10', timeout=2.0)
+        except requests.exceptions.Timeout as e:
+            assert 'Read timed out' in e.args[0].args[0]
+
+    def test_invalid_timeout(self):
+        with pytest.raises(ValueError) as e:
+            requests.get(httpbin('get'), timeout=(3, 4, 5))
+        assert '(connect, read)' in str(e)
+
+        with pytest.raises(ValueError) as e:
+            requests.get(httpbin('get'), timeout="foo")
+        assert 'must be an int or float' in str(e)
+
+    def test_none_timeout(self):
+        """ Check that you can set None as a valid timeout value.
+
+        To actually test this behavior, we'd want to check that setting the
+        timeout to None actually lets the request block past the system default
+        timeout. However, this would make the test suite unbearably slow.
+        Instead we verify that setting the timeout to None does not prevent the
+        request from succeeding.
+        """
+        r = requests.get(httpbin('get'), timeout=None)
+        assert r.status_code == 200
+
+    def test_read_timeout(self):
+        try:
+            requests.get(httpbin('delay/10'), timeout=(None, 0.1))
+            assert False, "The recv() request should time out."
+        except ReadTimeout:
+            pass
+
+    def test_connect_timeout(self):
+        try:
+            requests.get(TARPIT, timeout=(0.1, None))
+            assert False, "The connect() request should time out."
+        except ConnectTimeout as e:
+            assert isinstance(e, ConnectionError)
+            assert isinstance(e, Timeout)
+
+    def test_total_timeout_connect(self):
+        try:
+            requests.get(TARPIT, timeout=(0.1, 0.1))
+            assert False, "The connect() request should time out."
+        except ConnectTimeout:
+            pass
+
+    def test_encoded_methods(self):
+        """See: https://github.com/kennethreitz/requests/issues/2316"""
+        r = requests.request(b'GET', httpbin('get'))
+        assert r.ok
+
+
+SendCall = collections.namedtuple('SendCall', ('args', 'kwargs'))
+
+
+class RedirectSession(SessionRedirectMixin):
+    def __init__(self, order_of_redirects):
+        self.redirects = order_of_redirects
+        self.calls = []
+        self.max_redirects = 30
+        self.cookies = {}
+        self.trust_env = False
+
+    def send(self, *args, **kwargs):
+        self.calls.append(SendCall(args, kwargs))
+        return self.build_response()
+
+    def build_response(self):
+        request = self.calls[-1].args[0]
+        r = requests.Response()
+
+        try:
+            r.status_code = int(self.redirects.pop(0))
+        except IndexError:
+            r.status_code = 200
+
+        r.headers = CaseInsensitiveDict({'Location': '/'})
+        r.raw = self._build_raw()
+        r.request = request
+        return r
+
+    def _build_raw(self):
+        string = StringIO.StringIO('')
+        setattr(string, 'release_conn', lambda *args: args)
+        return string
+
+
+class TestRedirects:
+    default_keyword_args = {
+        'stream': False,
+        'verify': True,
+        'cert': None,
+        'timeout': None,
+        'allow_redirects': False,
+        'proxies': {},
+    }
+
+    def test_requests_are_updated_each_time(self):
+        session = RedirectSession([303, 307])
+        prep = requests.Request('POST', 'http://httpbin.org/post').prepare()
+        r0 = session.send(prep)
+        assert r0.request.method == 'POST'
+        assert session.calls[-1] == SendCall((r0.request,), {})
+        redirect_generator = session.resolve_redirects(r0, prep)
+        for response in redirect_generator:
+            assert response.request.method == 'GET'
+            send_call = SendCall((response.request,),
+                                 TestRedirects.default_keyword_args)
+            assert session.calls[-1] == send_call
+
+
+
+@pytest.fixture
+def list_of_tuples():
+    return [
+        (('a', 'b'), ('c', 'd')),
+        (('c', 'd'), ('a', 'b')),
+        (('a', 'b'), ('c', 'd'), ('e', 'f')),
+        ]
+
+
+def test_data_argument_accepts_tuples(list_of_tuples):
+    """
+    Ensure that the data argument will accept tuples of strings
+    and properly encode them.
+    """
+    for data in list_of_tuples:
+        p = PreparedRequest()
+        p.prepare(
+            method='GET',
+            url='http://www.example.com',
+            data=data,
+            hooks=default_hooks()
+        )
+        assert p.body == urlencode(data)
+
+
+def assert_copy(p, p_copy):
+    for attr in ('method', 'url', 'headers', '_cookies', 'body', 'hooks'):
+        assert getattr(p, attr) == getattr(p_copy, attr)
+
+
+def test_prepared_request_empty_copy():
+    p = PreparedRequest()
+    assert_copy(p, p.copy())
+
+
+def test_prepared_request_no_cookies_copy():
+    p = PreparedRequest()
+    p.prepare(
+        method='GET',
+        url='http://www.example.com',
+        data='foo=bar',
+        hooks=default_hooks()
+    )
+    assert_copy(p, p.copy())
+
+
+def test_prepared_request_complete_copy():
+    p = PreparedRequest()
+    p.prepare(
+        method='GET',
+        url='http://www.example.com',
+        data='foo=bar',
+        hooks=default_hooks(),
+        cookies={'foo': 'bar'}
+    )
+    assert_copy(p, p.copy())
+
+def test_prepare_unicode_url():
+    p = PreparedRequest()
+    p.prepare(
+        method='GET',
+        url=u('http://www.example.com/üniçø∂é'),
+        hooks=[]
+    )
+    assert_copy(p, p.copy())
+
+if __name__ == '__main__':
+    unittest.main()
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""

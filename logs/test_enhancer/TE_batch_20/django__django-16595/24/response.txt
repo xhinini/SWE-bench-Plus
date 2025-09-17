@@ -1,0 +1,139 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise optimization/reduction behavior around AlterField, RenameField and RemoveField interactions, including case-insensitivity and interactions with elidable operations and db_column handling. They are designed to catch incorrect reduce() logic in AlterField.reduce that would fail to collapse or incorrectly reorder operations.
+test_code: |
+  from django.db import migrations, models
+  from django.db.migrations import operations
+  from django.test import SimpleTestCase
+  
+  # Reuse helper utilities from the existing optimizer test module by importing
+  # the assert helpers pattern (we duplicate minimal functionality here to keep
+  # the tests self-contained).
+  from django.db.migrations.optimizer import MigrationOptimizer
+  from django.db.migrations.serializer import serializer_factory
+  
+  
+  class RegressionOptimizerTests(SimpleTestCase):
+      def optimize(self, operations, app_label):
+          optimizer = MigrationOptimizer()
+          return optimizer.optimize(operations, app_label), optimizer._iterations
+  
+      def serialize(self, value):
+          return serializer_factory(value).serialize()[0]
+  
+      def assertOptimizesTo(self, operations, expected, exact=None, less_than=None, app_label=None):
+          result, iterations = self.optimize(operations, app_label or "migrations")
+          result = [self.serialize(f) for f in result]
+          expected = [self.serialize(f) for f in expected]
+          self.assertEqual(expected, result)
+          if exact is not None and iterations != exact:
+              raise self.failureException(
+                  "Optimization did not take exactly %s iterations (it took %s)"
+                  % (exact, iterations)
+              )
+          if less_than is not None and iterations >= less_than:
+              raise self.failureException(
+                  "Optimization did not take less than %s iterations (it took %s)"
+                  % (less_than, iterations)
+              )
+  
+      def assertDoesNotOptimize(self, operations, **kwargs):
+          self.assertOptimizesTo(operations, operations, **kwargs)
+  
+      def test_consecutive_alterfields_collapses_to_last(self):
+          """
+          Two consecutive AlterField operations on the same model+field should
+          collapse into only the latter AlterField.
+          """
+          op1 = migrations.AlterField("Book", "title", models.CharField(max_length=256))
+          op2 = migrations.AlterField("Book", "title", models.CharField(max_length=128))
+          self.assertOptimizesTo([op1, op2], [op2])
+  
+      def test_multiple_alterfields_collapse_to_single(self):
+          """
+          Multiple AlterField operations (more than two) on the same field should
+          collapse into only the last AlterField operation.
+          """
+          ops = [
+              migrations.AlterField("Book", "title", models.CharField(max_length=256)),
+              migrations.AlterField("Book", "title", models.CharField(max_length=200)),
+              migrations.AlterField("Book", "title", models.CharField(max_length=150)),
+              migrations.AlterField("Book", "title", models.CharField(max_length=100)),
+          ]
+          expected = [migrations.AlterField("Book", "title", models.CharField(max_length=100))]
+          self.assertOptimizesTo(ops, expected)
+  
+      def test_alterfields_with_elidable_between_collapse(self):
+          """
+          An elidable operation between two AlterFields should not prevent collapse;
+          elidable operations are ignored by the optimizer and the two AlterFields
+          should still collapse to the latter.
+          """
+          elidable_op = operations.base.Operation()
+          elidable_op.elidable = True
+          op1 = migrations.AlterField("Book", "title", models.CharField(max_length=256))
+          op2 = migrations.AlterField("Book", "title", models.CharField(max_length=128))
+          self.assertOptimizesTo([op1, elidable_op, op2], [op2])
+  
+      def test_alterfield_case_insensitive_field_names_collapse(self):
+          """
+          Field names differing only by case should be considered the same for
+          collapse purposes (case-insensitive comparison).
+          """
+          op1 = migrations.AlterField("Book", "Title", models.CharField(max_length=256))
+          op2 = migrations.AlterField("book", "title", models.CharField(max_length=128))
+          self.assertOptimizesTo([op1, op2], [op2])
+  
+      def test_alterfield_and_removefield_reduce_to_remove(self):
+          """
+          An AlterField followed by a RemoveField on the same field should be
+          reduced to a single RemoveField.
+          """
+          op1 = migrations.AlterField("Author", "age", models.IntegerField())
+          op2 = migrations.RemoveField("Author", "age")
+          self.assertOptimizesTo([op1, op2], [op2])
+  
+      def test_alterfield_and_renamefield_with_db_column_none(self):
+          """
+          When the field has db_column=None, an AlterField followed by a RenameField
+          should result in the RenameField and then an AlterField renamed to the new name.
+          """
+          # field with default db_column=None
+          field = models.CharField(max_length=100)
+          op1 = migrations.AlterField("MyModel", "name", field)
+          op2 = migrations.RenameField("MyModel", "name", "title")
+          expected = [
+              migrations.RenameField("MyModel", "name", "title"),
+              migrations.AlterField("MyModel", "title", field),
+          ]
+          self.assertOptimizesTo([op1, op2], expected)
+  
+      def test_alterfield_and_renamefield_with_db_column_set(self):
+          """
+          When the field has an explicit db_column, the optimizer should NOT
+          rewrite AlterField onto the new name after a RenameField (no extra
+          AlterField should be emitted for the new name).
+          """
+          # field with an explicit db_column set (this prevents the automatic
+          # conversion path that injects an AlterField after a RenameField)
+          field = models.CharField(max_length=100, db_column="explicit_col")
+          op1 = migrations.AlterField("MyModel", "name", field)
+          op2 = migrations.RenameField("MyModel", "name", "title")
+          # In this case, the optimizer should not synthesize an AlterField for the new name.
+          # The safe expectation is that the pair does not collapse into "Rename + Alter(newname)",
+          # so we assert that the original sequence remains (i.e., no added alter on the new name).
+          self.assertDoesNotOptimize([op1, op2])
+  
+      def test_alterfields_on_different_models_do_not_collapse(self):
+          """AlterFields on different models must not collapse with each other."""
+          op1 = migrations.AlterField("A", "field", models.IntegerField())
+          op2 = migrations.AlterField("B", "field", models.IntegerField())
+          self.assertDoesNotOptimize([op1, op2])
+  
+      def test_alterfields_different_fields_do_not_collapse(self):
+          """AlterFields on the same model but different field names must not collapse."""
+          op1 = migrations.AlterField("A", "foo", models.IntegerField())
+          op2 = migrations.AlterField("A", "bar", models.IntegerField())
+          self.assertDoesNotOptimize([op1, op2])
+new_imports_code: |
+  # No new imports required; tests use built-in Django migration utilities already available in the test environment.

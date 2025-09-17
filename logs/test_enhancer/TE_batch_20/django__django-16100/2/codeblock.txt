@@ -1,0 +1,208 @@
+# No additional imports required; tests reuse imports present in the module.
+from django.test import TestCase, override_settings
+from django.urls import reverse
+from django.db import DatabaseError
+from unittest import mock
+
+from .models import Swallow
+from .admin import SwallowAdmin
+from django.contrib.admin.options import router
+
+@override_settings(ROOT_URLCONF="admin_changelist.urls")
+class TransactionAtomicUsageTests(TestCase):
+    def setUp(self):
+        # create a superuser and sample objects
+        from django.contrib.auth.models import User
+
+        self.superuser = User.objects.create_superuser(
+            username="atomic_super", email="a@b.com", password="xxx"
+        )
+        self.client.force_login(self.superuser)
+        self.changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+
+    def _base_post_data(self, objs):
+        """
+        Helper to build POST data for a list_editable changelist with the given
+        Swallow objects in the order provided.
+        """
+        data = {
+            "form-TOTAL_FORMS": str(len(objs)),
+            "form-INITIAL_FORMS": str(len(objs)),
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "_save": "Save",
+        }
+        # Use the ordering assumed by the changelist tests: fields are uuid, load, speed.
+        for idx, obj in enumerate(objs):
+            data[f"form-{idx}-uuid"] = str(obj.pk)
+            # Provide changed values by default
+            data[f"form-{idx}-load"] = str(float(obj.load) + 1.0)
+            data[f"form-{idx}-speed"] = str(float(obj.speed) + 1.0)
+        return data
+
+    def test_atomic_called_with_router_returning_default(self):
+        a = Swallow.objects.create(origin="A", load=1, speed=1)
+        b = Swallow.objects.create(origin="B", load=2, speed=2)
+
+        with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+            with mock.patch(
+                "django.contrib.admin.options.router.db_for_write",
+                return_value="default",
+            ) as mock_db_for_write:
+                response = self.client.post(self.changelist_url, self._base_post_data([a, b]))
+                # Ensure atomic was called with using='default'
+                mock_atomic.assert_called_with(using="default")
+                mock_db_for_write.assert_called_with(Swallow)
+
+    def test_atomic_called_with_router_returning_other(self):
+        a = Swallow.objects.create(origin="A", load=1, speed=1)
+        b = Swallow.objects.create(origin="B", load=2, speed=2)
+
+        with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+            with mock.patch(
+                "django.contrib.admin.options.router.db_for_write",
+                return_value="other_db_alias",
+            ) as mock_db_for_write:
+                response = self.client.post(self.changelist_url, self._base_post_data([a, b]))
+                mock_atomic.assert_called_with(using="other_db_alias")
+                mock_db_for_write.assert_called_with(Swallow)
+
+    def test_atomic_not_called_when_formset_invalid(self):
+        a = Swallow.objects.create(origin="A", load=1, speed=1)
+
+        # Make the POST invalid by using non-numeric value for a numeric field
+        data = {
+            "form-TOTAL_FORMS": "1",
+            "form-INITIAL_FORMS": "1",
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "form-0-uuid": str(a.pk),
+            "form-0-load": "not-a-number",  # invalid
+            "form-0-speed": "3.0",
+            "_save": "Save",
+        }
+
+        with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+            with mock.patch(
+                "django.contrib.admin.options.router.db_for_write", return_value="other"
+            ):
+                response = self.client.post(self.changelist_url, data)
+                # Formset invalid: atomic should not have been entered
+                mock_atomic.assert_not_called()
+                # Response should be 200 (rendering the changelist with errors)
+                self.assertEqual(response.status_code, 200)
+
+    def test_atomic_called_when_no_form_changed(self):
+        # Submitting identical values (no has_changed) should still enter atomic
+        a = Swallow.objects.create(origin="A", load=1, speed=1)
+        b = Swallow.objects.create(origin="B", load=2, speed=2)
+
+        data = {
+            "form-TOTAL_FORMS": "2",
+            "form-INITIAL_FORMS": "2",
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "form-0-uuid": str(a.pk),
+            "form-0-load": str(float(a.load)),
+            "form-0-speed": str(float(a.speed)),
+            "form-1-uuid": str(b.pk),
+            "form-1-load": str(float(b.load)),
+            "form-1-speed": str(float(b.speed)),
+            "_save": "Save",
+        }
+
+        with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+            with mock.patch(
+                "django.contrib.admin.options.router.db_for_write", return_value="mydb"
+            ) as mock_db_for_write:
+                response = self.client.post(self.changelist_url, data)
+                mock_atomic.assert_called_with(using="mydb")
+                mock_db_for_write.assert_called_with(Swallow)
+
+    def test_atomic_called_once(self):
+        a = Swallow.objects.create(origin="A", load=1, speed=1)
+        b = Swallow.objects.create(origin="B", load=2, speed=2)
+        c = Swallow.objects.create(origin="C", load=3, speed=3)
+
+        with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+            with mock.patch(
+                "django.contrib.admin.options.router.db_for_write", return_value="dbx"
+            ):
+                response = self.client.post(self.changelist_url, self._base_post_data([a, b, c]))
+                # Ensure atomic called exactly once for the whole save operation
+                self.assertEqual(mock_atomic.call_count, 1)
+
+    def test_atomic_called_with_multiple_forms_changed(self):
+        a = Swallow.objects.create(origin="A", load=1, speed=1)
+        b = Swallow.objects.create(origin="B", load=2, speed=2)
+        c = Swallow.objects.create(origin="C", load=3, speed=3)
+
+        # Change only two forms
+        data = {
+            "form-TOTAL_FORMS": "3",
+            "form-INITIAL_FORMS": "3",
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "form-0-uuid": str(a.pk),
+            "form-0-load": str(float(a.load) + 5.0),
+            "form-0-speed": str(float(a.speed) + 1.0),
+            "form-1-uuid": str(b.pk),
+            "form-1-load": str(float(b.load) + 5.0),
+            "form-1-speed": str(float(b.speed) + 1.0),
+            "form-2-uuid": str(c.pk),
+            "form-2-load": str(float(c.load)),
+            "form-2-speed": str(float(c.speed)),
+            "_save": "Save",
+        }
+
+        with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+            with mock.patch(
+                "django.contrib.admin.options.router.db_for_write", return_value="dbmulti"
+            ):
+                response = self.client.post(self.changelist_url, data)
+                mock_atomic.assert_called_with(using="dbmulti")
+                self.assertEqual(mock_atomic.call_count, 1)
+
+    def test_atomic_called_even_when_log_change_raises_on_first(self):
+        a = Swallow.objects.create(origin="A", load=1, speed=1)
+        b = Swallow.objects.create(origin="B", load=2, speed=2)
+        data = self._base_post_data([a, b])
+
+        # Simulate DatabaseError coming from log_change to ensure atomic is in place
+        with mock.patch("django.contrib.admin.options.ModelAdmin.log_change", side_effect=DatabaseError):
+            with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+                with mock.patch(
+                    "django.contrib.admin.options.router.db_for_write", return_value="dberr"
+                ):
+                    with self.assertRaises(DatabaseError):
+                        self.client.post(self.changelist_url, data)
+                    mock_atomic.assert_called_with(using="dberr")
+
+    def test_atomic_called_even_when_log_change_raises_on_second(self):
+        a = Swallow.objects.create(origin="A", load=1, speed=1)
+        b = Swallow.objects.create(origin="B", load=2, speed=2)
+        # Cause first log_change to succeed and second to raise
+        with mock.patch(
+            "django.contrib.admin.options.ModelAdmin.log_change", side_effect=[None, DatabaseError]
+        ):
+            with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+                with mock.patch(
+                    "django.contrib.admin.options.router.db_for_write", return_value="dbsecond"
+                ):
+                    data = self._base_post_data([a, b])
+                    with self.assertRaises(DatabaseError):
+                        self.client.post(self.changelist_url, data)
+                    mock_atomic.assert_called_with(using="dbsecond")
+
+    def test_router_db_for_write_invoked_with_model(self):
+        a = Swallow.objects.create(origin="A", load=1, speed=1)
+        b = Swallow.objects.create(origin="B", load=2, speed=2)
+
+        with mock.patch("django.contrib.admin.options.transaction.atomic") as mock_atomic:
+            with mock.patch("django.contrib.admin.options.router.db_for_write") as mock_db_for_write:
+                mock_db_for_write.return_value = "somedb"
+                data = self._base_post_data([a, b])
+                response = self.client.post(self.changelist_url, data)
+                # ensure router.db_for_write was called with the model class
+                mock_db_for_write.assert_called_with(Swallow)
+                mock_atomic.assert_called_with(using="somedb")

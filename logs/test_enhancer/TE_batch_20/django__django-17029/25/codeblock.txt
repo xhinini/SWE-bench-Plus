@@ -1,0 +1,214 @@
+from django.apps import apps
+from django.apps.registry import Apps
+from django.test import SimpleTestCase, override_settings
+from django.apps import apps
+from django.apps.registry import Apps
+from django.core.exceptions import AppRegistryNotReady
+from collections import defaultdict
+
+# Helper classes for stubbing
+class MetaStub:
+    def __init__(self, app_label="tests", model_name="fakemodel", swapped=None, swappable=None, label_lower=None, apps_registry=None):
+        self.app_label = app_label
+        self.model_name = model_name
+        self.swapped = swapped
+        self.swappable = swappable
+        self.label_lower = label_lower or f"{app_label}.{model_name}"
+        # store registry to call inside _expire_cache if needed
+        self._apps_registry = apps_registry
+
+    def _expire_cache(self):
+        """
+        This method simulates a model's _meta._expire_cache which could
+        touch other registry APIs (like get_swappable_settings_name),
+        potentially repopulating that cache. Tests use this to simulate
+        repopulation during clear_cache().
+        """
+        # If present, call get_swappable_settings_name on the provided registry
+        if self._apps_registry is not None:
+            # Call with known label; the call potentially populates the cache.
+            try:
+                self._apps_registry.get_swappable_settings_name(self.label_lower)
+            except Exception:
+                # ignore any issues here for the purposes of these tests
+                pass
+
+class FakeModel:
+    def __init__(self, meta):
+        self._meta = meta
+
+class StubAppConfig:
+    def __init__(self, models_list):
+        # models_list should be an iterable returning model classes/instances
+        self._models = list(models_list)
+
+    def get_models(self, include_auto_created=False):
+        # Return the configured set of models
+        return list(self._models)
+
+class ClearCacheTests(SimpleTestCase):
+    def test_main_registry_clear_cache_clears_both_caches(self):
+        # Sanity check for the main registry: prepare caches then clear
+        # Populate swappable cache and models cache
+        apps.get_swappable_settings_name("admin.LogEntry")
+        apps.get_models()
+
+        apps.clear_cache()
+
+        # Both caches should be empty after clear_cache
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(apps.get_models.cache_info().currsize, 0)
+
+    def test_custom_apps_clear_cache_clears_both_caches(self):
+        # Create a new Apps registry with a fake app config that returns no models
+        registry = Apps(installed_apps=[])
+        # Make sure registry is populated and ready (Apps created with installed_apps=[])
+        self.assertTrue(registry.ready)
+
+        # Populate caches
+        registry.get_swappable_settings_name("nothing.nothing")
+        registry.get_models()
+
+        registry.clear_cache()
+
+        self.assertEqual(registry.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(registry.get_models.cache_info().currsize, 0)
+
+    def test_clear_cache_during_expire_cache_does_not_leave_swappable_cache_populated(self):
+        """
+        Simulate a situation where model._meta._expire_cache() calls
+        get_swappable_settings_name(), potentially repopulating that cache
+        while clear_cache() is running. The final state should have the
+        swappable cache empty.
+        """
+        registry = Apps(installed_apps=[])
+        # Construct a fake model whose _meta._expire_cache calls registry.get_swappable_settings_name
+        meta = MetaStub(app_label="apps", model_name="fakemodel", swappable="apps.FakeModel", label_lower="apps.fakemodel", apps_registry=registry)
+        fake_model = FakeModel(meta)
+
+        # Replace the registry's app_configs with a stub that returns our fake model
+        registry.app_configs = {"apps": StubAppConfig([fake_model])}
+        registry.ready = True  # ensure the expire loop runs
+
+        # Populate the swappable cache so clear_cache has something to clear
+        registry.get_swappable_settings_name("apps.FakeModel")
+        self.assertGreaterEqual(registry.get_swappable_settings_name.cache_info().currsize, 1)
+
+        # Also populate the models cache
+        registry.get_models()
+        self.assertGreaterEqual(registry.get_models.cache_info().currsize, 1)
+
+        # Now call clear_cache, which will call each model._meta._expire_cache()
+        # The fake _expire_cache will call get_swappable_settings_name(), trying to repopulate.
+        registry.clear_cache()
+
+        # Final expectation: swappable cache must be empty.
+        self.assertEqual(registry.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(registry.get_models.cache_info().currsize, 0)
+
+    def test_clear_cache_when_not_ready_still_clears_swappable_and_models(self):
+        registry = Apps(installed_apps=[])
+        registry.get_swappable_settings_name("admin.LogEntry")
+        registry.get_models()
+
+        # Simulate not ready: expire loop shouldn't run
+        registry.ready = False
+        registry.clear_cache()
+
+        self.assertEqual(registry.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(registry.get_models.cache_info().currsize, 0)
+
+    def test_multiple_clear_cache_calls_idempotent(self):
+        registry = Apps(installed_apps=[])
+        registry.get_swappable_settings_name("admin.LogEntry")
+        registry.get_models()
+
+        registry.clear_cache()
+        # Call clear_cache again to ensure idempotence
+        registry.clear_cache()
+
+        self.assertEqual(registry.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(registry.get_models.cache_info().currsize, 0)
+
+    def test_clear_cache_with_multiple_models_and_expire_repopulation(self):
+        """
+        Same idea as test_clear_cache_during_expire_cache_does_not_leave_swappable_cache_populated
+        but with multiple models, one of which repopulates the swappable cache.
+        """
+        registry = Apps(installed_apps=[])
+        meta1 = MetaStub(app_label="apps", model_name="one", swappable=None, label_lower="apps.one", apps_registry=None)
+        meta2 = MetaStub(app_label="apps", model_name="two", swappable="apps.Two", label_lower="apps.two", apps_registry=registry)
+        fake1 = FakeModel(meta1)
+        fake2 = FakeModel(meta2)
+
+        registry.app_configs = {"apps": StubAppConfig([fake1, fake2])}
+        registry.ready = True
+
+        # Populate caches
+        registry.get_swappable_settings_name("apps.two")
+        registry.get_models()
+
+        registry.clear_cache()
+
+        self.assertEqual(registry.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(registry.get_models.cache_info().currsize, 0)
+
+    def test_clear_cache_does_not_raise_when_models_ready_false_but_models_cache_empty(self):
+        """
+        When models_ready is False, get_models() should raise if called. However
+        clear_cache() shouldn't raise just for being called; it should clear caches.
+        """
+        registry = Apps(installed_apps=[])
+        # Ensure we have a cache entry for swappable
+        registry.get_swappable_settings_name("admin.LogEntry")
+        registry.get_models()
+
+        # Simulate models not ready: clear_cache should still work
+        registry.models_ready = False
+        # Make sure get_models cache is cleared before asserting - simulate that the cache had content
+        registry.clear_cache()
+
+        self.assertEqual(registry.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(registry.get_models.cache_info().currsize, 0)
+
+    def test_clear_cache_for_main_registry_with_fake_expire_repopulation(self):
+        """
+        Ensure the global apps.clear_cache() also clears the swappable cache
+        even if model _expire_cache implementations call back into
+        get_swappable_settings_name().
+        """
+        # Create a fake model on a custom Apps and then attach that app_config briefly
+        # to the global apps registry for the duration of the test.
+        meta = MetaStub(app_label="global", model_name="gmodel", swappable="global.GModel", label_lower="global.gmodel", apps_registry=apps)
+        fake = FakeModel(meta)
+        stub_ac = StubAppConfig([fake])
+
+        # Backup current app_configs and replace with just our stub
+        old_app_configs = apps.app_configs
+        try:
+            apps.app_configs = {"global": stub_ac}
+            apps.ready = True
+            # Populate caches
+            apps.get_swappable_settings_name("global.gmodel")
+            apps.get_models()
+            # Now clear
+            apps.clear_cache()
+            self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+            self.assertEqual(apps.get_models.cache_info().currsize, 0)
+        finally:
+            apps.app_configs = old_app_configs
+
+    def test_clear_cache_when_appconfigs_empty_only_clears_caches(self):
+        registry = Apps(installed_apps=[])
+        # replace app_configs with empty mapping explicitly
+        registry.app_configs = {}
+        registry.ready = True
+        registry.get_swappable_settings_name("admin.LogEntry")
+        registry.get_models()
+
+        # Should not raise and should clear caches
+        registry.clear_cache()
+        self.assertEqual(registry.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(registry.get_models.cache_info().currsize, 0)
+
+# Expose tests so test runner will pick them up when this file is included in the test suite.

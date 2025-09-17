@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 ordering.tests_llm.GroupByRegressionTests._sql ordering.tests_llm.GroupByRegressionTests.setUpTestData ordering.tests_llm.GroupByRegressionTests.test_childmodel_values_group_by_minimal ordering.tests_llm.GroupByRegressionTests.test_group_by_sql_minimal_when_chaining_ordering_and_values ordering.tests_llm.GroupByRegressionTests.test_ordering_by_annotated_constant_does_not_change_group_by ordering.tests_llm.GroupByRegressionTests.test_ordering_by_meta_f_expression_does_not_affect_group_by ordering.tests_llm.GroupByRegressionTests.test_values_author_annotate_count_does_not_include_meta_ordering ordering.tests_llm.GroupByRegressionTests.test_values_author_annotate_then_explicit_order_by_field_not_in_group ordering.tests_llm.GroupByRegressionTests.test_values_author_annotate_with_order_by_does_not_include_meta_ordering ordering.tests_llm.GroupByRegressionTests.test_values_multiple_fields_group_by_contains_them ordering.tests_llm.GroupByRegressionTests.test_values_with_constant_annotation_and_grouping_minimal
+coverage json -o coverage.json
+: '>>>>> End Test Output'

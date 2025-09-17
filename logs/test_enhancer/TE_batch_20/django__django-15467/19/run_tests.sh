@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_widgets.tests_llm.RadioFieldEmptyLabelRegressionTests.test_direct_kwargs_empty_string_preserved_for_blank_fk admin_widgets.tests_llm.RadioFieldEmptyLabelRegressionTests.test_direct_kwargs_false_preserved_for_blank_fk admin_widgets.tests_llm.RadioFieldEmptyLabelRegressionTests.test_direct_kwargs_none_preserved_for_blank_fk admin_widgets.tests_llm.RadioFieldEmptyLabelRegressionTests.test_formfield_overrides_empty_string_preserved_for_blank_fk admin_widgets.tests_llm.RadioFieldEmptyLabelRegressionTests.test_formfield_overrides_false_preserved_for_blank_fk admin_widgets.tests_llm.RadioFieldEmptyLabelRegressionTests.test_formfield_overrides_ignored_for_non_blank_fk admin_widgets.tests_llm.RadioFieldEmptyLabelRegressionTests.test_formfield_overrides_none_preserved_for_blank_fk admin_widgets.tests_llm.RadioFieldEmptyLabelRegressionTests.test_mixed_case_override_none_and_kwargs_empty_string admin_widgets.tests_llm.RadioFieldEmptyLabelRegressionTests.test_mixed_case_override_present_but_empty_string
+coverage json -o coverage.json
+: '>>>>> End Test Output'

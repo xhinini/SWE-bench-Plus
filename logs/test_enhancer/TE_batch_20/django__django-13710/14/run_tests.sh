@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_inlines.tests_llm.InlineVerboseNameLazyTests.test_different_lazy_verbose_name_also_lazy_plural admin_inlines.tests_llm.InlineVerboseNameLazyTests.test_explicit_lazy_verbose_name_plural_is_preserved admin_inlines.tests_llm.InlineVerboseNameLazyTests.test_explicit_string_verbose_name_plural_is_preserved admin_inlines.tests_llm.InlineVerboseNameLazyTests.test_format_lazy_verbose_name_results_in_lazy_plural admin_inlines.tests_llm.InlineVerboseNameLazyTests.test_lazy_verbose_name_makes_lazy_plural admin_inlines.tests_llm.InlineVerboseNameLazyTests.test_lazy_verbose_name_preserved_type_when_plural_derived admin_inlines.tests_llm.InlineVerboseNameLazyTests.test_lazy_verbose_name_same_as_model_meta_still_lazy_plural admin_inlines.tests_llm.InlineVerboseNameLazyTests.test_lazy_verbose_name_unicode_characters admin_inlines.tests_llm.InlineVerboseNameLazyTests.test_lazy_verbose_name_with_spaces admin_inlines.tests_llm.InlineVerboseNameLazyTests.test_multiple_inlines_each_lazy_plural
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,153 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify the StaticFilesHandlerMixin and ASGIStaticFilesHandler behaviors, with emphasis on the async get_response_async path using sync_to_async and proper Http404 handling. They would fail for the candidate (model) patch because it does not use sync_to_async in get_response_async and thus the tests that assert sync_to_async was invoked would fail. The tests also cover file_path and _should_handle edge cases and ASGI path dispatch for non-HTTP scopes.
+test_code: |
+  from urllib.parse import urlparse
+  import asyncio
+  from django.test import SimpleTestCase, override_settings
+  from django.http import Http404
+  
+  import django.contrib.staticfiles.handlers as handlers
+  from django.contrib.staticfiles.handlers import StaticFilesHandlerMixin, ASGIStaticFilesHandler
+  
+  
+  class DummyMixin(StaticFilesHandlerMixin):
+      """Minimal concrete class for testing the mixin methods."""
+      def __init__(self, base_url):
+          # base_url is a ParseResult from urlparse
+          self.base_url = base_url
+  
+  class TestStaticFilesHandlers(SimpleTestCase):
+  
+      def test_file_path_strips_base_url(self):
+          h = DummyMixin(urlparse('/static/'))
+          result = h.file_path('/static/css/style.css')
+          # url2pathname should translate to a relative path without the base prefix
+          self.assertEqual(result, 'css/style.css')
+  
+      def test__should_handle_true_when_under_base_url(self):
+          h = DummyMixin(urlparse('/static/'))
+          # path that starts with the base_url path and no netloc should be handled
+          self.assertTrue(h._should_handle('/static/images/logo.png'))
+  
+      def test__should_handle_false_when_netloc_present(self):
+          # If the base_url contains a host (netloc), files should not be handled here
+          h = DummyMixin(urlparse('http://example.com/static/'))
+          self.assertFalse(h._should_handle('/static/images/logo.png'))
+  
+      def test_get_response_returns_serve_result_sync(self):
+          class S(DummyMixin):
+              def __init__(self):
+                  super().__init__(urlparse('/static/'))
+              def serve(self, request):
+                  return 'SERVE_OK'
+  
+          s = S()
+          # No exception: get_response should return value from serve
+          self.assertEqual(s.get_response(None), 'SERVE_OK')
+  
+      def test_get_response_handles_Http404_sync(self):
+          class S(DummyMixin):
+              def __init__(self):
+                  super().__init__(urlparse('/static/'))
+              def serve(self, request):
+                  raise Http404('not found')
+  
+          s = S()
+          # Patch the module-level response_for_exception to a deterministic function
+          orig = handlers.response_for_exception
+          try:
+              handlers.response_for_exception = lambda req, exc: 'RESPONSE_FOR_404'
+              self.assertEqual(s.get_response(None), 'RESPONSE_FOR_404')
+          finally:
+              handlers.response_for_exception = orig
+  
+      def test_get_response_async_uses_sync_to_async_and_returns_result(self):
+          # Ensure get_response_async uses the module's sync_to_async wrapper
+          class S(DummyMixin):
+              def __init__(self):
+                  super().__init__(urlparse('/static/'))
+              def serve(self, request):
+                  return 'ASYNC_OK'
+  
+          s = S()
+  
+          calls = []
+          orig_sync_to_async = handlers.sync_to_async
+          try:
+              def fake_sync_to_async(func):
+                  calls.append(('wrap', func.__name__))
+                  async def wrapper(*args, **kwargs):
+                      calls.append(('call', func.__name__))
+                      return func(*args, **kwargs)
+                  return wrapper
+              handlers.sync_to_async = fake_sync_to_async
+  
+              result = asyncio.run(s.get_response_async(None))
+              self.assertEqual(result, 'ASYNC_OK')
+              # Ensure our fake sync_to_async was used to wrap and call the serve function
+              self.assertEqual(calls, [('wrap', 'serve'), ('call', 'serve')])
+          finally:
+              handlers.sync_to_async = orig_sync_to_async
+  
+      def test_get_response_async_handles_Http404_and_uses_sync_to_async(self):
+          # When serve raises Http404, get_response_async should call response_for_exception
+          class S(DummyMixin):
+              def __init__(self):
+                  super().__init__(urlparse('/static/'))
+              def serve(self, request):
+                  raise Http404('missing')
+  
+          s = S()
+  
+          wrap_calls = []
+          orig_sync_to_async = handlers.sync_to_async
+          orig_response_for_exception = handlers.response_for_exception
+          try:
+              def fake_sync_to_async(func):
+                  # Record which functions are wrapped; return an async wrapper that records calls.
+                  wrap_calls.append(('wrap', func.__name__))
+                  async def wrapper(*args, **kwargs):
+                      wrap_calls.append(('call', func.__name__))
+                      return func(*args, **kwargs)
+                  return wrapper
+              handlers.sync_to_async = fake_sync_to_async
+              handlers.response_for_exception = lambda req, exc: 'ERR_404'
+  
+              result = asyncio.run(s.get_response_async('REQUEST'))
+              self.assertEqual(result, 'ERR_404')
+              # Expect serve wrapped/called first, then response_for_exception wrapped/called
+              self.assertEqual(wrap_calls, [('wrap', 'serve'), ('call', 'serve'), ('wrap', 'response_for_exception'), ('call', 'response_for_exception')])
+          finally:
+              handlers.sync_to_async = orig_sync_to_async
+              handlers.response_for_exception = orig_response_for_exception
+  
+      def test_asgi_handler_calls_application_for_non_http(self):
+          called = []
+  
+          async def app(scope, receive, send):
+              called.append(('app', scope))
+              # Return a sentinel by sending an ASGI response via send to emulate completion
+              return None
+  
+          h = ASGIStaticFilesHandler(app)
+  
+          # Non-HTTP scope should be forwarded to the wrapped application
+          scope = {'type': 'websocket', 'path': '/static/test.txt'}
+  
+          async def run_scope():
+              await h(scope, None, None)
+  
+          asyncio.run(run_scope())
+          self.assertEqual(called, [('app', scope)])
+  
+      def test__should_handle_equal_path(self):
+          h = DummyMixin(urlparse('/static/'))
+          # The path equal to base_url path itself should be handled
+          self.assertTrue(h._should_handle('/static/'))
+  
+      def test__should_handle_not_under_base_url(self):
+          h = DummyMixin(urlparse('/static/'))
+          self.assertFalse(h._should_handle('/media/file.png'))
+new_imports_code: |
+  # No additional import code required beyond what's in the test file.

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests._exists staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests._write staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.setUp staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.tearDown staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_adjustable_paths_empty_no_unbound staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_css_with_fragment_like_fonthack staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_hashed_css_with_nonadjustable_file staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_hashed_single_css_no_unbound staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_manifest_multiple_files_no_unbound staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_manifest_single_css_no_unbound_and_manifest_saved staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_multiple_css_files_no_unbound staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_nested_directory_css_no_unbound staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_stored_name_works_with_max_zero
+coverage json -o coverage.json
+: '>>>>> End Test Output'

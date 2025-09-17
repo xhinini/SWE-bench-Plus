@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_widgets.tests_llm.RadioEmptyLabelPreservationTests.test_blank_false_ignores_empty_label_provided_in_kwargs admin_widgets.tests_llm.RadioEmptyLabelPreservationTests.test_formfield_overrides_and_kwargs_precedence_with_empty_string admin_widgets.tests_llm.RadioEmptyLabelPreservationTests.test_kwargs_override_formfield_overrides_preserves_empty_string admin_widgets.tests_llm.RadioEmptyLabelPreservationTests.test_preserve_empty_string_in_formfield_overrides admin_widgets.tests_llm.RadioEmptyLabelPreservationTests.test_preserve_empty_string_in_kwargs_overrides admin_widgets.tests_llm.RadioEmptyLabelPreservationTests.test_preserve_false_in_kwargs admin_widgets.tests_llm.RadioEmptyLabelPreservationTests.test_preserve_none_in_formfield_overrides admin_widgets.tests_llm.RadioEmptyLabelPreservationTests.test_preserve_none_in_kwargs_overrides admin_widgets.tests_llm.RadioEmptyLabelPreservationTests.test_preserve_zero_in_kwargs admin_widgets.tests_llm.RadioEmptyLabelPreservationTests.test_widget_is_adminradio_and_empty_label_preserved_for_empty_string
+coverage json -o coverage.json
+: '>>>>> End Test Output'

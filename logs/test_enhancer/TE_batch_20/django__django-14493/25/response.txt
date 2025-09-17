@@ -1,0 +1,201 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise Hashed/Manifest files post-processing with max_post_process_passes set to 0. They create temporary storage locations, save CSS and referenced asset files, run post_process, and assert that:
+- No UnboundLocalError or RuntimeError('Max post-process passes exceeded.') is raised.
+- References to assets are rewritten to include the correct content hash.
+- Absolute/ignored URLs are left unchanged.
+- Manifest storage's hashed_files mapping is updated.
+All tests should fail on the original (buggy) code where "substitutions" can be referenced before assignment when max_post_process_passes == 0, and pass with the provided patch which initializes substitutions beforehand.
+test_code: |
+  import hashlib
+  import os
+  import shutil
+  import tempfile
+  import unittest
+  from django.core.files.base import ContentFile
+  from django.test import override_settings
+  from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
+  
+  class PostProcessMaxZeroTests(unittest.TestCase):
+      def setUp(self):
+          self.tmpdir = tempfile.mkdtemp()
+          self.addCleanup(shutil.rmtree, self.tmpdir)
+  
+      def _make_storage(self):
+          # Subclass to set max_post_process_passes to 0 to reproduce the edge case.
+          class MyManifestStorage(ManifestStaticFilesStorage):
+              max_post_process_passes = 0
+          return MyManifestStorage(location=self.tmpdir, base_url='/static/')
+  
+      def _md5_prefix(self, content_bytes):
+          return hashlib.md5(content_bytes).hexdigest()[:12]
+  
+      @override_settings(DEBUG=False, STATIC_URL='/static/')
+      def test_post_process_max_zero_basic(self):
+          storage = self._make_storage()
+          # image referenced by css
+          storage._save('image.png', ContentFile(b'image content'))
+          css_content = b'body { background: url("image.png"); }'
+          storage._save('test.css', ContentFile(css_content))
+  
+          paths = {'test.css': (storage, 'test.css')}
+          # Should not raise UnboundLocalError; should process and update reference.
+          results = list(storage.post_process(paths, dry_run=False))
+          # Find the processed entry for test.css
+          processed = None
+          for entry in results:
+              if entry[0] == 'test.css':
+                  processed = entry
+                  break
+          self.assertIsNotNone(processed, "test.css was not yielded by post_process")
+          _, hashed_name, processed_flag = processed
+          self.assertTrue(processed_flag)
+          with storage.open(hashed_name) as f:
+              content = f.read()
+          img_hash = self._md5_prefix(b'image content')
+          self.assertIn(img_hash.encode(), content)
+          self.assertIn(b'image.' + img_hash.encode() + b'.png', content)
+  
+      @override_settings(DEBUG=False, STATIC_URL='/static/')
+      def test_post_process_max_zero_fragment_in_url(self):
+          storage = self._make_storage()
+          storage._save('image.png', ContentFile(b'image2'))
+          # include a fragment in the url that should be preserved
+          storage._save('test_fragment.css', ContentFile(b'body{src:url("image.png#frag")}'))
+          paths = {'test_fragment.css': (storage, 'test_fragment.css')}
+          results = list(storage.post_process(paths, dry_run=False))
+          processed = next(e for e in results if e[0] == 'test_fragment.css')
+          _, hashed_name, _ = processed
+          with storage.open(hashed_name) as f:
+              content = f.read()
+          img_hash = self._md5_prefix(b'image2')
+          # should preserve fragment after hashed filename
+          self.assertIn(b'image.' + img_hash.encode() + b'.png#frag', content)
+  
+      @override_settings(DEBUG=False, STATIC_URL='/static/')
+      def test_post_process_max_zero_query_in_url(self):
+          storage = self._make_storage()
+          storage._save('img.png', ContentFile(b'imgcontent'))
+          storage._save('test_query.css', ContentFile(b'url("img.png?ver=1")'))
+          paths = {'test_query.css': (storage, 'test_query.css')}
+          results = list(storage.post_process(paths, dry_run=False))
+          processed = next(e for e in results if e[0] == 'test_query.css')
+          _, hashed_name, _ = processed
+          with storage.open(hashed_name) as f:
+              content = f.read()
+          img_hash = self._md5_prefix(b'imgcontent')
+          # query should be preserved appropriately (may be normalized)
+          self.assertIn(b'img.' + img_hash.encode() + b'.png', content)
+  
+      @override_settings(DEBUG=False, STATIC_URL='/static/')
+      def test_post_process_max_zero_ignored_absolute_url(self):
+          storage = self._make_storage()
+          # An absolute URL outside STATIC_URL should be ignored
+          storage._save('test_abs.css', ContentFile(b'body{background:url("/other/image.png")}'))
+          paths = {'test_abs.css': (storage, 'test_abs.css')}
+          results = list(storage.post_process(paths, dry_run=False))
+          processed = next(e for e in results if e[0] == 'test_abs.css')
+          _, hashed_name, _ = processed
+          with storage.open(hashed_name) as f:
+              content = f.read()
+          # content should still contain the original absolute path unchanged
+          self.assertIn(b'/other/image.png', content)
+  
+      @override_settings(DEBUG=False, STATIC_URL='/static/')
+      def test_post_process_max_zero_absolute_static_url_processed(self):
+          storage = self._make_storage()
+          # An absolute URL that begins with STATIC_URL should be processed.
+          storage._save('image_s.png', ContentFile(b'pics'))
+          storage._save('test_static_abs.css', ContentFile(b'body{background:url("/static/image_s.png")}'))
+          paths = {'test_static_abs.css': (storage, 'test_static_abs.css')}
+          results = list(storage.post_process(paths, dry_run=False))
+          processed = next(e for e in results if e[0] == 'test_static_abs.css')
+          _, hashed_name, _ = processed
+          with storage.open(hashed_name) as f:
+              content = f.read()
+          img_hash = self._md5_prefix(b'pics')
+          self.assertIn(b'image_s.' + img_hash.encode() + b'.png', content)
+  
+      @override_settings(DEBUG=False, STATIC_URL='/static/')
+      def test_post_process_max_zero_deep_relative_paths(self):
+          storage = self._make_storage()
+          # nested directory structure
+          storage._save(os.path.join('css', 'img', 'deep.png'), ContentFile(b'deepimg'))
+          storage._save(os.path.join('css', 'style.css'), ContentFile(b'body{background:url("img/deep.png")}'))
+          paths = {os.path.join('css', 'style.css'): (storage, os.path.join('css', 'style.css'))}
+          results = list(storage.post_process(paths, dry_run=False))
+          processed = next(e for e in results if e[0] == os.path.join('css', 'style.css'))
+          _, hashed_name, _ = processed
+          with storage.open(hashed_name) as f:
+              content = f.read()
+          img_hash = self._md5_prefix(b'deepimg')
+          self.assertIn(b'deep.' + img_hash.encode() + b'.png', content)
+  
+      @override_settings(DEBUG=False, STATIC_URL='/static/')
+      def test_post_process_max_zero_import_replacement(self):
+          storage = self._make_storage()
+          storage._save('styles.css', ContentFile(b'/* empty */'))
+          storage._save('importer.css', ContentFile(b'@import "styles.css";'))
+          paths = {'importer.css': (storage, 'importer.css')}
+          results = list(storage.post_process(paths, dry_run=False))
+          processed = next(e for e in results if e[0] == 'importer.css')
+          _, hashed_name, _ = processed
+          with storage.open(hashed_name) as f:
+              content = f.read()
+          styles_hash = self._md5_prefix(b'/* empty */')
+          # The @import should be converted to an import url("styles.<hash>.css")
+          self.assertIn(b'styles.' + styles_hash.encode() + b'.css', content)
+  
+      @override_settings(DEBUG=False, STATIC_URL='/static/')
+      def test_post_process_does_not_yield_all_runtime_error(self):
+          storage = self._make_storage()
+          storage._save('imagex.png', ContentFile(b'x'))
+          storage._save('a.css', ContentFile(b'url("imagex.png")'))
+          paths = {'a.css': (storage, 'a.css')}
+          # With max_post_process_passes = 0 we must not yield the "All" runtime error.
+          results = list(storage.post_process(paths, dry_run=False))
+          # Ensure no result with name 'All' was yielded.
+          names = [r[0] for r in results]
+          self.assertNotIn('All', names)
+  
+      @override_settings(DEBUG=False, STATIC_URL='/static/')
+      def test_post_process_updates_hashed_files_mapping(self):
+          storage = self._make_storage()
+          storage._save('imgmap.png', ContentFile(b'map'))
+          storage._save('map.css', ContentFile(b'url("imgmap.png")'))
+          paths = {'map.css': (storage, 'map.css')}
+          list(storage.post_process(paths, dry_run=False))
+          # After post_process, ensure the storage.hashed_files mapping was updated.
+          # The key is the cleaned name of the css file.
+          key = storage.clean_name('map.css')
+          self.assertIn(key, storage.hashed_files)
+  
+      @override_settings(DEBUG=False, STATIC_URL='/static/')
+      def test_post_process_multiple_files_no_unboundlocal_on_zero_passes(self):
+          storage = self._make_storage()
+          # multiple adjustable files but max passes == 0 should still process
+          storage._save('img1.png', ContentFile(b'i1'))
+          storage._save('img2.png', ContentFile(b'i2'))
+          storage._save('one.css', ContentFile(b'url("img1.png")'))
+          storage._save('two.css', ContentFile(b'url("img2.png")'))
+          paths = {
+              'one.css': (storage, 'one.css'),
+              'two.css': (storage, 'two.css'),
+          }
+          results = list(storage.post_process(paths, dry_run=False))
+          # Both should be processed and no UnboundLocalError should occur.
+          yielded_names = {r[0] for r in results}
+          self.assertIn('one.css', yielded_names)
+          self.assertIn('two.css', yielded_names)
+  
+  if __name__ == '__main__':
+      unittest.main()
+new_imports_code: |
+  import hashlib
+  import os
+  import shutil
+  import tempfile
+  import unittest
+  from django.core.files.base import ContentFile
+  from django.test import override_settings
+  from django.contrib.staticfiles.storage import ManifestStaticFilesStorage

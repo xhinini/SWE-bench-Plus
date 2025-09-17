@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_optimizer_llm.test_alter_then_rename_then_alter_on_new_name_collapses_properly migrations.test_optimizer_llm.test_alter_then_rename_with_db_column_none_keeps_altered_on_new_name migrations.test_optimizer_llm.test_alter_then_rename_with_db_column_set_does_not_emit_second_alter migrations.test_optimizer_llm.test_alterfield_case_insensitive_field_and_model_matching migrations.test_optimizer_llm.test_alterfield_followed_by_removefield_results_in_removefield_only migrations.test_optimizer_llm.test_alterfields_on_different_fields_do_not_collapse migrations.test_optimizer_llm.test_chain_of_alterfields_then_rename_then_more_alters_collapses_to_last_alter migrations.test_optimizer_llm.test_elidable_between_alterfields_does_not_prevent_collapsing migrations.test_optimizer_llm.test_multiple_alterfield_chain_collapses_to_last migrations.test_optimizer_llm.test_multiple_alterfields_chain_with_case_variations_collapses_to_last
+coverage json -o coverage.json
+: '>>>>> End Test Output'

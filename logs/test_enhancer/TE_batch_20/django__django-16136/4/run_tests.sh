@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 async.tests_llm.AdditionalViewTests.test_allowed_methods_includes_head_after_setup async.tests_llm.AdditionalViewTests.test_allowed_methods_without_setup_excludes_head_for_async_view async.tests_llm.AdditionalViewTests.test_as_view_callback_for_async_view_returns_coroutine_for_disallowed_method async.tests_llm.AdditionalViewTests.test_as_view_rejects_invalid_keyword async.tests_llm.AdditionalViewTests.test_as_view_rejects_method_name_in_initkwargs async.tests_llm.AdditionalViewTests.test_base_view_class_with_no_handlers_is_sync async.tests_llm.AdditionalViewTests.test_dispatch_on_instance_returns_coroutine_for_async_view_when_method_not_allowed async.tests_llm.AdditionalViewTests.test_http_method_not_allowed_async_response_allow_header_matches_allowed_methods async.tests_llm.AdditionalViewTests.test_http_method_not_allowed_returns_coroutine_for_async_post_only_view async.tests_llm.AdditionalViewTests.test_http_method_not_allowed_returns_sync_response_for_sync_view_instance
+coverage json -o coverage.json
+: '>>>>> End Test Output'

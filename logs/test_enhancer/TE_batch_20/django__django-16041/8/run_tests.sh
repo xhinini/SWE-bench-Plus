@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.EmptyFormConflictsTests.test_constructor_form_kwargs_conflicting_auto_id forms_tests.tests.test_formsets_llm.EmptyFormConflictsTests.test_constructor_form_kwargs_multiple_conflicts forms_tests.tests.test_formsets_llm.EmptyFormConflictsTests.test_custom_other_kwargs_and_conflict_preservation forms_tests.tests.test_formsets_llm.EmptyFormConflictsTests.test_empty_form_conflicting_auto_id forms_tests.tests.test_formsets_llm.EmptyFormConflictsTests.test_empty_form_conflicting_prefix forms_tests.tests.test_formsets_llm.EmptyFormConflictsTests.test_empty_form_conflicting_renderer forms_tests.tests.test_formsets_llm.EmptyFormConflictsTests.test_empty_form_conflicting_use_required_attribute forms_tests.tests.test_formsets_llm.EmptyFormConflictsTests.test_empty_form_multiple_conflicting_keys forms_tests.tests.test_formsets_llm.EmptyFormConflictsTests.test_empty_permitted_ignored_when_false_in_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormConflictsTests.test_renderer_conflict_with_custom_renderer_arg
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 xor_lookups.tests_llm.FakeCase.__add__ xor_lookups.tests_llm.FakeCase.__init__ xor_lookups.tests_llm.FakeChild.__init__ xor_lookups.tests_llm.FakeChild.__repr__ xor_lookups.tests_llm.FakeCompiler.__init__ xor_lookups.tests_llm.FakeCompiler.compile xor_lookups.tests_llm.FakeExact.__init__ xor_lookups.tests_llm.FakeWhen.__init__ xor_lookups.tests_llm.ModExpr.__init__ xor_lookups.tests_llm.SumExpr.__add__ xor_lookups.tests_llm.SumExpr.__init__ xor_lookups.tests_llm.SumExpr.__mod__ xor_lookups.tests_llm.WhereNodeModConversionTests.make_children xor_lookups.tests_llm.WhereNodeModConversionTests.make_connection xor_lookups.tests_llm.WhereNodeModConversionTests.setUpClass xor_lookups.tests_llm.WhereNodeModConversionTests.tearDownClass xor_lookups.tests_llm.WhereNodeModConversionTests.test_leaves_yield_only_leaf_children xor_lookups.tests_llm.WhereNodeModConversionTests.test_negated_xor_three_children_wrapped_in_not xor_lookups.tests_llm.WhereNodeModConversionTests.test_resolved_flag_adds_parentheses_when_resolved xor_lookups.tests_llm.WhereNodeModConversionTests.test_sum_expression_mod_not_called_under_gold xor_lookups.tests_llm.WhereNodeModConversionTests.test_supports_logical_xor_true_uses_xor_connector xor_lookups.tests_llm.WhereNodeModConversionTests.test_three_children_compiles_case_when_count xor_lookups.tests_llm.WhereNodeModConversionTests.test_three_children_uses_mod_in_sql xor_lookups.tests_llm.WhereNodeModConversionTests.test_two_children_compiles_case_when_count xor_lookups.tests_llm.WhereNodeModConversionTests.test_two_children_no_mod_in_sql
+coverage json -o coverage.json
+: '>>>>> End Test Output'

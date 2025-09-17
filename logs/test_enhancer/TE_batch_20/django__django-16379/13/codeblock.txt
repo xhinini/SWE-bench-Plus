@@ -1,0 +1,107 @@
+import os
+import shutil
+import tempfile
+import time
+import pickle
+import zlib
+import unittest
+from unittest import mock
+from django.core.cache.backends.filebased import FileBasedCache
+
+class FileBasedCacheRegressionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp()
+        # Instantiate FileBasedCache directly with minimal params
+        self.cache = FileBasedCache(self.tmpdir, params={})
+
+    def tearDown(self):
+        try:
+            shutil.rmtree(self.tmpdir)
+        except FileNotFoundError:
+            pass
+
+    def _write_cache_file(self, key, expiry, value):
+        fname = self.cache._key_to_file(key)
+        # Create the file in the same format the backend expects
+        with open(fname, "wb") as fh:
+            fh.write(pickle.dumps(expiry, self.cache.pickle_protocol))
+            fh.write(zlib.compress(pickle.dumps(value, self.cache.pickle_protocol)))
+        return fname
+
+    def test_has_key_handles_filenotfound_during_open(self):
+        # Simulate open raising FileNotFoundError (race) -> has_key should return False
+        self.cache.set("racekey", "value")
+        with mock.patch("builtins.open", side_effect=FileNotFoundError()) as m_open:
+            self.assertIs(self.cache.has_key("racekey"), False)
+            m_open.assert_called_once()
+
+    def test_has_key_propagates_other_oserror(self):
+        # If open raises an OSError (not FileNotFoundError), it should propagate
+        self.cache.set("oserrkey", "value")
+        with mock.patch("builtins.open", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                self.cache.has_key("oserrkey")
+
+    def test_has_key_with_version_handles_filenotfound(self):
+        # Ensure versioned keys are handled the same way on race
+        self.cache.set("vkey", "value", version=2)
+        with mock.patch("builtins.open", side_effect=FileNotFoundError()) as m_open:
+            self.assertIs(self.cache.has_key("vkey", version=2), False)
+            m_open.assert_called_once()
+
+    def test_has_key_considers_expired_and_deletes_file(self):
+        # Create an expired cache file and ensure has_key returns False and file removed
+        fname = self._write_cache_file("expired", time.time() - 10, "old")
+        # Sanity: file exists
+        self.assertTrue(os.path.exists(fname))
+        self.assertIs(self.cache.has_key("expired"), False)
+        self.assertFalse(os.path.exists(fname))
+
+    def test_has_key_expired_but_delete_missing_is_handled(self):
+        # If the file is expired and os.remove raises FileNotFoundError (another process removed it),
+        # has_key should still return False and not raise.
+        fname = self._write_cache_file("expired2", time.time() - 10, "old")
+        self.assertTrue(os.path.exists(fname))
+        with mock.patch("os.remove", side_effect=FileNotFoundError()):
+            # Should not raise, just return False
+            self.assertIs(self.cache.has_key("expired2"), False)
+        # File may or may not exist depending on timing; ensure method completed.
+
+    def test_has_key_does_not_swallow_exceptions_from_is_expired(self):
+        # If _is_expired raises a non-FileNotFoundError exception, it should propagate.
+        fname = self._write_cache_file("kraise", None, "v")
+        self.assertTrue(os.path.exists(fname))
+        original_is_expired = self.cache._is_expired
+        try:
+            def raise_value(f):
+                raise ValueError("boom")
+            self.cache._is_expired = raise_value
+            with self.assertRaises(ValueError):
+                self.cache.has_key("kraise")
+        finally:
+            self.cache._is_expired = original_is_expired
+
+    def test_has_key_open_called_once_on_race(self):
+        # Ensure open is invoked exactly once when it raises FileNotFoundError
+        self.cache.set("singleopen", "value")
+        with mock.patch("builtins.open", side_effect=FileNotFoundError()) as m_open:
+            self.assertIs(self.cache.has_key("singleopen"), False)
+            self.assertEqual(m_open.call_count, 1)
+
+    def test_has_key_unicode_key_race(self):
+        # Unicode keys should be treated the same as bytes keys during race
+        key = "unicøde-key-清"
+        self.cache.set(key, "val")
+        with mock.patch("builtins.open", side_effect=FileNotFoundError()) as m_open:
+            self.assertIs(self.cache.has_key(key), False)
+            m_open.assert_called_once()
+
+    def test_has_key_returns_true_for_none_expiry(self):
+        # expiry == None means never expire -> has_key True
+        fname = self._write_cache_file("forever", None, {"a": 1})
+        self.assertIs(self.cache.has_key("forever"), True)
+
+    def test_has_key_returns_true_for_future_expiry(self):
+        # expiry in the future means key is present
+        fname = self._write_cache_file("future", time.time() + 1000, "not yet")
+        self.assertIs(self.cache.has_key("future"), True)

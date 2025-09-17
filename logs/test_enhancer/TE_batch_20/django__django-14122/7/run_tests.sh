@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 ordering.tests_llm.GroupByRegressionTests._sql_of ordering.tests_llm.GroupByRegressionTests.setUpTestData ordering.tests_llm.GroupByRegressionTests.test_annotate_order_by_annotation_outside_select_does_not_leak_meta_ordering ordering.tests_llm.GroupByRegressionTests.test_annotate_subquery_default_ordering_no_groupby_meta_ordering ordering.tests_llm.GroupByRegressionTests.test_annotate_with_function_ordering_does_not_force_group_by_meta_ordering ordering.tests_llm.GroupByRegressionTests.test_default_ordering_on_related_models_does_not_cause_groupby_change ordering.tests_llm.GroupByRegressionTests.test_distinct_with_values_and_meta_ordering_groupby_stable ordering.tests_llm.GroupByRegressionTests.test_group_by_sql_equivalence_with_and_without_meta_ordering_override ordering.tests_llm.GroupByRegressionTests.test_values_annotate_default_ordering_no_groupby_of_meta_ordering_columns ordering.tests_llm.GroupByRegressionTests.test_values_annotate_with_explicit_order_by_includes_orderby_in_groupby_when_requested ordering.tests_llm.GroupByRegressionTests.test_values_list_flat_with_annotation_default_ordering
+coverage json -o coverage.json
+: '>>>>> End Test Output'

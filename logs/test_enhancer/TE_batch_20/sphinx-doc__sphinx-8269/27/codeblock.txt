@@ -1,0 +1,221 @@
+from requests.exceptions import HTTPError
+from unittest import mock
+import json
+from unittest import mock
+import pytest
+from pathlib import Path
+from requests.exceptions import HTTPError
+
+# Helper fake response used to simulate requests responses in tests
+class FakeRequest:
+    def __init__(self, method='GET'):
+        self.method = method
+
+class FakeResponse:
+    def __init__(self, status_code=200, url='https://example.com/page', headers=None,
+                 chunks=None, history=None, request_method='GET'):
+        self.status_code = status_code
+        self.url = url
+        self.headers = headers or {}
+        self._chunks = chunks or []
+        self.history = history or []
+        self.request = FakeRequest(method=request_method)
+
+    def iter_content(self, chunk_size=4096, decode_unicode=True):
+        # Simulate requests' iter_content generator
+        for chunk in self._chunks:
+            yield chunk
+
+    def raise_for_status(self):
+        if 400 <= self.status_code:
+            # mimic requests' HTTPError that carries response attribute
+            err = HTTPError(f"{self.status_code} Client Error for url: {self.url}")
+            err.response = self
+            raise err
+
+def write_index_with_link(srcdir, uri):
+    (Path(srcdir) / 'index.rst').write_text(
+        "Test\n====\n\n"
+        f"`link <{uri}>`_\n"
+    )
+
+def read_json_rows(outdir):
+    content = (Path(outdir) / 'output.json').read_text()
+    return [json.loads(x) for x in content.splitlines()]
+
+# Utility to run the builder with patched get/head and return the row for a given URI
+def run_with_patches(app, src_uri, head_response, get_response):
+    write_index_with_link(app.srcdir, src_uri)
+
+    def fake_head(url, *args, **kwargs):
+        return head_response
+
+    def fake_get(url, *args, **kwargs):
+        return get_response
+
+    patchers = [
+        mock.patch('sphinx.builders.linkcheck.requests.head', side_effect=fake_head),
+        mock.patch('sphinx.builders.linkcheck.requests.get', side_effect=fake_get),
+    ]
+    with patchers[0], patchers[1]:
+        app.builder.build_all()
+
+    rows = read_json_rows(app.outdir)
+    rowsby = {row['uri']: row for row in rows}
+    return rowsby[src_uri]
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_non_html_content_type_missing_anchor_marked_broken(app, status, warning):
+    """
+    When the GET response has a non-HTML Content-Type and does not contain the anchor,
+    the linkcheck builder must still perform the anchor check and respect HTTP error
+    status. The candidate patch skips anchor checking for non-HTML and would mark this
+    link as working; the gold patch (with raise_for_status) will mark it broken.
+    """
+    uri = 'https://example.com/nonhtml#frag'
+    # HEAD returns 200 OK
+    head_resp = FakeResponse(status_code=200, url=uri, headers={'Content-Type': 'application/octet-stream'}, request_method='HEAD')
+    # GET returns 200 OK but non-HTML content and body does NOT contain the anchor
+    get_resp = FakeResponse(status_code=200, url=uri, headers={'Content-Type': 'application/octet-stream'},
+                            chunks=['<html><body>No anchor here</body></html>'], request_method='GET')
+
+    row = run_with_patches(app, uri, head_resp, get_resp)
+    # anchor not found should be reported as broken
+    assert row['status'] == 'broken'
+    assert "Anchor 'frag' not found" in row['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_missing_content_type_header_still_checks_anchor(app, status, warning):
+    """
+    When Content-Type header is absent, anchor checking must still be performed.
+    Candidate patch that checks headers.get('content-type', '').startswith('text/html')
+    will skip check; gold patch does not skip. This should be broken because anchor missing.
+    """
+    uri = 'https://example.com/nocontenttype#frag'
+    head_resp = FakeResponse(status_code=200, url=uri, headers={}, request_method='HEAD')
+    get_resp = FakeResponse(status_code=200, url=uri, headers={},
+                            chunks=['<html><body>no anchor</body></html>'], request_method='GET')
+
+    row = run_with_patches(app, uri, head_resp, get_resp)
+    assert row['status'] == 'broken'
+    assert "Anchor 'frag' not found" in row['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_404_with_anchor_in_body_is_treated_as_error(app, status, warning):
+    """
+    If GET returns a 404 but its body contains the anchor, the link should still be treated
+    as broken (HTTP error takes precedence). Candidate patch that skipped raise_for_status
+    on a re-GET could incorrectly mark this as working because the anchor is present in the body.
+    """
+    uri = 'https://example.com/404withanchor#frag'
+    # HEAD returns 200 so candidate will re-GET; gold will GET directly and call raise_for_status
+    head_resp = FakeResponse(status_code=200, url=uri, headers={'Content-Type': 'text/html'}, request_method='HEAD')
+    # GET returns 404 but contains the anchor in the body
+    get_resp = FakeResponse(status_code=404, url=uri,
+                            headers={'Content-Type': 'text/html'},
+                            chunks=['<html><body><a id="frag"></a></body></html>'],
+                            request_method='GET')
+
+    row = run_with_patches(app, uri, head_resp, get_resp)
+    # Gold: treat as broken due to 404; candidate: may mark working (regression)
+    assert row['status'] == 'broken'
+    assert '404' in row['info'] or '404' in json.dumps(row)
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_working_anchor_detected_in_html(app, status, warning):
+    """
+    A normal HTML page that contains the anchor should be marked working.
+    """
+    uri = 'https://example.com/ok#present'
+    head_resp = FakeResponse(status_code=200, url=uri, headers={'Content-Type': 'text/html'}, request_method='HEAD')
+    get_resp = FakeResponse(status_code=200, url=uri, headers={'Content-Type': 'text/html'},
+                            chunks=['<html><body><div id="present"></div></body></html>'],
+                            request_method='GET')
+
+    row = run_with_patches(app, uri, head_resp, get_resp)
+    assert row['status'] == 'working'
+    assert row['info'] == ''
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_missing_on_html_marked_broken(app, status, warning):
+    """
+    HTML content without the anchor must be reported as broken.
+    """
+    uri = 'https://example.com/html_no_anchor#x'
+    head_resp = FakeResponse(status_code=200, url=uri, headers={'Content-Type': 'text/html'}, request_method='HEAD')
+    get_resp = FakeResponse(status_code=200, url=uri, headers={'Content-Type': 'text/html'},
+                            chunks=['<html><body>No x here</body></html>'], request_method='GET')
+
+    row = run_with_patches(app, uri, head_resp, get_resp)
+    assert row['status'] == 'broken'
+    assert "Anchor 'x' not found" in row['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_404_without_anchor_reports_404(app, status, warning):
+    """
+    A GET that returns 404 without any anchor must be reported as broken and include 404 info.
+    """
+    uri = 'https://example.com/404_no_anchor#z'
+    head_resp = FakeResponse(status_code=200, url=uri, headers={'Content-Type': 'text/html'}, request_method='HEAD')
+    get_resp = FakeResponse(status_code=404, url=uri, headers={'Content-Type': 'text/html'},
+                            chunks=['<html><body>missing z</body></html>'],
+                            request_method='GET')
+
+    row = run_with_patches(app, uri, head_resp, get_resp)
+    assert row['status'] == 'broken'
+    assert '404' in row['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_check_with_redirect_history_reports_redirected(app, status, warning):
+    """
+    If the response has a redirect history, the result should be marked redirected
+    with the incoming redirect status code from history[-1].
+    """
+    uri = 'https://example.com/redirect#fragment'
+    head_resp = FakeResponse(status_code=200, url=uri, headers={'Content-Type': 'text/html'}, request_method='HEAD')
+    # Simulate a final 200 with history containing a 301
+    get_resp = FakeResponse(status_code=200, url='https://example.com/newpage', headers={'Content-Type': 'text/html'},
+                            chunks=['<html><body><div id="fragment"></div></body></html>'],
+                            history=[mock.Mock(status_code=301)],
+                            request_method='GET')
+
+    row = run_with_patches(app, uri, head_resp, get_resp)
+    assert row['status'] == 'redirected'
+    # the recorded 'code' is the redirect code from history[-1]
+    assert row['code'] == 301
+    assert 'to' in json.dumps(row) or 'https://example.com/newpage' in row['uri'] or 'newpage' in row['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_check_when_head_fails_uses_get_and_respects_status(app, status, warning):
+    """
+    If HEAD raises an HTTPError, the builder should retry with GET and honor its status.
+    """
+    uri = 'https://example.com/head-fails#q'
+    # Simulate HEAD returning 404 (raise on raise_for_status)
+    head_resp = FakeResponse(status_code=404, url=uri, headers={'Content-Type': 'text/html'}, request_method='HEAD')
+    # GET also returns 404 and contains no anchor
+    get_resp = FakeResponse(status_code=404, url=uri, headers={'Content-Type': 'text/html'},
+                            chunks=['<html><body>no q</body></html>'],
+                            request_method='GET')
+
+    row = run_with_patches(app, uri, head_resp, get_resp)
+    assert row['status'] == 'broken'
+    assert '404' in row['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_found_in_non_html_bytes_body(app, status, warning):
+    """
+    If the body is bytes (requests.iter_content yields bytes) and contains the anchor,
+    check_anchor should find it. The gold patch will raise for bad status before checking;
+    here status is 200 and the anchor is present so result must be working regardless of content-type.
+    """
+    uri = 'https://example.com/bytesbody#b'
+    head_resp = FakeResponse(status_code=200, url=uri, headers={'Content-Type': 'application/octet-stream'}, request_method='HEAD')
+    # iter_content returns bytes; anchor is present as bytes
+    get_resp = FakeResponse(status_code=200, url=uri, headers={'Content-Type': 'application/octet-stream'},
+                            chunks=[b'<html><body><a id="b"></a></body></html>'],
+                            request_method='GET')
+
+    row = run_with_patches(app, uri, head_resp, get_resp)
+    assert row['status'] == 'working'
+    assert row['info'] == ''

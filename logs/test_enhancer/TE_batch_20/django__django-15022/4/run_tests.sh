@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.test_admin_llm.GetSearchResultsTests._get_admin_and_qs admin_changelist.test_admin_llm.GetSearchResultsTests.setUp admin_changelist.test_admin_llm.GetSearchResultsTests.setUpTestData admin_changelist.test_admin_llm.GetSearchResultsTests.test_multi_term_all_terms_must_match admin_changelist.test_admin_llm.GetSearchResultsTests.test_multi_term_order_independent admin_changelist.test_admin_llm.GetSearchResultsTests.test_multi_term_search_and_matches_name_and_age admin_changelist.test_admin_llm.GetSearchResultsTests.test_multiple_results_for_same_term admin_changelist.test_admin_llm.GetSearchResultsTests.test_partial_match_with_transform_lookup admin_changelist.test_admin_llm.GetSearchResultsTests.test_pk_lookup_supports_pk_keyword_in_search_fields admin_changelist.test_admin_llm.GetSearchResultsTests.test_quoted_phrase_search admin_changelist.test_admin_llm.GetSearchResultsTests.test_search_term_with_transform_lookup_explicit admin_changelist.test_admin_llm.GetSearchResultsTests.test_search_with_special_characters_and_quotes admin_changelist.test_admin_llm.GetSearchResultsTests.test_single_term_search_matches_child_name
+coverage json -o coverage.json
+: '>>>>> End Test Output'

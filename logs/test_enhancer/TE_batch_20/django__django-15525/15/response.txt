@@ -1,0 +1,227 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests exercise django.core.serializers.base.build_instance behavior around
+  natural key lookup when the incoming data lacks a primary key. They verify that:
+  - build_instance sets the instance _state.db before calling natural_key so that
+    managers invoked from natural_key use the expected database (the value passed
+    via the db argument).
+  - build_instance uses the default_manager.get_by_natural_key when appropriate,
+    fills in the pk using the model's pk.to_python conversion and returns a new
+    instance with that pk present.
+  - build_instance does not call get_by_natural_key when a pk is already present.
+  - build_instance skips the natural key flow when default_manager doesn't provide
+    get_by_natural_key or the Model doesn't implement natural_key.
+  - Exceptions are handled appropriately: Model.DoesNotExist is swallowed but
+    AttributeError raised from natural_key is propagated (the candidate patch
+    incorrectly suppressed AttributeError).
+  - The candidate model patch's behavior (creating an instance and only setting
+    non-relational fields) is covered: if natural_key relies on relational fields
+    being present on the created instance, build_instance must provide those;
+    otherwise natural_key will raise AttributeError and that should surface.
+test_code: |
+  from types import SimpleNamespace
+  import unittest
+  from django.core.serializers.base import build_instance
+  
+  
+  class FakeManager:
+      def __init__(self, result_pk=None, raise_exc=None):
+          self.last_db = None
+          self.called = False
+          self.last_args = None
+          self.result_pk = result_pk
+          self.raise_exc = raise_exc
+  
+      def db_manager(self, db):
+          # Record which DB was requested and return self to service get_by_natural_key.
+          self.last_db = db
+          return self
+  
+      def get_by_natural_key(self, *args):
+          self.called = True
+          self.last_args = args
+          if self.raise_exc:
+              raise self.raise_exc
+          # Return a simple object with a pk attribute.
+          return SimpleNamespace(pk=self.result_pk)
+  
+  
+  class PkField:
+      def __init__(self, attname):
+          self.attname = attname
+  
+      def to_python(self, value):
+          # convert numeric string to int for tests
+          return int(value)
+  
+  
+  class SimpleModelClassFactory:
+      """
+      Factory to create a fake "Model-like" class suitable for build_instance tests.
+      It does not subclass django.db.models.Model -- that is unnecessary for
+      exercising build_instance's logic and allows avoiding DB operations.
+      """
+  
+      @staticmethod
+      def make_class(
+          name="M",
+          has_natural_key=True,
+          manager=None,
+          natural_key_impl=None,
+      ):
+          manager = manager or FakeManager(result_pk="42")
+          pk_field = PkField("id")
+  
+          class DoesNotExist(Exception):
+              pass
+  
+          attrs = {}
+          # Attach a _meta namespace with required attributes.
+          attrs["_meta"] = SimpleNamespace(default_manager=manager, pk=pk_field)
+          # Attach a DoesNotExist exception as used by build_instance
+          attrs["DoesNotExist"] = DoesNotExist
+          if has_natural_key:
+              if natural_key_impl is not None:
+                  attrs["natural_key"] = natural_key_impl
+              else:
+                  # default natural_key that triggers a manager lookup using the
+                  # instance's _state.db value (this is the behavior we want to assert)
+                  def natural_key(self):
+                      # Call the manager with the db that should have been set on _state
+                      obj = self._meta.default_manager.db_manager(self._state.db).get_by_natural_key("nk")
+                      # return value not used by build_instance beyond being passed into get_by_natural_key
+                      return ("nk",)
+  
+                  attrs["natural_key"] = natural_key
+  
+          # __init__ should accept arbitrary data and set attributes accordingly,
+          # and initialize _state with a db attribute (None by default).
+          def __init__(self, **data):
+              for k, v in data.items():
+                  setattr(self, k, v)
+              # _state.db is what build_instance should set before calling natural_key.
+              self._state = SimpleNamespace(db=None)
+  
+          attrs["__init__"] = __init__
+          return type(name, (), attrs)
+  
+  
+  class BuildInstanceTests(unittest.TestCase):
+      def test_sets_state_db_before_natural_key_calls_manager_with_db(self):
+          manager = FakeManager(result_pk="10")
+          Model = SimpleModelClassFactory.make_class(manager=manager)
+          data = {}  # no pk -> build_instance should attempt natural key lookup
+          inst = build_instance(Model, data, db="other_db")
+          # manager.db_manager should have been called with 'other_db'
+          self.assertEqual(manager.last_db, "other_db")
+          self.assertTrue(manager.called)
+  
+      def test_returns_instance_with_pk_set_from_manager(self):
+          manager = FakeManager(result_pk="7")
+          Model = SimpleModelClassFactory.make_class(manager=manager)
+          data = {}
+          obj = build_instance(Model, data, db="db1")
+          # The returned instance should have id attribute equal to pk.to_python(result_pk)
+          self.assertTrue(hasattr(obj, "id"))
+          self.assertEqual(obj.id, 7)
+  
+      def test_does_not_call_get_by_natural_key_if_pk_present(self):
+          manager = FakeManager(result_pk="9")
+          Model = SimpleModelClassFactory.make_class(manager=manager)
+          data = {"id": "9"}  # pk present => no natural key lookup
+          obj = build_instance(Model, data, db="whatever")
+          self.assertFalse(manager.called)
+          # returned object's id should be from provided data (converted by final Model(**data))
+          self.assertEqual(obj.id, "9")
+  
+      def test_skips_if_default_manager_lacks_get_by_natural_key(self):
+          # Manager without get_by_natural_key attribute
+          class NoNKManager:
+              def db_manager(self, db):
+                  self.last_db = db
+                  return self
+          manager = NoNKManager()
+          Model = SimpleModelClassFactory.make_class(manager=manager)
+          data = {}
+          # Should not raise and manager shouldn't be used for natural key
+          obj = build_instance(Model, data, db="x")
+          self.assertFalse(hasattr(manager, "get_by_natural_key"))
+          # returned instance should be created from data (no id present)
+          self.assertFalse(hasattr(obj, "id"))
+  
+      def test_skips_if_model_has_no_natural_key(self):
+          manager = FakeManager(result_pk="11")
+          Model = SimpleModelClassFactory.make_class(has_natural_key=False, manager=manager)
+          data = {}
+          obj = build_instance(Model, data, db="x")
+          # No natural_key on Model -> manager should not be invoked
+          self.assertFalse(manager.called)
+          self.assertFalse(hasattr(obj, "id"))
+  
+      def test_swallows_does_not_exist_exception(self):
+          # Simulate manager raising Model.DoesNotExist
+          # build_instance should swallow this and return an instance without id set.
+          class MNManager(FakeManager):
+              def __init__(self):
+                  super().__init__(result_pk=None, raise_exc=None)
+  
+              def get_by_natural_key(self, *args):
+                  raise SimpleModelClassFactory.make_class().__class__.DoesNotExist()  # dummy raise (won't be used)
+  
+          # Simpler: use FakeManager but instruct it to raise the correct exception instance
+          class M(Model := None):  # helper placeholder to get a DoesNotExist defined below
+              pass
+  
+          # Create a model class to retrieve its DoesNotExist for raising
+          TempModel = SimpleModelClassFactory.make_class()
+          manager = FakeManager(result_pk=None, raise_exc=TempModel.DoesNotExist())
+          Model = SimpleModelClassFactory.make_class(manager=manager)
+          data = {}
+          # Should not raise; DoesNotExist should be swallowed
+          obj = build_instance(Model, data, db="x")
+          self.assertFalse(hasattr(obj, "id"))
+  
+      def test_uses_pk_to_python_conversion(self):
+          manager = FakeManager(result_pk="314")
+          Model = SimpleModelClassFactory.make_class(manager=manager)
+          data = {}
+          obj = build_instance(Model, data, db="dbx")
+          # pk.to_python should convert '314' into integer 314
+          self.assertEqual(obj.id, 314)
+  
+      def test_natural_key_accessing_relational_attribute_uses_state_db(self):
+          # natural_key will access a relation-like attribute (e.g. 'related_key')
+          # We create a natural_key impl that reads self.related_key and uses the manager
+          def natkey(self):
+              # read an attribute that should have been set by Model(**data)
+              # then call manager.db_manager with the instance db
+              _ = getattr(self, "related_key")
+              self._meta.default_manager.db_manager(self._state.db).get_by_natural_key("k")
+              return ("k",)
+  
+          manager = FakeManager(result_pk="55")
+          Model = SimpleModelClassFactory.make_class(natural_key_impl=natkey, manager=manager)
+          # Provide related_key in data; build_instance must create instance with that attribute set.
+          data = {"related_key": "present"}
+          obj = build_instance(Model, data, db="Y")
+          # Manager should have been called and with correct db
+          self.assertTrue(manager.called)
+          self.assertEqual(manager.last_db, "Y")
+  
+      def test_attribute_error_in_natural_key_propagates(self):
+          # natural_key raises AttributeError for some bug inside it. build_instance
+          # should not swallow AttributeError (candidate patch incorrectly swallows).
+          def natkey_raising(self):
+              raise AttributeError("boom")
+  
+          manager = FakeManager(result_pk="1")
+          Model = SimpleModelClassFactory.make_class(natural_key_impl=natkey_raising, manager=manager)
+          data = {}
+          with self.assertRaises(AttributeError):
+              build_instance(Model, data, db="any")
+  
+  if __name__ == "__main__":
+      unittest.main()
+new_imports_code: |
+  from types import SimpleNamespace

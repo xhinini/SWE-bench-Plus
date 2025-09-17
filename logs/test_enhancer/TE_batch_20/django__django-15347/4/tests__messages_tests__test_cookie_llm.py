@@ -1,0 +1,1 @@
+from django.contrib.messages.storage.cookie import MessageSerializer

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 decorators.tests_llm.MethodDecoratorWrapsChainTests.test_class_based_decorator_recovers_original decorators.tests_llm.MethodDecoratorWrapsChainTests.test_decorating_different_named_method_recovers_original decorators.tests_llm.MethodDecoratorWrapsChainTests.test_decorating_dunder_call_recovers_original decorators.tests_llm.MethodDecoratorWrapsChainTests.test_decorator_chain_ordering_still_recovers_original decorators.tests_llm.MethodDecoratorWrapsChainTests.test_decorator_that_adds_attribute_and_uses_wraps_recovers_original decorators.tests_llm.MethodDecoratorWrapsChainTests.test_iterable_of_decorators_as_tuple_recovers_original decorators.tests_llm.MethodDecoratorWrapsChainTests.test_mixed_function_and_class_decorators_recover_original decorators.tests_llm.MethodDecoratorWrapsChainTests.test_multiple_instances_preserve_original_reference decorators.tests_llm.MethodDecoratorWrapsChainTests.test_single_function_decorator_recovers_original decorators.tests_llm.MethodDecoratorWrapsChainTests.test_two_function_decorators_recover_original decorators.tests_llm.make_class_decorator decorators.tests_llm.make_func_decorator
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,196 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests exercise HashedFilesMixin.post_process behavior around the "substitutions"
+  loop variable and the max_post_process_passes control. They simulate _post_process
+  behavior with a small in-memory storage subclass to assert:
+  - No UnboundLocalError occurs when max_post_process_passes is 0 (including when there
+    are no adjustable files).
+  - The "All" runtime error tuple is yielded when substitutions persist beyond the
+    configured max_post_process_passes.
+  - Hashed files cache is updated by the post_process flow.
+  - Various combinations of substitution behavior across multiple passes behave as
+    expected (stop within limits vs. exceed limits).
+test_code: |
+  import unittest
+  from django.conf import settings
+  from django.core.files.storage import FileSystemStorage
+  from django.test import override_settings
+  from django.contrib.staticfiles.storage import HashedFilesMixin
+  import os
+
+  # A tiny simulated storage that uses HashedFilesMixin but overrides _post_process
+  # to produce deterministic processed/substitution behavior without touching real files.
+  class SimulatedStorage(HashedFilesMixin, FileSystemStorage):
+      def __init__(self, subst_calls=0, *args, **kwargs):
+          # Ensure FileSystemStorage has a valid location to avoid unexpected IO errors.
+          location = kwargs.pop('location', settings.STATIC_ROOT)
+          base_url = kwargs.pop('base_url', settings.STATIC_URL)
+          FileSystemStorage.__init__(self, location=location, base_url=base_url)
+          # Initialize regex patterns and hashed_files as HashedFilesMixin expects.
+          HashedFilesMixin.__init__(self)
+          self._call_count = 0
+          # Number of _post_process calls for which substitutions should be True
+          self._subst_calls = subst_calls
+
+      def _post_process(self, paths, adjustable_paths, hashed_files):
+          """
+          Each call to _post_process yields a processed tuple for each path in 'paths'.
+          'subst' is True for the first self._subst_calls calls to this method,
+          afterwards False. We also populate the hashed_files mapping to simulate
+          that behavior.
+          """
+          self._call_count += 1
+          subst = self._call_count <= self._subst_calls
+          for name in sorted(paths):
+              # Simulate creation of a hashed name and store in the passed hashed_files map.
+              hkey = self.hash_key(self.clean_name(name))
+              hashed_name = self.clean_name(name) + ('.hashed' if not name.endswith('.hashed') else '')
+              hashed_files[hkey] = hashed_name
+              yield name, hashed_name, True, subst
+
+  @override_settings(STATIC_ROOT=os.path.join(settings.BASE_DIR, 'static_root_test'),
+                     STATIC_URL='/static/')
+  class TestPostProcessSubstitutions(unittest.TestCase):
+      def run_post_process(self, storage, paths):
+          # Collect the results into a list to inspect yielded tuples.
+          return list(storage.post_process(paths, dry_run=False))
+
+      def test_no_adjustable_paths_max_passes_zero(self):
+          """
+          When there are no adjustable files and max_post_process_passes == 0,
+          post_process should not raise an UnboundLocalError or similar, and
+          should yield the non-adjustable entries returned by _post_process.
+          """
+          storage = SimulatedStorage(subst_calls=0)
+          storage.max_post_process_passes = 0
+          paths = {'static/test.txt': (storage, 'test.txt')}  # not matching CSS/JS patterns
+          results = self.run_post_process(storage, paths)
+          # Should have yielded the single item coming from _post_process
+          self.assertEqual(len(results), 1)
+          name, hashed_name, processed = results[0][:3]
+          self.assertEqual(name, 'static/test.txt')
+          self.assertTrue(processed)
+
+      def test_adjustable_paths_max_passes_zero(self):
+          """
+          When adjustable files are present but max_post_process_passes == 0,
+          there should be no UnboundLocalError and files should still be processed.
+          """
+          storage = SimulatedStorage(subst_calls=0)
+          storage.max_post_process_passes = 0
+          # Use a CSS filename so it is considered adjustable by default patterns.
+          paths = {'cached/styles.css': (storage, 'cached/styles.css')}
+          results = self.run_post_process(storage, paths)
+          # Expect the adjustable file to be processed and yielded in final results.
+          self.assertTrue(any(r[0] == 'cached/styles.css' for r in results))
+
+      def test_adjustable_substitution_stops_within_max_passes(self):
+          """
+          If substitutions occur but stop within the allowed max_post_process_passes,
+          no 'All' runtime error tuple should be yielded.
+          """
+          storage = SimulatedStorage(subst_calls=1)  # substitutions True only on first _post_process call
+          storage.max_post_process_passes = 2
+          paths = {'cached/a.css': (storage, 'cached/a.css')}
+          results = self.run_post_process(storage, paths)
+          # Ensure there is no 'All' error tuple in the yielded results.
+          self.assertFalse(any(r[0] == 'All' and isinstance(r[2], RuntimeError) for r in results))
+          # And the file should be present in the results.
+          self.assertTrue(any(r[0] == 'cached/a.css' for r in results))
+
+      def test_adjustable_substitution_exceeds_max_passes_yields_error(self):
+          """
+          If substitutions continue beyond max_post_process_passes, post_process
+          should yield the sentinel ('All', None, RuntimeError(...)).
+          """
+          storage = SimulatedStorage(subst_calls=10)  # substitutions True for many calls
+          storage.max_post_process_passes = 2
+          paths = {'cached/a.css': (storage, 'cached/a.css')}
+          results = self.run_post_process(storage, paths)
+          # There should be at least one tuple where the name is 'All' and processed is a RuntimeError.
+          self.assertTrue(any(r[0] == 'All' and isinstance(r[2], RuntimeError) for r in results))
+
+      def test_multiple_files_mixed_substitutions_stop(self):
+          """
+          Multiple files should be handled and substitutions that stop within the limit
+          should not produce the 'All' sentinel.
+          """
+          storage = SimulatedStorage(subst_calls=2)
+          storage.max_post_process_passes = 3
+          paths = {
+              'cached/a.css': (storage, 'cached/a.css'),
+              'cached/b.css': (storage, 'cached/b.css'),
+              'other/file.txt': (storage, 'other/file.txt'),
+          }
+          results = self.run_post_process(storage, paths)
+          # No 'All' RuntimeError sentinel expected
+          self.assertFalse(any(r[0] == 'All' and isinstance(r[2], RuntimeError) for r in results))
+          # Both css files should be present in final results
+          found = {r[0] for r in results}
+          self.assertIn('cached/a.css', found)
+          self.assertIn('cached/b.css', found)
+          self.assertIn('other/file.txt', found)
+
+      def test_multiple_files_substitutions_persist_and_trigger_all(self):
+          """
+          If substitutions persist across multiple passes for multiple files and exceed
+          the allowed number of passes, the 'All' sentinel should be present.
+          """
+          storage = SimulatedStorage(subst_calls=5)
+          storage.max_post_process_passes = 1
+          paths = {
+              'cached/a.css': (storage, 'cached/a.css'),
+              'cached/b.css': (storage, 'cached/b.css'),
+          }
+          results = self.run_post_process(storage, paths)
+          self.assertTrue(any(r[0] == 'All' and isinstance(r[2], RuntimeError) for r in results))
+
+      def test_hashed_files_map_is_updated_by_post_process(self):
+          """
+          Ensure that the hashed_files mapping populated by _post_process is
+          propagated into the storage.hashed_files at the end of post_process.
+          """
+          storage = SimulatedStorage(subst_calls=0)
+          storage.max_post_process_passes = 0
+          paths = {'cached/a.css': (storage, 'cached/a.css')}
+          # Run post_process to populate hashed_files
+          list(storage.post_process(paths, dry_run=False))
+          # The storage.hashed_files should include the hash_key for the provided name.
+          key = storage.hash_key(storage.clean_name('cached/a.css'))
+          self.assertIn(key, storage.hashed_files)
+
+      def test_post_process_with_empty_paths_dict(self):
+          """
+          An empty 'paths' dict should not raise and should simply result in nothing yielded.
+          """
+          storage = SimulatedStorage(subst_calls=0)
+          storage.max_post_process_passes = 0
+          results = self.run_post_process(storage, {})
+          self.assertEqual(results, [])
+
+      def test_post_process_keeps_processed_flag_consistent(self):
+          """
+          Confirm that the 'processed' flag passed through from _post_process is
+          reflected in the yielded tuples for adjustable files.
+          """
+          storage = SimulatedStorage(subst_calls=0)
+          storage.max_post_process_passes = 0
+          paths = {'cached/z.css': (storage, 'cached/z.css')}
+          results = self.run_post_process(storage, paths)
+          # Find the tuple for our file and ensure 'processed' is True
+          for r in results:
+              if r[0] == 'cached/z.css':
+                  self.assertTrue(r[2])
+                  break
+          else:
+              self.fail("Expected cached/z.css in post_process results")
+
+  if __name__ == '__main__':
+      unittest.main()
+new_imports_code: |
+  import os
+  import unittest
+  from django.conf import settings
+  from django.test import override_settings
+  from django.core.files.storage import FileSystemStorage

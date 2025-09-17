@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.EmptyFormKwargsConflictTests.test_empty_form_allows_auto_id_in_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsConflictTests.test_empty_form_allows_prefix_in_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsConflictTests.test_empty_form_allows_renderer_in_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsConflictTests.test_empty_form_allows_use_required_attribute_in_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsConflictTests.test_empty_form_explicit_auto_id_overrides_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsConflictTests.test_empty_form_explicit_prefix_overrides_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsConflictTests.test_empty_form_explicit_renderer_overrides_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsConflictTests.test_empty_form_no_type_error_with_multiple_conflicting_keys
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_function_autoescape_false_does_not_escape_marked_safe_items template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_function_autoescape_false_generator_of_html template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_function_autoescape_false_list_of_html template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_function_autoescape_false_preserves_original_sequence_object template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_function_autoescape_false_tuple_of_html template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_function_autoescape_false_with_integer_items template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_function_autoescape_false_with_mark_safe_joiner template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_function_autoescape_false_with_mixed_types template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_function_noniterable_value_returned_unchanged template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_template_join_autoescape_off_rendering
+coverage json -o coverage.json
+: '>>>>> End Test Output'

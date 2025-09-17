@@ -1,0 +1,143 @@
+from django.test import TestCase
+from django.test.utils import override_settings, requires_tz_support
+from django.utils import timezone
+from django.utils.timesince import timesince, timeuntil
+import datetime
+
+@requires_tz_support
+@override_settings(USE_TZ=True)
+class TZAwarePivotTimesinceTests(TestCase):
+
+    def setUp(self):
+        self.tz_default = timezone.get_default_timezone()
+        self.tz_fixed = timezone.get_fixed_timezone(195)
+
+import datetime
+from django.test import TestCase
+from django.test.utils import override_settings, requires_tz_support
+from django.utils import timezone
+from django.utils.timesince import timesince, timeuntil
+
+@requires_tz_support
+@override_settings(USE_TZ=True)
+class TZAwarePivotTimesinceAdditionalTests(TestCase):
+
+    def setUp(self):
+        self.tz1 = timezone.get_fixed_timezone(120)
+        self.tz2 = timezone.get_fixed_timezone(195)
+
+import datetime
+from django.test import TestCase
+from django.test.utils import override_settings, requires_tz_support
+from django.utils import timezone
+from django.utils.timesince import timesince, timeuntil
+
+@requires_tz_support
+@override_settings(USE_TZ=True)
+class TimesincePivotTZTests(TestCase):
+
+    def setUp(self):
+        self.tz1 = timezone.get_fixed_timezone(60)
+        self.tz2 = timezone.get_fixed_timezone(-330)
+
+import datetime
+from django.test import TestCase
+from django.test.utils import override_settings, requires_tz_support
+from django.utils import timezone
+from django.utils.timesince import timesince, timeuntil
+import datetime
+from django.test import TestCase
+from django.test.utils import override_settings, requires_tz_support
+from django.utils import timezone
+from django.utils.timesince import timesince, timeuntil
+
+@requires_tz_support
+@override_settings(USE_TZ=True)
+class TimesincePivotTzTests(TestCase):
+
+    def setUp(self):
+        self.tz_0 = timezone.get_fixed_timezone(0)
+        self.tz_p60 = timezone.get_fixed_timezone(60)
+        self.tz_p330 = timezone.get_fixed_timezone(330)
+        self.tz_m120 = timezone.get_fixed_timezone(-120)
+
+import datetime
+from django.test import TestCase
+from django.test.utils import override_settings, requires_tz_support
+from django.utils import timezone
+from django.utils.timesince import timesince, timeuntil
+
+@requires_tz_support
+@override_settings(USE_TZ=True)
+class AdditionalTZAwareTimesinceTests(TestCase):
+
+    def setUp(self):
+        self.tz = timezone.get_fixed_timezone(0)
+
+import datetime
+from django.test import TestCase
+from django.test.utils import override_settings, requires_tz_support
+from django.utils import timezone
+from django.utils.timesince import timesince, timeuntil
+
+@requires_tz_support
+@override_settings(USE_TZ=True)
+class TZAwarePivotTimesinceTests(TestCase):
+
+    def setUp(self):
+        self.tz_utc = timezone.get_fixed_timezone(0)
+        self.tz_plus3 = timezone.get_fixed_timezone(180)
+
+import datetime
+from django.test import TestCase
+from django.test.utils import override_settings, requires_tz_support
+from django.utils import timezone
+from django.utils.timesince import timesince, timeuntil
+
+@requires_tz_support
+@override_settings(USE_TZ=True)
+class TZPivotRegressionTests(TestCase):
+
+    def setUp(self):
+        self.tz1 = timezone.get_default_timezone()
+        self.tz2 = timezone.get_fixed_timezone(195)
+
+import datetime
+from django.test import TestCase
+from django.test.utils import requires_tz_support, override_settings
+from django.utils import timezone
+from django.utils.timesince import timesince, timeuntil
+import datetime
+from django.test import TestCase
+from django.test.utils import requires_tz_support, override_settings
+from django.utils import timezone
+from django.utils.timesince import timesince, timeuntil
+
+@requires_tz_support
+@override_settings(USE_TZ=True)
+class TZAwareAdditionalTimesinceTests(TestCase):
+
+    def setUp(self):
+        self.base = datetime.datetime(2007, 8, 14, 13, 46, 0)
+        self.tz1 = timezone.get_fixed_timezone(120)
+        self.tz2 = timezone.get_fixed_timezone(-60)
+
+from django.test import TestCase
+from django.test.utils import override_settings, requires_tz_support
+from django.utils import timezone
+from django.utils.timesince import timesince, timeuntil
+import datetime
+
+@requires_tz_support
+@override_settings(USE_TZ=True)
+class AwarePivotTimesinceTests(TestCase):
+
+    def setUp(self):
+        self.tz = timezone.get_default_timezone()
+        self.oneminute = datetime.timedelta(minutes=1)
+        self.onehour = datetime.timedelta(hours=1)
+        self.oneday = datetime.timedelta(days=1)
+        self.oneweek = datetime.timedelta(days=7)
+        self.onemonth = datetime.timedelta(days=31)
+        self.oneyear = datetime.timedelta(days=366)
+new_imports_code: ''

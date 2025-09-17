@@ -1,0 +1,199 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests verify that ForeignKey/OneToOneField validation uses the model's
+  base manager (._base_manager) to check for the existence of a related object,
+  rather than the default manager which may filter out records (e.g. archived
+  ones). They exercise ModelForm validation (which triggers model validation
+  during _post_clean) and direct Field.validate(...) calls to ensure archived
+  objects are accepted when looked up via the base manager. They also check the
+  inverse: using the default manager for the form queryset excludes archived
+  objects and thus validation fails.
+test_code: |
+  from django import forms
+  from django.core.exceptions import ValidationError
+  from django.test import TestCase
+  from datetime import date
+  
+  # Relative import to the models module in the same tests package.
+  from .models import Writer, Article, WriterProfile
+  
+  
+  class ArticleForm(forms.ModelForm):
+      class Meta:
+          model = Article
+          # Only include the minimum required fields for validation.
+          fields = ['headline', 'slug', 'pub_date', 'writer', 'article']
+  
+      def __init__(self, *args, **kwargs):
+          super().__init__(*args, **kwargs)
+  
+  
+  class WriterProfileForm(forms.ModelForm):
+      class Meta:
+          model = WriterProfile
+          fields = ['writer', 'age']
+  
+      def __init__(self, *args, **kwargs):
+          super().__init__(*args, **kwargs)
+  
+  
+  class ForeignKeyValidateTests(TestCase):
+      def setUp(self):
+          # Create an archived Writer using the base manager so it ends up in DB
+          # but is excluded by the default manager's queryset.
+          self.archived_writer = Writer._base_manager.create(name='Archived Writer', archived=True)
+  
+      def test_modelform_accepts_archived_writer_when_field_queryset_is_base_manager(self):
+          """
+          If the ModelForm's ModelChoiceField queryset is set to the model's
+          base manager, selecting an object that is excluded by the default
+          manager should still validate (i.e., ForeignKey.validate should use
+          the base manager when checking existence).
+          """
+          form = ArticleForm(
+              data={
+                  'headline': 'Test',
+                  'slug': 'test',
+                  'pub_date': date.today(),
+                  'writer': str(self.archived_writer.pk),
+                  'article': 'content',
+              }
+          )
+          # Use the base manager for the form field queryset to simulate a
+          # view that exposes otherwise filtered objects.
+          form.fields['writer'].queryset = Writer._base_manager.all()
+          self.assertTrue(form.is_valid(), msg=form.errors.as_json())
+  
+      def test_modelform_rejects_archived_writer_when_field_queryset_is_default_manager(self):
+          """
+          If the ModelForm's ModelChoiceField queryset uses the default manager,
+          archived writers (excluded by the default manager) should not be
+          selectable/valid.
+          """
+          form = ArticleForm(
+              data={
+                  'headline': 'Test',
+                  'slug': 'test',
+                  'pub_date': date.today(),
+                  'writer': str(self.archived_writer.pk),
+                  'article': 'content',
+              }
+          )
+          # Use the default manager (which filters archived=True) for the form field.
+          form.fields['writer'].queryset = Writer.objects.all()
+          self.assertFalse(form.is_valid())
+          self.assertIn('writer', form.errors)
+  
+      def test_field_validate_direct_accepts_archived_writer_pk(self):
+          """
+          Calling Field.validate directly on the ForeignKey should accept the
+          archived writer pk (i.e., it should find the related object via the
+          base manager).
+          """
+          writer_field = Article._meta.get_field('writer')
+          article_instance = Article()
+          try:
+              # Should not raise
+              writer_field.validate(self.archived_writer.pk, article_instance)
+          except ValidationError:
+              self.fail('ForeignKey.validate raised ValidationError for archived writer pk')
+  
+      def test_field_validate_direct_rejects_nonexistent_pk(self):
+          """
+          Validation should raise for a pk that does not exist.
+          """
+          writer_field = Article._meta.get_field('writer')
+          article_instance = Article()
+          nonexistent_pk = self.archived_writer.pk + 9999
+          with self.assertRaises(ValidationError):
+              writer_field.validate(nonexistent_pk, article_instance)
+  
+      def test_one_to_one_modelform_accepts_archived_writer_when_queryset_is_base_manager(self):
+          """
+          OneToOneField should behave like ForeignKey for validation: using the
+          form field queryset set to base manager allows choosing archived
+          writer.
+          """
+          form = WriterProfileForm(
+              data={
+                  'writer': str(self.archived_writer.pk),
+                  'age': 42,
+              }
+          )
+          form.fields['writer'].queryset = Writer._base_manager.all()
+          self.assertTrue(form.is_valid(), msg=form.errors.as_json())
+  
+      def test_one_to_one_field_direct_validate_accepts_archived_writer_pk(self):
+          """
+          Direct validate on OneToOneField should accept archived writer pk.
+          """
+          o2o_field = WriterProfile._meta.get_field('writer')
+          profile_instance = WriterProfile()
+          try:
+              o2o_field.validate(self.archived_writer.pk, profile_instance)
+          except ValidationError:
+              self.fail('OneToOneField.validate raised ValidationError for archived writer pk')
+  
+      def test_modelform_accepts_archived_writer_with_string_pk(self):
+          """
+          Ensure string representation of PK (as submitted by forms) is accepted
+          when the related object exists (and is only discoverable via the base manager).
+          """
+          form = ArticleForm(
+              data={
+                  'headline': 'Test',
+                  'slug': 'test',
+                  'pub_date': date.today(),
+                  'writer': str(self.archived_writer.pk),  # string form
+                  'article': 'content',
+              }
+          )
+          form.fields['writer'].queryset = Writer._base_manager.all()
+          self.assertTrue(form.is_valid(), msg=form.errors.as_json())
+  
+      def test_modelform_invalid_if_limit_choices_to_filters_out_archived(self):
+          """
+          If the ForeignKey's limit_choices_to further restricts allowed targets,
+          validation should respect that restriction even if the base manager
+          would find the object.
+          """
+          writer_field = Article._meta.get_field('writer')
+          # Temporarily set a limit_choices_to that excludes our archived writer.
+          original_limit = writer_field.remote_field.limit_choices_to
+          writer_field.remote_field.limit_choices_to = {'name': 'NO_MATCH'}
+          try:
+              form = ArticleForm(
+                  data={
+                      'headline': 'Test',
+                      'slug': 'test',
+                      'pub_date': date.today(),
+                      'writer': str(self.archived_writer.pk),
+                      'article': 'content',
+                  }
+              )
+              # Use base manager in form queryset so the form field itself is permissive.
+              form.fields['writer'].queryset = Writer._base_manager.all()
+              # But model validation should apply limit_choices_to and thus fail.
+              self.assertFalse(form.is_valid())
+              # The error may be either on the writer field or non-field (post-clean),
+              # but ensure validation did not pass.
+          finally:
+              writer_field.remote_field.limit_choices_to = original_limit
+  
+      def test_field_validate_respects_limit_choices_to(self):
+          """
+          Even when using the base manager, the field's limit_choices_to should
+          be applied via complex_filter and may cause validation to fail.
+          """
+          writer_field = Article._meta.get_field('writer')
+          article_instance = Article()
+          # Temporarily set a limit that excludes the archived writer.
+          original_limit = writer_field.remote_field.limit_choices_to
+          writer_field.remote_field.limit_choices_to = {'name': 'NO_MATCH'}
+          try:
+              with self.assertRaises(ValidationError):
+                  writer_field.validate(self.archived_writer.pk, article_instance)
+          finally:
+              writer_field.remote_field.limit_choices_to = original_limit
+  new_imports_code: ""

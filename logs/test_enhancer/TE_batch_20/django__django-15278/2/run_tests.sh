@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 schema.tests_llm.AddPrimaryKeyFieldTests._get_primary_key schema.tests_llm.AddPrimaryKeyFieldTests.test_add_autofield_primary_key_triggers_remake schema.tests_llm.AddPrimaryKeyFieldTests.test_add_autofield_primary_key_triggers_remake_with_different_name schema.tests_llm.AddPrimaryKeyFieldTests.test_add_bigautofield_primary_key_triggers_remake schema.tests_llm.AddPrimaryKeyFieldTests.test_add_bigautofield_primary_key_triggers_remake_with_different_name schema.tests_llm.AddPrimaryKeyFieldTests.test_add_charfield_primary_key_triggers_remake schema.tests_llm.AddPrimaryKeyFieldTests.test_add_integerfield_primary_key_triggers_remake schema.tests_llm.AddPrimaryKeyFieldTests.test_add_integerfield_primary_key_triggers_remake_preserves_table_data schema.tests_llm.AddPrimaryKeyFieldTests.test_add_smallautofield_primary_key_triggers_remake schema.tests_llm.AddPrimaryKeyFieldTests.test_add_uuidfield_primary_key_triggers_remake
+coverage json -o coverage.json
+: '>>>>> End Test Output'

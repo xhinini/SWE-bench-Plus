@@ -1,0 +1,178 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests validate DraggableBase's callback-registration and disconnection behavior by injecting a fake _canvas_callbacks object on a Figure. They verify that DraggableBase registers callbacks via _connect_picklable for the three events, that it exposes the first two connected ids via the cids property, that the internal _disconnectors are functools.partial objects carrying the connected ids, that disconnect() calls the callbacks.disconnect with the expected ids, that on_pick/on_release/on_motion call the user-overridable hooks (save_offset, finalize_offset, update_offset) appropriately, and that disconnect() is safe to call multiple times and when the artist's figure is removed. These behaviors would pass with the gold patch and fail with the provided model patch.
+test_code: |
+  import functools
+  from types import SimpleNamespace
+  
+  import matplotlib.lines as mlines
+  import pytest
+  import matplotlib.pyplot as plt
+  
+  from matplotlib.offsetbox import DraggableBase
+  
+  
+  class FakeCallbacks:
+      def __init__(self):
+          self.connect_calls = []       # store tuples (name, func)
+          self.disconnect_calls = []    # store cids passed to disconnect
+          self._next = 1000
+  
+      def _connect_picklable(self, name, func):
+          # emulate returning a numeric cid
+          cid = self._next
+          self._next += 1
+          self.connect_calls.append((name, func))
+          return cid
+  
+      def disconnect(self, cid):
+          self.disconnect_calls.append(cid)
+  
+  
+  class DummyDraggable(DraggableBase):
+      def __init__(self, ref_artist, use_blit=False):
+          self.saved = False
+          self.finalized = False
+          self.updated = None
+          super().__init__(ref_artist, use_blit=use_blit)
+  
+      def save_offset(self):
+          self.saved = True
+  
+      def finalize_offset(self):
+          self.finalized = True
+  
+      def update_offset(self, dx, dy):
+          self.updated = (dx, dy)
+  
+  
+  def _make_line_and_fake_callbacks():
+      fig, ax = plt.subplots()
+      # create a simple artist and add to axes so .figure is set
+      line = mlines.Line2D([0, 1], [0, 1])
+      ax.add_line(line)
+      fake = FakeCallbacks()
+      # inject fake callbacks into the figure under the attribute name expected
+      fig._canvas_callbacks = fake
+      return fig, ax, line, fake
+  
+  
+  def test_draggablebase_registers_three_callbacks_on_init():
+      fig, ax, line, fake = _make_line_and_fake_callbacks()
+      d = DummyDraggable(line)
+      # three events should have been connected
+      assert len(fake.connect_calls) == 3
+      names = [name for name, func in fake.connect_calls]
+      assert names == ["pick_event", "button_release_event", "motion_notify_event"]
+      # the stored funcs should be the instance methods
+      funcs = [func for name, func in fake.connect_calls]
+      assert funcs[0].__name__ == "on_pick"
+      assert funcs[1].__name__ == "on_release"
+      assert funcs[2].__name__ == "on_motion"
+      d.disconnect()
+  
+  
+  def test_cids_property_reflects_first_two_connected_ids():
+      fig, ax, line, fake = _make_line_and_fake_callbacks()
+      d = DummyDraggable(line)
+      # cids should expose the first two connected ids
+      cids = d.cids
+      assert isinstance(cids, list)
+      assert len(cids) == 2
+      # they should match the first two ids returned by our FakeCallbacks
+      expected_first_two = [fake.connect_calls[0], fake.connect_calls[1]]
+      # extract returned ids from FakeCallbacks; they were the sequential integers starting at 1000
+      expected_ids = [1000, 1001]
+      assert cids == expected_ids
+      d.disconnect()
+  
+  
+  def test_disconnect_calls_callbacks_disconnect_with_expected_ids():
+      fig, ax, line, fake = _make_line_and_fake_callbacks()
+      d = DummyDraggable(line)
+      # call disconnect() and ensure FakeCallbacks.disconnect got called with the three ids
+      d.disconnect()
+      # the disconnects should include at least the first two ids (the implementation
+      # created 3 partial disconnectors; we expect 3 calls)
+      assert fake.disconnect_calls[:2] == [1000, 1001]
+  
+  
+  def test__disconnectors_are_partials_with_args_containing_cids():
+      fig, ax, line, fake = _make_line_and_fake_callbacks()
+      d = DummyDraggable(line)
+      # internal attribute should exist
+      assert hasattr(d, "_disconnectors")
+      assert len(d._disconnectors) == 3
+      for part in d._disconnectors:
+          assert isinstance(part, functools.partial)
+          # the first positional arg should be the cid assigned at connect time
+          assert isinstance(part.args[0], int)
+      # cids property uses the first two partials' args; check equivalence
+      assert d.cids == [d._disconnectors[0].args[0], d._disconnectors[1].args[0]]
+      d.disconnect()
+  
+  
+  def test_on_pick_sets_got_artist_and_calls_save_offset():
+      fig, ax, line, fake = _make_line_and_fake_callbacks()
+      d = DummyDraggable(line)
+      # craft a fake pick event expected by on_pick
+      fake_mouse = SimpleNamespace(x=10, y=20)
+      evt = SimpleNamespace(artist=line, mouseevent=fake_mouse)
+      d.on_pick(evt)
+      assert d.got_artist is True
+      assert d.saved is True
+      d.disconnect()
+  
+  
+  def test_on_release_calls_finalize_and_unsets_got_artist():
+      fig, ax, line, fake = _make_line_and_fake_callbacks()
+      d = DummyDraggable(line)
+      # simulate that we have been picked previously
+      d.got_artist = True
+      # ensure finalize_offset called and got_artist reset
+      d.on_release(SimpleNamespace())
+      assert d.finalized is True
+      assert d.got_artist is False
+      # calling disconnect afterwards should be safe
+      d.disconnect()
+  
+  
+  def test_on_motion_updates_offset_when_got_artist_true():
+      fig, ax, line, fake = _make_line_and_fake_callbacks()
+      d = DummyDraggable(line)
+      # simulate pick to set mouse_x/y and got_artist True
+      d.mouse_x = 5
+      d.mouse_y = 7
+      d.got_artist = True
+      evt = SimpleNamespace(x=15, y=12)
+      d.on_motion(evt)
+      # dx = 10, dy = 5
+      assert d.updated == (10, 5)
+      d.disconnect()
+  
+  
+  def test_disconnect_idempotent_and_safe_when_figure_removed():
+      fig, ax, line, fake = _make_line_and_fake_callbacks()
+      d = DummyDraggable(line)
+      # first disconnect should call FakeCallbacks.disconnect
+      d.disconnect()
+      first = list(fake.disconnect_calls)
+      # calling disconnect again should not raise
+      d.disconnect()
+      # disconnect_calls may have increased or not, but calling twice must not error
+      assert isinstance(first, list)
+  
+  def test__check_still_parented_calls_disconnect_when_figure_none():
+      fig, ax, line, fake = _make_line_and_fake_callbacks()
+      d = DummyDraggable(line)
+      # remove the figure from the artist to simulate being unparented
+      line.figure = None
+      # _check_still_parented should call disconnect and return False
+      res = d._check_still_parented()
+      assert res is False
+      # FakeCallbacks.disconnect should have been called (from disconnect())
+      # there may be multiple calls (from prior or current), but ensure at least one
+      assert len(fake.disconnect_calls) >= 1
+new_imports_code: |
+  from types import SimpleNamespace
+  from matplotlib.offsetbox import DraggableBase

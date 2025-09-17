@@ -1,0 +1,189 @@
+# No new top-level imports required beyond standard pytest testing imports.
+# -*- coding: utf-8 -*-
+import logging
+import types
+import pytest
+import py
+import six
+
+from _pytest import logging as pytest_logging
+from _pytest.logging import ColoredLevelFormatter, DEFAULT_LOG_FORMAT, LEVELNAME_FMT_REGEX
+from _pytest.logging import get_actual_log_level, catching_logs, LogCaptureHandler, LogCaptureFixture
+
+
+class DummyTerminalWriter(object):
+    def __init__(self):
+        self.calls = []
+
+    def markup(self, text, **kwargs):
+        # return a visible wrapper so tests can assert colorization happened
+        opts = ",".join(sorted(kwargs.keys())) or "none"
+        return "<markup opts=%s>%s</markup>" % (opts, text)
+
+
+def make_record(name="testlogger", level=logging.INFO, msg="hello %s", args=("world",)):
+    # helper to construct a LogRecord similar to what logging.Logger would create
+    pathname = __file__
+    lineno = 123
+    return logging.LogRecord(name, level, pathname, lineno, msg, args, None)
+
+
+def test_colored_formatter_builds_level_mapping_for_default_format():
+    tw = DummyTerminalWriter()
+    # Ensure default format contains a %(levelname) pattern that the regex recognizes
+    assert LEVELNAME_FMT_REGEX.search(DEFAULT_LOG_FORMAT)
+    fmt = ColoredLevelFormatter(tw, DEFAULT_LOG_FORMAT)
+    # Mapping should have entries for known log levels
+    for lvl in pytest_logging.ColoredLevelFormatter.LOGLEVEL_COLOROPTS.keys():
+        assert lvl in fmt._level_to_fmt_mapping
+        mapped = fmt._level_to_fmt_mapping[lvl]
+        # the mapped format should contain the markup wrapper from our DummyTerminalWriter
+        assert "<markup" in mapped and "</markup>" in mapped
+
+
+def test_colored_formatter_format_outputs_colorized_levelname():
+    tw = DummyTerminalWriter()
+    fmt = ColoredLevelFormatter(tw, DEFAULT_LOG_FORMAT)
+    rec_info = make_record(level=logging.INFO, msg="info message")
+    rec_debug = make_record(level=logging.DEBUG, msg="debug message")
+    out_info = fmt.format(rec_info)
+    out_debug = fmt.format(rec_debug)
+    # Our DummyTerminalWriter wraps the levelname portion; ensure the outputs contain the wrapper
+    assert "<markup" in out_info and "</markup>" in out_info
+    assert "<markup" in out_debug and "</markup>" in out_debug
+    # The messages should still be present and interpolated
+    assert "info message" in out_info
+    assert "debug message" in out_debug
+
+
+def test_colored_formatter_no_levelname_pattern_leaves_format_unchanged():
+    tw = DummyTerminalWriter()
+    simple_fmt = "%(message)s"
+    # Confirm no %(levelname) piece present
+    assert not LEVELNAME_FMT_REGEX.search(simple_fmt)
+    fmt = ColoredLevelFormatter(tw, simple_fmt)
+    # There should be no level to fmt mapping because pattern isn't present
+    assert fmt._level_to_fmt_mapping == {}
+    rec = make_record(msg="plain message")
+    out = fmt.format(rec)
+    assert out.strip() == "plain message"
+
+
+def test_get_actual_log_level_with_string_and_numeric_and_invalid():
+    class DummyConfig(object):
+        def __init__(self, option_value=None, ini_value=None):
+            self._opt = option_value
+            self._ini = ini_value
+        def getoption(self, name):
+            return self._opt
+        def getini(self, name):
+            return self._ini
+
+    # String name (case-insensitive)
+    cfg = DummyConfig(option_value="info")
+    assert get_actual_log_level(cfg, "doesntmatter") == logging.INFO
+
+    # Numeric value passed through
+    cfg2 = DummyConfig(option_value=logging.DEBUG)
+    assert get_actual_log_level(cfg2, "anything") == logging.DEBUG
+
+    # Unknown level should raise pytest.UsageError
+    cfg3 = DummyConfig(option_value="notalevel")
+    with pytest.raises(pytest.UsageError) as excinfo:
+        get_actual_log_level(cfg3, "some_setting")
+    assert "not recognized as a logging level" in str(excinfo.value) or "notalevel" in str(excinfo.value)
+
+
+def test_catching_logs_does_not_double_add_handler_on_nested_contexts():
+    root = logging.getLogger()
+    # snapshot original handlers and restore later
+    orig_handlers = list(root.handlers)
+    handler = LogCaptureHandler()
+    try:
+        # Outer context should add the handler
+        with catching_logs(handler):
+            assert handler in root.handlers
+            # Re-enter with same handler: should not result in duplicate addition
+            with catching_logs(handler):
+                # still only one instance in handlers
+                assert root.handlers.count(handler) == 1
+            # After inner exit, still present for outer
+            assert handler in root.handlers
+        # After outer exit, handler should be removed
+        assert handler not in root.handlers
+    finally:
+        # restore original handlers (defensive)
+        root.handlers[:] = orig_handlers
+
+
+def test_logcapturehandler_emit_and_reset_records_and_stream_cleared(tmp_path):
+    handler = LogCaptureHandler()
+    logger = logging.getLogger("test_emit_reset")
+    # attach handler temporarily
+    logger.addHandler(handler)
+    try:
+        logger.setLevel(logging.INFO)
+        logger.info("one %s", "two")
+        # The handler should have recorded a record and the stream should contain the message
+        assert len(handler.records) == 1
+        assert "one two" in handler.stream.getvalue()
+        # reset should clear both
+        handler.reset()
+        assert handler.records == []
+        assert handler.stream.getvalue() == ""
+    finally:
+        logger.removeHandler(handler)
+
+
+def test_logcapturefixture_records_record_tuples_messages_and_clear():
+    # setup a LogCaptureHandler and a dummy item that the fixture expects
+    handler = LogCaptureHandler()
+    # create a fake 'item' with required attributes
+    item = types.SimpleNamespace()
+    item.catch_log_handler = handler
+    item.catch_log_handlers = {"call": handler}
+
+    fixture = LogCaptureFixture(item)
+    logger = logging.getLogger("fixture_test_logger")
+    logger.addHandler(handler)
+    try:
+        logger.setLevel(logging.INFO)
+        logger.info("hello %s", "fixture")
+        # ensure the fixture proxies to the handler correctly
+        assert fixture.handler is handler
+        assert fixture.records == handler.records
+        assert fixture.record_tuples == [(handler.records[0].name, handler.records[0].levelno, handler.records[0].getMessage())]
+        assert fixture.messages == ["hello fixture"]
+        # clear should reset handler
+        fixture.clear()
+        assert fixture.records == []
+        assert fixture.text == ""
+    finally:
+        logger.removeHandler(handler)
+
+def test_set_level_and_at_level_restore_logger_levels():
+    root = logging.getLogger()
+    orig_root_level = root.level
+    # make a dummy item for fixture
+    item = types.SimpleNamespace()
+    item.catch_log_handler = LogCaptureHandler()
+    item.catch_log_handlers = {}
+    fixture = LogCaptureFixture(item)
+    try:
+        # set_level should change the root level and save original under key None
+        fixture.set_level(logging.DEBUG, logger=None)
+        try:
+            assert logging.getLogger().level == logging.DEBUG
+            assert None in fixture._initial_log_levels
+        finally:
+            # finalize should restore original level
+            fixture._finalize()
+            assert logging.getLogger().level == orig_root_level
+        # test at_level context manager restores after exit
+        root.setLevel(logging.WARNING)
+        with fixture.at_level(logging.ERROR, logger=None):
+            assert logging.getLogger().level == logging.ERROR
+        assert logging.getLogger().level == logging.WARNING
+    finally:
+        # ensure we restore whatever we touched
+        root.setLevel(orig_root_level)

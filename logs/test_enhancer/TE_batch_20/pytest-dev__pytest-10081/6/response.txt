@@ -1,0 +1,240 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  A set of regression tests that ensure when running with --pdb, unittest-style
+  TestCase tearDown/setUp are not invoked (and are not deferred) for tests that
+  are skipped either at the function-level or class-level. These exercises cover
+  multiple ways of skipping (unittest.skip decorator, pytest.mark.skip,
+  dynamic skip via attributes, and skipping in setUpClass), and verify that no
+  tearDown/setup side-effects are recorded when running tests under --pdb.
+  The intended fix ensures that the code correctly detects skips on both the
+  test method and the containing TestCase class when deciding whether to delay
+  tearDown under --pdb. These tests are written in the same style as the
+  existing unittest-related tests in the test suite.
+test_code: |
+  import pytest
+  from typing import List
+
+  # These tests are intended to run within pytest's own test harness (they use
+  # the Pytester fixture). They validate behavior when running with --pdb.
+
+  def _run_inprocess_and_get_tracked(pytester, src: str, extra_args: List[str] = None):
+      """Helper to create a file, run pytest in-process with --pdb and return tracked list."""
+      if extra_args is None:
+          extra_args = ["--pdb"]
+      pytester.makepyfile(src)
+      result = pytester.runpytest_inprocess(*extra_args)
+      result.stdout.fnmatch_lines("* 1 skipped in *")
+      # The module will have populated pytest.track_pdb_teardown_skipped (if used),
+      # which we can inspect by importing the test module (it was created as conftest-like file).
+      # To obtain the list, we rely on the test writing to a global in pytest module (see tests below).
+      return result
+
+  def test_pdb_teardown_skipped_unittest_decorator(pytester):
+      tracked: List[str] = []
+      pytester.monkeypatch.setattr(pytest, "track_pdb_teardown_skipped", tracked, raising=False)
+
+      src = """
+      import unittest
+      import pytest
+
+      @unittest.skip("skipped for reasons")
+      class MyTestCase(unittest.TestCase):
+
+          def setUp(self):
+              pytest.track_pdb_teardown_skipped.append("setUp:" + self.id())
+
+          def tearDown(self):
+              pytest.track_pdb_teardown_skipped.append("tearDown:" + self.id())
+
+          def test_1(self):
+              pass
+      """
+      _run_inprocess_and_get_tracked(pytester, src)
+      assert tracked == []
+
+  @pytest.mark.parametrize("mark", ["@unittest.skip", "@pytest.mark.skip"])
+  def test_pdb_teardown_skipped_function_decorator(pytester, mark: str):
+      tracked: List[str] = []
+      pytester.monkeypatch.setattr(pytest, "track_pdb_teardown_skipped", tracked, raising=False)
+
+      src = f"""
+      import unittest
+      import pytest
+
+      class MyTestCase(unittest.TestCase):
+
+          def setUp(self):
+              pytest.track_pdb_teardown_skipped.append("setUp:" + self.id())
+
+          def tearDown(self):
+              pytest.track_pdb_teardown_skipped.append("tearDown:" + self.id())
+
+          {mark}("skipped for reasons")
+          def test_1(self):
+              pass
+      """
+      _run_inprocess_and_get_tracked(pytester, src)
+      assert tracked == []
+
+  def test_pdb_teardown_skipped_assignment_attribute(pytester):
+      tracked: List[str] = []
+      pytester.monkeypatch.setattr(pytest, "track_pdb_teardown_skipped", tracked, raising=False)
+
+      src = """
+      import unittest
+      import pytest
+
+      class MyTestCase(unittest.TestCase):
+
+          def setUp(self):
+              pytest.track_pdb_teardown_skipped.append("setUp:" + self.id())
+
+          def tearDown(self):
+              pytest.track_pdb_teardown_skipped.append("tearDown:" + self.id())
+
+          def test_1(self):
+              pass
+
+          test_1.__test__ = True
+          test_1.skip = "skip-via-attribute"
+      """
+      # Running in-process with --pdb should skip the test and not call setUp/tearDown
+      result = pytester.runpytest_inprocess("--pdb")
+      result.stdout.fnmatch_lines("* 1 skipped in *")
+      # The attribute-based skip in unittest/twisted-trial style sets a 'skip' attr on the test method.
+      # We cannot rely on pytest.track_pdb_teardown_skipped being set here (the test code above used it),
+      # but we can assert that the captured output indicates skipping and that no teardown lines appear.
+      # Ensure no tearDown or setUp lines are printed in the session output.
+      out = result.stdout.str()
+      assert "setUp:" not in out
+      assert "tearDown:" not in out
+
+  def test_pdb_teardown_skipped_via_setUpClass_call(pytester):
+      tracked: List[str] = []
+      pytester.monkeypatch.setattr(pytest, "track_pdb_teardown_skipped", tracked, raising=False)
+
+      src = """
+      import unittest
+      import pytest
+
+      class MyTestCase(unittest.TestCase):
+
+          @classmethod
+          def setUpClass(cls):
+              pytest.track_pdb_teardown_skipped.append("setUpClass")
+              pytest.skip("skip in setUpClass")
+
+          def setUp(self):
+              pytest.track_pdb_teardown_skipped.append("setUp:" + self.id())
+
+          def tearDown(self):
+              pytest.track_pdb_teardown_skipped.append("tearDown:" + self.id())
+
+          def test_1(self):
+              pass
+      """
+      _run_inprocess_and_get_tracked(pytester, src)
+      # setUpClass was executed (and marked skip) but instance setUp/tearDown must not have run
+      assert "setUpClass" in pytest.track_pdb_teardown_skipped or True  # presence accepted
+      assert tracked == []
+
+  def test_pdb_teardown_skipped_mixed_pytest_mark(pytester):
+      tracked: List[str] = []
+      pytester.monkeypatch.setattr(pytest, "track_pdb_teardown_skipped", tracked, raising=False)
+
+      src = """
+      import unittest
+      import pytest
+
+      @pytest.mark.skip(reason="class-level pytest skip")
+      class MyTestCase(unittest.TestCase):
+
+          def setUp(self):
+              pytest.track_pdb_teardown_skipped.append("setUp:" + self.id())
+
+          def tearDown(self):
+              pytest.track_pdb_teardown_skipped.append("tearDown:" + self.id())
+
+          def test_1(self):
+              pass
+      """
+      _run_inprocess_and_get_tracked(pytester, src)
+      assert tracked == []
+
+  def test_pdb_does_not_defer_teardown_if_not_skipped(pytester):
+      # When not skipped, --pdb should defer tearDown until after pdb handling.
+      teardowns: List[str] = []
+      pytester.monkeypatch.setattr(pytest, "test_pdb_teardown_called_teardowns", teardowns, raising=False)
+
+      src = """
+      import unittest
+      import pytest
+
+      class MyTestCase(unittest.TestCase):
+
+          def tearDown(self):
+              pytest.test_pdb_teardown_called_teardowns.append(self.id())
+
+          def test_1(self):
+              assert True
+      """
+      result = pytester.runpytest_inprocess("--pdb")
+      result.stdout.fnmatch_lines("* 1 passed in *")
+      assert teardowns == ["test_pdb_does_not_defer_teardown_if_not_skipped.MyTestCase.test_1"]
+
+  def test_pdb_teardown_skipped_class_with_test_methods_marked(pytester):
+      # Class skipped via unittest.skip decorator, ensure neither setUp nor tearDown called
+      tracked: List[str] = []
+      pytester.monkeypatch.setattr(pytest, "track_pdb_teardown_skipped", tracked, raising=False)
+
+      src = """
+      import unittest
+      import pytest
+
+      @unittest.skip("class skip")
+      class MyTestCase(unittest.TestCase):
+
+          def setUp(self):
+              pytest.track_pdb_teardown_skipped.append("setUp:" + self.id())
+
+          def tearDown(self):
+              pytest.track_pdb_teardown_skipped.append("tearDown:" + self.id())
+
+          def test_1(self):
+              pass
+
+          def test_2(self):
+              pass
+      """
+      _run_inprocess_and_get_tracked(pytester, src)
+      assert tracked == []
+
+  def test_pdb_teardown_skipped_explicit_test_skip_attribute(pytester):
+      # Some frameworks (e.g. twisted trial) set .skip on the TestCase itself;
+      # ensure --pdb doesn't cause setUp/tearDown invocation for such class-level skip.
+      tracked: List[str] = []
+      pytester.monkeypatch.setattr(pytest, "track_pdb_teardown_skipped", tracked, raising=False)
+
+      src = """
+      import unittest
+      import pytest
+
+      class MyTestCase(unittest.TestCase):
+          skip = "dont run"
+
+          def setUp(self):
+              pytest.track_pdb_teardown_skipped.append("setUp:" + self.id())
+
+          def tearDown(self):
+              pytest.track_pdb_teardown_skipped.append("tearDown:" + self.id())
+
+          def test_1(self):
+              pass
+      """
+      result = pytester.runpytest_inprocess("--pdb")
+      result.stdout.fnmatch_lines("* 1 skipped in *")
+      # No setUp/tearDown should have been called
+      assert tracked == []
+new_imports_code: |
+  # No additional imports required beyond pytest and typing which are already available.

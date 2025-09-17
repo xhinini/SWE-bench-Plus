@@ -1,0 +1,147 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests assert that Meta.ordering (default model ordering) does not leak ordering columns into the GROUP BY clause when performing aggregation queries (values().annotate(), distinct + annotate, subquery annotations, extra order_by usage, function/F expressions, RawSQL ordering, and select_related). They inspect the generated SQL GROUP BY clause to ensure it does not contain model ordering columns (pub_date, headline) and also verify aggregate results where appropriate.
+test_code: |
+  from datetime import datetime
+  from operator import attrgetter
+  
+  from django.db.models import Count, DateTimeField, F, Max, OuterRef, Subquery, Value
+  from django.db.models.functions import Upper
+  from django.test import TestCase
+  
+  from .models import Article, Author, ChildArticle, OrderedByFArticle
+  
+  
+  class GroupByRegressionTests(TestCase):
+  
+      @classmethod
+      def setUpTestData(cls):
+          # Create authors
+          cls.author_1 = Author.objects.create(name="Name 1")
+          cls.author_2 = Author.objects.create(name="Name 2")
+          # Create articles with different pub_date/headline to exercise Meta.ordering
+          cls.a1 = Article.objects.create(headline="Article 1", pub_date=datetime(2005, 7, 26), author=cls.author_1)
+          cls.a2 = Article.objects.create(headline="Article 2", pub_date=datetime(2005, 7, 27), author=cls.author_1)
+          cls.a3 = Article.objects.create(headline="Article 3", pub_date=datetime(2005, 7, 27), author=cls.author_2)
+          cls.a4 = Article.objects.create(headline="Article 4", pub_date=datetime(2005, 7, 28), author=cls.author_2)
+  
+      def _group_by_clause_upper(self, qs):
+          """
+          Return the GROUP BY clause from the compiled SQL for the given queryset,
+          upper-cased for easy assertions. If no GROUP BY, return an empty string.
+          """
+          sql = str(qs.query).upper()
+          if 'GROUP BY' not in sql:
+              return ''
+          fragment = sql[sql.find('GROUP BY'):]
+          # Only return until ORDER BY or HAVING or end
+          for terminator in ('ORDER BY', 'HAVING', 'LIMIT', 'OFFSET'):
+              idx = fragment.find(terminator)
+              if idx != -1:
+                  fragment = fragment[:idx]
+          return fragment
+  
+      def test_values_annotate_does_not_include_meta_ordering(self):
+          # values('author') + annotate should group by author only, not meta ordering columns.
+          qs = Article.objects.values('author').annotate(count=Count('author'))
+          gb = self._group_by_clause_upper(qs)
+          # Ensure GROUP BY exists and does not include the Meta ordering columns.
+          self.assertTrue('GROUP BY' in gb)
+          self.assertNotIn('PUB_DATE', gb)
+          self.assertNotIn('HEADLINE', gb)
+          # And the aggregation result is correct.
+          self.assertCountEqual(list(qs), [
+              {'author': self.author_1.pk, 'count': 2},
+              {'author': self.author_2.pk, 'count': 2},
+          ])
+  
+      def test_distinct_with_annotation_group_by_ignores_meta_ordering(self):
+          qs = Author.objects.annotate(last_date=Subquery(
+              Article.objects.filter(author=OuterRef('pk')).order_by().values('author').annotate(
+                  last_date=Max('pub_date'),
+              ).values('last_date'),
+              output_field=DateTimeField(),
+          )).order_by('last_date').distinct()
+          gb = self._group_by_clause_upper(qs)
+          # Should not leak Article meta ordering columns into GROUP BY.
+          self.assertNotIn('PUB_DATE', gb)
+          self.assertNotIn('HEADLINE', gb)
+  
+      def test_extra_order_by_does_not_leak_meta_ordering_into_group_by(self):
+          # Using extra(order_by=...) should not cause Meta.ordering columns to be added to GROUP BY.
+          qs = Article.objects.extra(select={'foo': 'pub_date'}, order_by=['foo']).values('author').annotate(count=Count('author'))
+          gb = self._group_by_clause_upper(qs)
+          self.assertNotIn('PUB_DATE', gb)
+          self.assertNotIn('HEADLINE', gb)
+          # Aggregation correctness.
+          self.assertCountEqual(list(qs), [
+              {'author': self.author_1.pk, 'count': 2},
+              {'author': self.author_2.pk, 'count': 2},
+          ])
+  
+      def test_order_by_f_expression_ignored_in_group_by_when_meta_ordering(self):
+          # F expression based ordering should not cause meta-ordering cols to appear in GROUP BY.
+          qs = Article.objects.values('author').annotate(count=Count('author')).order_by(F('headline'))
+          gb = self._group_by_clause_upper(qs)
+          self.assertNotIn('HEADLINE', gb)
+          self.assertNotIn('PUB_DATE', gb)
+  
+      def test_function_ordering_ignored_in_group_by_when_meta_ordering(self):
+          # Function based ordering (Upper) should not leak into GROUP BY because of Meta.ordering.
+          qs = Article.objects.values('author').annotate(count=Count('author')).order_by(Upper('headline'))
+          gb = self._group_by_clause_upper(qs)
+          self.assertNotIn('HEADLINE', gb)
+          self.assertNotIn('PUB_DATE', gb)
+  
+      def test_subquery_annotation_group_by_ignores_meta_ordering(self):
+          # Annotate with a subquery that orders internally; outer annotate should not include meta ordering cols in GROUP BY.
+          article_subquery = Article.objects.filter(
+              author=OuterRef('pk'),
+              headline__icontains='Article',
+          ).order_by().values('author').annotate(
+              last_date=Max('pub_date'),
+          ).values('last_date')
+          qs = Author.objects.annotate(last_date=Subquery(article_subquery, output_field=DateTimeField())).values('pk').annotate(cnt=Count('pk'))
+          gb = self._group_by_clause_upper(qs)
+          self.assertNotIn('PUB_DATE', gb)
+          self.assertNotIn('HEADLINE', gb)
+  
+      def test_annotation_out_of_select_ordering_does_not_change_group_by(self):
+          # Order by an annotation that isn't selected (masked out) should not bring Meta.ordering columns into GROUP BY.
+          qs = Article.objects.annotate(const=Value('1')).values_list('headline', flat=True).order_by('const')
+          # It's possible there's no GROUP BY at all for this query; ensure meta ordering cols aren't present.
+          gb = self._group_by_clause_upper(qs)
+          self.assertNotIn('PUB_DATE', gb)
+          self.assertNotIn('HEADLINE', gb)
+  
+      def test_rawsql_order_by_table_column_ignored_in_group_by(self):
+          # Using a table-qualified order_by expression shouldn't cause Meta.ordering columns to be injected into GROUP BY.
+          qs = Article.objects.extra(order_by=['ordering_article.pub_date']).values('author').annotate(count=Count('author'))
+          gb = self._group_by_clause_upper(qs)
+          self.assertNotIn('PUB_DATE', gb)
+          self.assertNotIn('HEADLINE', gb)
+  
+      def test_select_related_does_not_cause_meta_ordering_leak_into_group_by(self):
+          # select_related present should not change group by behavior with Meta.ordering.
+          qs = Article.objects.select_related('author').values('author__id').annotate(count=Count('author__id'))
+          gb = self._group_by_clause_upper(qs)
+          self.assertNotIn('PUB_DATE', gb)
+          self.assertNotIn('HEADLINE', gb)
+  
+      def test_child_model_order_by_ptr_field_with_meta_ordering_group_by_ok(self):
+          # Ensure ordering by ptr field on child model (with parent's Meta.ordering) doesn't inject parent ordering into GROUP BY
+          ca1 = ChildArticle.objects.create(
+              headline='h2',
+              pub_date=datetime(2005, 7, 27),
+              author=self.author_2,
+          )
+          ca2 = ChildArticle.objects.create(
+              headline='h2',
+              pub_date=datetime(2005, 7, 27),
+              author=self.author_1,
+          )
+          qs = ChildArticle.objects.order_by('article_ptr').values('author').annotate(count=Count('author'))
+          gb = self._group_by_clause_upper(qs)
+          self.assertNotIn('PUB_DATE', gb)
+          self.assertNotIn('HEADLINE', gb)
+new_imports_code: ""

@@ -1,0 +1,213 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that Query.resolve_lookup_value correctly and recursively resolves expressions (like F()) inside nested iterables (lists/tuples) and preserves the outer iterable types. They also check that build_filter correctly accepts nested iterables with expressions and that non-expression values are unaffected. The candidate (incorrect) patch that fails to recurse into nested iterables will cause these tests to fail, while the provided (gold) patch that recursively resolves nested iterables will pass.
+test_code: |
+  from datetime import datetime
+
+  from django.core.exceptions import FieldError
+  from django.db.models import CharField, F, Q
+  from django.db.models.expressions import SimpleCol
+  from django.db.models.fields.related_lookups import RelatedIsNull
+  from django.db.models.functions import Lower
+  from django.db.models.lookups import Exact, GreaterThan, IsNull, LessThan
+  from django.db.models.sql.query import Query
+  from django.db.models.sql.where import OR
+  from django.test import SimpleTestCase
+  from django.test.utils import register_lookup
+
+  from .models import Author, Item, ObjectC, Ranking
+
+
+  class TestQuery(SimpleTestCase):
+      def test_simple_query(self):
+          query = Query(Author)
+          where = query.build_where(Q(num__gt=2))
+          lookup = where.children[0]
+          self.assertIsInstance(lookup, GreaterThan)
+          self.assertEqual(lookup.rhs, 2)
+          self.assertEqual(lookup.lhs.target, Author._meta.get_field('num'))
+
+      def test_simplecol_query(self):
+          query = Query(Author)
+          where = query.build_where(Q(num__gt=2, name__isnull=False) | Q(num__lt=F('id')))
+
+          name_isnull_lookup, num_gt_lookup = where.children[0].children
+          self.assertIsInstance(num_gt_lookup, GreaterThan)
+          self.assertIsInstance(num_gt_lookup.lhs, SimpleCol)
+          self.assertIsInstance(name_isnull_lookup, IsNull)
+          self.assertIsInstance(name_isnull_lookup.lhs, SimpleCol)
+
+          num_lt_lookup = where.children[1]
+          self.assertIsInstance(num_lt_lookup, LessThan)
+          self.assertIsInstance(num_lt_lookup.rhs, SimpleCol)
+          self.assertIsInstance(num_lt_lookup.lhs, SimpleCol)
+
+      def test_complex_query(self):
+          query = Query(Author)
+          where = query.build_where(Q(num__gt=2) | Q(num__lt=0))
+          self.assertEqual(where.connector, OR)
+
+          lookup = where.children[0]
+          self.assertIsInstance(lookup, GreaterThan)
+          self.assertEqual(lookup.rhs, 2)
+          self.assertEqual(lookup.lhs.target, Author._meta.get_field('num'))
+
+          lookup = where.children[1]
+          self.assertIsInstance(lookup, LessThan)
+          self.assertEqual(lookup.rhs, 0)
+          self.assertEqual(lookup.lhs.target, Author._meta.get_field('num'))
+
+      def test_multiple_fields(self):
+          query = Query(Item)
+          where = query.build_where(Q(modified__gt=F('created')))
+          lookup = where.children[0]
+          self.assertIsInstance(lookup, GreaterThan)
+          self.assertIsInstance(lookup.rhs, SimpleCol)
+          self.assertIsInstance(lookup.lhs, SimpleCol)
+          self.assertEqual(lookup.rhs.target, Item._meta.get_field('created'))
+          self.assertEqual(lookup.lhs.target, Item._meta.get_field('modified'))
+
+      def test_transform(self):
+          query = Query(Author)
+          with register_lookup(CharField, Lower):
+              where = query.build_where(~Q(name__lower='foo'))
+          lookup = where.children[0]
+          self.assertIsInstance(lookup, Exact)
+          self.assertIsInstance(lookup.lhs, Lower)
+          self.assertIsInstance(lookup.lhs.lhs, SimpleCol)
+          self.assertEqual(lookup.lhs.lhs.target, Author._meta.get_field('name'))
+
+      def test_negated_nullable(self):
+          query = Query(Item)
+          where = query.build_where(~Q(modified__lt=datetime(2017, 1, 1)))
+          self.assertTrue(where.negated)
+          lookup = where.children[0]
+          self.assertIsInstance(lookup, LessThan)
+          self.assertEqual(lookup.lhs.target, Item._meta.get_field('modified'))
+          lookup = where.children[1]
+          self.assertIsInstance(lookup, IsNull)
+          self.assertEqual(lookup.lhs.target, Item._meta.get_field('modified'))
+
+      def test_foreign_key(self):
+          query = Query(Item)
+          msg = 'Joined field references are not permitted in this query'
+          with self.assertRaisesMessage(FieldError, msg):
+              query.build_where(Q(creator__num__gt=2))
+
+      def test_foreign_key_f(self):
+          query = Query(Ranking)
+          with self.assertRaises(FieldError):
+              query.build_where(Q(rank__gt=F('author__num')))
+
+      def test_foreign_key_exclusive(self):
+          query = Query(ObjectC)
+          where = query.build_where(Q(objecta=None) | Q(objectb=None))
+          a_isnull = where.children[0]
+          self.assertIsInstance(a_isnull, RelatedIsNull)
+          self.assertIsInstance(a_isnull.lhs, SimpleCol)
+          self.assertEqual(a_isnull.lhs.target, ObjectC._meta.get_field('objecta'))
+          b_isnull = where.children[1]
+          self.assertIsInstance(b_isnull, RelatedIsNull)
+          self.assertIsInstance(b_isnull.lhs, SimpleCol)
+          self.assertEqual(b_isnull.lhs.target, ObjectC._meta.get_field('objectb'))
+
+      def test_iterable_lookup_value(self):
+          query = Query(Item)
+          where = query.build_where(Q(name=['a', 'b']))
+          name_exact = where.children[0]
+          self.assertIsInstance(name_exact, Exact)
+          self.assertEqual(name_exact.rhs, "['a', 'b']")
+
+      def test_clone_select_related(self):
+          query = Query(Item)
+          query.add_select_related(['creator'])
+          clone = query.clone()
+          clone.add_select_related(['note', 'creator__extra'])
+          self.assertEqual(query.select_related, {'creator': {}})
+
+      # New tests to ensure recursive resolution of nested iterables containing expressions (F)
+      def test_resolve_lookup_value_nested_list_resolves_F_to_SimpleCol(self):
+          q = Query(Item)
+          value = ['a', [F('created')]]
+          resolved = q.resolve_lookup_value(value, can_reuse=None, allow_joins=True, simple_col=True)
+          self.assertIsInstance(resolved, list)
+          self.assertIsInstance(resolved[1], list)
+          self.assertIsInstance(resolved[1][0], SimpleCol)
+          self.assertEqual(resolved[1][0].target, Item._meta.get_field('created'))
+
+      def test_resolve_lookup_value_nested_tuple_resolves_F_to_SimpleCol(self):
+          q = Query(Item)
+          value = ('x', (F('modified'),))
+          resolved = q.resolve_lookup_value(value, can_reuse=None, allow_joins=True, simple_col=True)
+          self.assertIsInstance(resolved, tuple)
+          self.assertIsInstance(resolved[1], tuple)
+          self.assertIsInstance(resolved[1][0], SimpleCol)
+          self.assertEqual(resolved[1][0].target, Item._meta.get_field('modified'))
+
+      def test_resolve_lookup_value_deep_mixed_nesting(self):
+          q = Query(Item)
+          value = ([('a', F('created'))],)
+          resolved = q.resolve_lookup_value(value, can_reuse=None, allow_joins=True, simple_col=True)
+          self.assertIsInstance(resolved, tuple)
+          # resolved[0] is a list, its first item is a tuple ('a', SimpleCol)
+          self.assertIsInstance(resolved[0], list)
+          self.assertIsInstance(resolved[0][0], tuple)
+          self.assertIsInstance(resolved[0][0][1], SimpleCol)
+          self.assertEqual(resolved[0][0][1].target, Item._meta.get_field('created'))
+
+      def test_resolve_lookup_value_preserves_outer_types(self):
+          q = Query(Item)
+          val_list = [F('created'), F('modified')]
+          val_tuple = (F('created'), F('modified'))
+          resolved_list = q.resolve_lookup_value(val_list, can_reuse=None, allow_joins=True, simple_col=True)
+          resolved_tuple = q.resolve_lookup_value(val_tuple, can_reuse=None, allow_joins=True, simple_col=True)
+          self.assertIsInstance(resolved_list, list)
+          self.assertIsInstance(resolved_tuple, tuple)
+          self.assertIsInstance(resolved_list[0], SimpleCol)
+          self.assertIsInstance(resolved_tuple[0], SimpleCol)
+
+      def test_resolve_lookup_value_multiple_expressions_in_nested(self):
+          q = Query(Item)
+          value = [[F('created'), F('modified')]]
+          resolved = q.resolve_lookup_value(value, can_reuse=None, allow_joins=True, simple_col=True)
+          self.assertIsInstance(resolved, list)
+          self.assertIsInstance(resolved[0], list)
+          self.assertIsInstance(resolved[0][0], SimpleCol)
+          self.assertIsInstance(resolved[0][1], SimpleCol)
+          self.assertEqual(resolved[0][0].target, Item._meta.get_field('created'))
+          self.assertEqual(resolved[0][1].target, Item._meta.get_field('modified'))
+
+      def test_resolve_lookup_value_handles_empty_iterables(self):
+          q = Query(Item)
+          self.assertEqual(q.resolve_lookup_value([], can_reuse=None, allow_joins=True, simple_col=True), [])
+          self.assertEqual(q.resolve_lookup_value((), can_reuse=None, allow_joins=True, simple_col=True), ())
+
+      def test_resolve_lookup_value_non_expression_values_unchanged(self):
+          q = Query(Item)
+          value = ['a', [1, 2, ('z',)]]
+          resolved = q.resolve_lookup_value(value, can_reuse=None, allow_joins=True, simple_col=True)
+          self.assertEqual(resolved[0], 'a')
+          self.assertEqual(resolved[1][0], 1)
+          self.assertEqual(resolved[1][2][0], 'z')
+
+      def test_build_filter_with_nested_iterable_expression(self):
+          q = Query(Item)
+          # Use can_reuse to capture any joins; ensure nested F is resolved in the RHS
+          clause, used_joins = q.build_filter(('created__in', [[F('modified')]]), can_reuse=set(), allow_joins=True, simple_col=True)
+          # clause is a WhereNode containing the lookup
+          lookup = clause.children[0]
+          # The rhs should be a nested iterable where the inner element is a SimpleCol
+          # Some backends may represent RHS differently at this stage, but resolution
+          # should have converted the F() into a SimpleCol inside the nested structure.
+          # So we assert the nested element is a SimpleCol.
+          # For the common case, lookup.rhs[0][0] is the inner element.
+          try:
+              inner = lookup.rhs[0][0]
+          except Exception:
+              # As a fallback, try to handle tuple/other container shapes
+              inner = lookup.rhs
+              # drill down until we find a SimpleCol for the test to be meaningful
+              while isinstance(inner, (list, tuple)) and inner:
+                  inner = inner[0]
+          self.assertIsInstance(inner, SimpleCol)
+  new_imports_code: ""

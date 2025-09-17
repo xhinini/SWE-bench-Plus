@@ -1,0 +1,304 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests validate that MigrationWriter.as_string() orders import lines so that all "import ..." statements come before any "from ... import ..." statements and that the overall imports ordering matches the intended sort key: (is_from, module_name) where is_from is True for "from" imports and False for "import" imports, and module_name is the token after "import" or after "from". They register temporary custom serializers to inject controlled import strings and assert the ordering in a variety of combinations, including aliases and identical module bases.
+test_code: |
+  from django.test import SimpleTestCase
+  from django.db import migrations, models
+  from django.db.migrations.writer import MigrationWriter
+  from django.db.migrations.serializer import BaseSerializer
+  import datetime
+  import decimal
+  import uuid
+  import time
+  
+  
+  def _extract_import_lines(migration_string):
+      """
+      Extract consecutive import lines (lines starting with 'import ' or
+      'from ') from the migration string in the order they appear,
+      stopping at the class definition.
+      """
+      lines = []
+      for line in migration_string.splitlines():
+          if line.startswith("class Migration"):
+              break
+          if line.startswith("import ") or line.startswith("from "):
+              lines.append(line)
+      return lines
+  
+  
+  class ImportSortingTests(SimpleTestCase):
+      def test_grouping_simple(self):
+          """
+          Ensure plain import lines come before from-import lines (settings).
+          """
+          migration = type(
+              "Migration",
+              (migrations.Migration,),
+              {
+                  "operations": [
+                      migrations.AddField(
+                          "mymodel", "dt", models.DateTimeField(default=datetime.datetime.now)
+                      )
+                  ],
+                  "dependencies": [("__setting__", "AUTH_USER_MODEL")],
+              },
+          )
+          writer = MigrationWriter(migration)
+          out = writer.as_string()
+          imports = _extract_import_lines(out)
+          # All import lines must precede any from- lines.
+          first_from_index = next((i for i, l in enumerate(imports) if l.startswith("from ")), None)
+          if first_from_index is not None:
+              # Ensure every earlier line is an import line.
+              for earlier in imports[:first_from_index]:
+                  self.assertTrue(earlier.startswith("import "), msg=imports)
+  
+      def test_mixed_sorting_datetime_time(self):
+          """
+          Names should be sorted and imports grouped first. This is similar to
+          the existing sorted_imports test, kept explicit here.
+          """
+          migration = type(
+              "Migration",
+              (migrations.Migration,),
+              {
+                  "operations": [
+                      migrations.AddField(
+                          "mymodel",
+                          "d1",
+                          models.DateTimeField(
+                              default=datetime.datetime(2012, 1, 1, 1, 1, tzinfo=datetime.timezone.utc)
+                          ),
+                      ),
+                      migrations.AddField(
+                          "mymodel", "f1", models.FloatField(default=time.time)
+                      ),
+                  ]
+              },
+          )
+          writer = MigrationWriter(migration)
+          out = writer.as_string()
+          imports = _extract_import_lines(out)
+          # Expected ordering: import datetime, import time, then other froms (if any).
+          self.assertIn("import datetime", imports[0])
+          # find import time present and ensure it comes after import datetime
+          self.assertIn("import time", imports[1])
+  
+      def test_decimal_uuid_mix(self):
+          """
+          Ensure that 'import uuid' appears before 'from decimal import Decimal'
+          because import-* lines should be grouped before from-* lines.
+          """
+          migration = type(
+              "Migration",
+              (migrations.Migration,),
+              {
+                  "operations": [
+                      migrations.AddField("m", "u", models.UUIDField(default=uuid.uuid4)),
+                      migrations.AddField("m", "d", models.DecimalField(default=decimal.Decimal("1.3"), max_digits=3, decimal_places=1)),
+                  ]
+              },
+          )
+          writer = MigrationWriter(migration)
+          out = writer.as_string()
+          imports = _extract_import_lines(out)
+          # 'import uuid' should appear and 'from decimal import Decimal' should appear later
+          idx_uuid = next((i for i, l in enumerate(imports) if l.startswith("import uuid")), None)
+          idx_decimal = next((i for i, l in enumerate(imports) if l.startswith("from decimal import Decimal")), None)
+          self.assertIsNotNone(idx_uuid)
+          self.assertIsNotNone(idx_decimal)
+          self.assertLess(idx_uuid, idx_decimal)
+  
+      def test_custom_and_decimal(self):
+          """
+          A custom operation (import X) and a from-import introduced by Decimal
+          should have the import-group before the from-group.
+          """
+          # Use a custom, inline simple operation class to force an import line.
+          class CustomOp(migrations.operations.base.Operation):
+              reduces_to_sql = False
+  
+              def __init__(self):
+                  super().__init__()
+  
+              def deconstruct(self):
+                  return ("CustomOp", [], {})
+  
+          # Monkeypatch its module so OperationWriter will add an import.
+          CustomOp.__module__ = "custom.op.module"
+  
+          migration = type(
+              "Migration",
+              (migrations.Migration,),
+              {
+                  "operations": [
+                      CustomOp(),
+                      migrations.AddField("m", "d", models.DecimalField(default=decimal.Decimal("1.3"), max_digits=3, decimal_places=1)),
+                  ]
+              },
+          )
+          writer = MigrationWriter(migration)
+          out = writer.as_string()
+          imports = _extract_import_lines(out)
+          # Find import for custom.op.module and from decimal import Decimal
+          idx_custom = next((i for i, l in enumerate(imports) if l.startswith("import custom.op.module")), None)
+          idx_decimal = next((i for i, l in enumerate(imports) if l.startswith("from decimal import Decimal")), None)
+          self.assertIsNotNone(idx_custom)
+          self.assertIsNotNone(idx_decimal)
+          self.assertLess(idx_custom, idx_decimal)
+  
+      def test_injected_imports_via_serializer(self):
+          """
+          Use a custom serializer to inject arbitrary import and from-import
+          strings and assert they are ordered as per the expected key.
+          """
+          class Dummy:
+              pass
+  
+          class DummySerializer(BaseSerializer):
+              def serialize(self):
+                  # Return controlled imports covering both 'import' and 'from'
+                  return "Dummy()", {"import zlib", "from alpha import beta", "import os"}
+  
+          MigrationWriter.register_serializer(Dummy, DummySerializer)
+          try:
+              migration = type(
+                  "Migration",
+                  (migrations.Migration,),
+                  {"operations": [migrations.AddField("m", "x", models.Field(default=Dummy()))]},
+              )
+              writer = MigrationWriter(migration)
+              out = writer.as_string()
+              imports = _extract_import_lines(out)
+              # Validate ordering against gold key
+              expected = sorted(
+                  [l for l in imports],
+                  key=lambda i: (i.split()[0] == "from", i.split()[1]),
+              )
+              self.assertEqual(imports, expected)
+          finally:
+              MigrationWriter.unregister_serializer(Dummy)
+  
+      def test_import_and_from_same_module(self):
+          """
+          Ensure 'import a' sorts before 'from a import b'.
+          """
+          class A1:
+              pass
+  
+          class SerializerA1(BaseSerializer):
+              def serialize(self):
+                  return "A1()", {"import a"}
+  
+          class A2:
+              pass
+  
+          class SerializerA2(BaseSerializer):
+              def serialize(self):
+                  return "A2()", {"from a import b"}
+  
+          MigrationWriter.register_serializer(A1, SerializerA1)
+          MigrationWriter.register_serializer(A2, SerializerA2)
+          try:
+              migration = type(
+                  "Migration",
+                  (migrations.Migration,),
+                  {
+                      "operations": [
+                          migrations.AddField("m", "a1", models.Field(default=A1())),
+                          migrations.AddField("m", "a2", models.Field(default=A2())),
+                      ]
+                  },
+              )
+              writer = MigrationWriter(migration)
+              out = writer.as_string()
+              imports = _extract_import_lines(out)
+              idx_import_a = next((i for i, l in enumerate(imports) if l == "import a"), None)
+              idx_from_a = next((i for i, l in enumerate(imports) if l == "from a import b"), None)
+              self.assertIsNotNone(idx_import_a)
+              self.assertIsNotNone(idx_from_a)
+              self.assertLess(idx_import_a, idx_from_a)
+          finally:
+              MigrationWriter.unregister_serializer(A1)
+              MigrationWriter.unregister_serializer(A2)
+  
+      def test_alias_and_submodule_imports(self):
+          """
+          Ensure that import-alias forms (e.g. 'import a as b') are treated as
+          import statements and kept in the import-group.
+          """
+          class AliasType:
+              pass
+  
+          class AliasSerializer(BaseSerializer):
+              def serialize(self):
+                  return "Alias()", {"import a as b", "from z import q"}
+  
+          MigrationWriter.register_serializer(AliasType, AliasSerializer)
+          try:
+              migration = type(
+                  "Migration",
+                  (migrations.Migration,),
+                  {"operations": [migrations.AddField("m", "alias", models.Field(default=AliasType()))]},
+              )
+              writer = MigrationWriter(migration)
+              out = writer.as_string()
+              imports = _extract_import_lines(out)
+              # alias import should be before the from-import
+              idx_alias = next((i for i, l in enumerate(imports) if l.startswith("import a as b")), None)
+              idx_from = next((i for i, l in enumerate(imports) if l.startswith("from z import q")), None)
+              self.assertIsNotNone(idx_alias)
+              self.assertIsNotNone(idx_from)
+              self.assertLess(idx_alias, idx_from)
+          finally:
+              MigrationWriter.unregister_serializer(AliasType)
+  
+      def test_many_combination_sorting(self):
+          """
+          Complex combination to assert full ordering stability against the
+          sorting key used in the writer.
+          """
+          class X: pass
+          class Y: pass
+          class Z: pass
+  
+          class SX(BaseSerializer):
+              def serialize(self):
+                  return "X()", {"import zebra", "from beta import one"}
+  
+          class SY(BaseSerializer):
+              def serialize(self):
+                  return "Y()", {"import alpha", "from omega import two"}
+  
+          class SZ(BaseSerializer):
+              def serialize(self):
+                  return "Z()", {"import mu", "from alpha import gamma"}
+  
+          MigrationWriter.register_serializer(X, SX)
+          MigrationWriter.register_serializer(Y, SY)
+          MigrationWriter.register_serializer(Z, SZ)
+          try:
+              migration = type(
+                  "Migration",
+                  (migrations.Migration,),
+                  {
+                      "operations": [
+                          migrations.AddField("m", "x", models.Field(default=X())),
+                          migrations.AddField("m", "y", models.Field(default=Y())),
+                          migrations.AddField("m", "z", models.Field(default=Z())),
+                      ]
+                  },
+              )
+              writer = MigrationWriter(migration)
+              out = writer.as_string()
+              imports = _extract_import_lines(out)
+              # expected order produced by gold key:
+              expected = sorted(imports, key=lambda i: (i.split()[0] == "from", i.split()[1]))
+              self.assertEqual(imports, expected)
+          finally:
+              MigrationWriter.unregister_serializer(X)
+              MigrationWriter.unregister_serializer(Y)
+              MigrationWriter.unregister_serializer(Z)
+new_imports_code: |
+  from django.db.migrations.serializer import BaseSerializer

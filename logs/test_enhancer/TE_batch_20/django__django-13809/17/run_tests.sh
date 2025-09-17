@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.setUp admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_check_migrations_called_when_default_addr_and_skip_checks_true admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_check_migrations_called_when_skip_checks_true admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_check_migrations_called_with_addrport admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_check_migrations_called_with_hostname admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_check_migrations_called_with_ipv6_literal admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_check_migrations_called_with_no_color admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_check_migrations_called_with_raw_ipv6 admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_check_migrations_called_with_threading_disabled admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_check_migrations_called_with_use_ipv6_flag
+coverage json -o coverage.json
+: '>>>>> End Test Output'

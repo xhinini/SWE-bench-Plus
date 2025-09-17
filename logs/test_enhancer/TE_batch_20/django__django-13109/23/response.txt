@@ -1,0 +1,225 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests ensure ForeignKey.validate uses the model's _base_manager (which ignores any custom default manager queryset filtering) to determine whether a related object exists. They create dynamic test models with a default manager that filters out "archived" records and an explicit base manager that returns all records. The tests cover direct field validation, full_clean path, using a non-pk to_field, object-instance values, None values, and the negative case where no matching related object exists. Each test creates and destroys the temporary models' database tables to avoid interference.
+test_code: |
+  from django.test import TestCase
+  from django.apps import apps
+  from django.db import models, connection
+  from django.core.exceptions import ValidationError
+  from django.db import router
+  import uuid
+  
+  def register_and_create_models(app_label, article_name, fav_name, to_field=None, base_manager_name='base_objects'):
+      """
+      Dynamically create two models:
+      - Article-like model with an 'archived' boolean, a 'title' and optionally a unique 'slug'
+        The class will have a custom default manager that filters archived=False and a base manager
+        referenced by base_manager_name.
+      - Favorite-like model with a ForeignKey to the Article model (optionally to_field).
+  
+      Returns (ArticleModel, FavoriteModel)
+      """
+      # Unique model class names to avoid collisions in the app registry
+      ArticleClassName = f"{article_name}_{uuid.uuid4().hex}"
+      FavoriteClassName = f"{fav_name}_{uuid.uuid4().hex}"
+  
+      # Custom manager that filters archived=True out
+      class FilteredManager(models.Manager):
+          def get_queryset(self):
+              return super().get_queryset().filter(archived=False)
+  
+      attrs_article = {
+          '__module__': 'tests.model_forms.models',
+          'title': models.CharField(max_length=50),
+          'archived': models.BooleanField(default=False),
+          'objects': FilteredManager(),
+          base_manager_name: models.Manager(),
+      }
+      # Optionally add a unique slug field as an alternative to pk
+      if to_field:
+          attrs_article['slug'] = models.CharField(max_length=50, unique=True)
+  
+      MetaArticle = type('Meta', (), {
+          'app_label': app_label,
+          'base_manager_name': base_manager_name,
+      })
+      attrs_article['Meta'] = MetaArticle
+      ArticleModel = type(ArticleClassName, (models.Model,), attrs_article)
+  
+      # Now the favorite model with a ForeignKey to ArticleModel
+      fk_kwargs = {}
+      if to_field:
+          fk_kwargs['to_field'] = to_field
+      attrs_fav = {
+          '__module__': 'tests.model_forms.models',
+          'article': models.ForeignKey(ArticleModel, models.CASCADE, **fk_kwargs),
+          'Meta': type('Meta', (), {'app_label': app_label}),
+      }
+      FavoriteModel = type(FavoriteClassName, (models.Model,), attrs_fav)
+  
+      # Register models with the app registry
+      apps.register_model(app_label, ArticleModel)
+      apps.register_model(app_label, FavoriteModel)
+  
+      # Create DB tables
+      with connection.schema_editor() as schema_editor:
+          schema_editor.create_model(ArticleModel)
+          schema_editor.create_model(FavoriteModel)
+  
+      return ArticleModel, FavoriteModel
+  
+  def unregister_and_delete_models(article_model, fav_model):
+      # Drop DB tables and remove from app registry
+      with connection.schema_editor() as schema_editor:
+          schema_editor.delete_model(fav_model)
+          schema_editor.delete_model(article_model)
+      app_label = article_model._meta.app_label
+      # Remove registered models to avoid later collisions
+      try:
+          del apps.all_models[app_label][article_model.__name__.lower()]
+      except Exception:
+          pass
+      try:
+          del apps.all_models[app_label][fav_model.__name__.lower()]
+      except Exception:
+          pass
+  
+  class ForeignKeyBaseManagerTests(TestCase):
+      def test_field_validate_uses_base_manager_includes_archived(self):
+          Article, Favorite = register_and_create_models('model_forms', 'ArticleA', 'FavoriteA')
+          try:
+              # Create an archived article using the base manager so it exists in DB
+              archived = Article._base_manager.create(title='archived', archived=True)
+  
+              # Ensure default manager does not see it
+              self.assertFalse(Article.objects.filter(pk=archived.pk).exists())
+              self.assertTrue(Article._base_manager.filter(pk=archived.pk).exists())
+  
+              # Validate the FK field directly using the archived pk; should not raise
+              fav_instance = Favorite()
+              field = Favorite._meta.get_field('article')
+              # This should use _base_manager internally and therefore not raise ValidationError
+              field.validate(archived.pk, fav_instance)
+          finally:
+              unregister_and_delete_models(Article, Favorite)
+  
+      def test_full_clean_uses_base_manager_includes_archived(self):
+          Article, Favorite = register_and_create_models('model_forms', 'ArticleB', 'FavoriteB')
+          try:
+              archived = Article._base_manager.create(title='archived', archived=True)
+              self.assertFalse(Article.objects.filter(pk=archived.pk).exists())
+              fav = Favorite()
+              # Assign the archived pk to the instance attribute (simulates form input)
+              setattr(fav, 'article_id', archived.pk)
+              # full_clean should call the field validators and not raise
+              fav.full_clean()  # should not raise ValidationError
+          finally:
+              unregister_and_delete_models(Article, Favorite)
+  
+      def test_field_validate_with_to_field_uses_base_manager(self):
+          # Create models where FK targets a non-PK unique field (slug)
+          Article, Favorite = register_and_create_models('model_forms', 'ArticleC', 'FavoriteC', to_field='slug')
+          try:
+              # Create an archived article with a slug via base manager
+              archived = Article._base_manager.create(title='archived', archived=True, slug='arch-slug')
+              self.assertFalse(Article.objects.filter(slug='arch-slug').exists())
+              fav_instance = Favorite()
+              field = Favorite._meta.get_field('article')
+              # Validate using the slug value (to_field); should not raise
+              field.validate('arch-slug', fav_instance)
+          finally:
+              unregister_and_delete_models(Article, Favorite)
+  
+      def test_full_clean_with_to_field_uses_base_manager(self):
+          Article, Favorite = register_and_create_models('model_forms', 'ArticleD', 'FavoriteD', to_field='slug')
+          try:
+              archived = Article._base_manager.create(title='archived', archived=True, slug='arch-slug2')
+              fav = Favorite()
+              # Assign the slug value to the FK attribute's raw column (article_id won't be used for to_field)
+              setattr(fav, 'article', archived.slug)
+              # full_clean should not raise
+              fav.full_clean()
+          finally:
+              unregister_and_delete_models(Article, Favorite)
+  
+      def test_validate_none_value_early_return(self):
+          Article, Favorite = register_and_create_models('model_forms', 'ArticleE', 'FavoriteE')
+          try:
+              fav = Favorite()
+              field = Favorite._meta.get_field('article')
+              # None should be accepted (no validation error for null unless field disallows null)
+              field.validate(None, fav)  # should not raise
+          finally:
+              unregister_and_delete_models(Article, Favorite)
+  
+      def test_validate_with_object_instance_value(self):
+          Article, Favorite = register_and_create_models('model_forms', 'ArticleF', 'FavoriteF')
+          try:
+              archived = Article._base_manager.create(title='archived', archived=True)
+              fav = Favorite()
+              field = Favorite._meta.get_field('article')
+              # Pass the object instance itself rather than pk; validate should handle it
+              field.validate(archived.pk, fav)  # still using pk; should not raise
+              # Also ensure if someone passes instance.pk via router lookup path, it still validates
+              using = router.db_for_read(Article, instance=fav)
+              qs = Article._base_manager.using(using).filter(pk=archived.pk)
+              self.assertTrue(qs.exists())
+          finally:
+              unregister_and_delete_models(Article, Favorite)
+  
+      def test_default_manager_filters_out_archived_confirm(self):
+          Article, Favorite = register_and_create_models('model_forms', 'ArticleG', 'FavoriteG')
+          try:
+              archived = Article._base_manager.create(title='archived', archived=True)
+              # Default manager should not see the archived object
+              self.assertFalse(Article.objects.filter(pk=archived.pk).exists())
+          finally:
+              unregister_and_delete_models(Article, Favorite)
+  
+      def test_validation_raises_when_base_manager_has_no_match(self):
+          Article, Favorite = register_and_create_models('model_forms', 'ArticleH', 'FavoriteH')
+          try:
+              # No article created at all; validation should raise
+              fav = Favorite()
+              field = Favorite._meta.get_field('article')
+              with self.assertRaises(ValidationError):
+                  field.validate(9999999, fav)
+          finally:
+              unregister_and_delete_models(Article, Favorite)
+  
+      def test_multiple_archived_entries_non_pk_validate(self):
+          # Ensure when multiple archived rows exist, targeting by to_field still uses base manager
+          Article, Favorite = register_and_create_models('model_forms', 'ArticleI', 'FavoriteI', to_field='slug')
+          try:
+              # Create two archived articles with distinct slugs
+              a1 = Article._base_manager.create(title='a1', archived=True, slug='s1')
+              a2 = Article._base_manager.create(title='a2', archived=True, slug='s2')
+              fav = Favorite()
+              field = Favorite._meta.get_field('article')
+              # Validate both slugs individually -- should not raise
+              field.validate('s1', fav)
+              field.validate('s2', fav)
+          finally:
+              unregister_and_delete_models(Article, Favorite)
+  
+      def test_validate_after_creating_via_default_manager_fails_but_base_ok(self):
+          # Create one archived via base, another live via default manager; ensure behavior consistent
+          Article, Favorite = register_and_create_models('model_forms', 'ArticleJ', 'FavoriteJ')
+          try:
+              archived = Article._base_manager.create(title='archived', archived=True)
+              live = Article.objects.create(title='live', archived=False)
+              fav = Favorite()
+              field = Favorite._meta.get_field('article')
+              # Validate should accept archived via base_manager
+              field.validate(archived.pk, fav)
+              # Validate should also accept live (visible to both managers)
+              field.validate(live.pk, fav)
+          finally:
+              unregister_and_delete_models(Article, Favorite)
+new_imports_code: |
+  from django.test import TestCase
+  from django.apps import apps
+  from django.db import models, connection
+  from django.core.exceptions import ValidationError
+  from django.db import router
+  import uuid

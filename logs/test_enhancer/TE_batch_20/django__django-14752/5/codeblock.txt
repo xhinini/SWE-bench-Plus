@@ -1,0 +1,207 @@
+import json
+from django.test import RequestFactory
+from django.contrib import admin
+import json
+from contextlib import contextmanager
+
+from django.contrib import admin
+from django.contrib.admin.views.autocomplete import AutocompleteJsonView
+from django.test import RequestFactory
+from django.urls import reverse_lazy
+
+from .admin import QuestionAdmin
+from .models import Answer, Question, Employee, WorkHour, Manager, Bonus
+from .tests import AdminViewBasicTestCase
+
+# Build the opts for Answer.question field (ForeignKey to Question).
+ANSWER_OPTS = {
+    'app_label': Answer._meta.app_label,
+    'model_name': Answer._meta.model_name,
+    'field_name': 'question',
+}
+
+class AutocompleteSerializeRegressionTests(AdminViewBasicTestCase):
+    """
+    Regression tests for AutocompleteJsonView.serialize_result behavior.
+    """
+    as_view_args = {}  # we'll pass admin_site in each test
+    factory = RequestFactory()
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.superuser = cls._create_superuser()
+        super().setUpTestData()
+
+    def _build_admin_site(self):
+        site = admin.AdminSite(name='regress_admin')
+        site.register(Question, QuestionAdmin)
+        return site
+
+    def _get_response(self, view_cls, params):
+        admin_site = self._build_admin_site()
+        request = self.factory.get('/admin/autocomplete/', params)
+        request.user = self.superuser
+        return view_cls.as_view(admin_site=admin_site)(request)
+
+    def test_override_adds_extra_key(self):
+        """Overriding serialize_result can add extra keys to each result."""
+        class CustomView(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                base = super().serialize_result(obj, to_field_name)
+                base['extra'] = 'X-' + str(getattr(obj, to_field_name))
+                return base
+
+        q = Question.objects.create(question='Is this a question?')
+        params = {'term': 'is', **ANSWER_OPTS}
+        response = self._get_response(CustomView, params)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        self.assertEqual(data['results'], [{
+            'id': str(q.pk),
+            'text': q.question,
+            'extra': 'X-' + str(q.pk),
+        }])
+
+    def test_serialize_called_for_each_object_and_keeps_ordering(self):
+        """serialize_result is called for all objects and ordering is preserved."""
+        class CustomView(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                base = super().serialize_result(obj, to_field_name)
+                # attach the first character of the text to verify ordering
+                base['marker'] = base['text'][0]
+                return base
+
+        q1 = Question.objects.create(question='A first')
+        q2 = Question.objects.create(question='B second')
+        params = {'term': '', **ANSWER_OPTS}
+        response = self._get_response(CustomView, params)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        # Ensure both objects present and in the default order (by -posted in QuestionAdmin)
+        ids = [r['id'] for r in data['results']]
+        self.assertIn(str(q1.pk), ids)
+        self.assertIn(str(q2.pk), ids)
+        # verify marker keys exist
+        for r in data['results']:
+            self.assertIn('marker', r)
+
+    def test_serialize_respects_to_field_name_uuid(self):
+        """When the to_field_name resolves to a UUID-like field, serialize_result gets it."""
+        class CustomView(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                return {**super().serialize_result(obj, to_field_name), 'to_field_name': to_field_name}
+
+        # Create a Question that has a UUID to_field defined in tests' fixtures
+        q = Question.objects.create(question='Unique thing')
+        # Request the custom "question_with_to_field" which maps to uuid on Question
+        params = {'term': 'unique', 'app_label': Question._meta.app_label,
+                  'model_name': Question._meta.model_name, 'field_name': 'question_with_to_field'}
+        response = self._get_response(CustomView, params)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        # id should be the uuid field value cast to string
+        self.assertEqual(data['results'][0]['id'], str(q.uuid))
+        self.assertIn('to_field_name', data['results'][0])
+
+    def test_serialize_with_non_string_id_coerces_to_str(self):
+        """IDs returned in serialize_result should be strings even for non-string fields."""
+        class CustomView(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                return super().serialize_result(obj, to_field_name)
+
+        # Use a relation that resolves to PK (integer) like WorkHour -> employee (Employee PK)
+        e = Employee.objects.create(name='Emp', gender=1, code='X', alive=True)
+        wh = WorkHour.objects.create(employee=e, hours=5)
+        params = {'term': 'emp', 'app_label': WorkHour._meta.app_label,
+                  'model_name': WorkHour._meta.model_name, 'field_name': 'employee'}
+        response = self._get_response(CustomView, params)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        self.assertEqual(data['results'][0]['id'], str(e.pk))
+
+    def test_serialize_with_pagination_includes_extra_on_second_page(self):
+        """serialize_result is applied to paginated results as well."""
+        class PaginatedView(AutocompleteJsonView):
+            paginate_by = 5
+            def serialize_result(self, obj, to_field_name):
+                return {**super().serialize_result(obj, to_field_name), 'paged': True}
+
+        # Create more than paginate_by objects so we have a second page.
+        Question.objects.bulk_create(Question(question=str(i)) for i in range(12))
+        params_page2 = {'term': '', 'page': '2', **ANSWER_OPTS}
+        admin_site = self._build_admin_site()
+        request = self.factory.get('/admin/autocomplete/', params_page2)
+        request.user = self.superuser
+        response = PaginatedView.as_view(admin_site=admin_site)(request)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        # All returned results should have the 'paged' key from serialize_result
+        for r in data['results']:
+            self.assertTrue(r.get('paged'))
+
+    def test_super_serialize_result_can_be_extended(self):
+        """Subclasses should be able to call super().serialize_result() and extend it."""
+        class ExtendingView(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                base = super().serialize_result(obj, to_field_name)
+                base['len_text'] = len(base['text'])
+                return base
+
+        q = Question.objects.create(question='LenTest')
+        response = self._get_response(ExtendingView, {'term': 'lent', **ANSWER_OPTS})
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        self.assertEqual(data['results'][0]['len_text'], len(q.question))
+
+    def test_serialize_called_for_mti_related_fields(self):
+        """serialize_result is used for MTI/related target models (Employee/Manager cases)."""
+        class MTIView(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                return {**super().serialize_result(obj, to_field_name), 'name_upper': obj.name.upper()}
+
+        # Employee -> WorkHour relation
+        emp = Employee.objects.create(name='Frida Kahlo', gender=2, code='painter', alive=False)
+        params = {'term': 'frida', 'app_label': WorkHour._meta.app_label,
+                  'model_name': WorkHour._meta.model_name, 'field_name': 'employee'}
+        response = self._get_response(MTIView, params)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        self.assertEqual(data['results'][0]['name_upper'], emp.name.upper())
+
+        # Manager -> Bonus relation (multi-level)
+        mgr = Manager.objects.create(name='X', gender=1, code='c', alive=True)
+        params2 = {'term': '', 'app_label': Bonus._meta.app_label,
+                   'model_name': Bonus._meta.model_name, 'field_name': 'recipient'}
+        response2 = self._get_response(MTIView, params2)
+        # view should respond 200 even if no matches; ensure no error/exception
+        self.assertEqual(response2.status_code, 200)
+
+    def test_serialize_exceptions_propagate(self):
+        """If serialize_result raises, the exception should propagate (500 in production)."""
+        class BrokenView(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                raise RuntimeError("boom")
+
+        params = {'term': '', **ANSWER_OPTS}
+        admin_site = self._build_admin_site()
+        request = self.factory.get('/admin/autocomplete/', params)
+        request.user = self.superuser
+        with self.assertRaises(RuntimeError):
+            # call the view directly so the exception surfaces to the test
+            BrokenView.as_view(admin_site=admin_site)(request)
+
+    def test_serialize_receives_expected_to_field_name(self):
+        """serialize_result should receive the resolved to_field_name for each object."""
+        seen = []
+        class InspectView(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                seen.append(to_field_name)
+                return super().serialize_result(obj, to_field_name)
+
+        q = Question.objects.create(question='InspectMe')
+        params = {'term': 'inspect', **ANSWER_OPTS}
+        response = self._get_response(InspectView, params)
+        self.assertEqual(response.status_code, 200)
+        # We should have recorded exactly one to_field_name, and it should be a string
+        self.assertEqual(len(seen), 1)
+        self.assertIsInstance(seen[0], str)

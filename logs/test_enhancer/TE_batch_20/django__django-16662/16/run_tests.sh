@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_writer_llm.LeadingWhitespaceImportTests._register_and_run migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_single_space_on_from migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_single_space_on_import migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_space_and_normal_import_coexist migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_tab_on_from migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_tab_on_import migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_two_spaces_on_import migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_whitespace_does_not_remove_other_imports migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_whitespace_in_many_imports_kept migrations.test_writer_llm.LeadingWhitespaceImportTests.test_mixed_leading_whitespace_imports_present
+coverage json -o coverage.json
+: '>>>>> End Test Output'

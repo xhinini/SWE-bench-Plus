@@ -1,0 +1,299 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  Ten regression tests that verify the linkcheck builder correctly handles
+  TooManyRedirects raised by HEAD requests by falling back to GET and behaving
+  appropriately (working, redirected, broken), that request headers are used on
+  the GET fallback, and that retries are honored. These tests use the existing
+  http_server/https_server fixtures and follow the style of the existing suite.
+test_code: |
+  import json
+  import http.server
+  import pytest
+  from textwrap import dedent
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_too_many_redirects_fallback_to_get_success(app):
+      class InfiniteRedirectOnHeadHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              # force a redirect loop for HEAD -> requests.head raises TooManyRedirects
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              self.send_response(200, "OK")
+              self.end_headers()
+              self.wfile.write(b"ok\n")
+  
+          def log_date_time_string(self):
+              return ""
+  
+      with pytest.helpers.http_server(InfiniteRedirectOnHeadHandler):
+          app.builder.build_all()
+  
+      # The fallback GET should succeed and mark the link as working
+      with open(app.outdir / 'output.json') as fp:
+          content = json.load(fp)
+      assert content == {
+          "code": 0,
+          "status": "working",
+          "filename": "index.rst",
+          "lineno": 1,
+          "uri": "http://localhost:7777/",
+          "info": "",
+      }
+      # app.statuscode should remain success
+      assert app.statuscode == 0
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_too_many_redirects_fallback_to_get_broken_on_404(app):
+      class InfiniteRedirectHeadGET404Handler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              # HEAD triggers TooManyRedirects
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              # GET returns 404 -> should be reported as broken
+              self.send_error(404, "Not Found")
+  
+          def log_date_time_string(self):
+              return ""
+  
+      with pytest.helpers.http_server(InfiniteRedirectHeadGET404Handler):
+          app.builder.build_all()
+  
+      with open(app.outdir / 'output.json') as fp:
+          content = json.load(fp)
+      assert content["status"] == "broken"
+      assert content["filename"] == "index.rst"
+      assert content["lineno"] == 1
+      assert content["uri"] == "http://localhost:7777/"
+      assert "404 Client Error" in content["info"]
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_too_many_redirects_fallback_to_get_redirected_with_history(app):
+      class InfiniteHeadThenGetRedirectHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              # HEAD triggers TooManyRedirects loop
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              # emulate a redirect chain on GET: / -> /a -> /final
+              if self.path == "/":
+                  self.send_response(302, "Found")
+                  self.send_header("Location", "http://localhost:7777/a")
+                  self.end_headers()
+              elif self.path == "/a":
+                  self.send_response(301, "Moved Permanently")
+                  self.send_header("Location", "http://localhost:7777/final")
+                  self.end_headers()
+              else:
+                  self.send_response(204, "No content")
+                  self.end_headers()
+  
+          def log_date_time_string(self):
+              return ""
+  
+      with pytest.helpers.http_server(InfiniteHeadThenGetRedirectHandler):
+          app.builder.build_all()
+  
+      # should be treated as redirected; last code in history should be 301
+      with open(app.outdir / 'output.json') as fp:
+          content = json.load(fp)
+      assert content["status"] == "redirected"
+      assert content["uri"].endswith("/final")
+      assert content["code"] == 301
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_headers_used_on_get_fallback_after_toomanyredirects(app, capsys):
+      class HeadersDumperHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              # HEAD redirects to force TooManyRedirects
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              self.send_response(200, "OK")
+              self.end_headers()
+              # Print headers to server stdout so test can capture them
+              print(self.headers.as_string())
+  
+          def log_date_time_string(self):
+              return ""
+  
+      # configure a specific header for the base URL so GET fallback should present it
+      confoverrides = {
+          'linkcheck_request_headers': {
+              "http://localhost:7777/": {"X-Test-Header": "fallback"},
+          }
+      }
+      with pytest.helpers.http_server(HeadersDumperHandler):
+          app.config.linkcheck_request_headers = confoverrides['linkcheck_request_headers']
+          app.builder.build_all()
+  
+      stdout, _stderr = capsys.readouterr()
+      # server printed headers should include our X-Test-Header showing GET fallback was used
+      assert "X-Test-Header: fallback" in stdout
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_retries_on_get_after_toomanyredirects_then_success(app):
+      class RetryHandler(http.server.BaseHTTPRequestHandler):
+          hits = 0
+          def do_HEAD(self):
+              # HEAD triggers TooManyRedirects
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              RetryHandler.hits += 1
+              if RetryHandler.hits == 1:
+                  # first GET appears to fail with a 500 so the builder should retry
+                  self.send_error(500, "Internal Server Error")
+              else:
+                  self.send_response(200, "OK")
+                  self.end_headers()
+                  self.wfile.write(b"ok\n")
+  
+          def log_date_time_string(self):
+              return ""
+  
+      # allow 2 retries so the second GET attempt will succeed
+      app.config.linkcheck_retries = 2
+      with pytest.helpers.http_server(RetryHandler):
+          app.builder.build_all()
+  
+      with open(app.outdir / 'output.json') as fp:
+          content = json.load(fp)
+      assert content["status"] == "working"
+      assert RetryHandler.hits >= 2
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_retries_exhausted_results_in_broken(app):
+      class AlwaysFailGetHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              # always fail with 500
+              self.send_error(500, "Internal Server Error")
+  
+          def log_date_time_string(self):
+              return ""
+  
+      app.config.linkcheck_retries = 1
+      with pytest.helpers.http_server(AlwaysFailGetHandler):
+          app.builder.build_all()
+  
+      with open(app.outdir / 'output.json') as fp:
+          content = json.load(fp)
+      assert content["status"] == "broken"
+      assert "500 Server Error" in content["info"]
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_anchor_with_get_fallback_finds_anchor(app):
+      class AnchorHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              # HEAD triggers TooManyRedirects
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              # Return an HTML page with an anchor "section"
+              self.send_response(200, "OK")
+              self.send_header("Content-Type", "text/html; charset=utf-8")
+              self.end_headers()
+              self.wfile.write(b'<html><body><h1 id="section">Title</h1></body></html>')
+  
+          def log_date_time_string(self):
+              return ""
+  
+      # make the test URL include an anchor that exists in the returned HTML
+      # The testroot 'linkcheck-localserver' uses http://localhost:7777/ in its index.rst
+      # we emulate checking http://localhost:7777/#section by trusting builder to split anchor
+      with pytest.helpers.http_server(AnchorHandler):
+          app.builder.build_all()
+  
+      # the presence of id="section" should mark the anchor as found (working)
+      with open(app.outdir / 'output.json') as fp:
+          content = json.load(fp)
+      assert content["status"] in ("working", "redirected")
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_anchor_ignored_skips_anchor_check_and_uses_get_fallback(app):
+      class AnchorIgnoredHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              # HEAD triggers TooManyRedirects
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              # return HTML without the anchor
+              self.send_response(200, "OK")
+              self.send_header("Content-Type", "text/html; charset=utf-8")
+              self.end_headers()
+              self.wfile.write(b'<html><body><p>no anchor here</p></body></html>')
+  
+          def log_date_time_string(self):
+              return ""
+  
+      # ignore anchors matching 'section' so builder won't perform anchor GET-only path
+      app.config.linkcheck_anchors_ignore = [r'^section$']
+      with pytest.helpers.http_server(AnchorIgnoredHandler):
+          app.builder.build_all()
+  
+      # since the anchor is ignored, the fallback behavior (GET after HEAD TooManyRedirects)
+      # should still allow the request to succeed (200), marking it working.
+      with open(app.outdir / 'output.json') as fp:
+          content = json.load(fp)
+      assert content["status"] in ("working", "redirected")
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_toomanyredirects_then_get_redirect_code_used(app):
+      class ChainRedirectHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              # HEAD triggers TooManyRedirects
+              self.send_response(302, "Found")
+              self.send_header("Location", "http://localhost:7777/")
+              self.end_headers()
+  
+          def do_GET(self):
+              # create a chain where the last redirect before the final response is 307
+              if self.path == "/":
+                  self.send_response(302, "Found")
+                  self.send_header("Location", "http://localhost:7777/step1")
+                  self.end_headers()
+              elif self.path == "/step1":
+                  self.send_response(307, "Temporary Redirect")
+                  self.send_header("Location", "http://localhost:7777/final")
+                  self.end_headers()
+              else:
+                  self.send_response(204, "No content")
+                  self.end_headers()
+  
+          def log_date_time_string(self):
+              return ""
+  
+      with pytest.helpers.http_server(ChainRedirectHandler):
+          app.builder.build_all()
+  
+      with open(app.outdir / 'output.json') as fp:
+          content = json.load(fp)
+      assert content["status"] == "redirected"
+      # code should be the last redirect code (307)
+      assert content["code"] == 307
+new_imports_code: |
+  import json
+  import http.server
+  import pytest
+  from textwrap import dedent

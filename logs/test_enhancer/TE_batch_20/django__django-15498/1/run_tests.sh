@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 view_tests.tests.test_static_llm.WasModifiedSinceRegressionTests.test_serve_with_empty_length_header view_tests.tests.test_static_llm.WasModifiedSinceRegressionTests.test_serve_with_garbage_if_modified_since_header view_tests.tests.test_static_llm.WasModifiedSinceRegressionTests.test_serve_with_non_numeric_length_header view_tests.tests.test_static_llm.WasModifiedSinceRegressionTests.test_serve_with_semicolon_starting_header view_tests.tests.test_static_llm.WasModifiedSinceRegressionTests.test_was_modified_since_empty_length_field view_tests.tests.test_static_llm.WasModifiedSinceRegressionTests.test_was_modified_since_leading_semicolon view_tests.tests.test_static_llm.WasModifiedSinceRegressionTests.test_was_modified_since_non_digit_length_direct view_tests.tests.test_static_llm.WasModifiedSinceRegressionTests.test_was_modified_since_none_header view_tests.tests.test_static_llm.WasModifiedSinceRegressionTests.test_was_modified_since_random_string view_tests.tests.test_static_llm.WasModifiedSinceRegressionTests.test_was_modified_since_trailing_semicolon_no_length
+coverage json -o coverage.json
+: '>>>>> End Test Output'

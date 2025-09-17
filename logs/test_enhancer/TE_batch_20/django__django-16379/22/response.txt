@@ -1,0 +1,133 @@
+language: Python
+number_of_tests: 10
+test_behavior: "These tests exercise FileBasedCache.has_key() error handling and race conditions. They ensure that FileNotFoundError raised when opening a cache file is handled (has_key returns False) while other errors (PermissionError, OSError with other errno, pickle.UnpicklingError) are propagated. They also verify correct behavior for expired and empty cache files and that versioning is respected."
+test_code: |
+  import errno
+  import os
+  import pickle
+  import shutil
+  import tempfile
+  from unittest import mock
+
+  from django.test import SimpleTestCase
+
+  from django.core.cache.backends.filebased import FileBasedCache
+  from django.core.cache.backends.base import DEFAULT_TIMEOUT
+
+  class FileBasedCacheHasKeyRegressionTests(SimpleTestCase):
+      def setUp(self):
+          self.dirname = tempfile.mkdtemp()
+          # Instantiate FileBasedCache directly with minimal params.
+          self.cache = FileBasedCache(self.dirname, params={})
+
+      def tearDown(self):
+          try:
+              shutil.rmtree(self.dirname)
+          except OSError:
+              pass
+
+      def _fname(self, key, version=None):
+          return self.cache._key_to_file(key, version)
+
+      def test_has_key_returns_false_when_open_raises_filenotfound(self):
+          # Ensure an existing key becomes "not found" if open raises FileNotFoundError.
+          self.cache.set("racy-key", "value", timeout=DEFAULT_TIMEOUT)
+          # Only patch open during the has_key call.
+          with mock.patch("builtins.open", side_effect=FileNotFoundError) as mocked_open:
+              self.assertIs(self.cache.has_key("racy-key"), False)
+              mocked_open.assert_called_once()
+
+      def test_has_key_with_os_path_exists_true_then_open_raises_filenotfound(self):
+          # Simulate the window between os.path.exists() and open() where the file
+          # is removed by another process.
+          key = "exists-then-gone"
+          # Create the file first.
+          self.cache.set(key, "v", timeout=DEFAULT_TIMEOUT)
+          with mock.patch("os.path.exists", return_value=True), mock.patch(
+              "builtins.open", side_effect=FileNotFoundError
+          ):
+              # With the race condition simulated, has_key should simply return False.
+              self.assertIs(self.cache.has_key(key), False)
+
+      def test_has_key_propagates_permissionerror(self):
+          # If open raises PermissionError, it should not be swallowed.
+          key = "permission-key"
+          self.cache.set(key, "v", timeout=DEFAULT_TIMEOUT)
+          with mock.patch("builtins.open", side_effect=PermissionError):
+              with self.assertRaises(PermissionError):
+                  self.cache.has_key(key)
+
+      def test_has_key_propagates_oserror_with_different_errno(self):
+          # Only FileNotFoundError should be swallowed. Other OSErrors must propagate.
+          key = "other-oserror"
+          self.cache.set(key, "v", timeout=DEFAULT_TIMEOUT)
+          err = OSError(errno.EACCES, "permission denied")
+          with mock.patch("builtins.open", side_effect=err):
+              with self.assertRaises(OSError) as cm:
+                  self.cache.has_key(key)
+              self.assertEqual(cm.exception.errno, errno.EACCES)
+
+      def test_has_key_with_corrupt_metadata_raises_unpicklingerror(self):
+          # If the expiry metadata is corrupted (pickle.UnpicklingError),
+          # the error should propagate rather than being swallowed.
+          key = "corrupt-meta"
+          fname = self._fname(key)
+          # Create a cache file with invalid pickle data at the beginning.
+          # _is_expired uses pickle.load on the file; invalid data should raise.
+          # The file must end with the compressed pickled value part to mimic structure,
+          # but the first pickle.load will fail.
+          with open(fname, "wb") as fh:
+              fh.write(b"not-a-pickle")  # invalid pickle for expiry metadata
+          with self.assertRaises(pickle.UnpicklingError):
+              self.cache.has_key(key)
+
+      def test_has_key_returns_false_and_deletes_expired_file(self):
+          # Create an entry that expires immediately.
+          self.cache.set("short-lived", "v", timeout=0.1)
+          fname = self._fname("short-lived")
+          # Wait for it to expire.
+          import time
+          time.sleep(0.2)
+          # has_key should return False and the backing file should be removed.
+          self.assertIs(self.cache.has_key("short-lived"), False)
+          self.assertFalse(os.path.exists(fname))
+
+      def test_has_key_considers_empty_cache_file_expired_and_removes_it(self):
+          # An empty cache file is considered expired by _is_expired.
+          key = "empty-file"
+          fname = self._fname(key)
+          # Create an empty file (simulating a partially written cache file).
+          with open(fname, "wb"):
+              pass
+          # has_key should consider it expired, return False, and remove the file.
+          self.assertIs(self.cache.has_key(key), False)
+          self.assertFalse(os.path.exists(fname))
+
+      def test_has_key_respects_version_argument(self):
+          # Ensure versioning affects file names and has_key checks the correct file.
+          self.cache.set("ver-key", "v1", version=1)
+          self.cache.set("ver-key", "v2", version=2)
+          # Default version (if not provided) uses cache's default (1).
+          self.assertIs(self.cache.has_key("ver-key", version=1), True)
+          self.assertIs(self.cache.has_key("ver-key", version=2), True)
+          # A non-existing version should be False.
+          self.assertIs(self.cache.has_key("ver-key", version=3), False)
+
+      def test_has_key_returns_false_when_open_raises_filenotfound_even_on_new_keys(self):
+          # Simulate a race for a key that does not yet exist: open raising FileNotFoundError
+          # should be handled and has_key should return False (not raise).
+          with mock.patch("builtins.open", side_effect=FileNotFoundError):
+              self.assertIs(self.cache.has_key("never-was"), False)
+
+      def test_has_key_does_not_mask_unrelated_exceptions_from__is_expired(self):
+          # Simulate _is_expired raising an unrelated exception (e.g. ValueError).
+          key = "is-expired-exception"
+          fname = self._fname(key)
+          # Create a (valid) cache file so open succeeds.
+          self.cache.set(key, "value", timeout=DEFAULT_TIMEOUT)
+          # Patch _is_expired to raise ValueError when called.
+          with mock.patch.object(self.cache, "_is_expired", side_effect=ValueError):
+              with self.assertRaises(ValueError):
+                  self.cache.has_key(key)
+new_imports_code: |
+  # No new module-level imports are required beyond those included in test_code.

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 messages_tests.test_cookie_llm.test_cookie_storage_roundtrip_preserves_empty_string_extra_tags messages_tests.test_cookie_llm.test_cookie_storage_roundtrip_preserves_various_falsey_extra_tags messages_tests.test_cookie_llm.test_json_encoder_decoder_preserves_empty_string_extra_tags messages_tests.test_cookie_llm.test_nested_structure_preserves_empty_string_extra_tags messages_tests.test_cookie_llm.test_serializer_preserves_empty_dict_extra_tags messages_tests.test_cookie_llm.test_serializer_preserves_empty_list_extra_tags messages_tests.test_cookie_llm.test_serializer_preserves_empty_string_extra_tags messages_tests.test_cookie_llm.test_serializer_preserves_false_extra_tags messages_tests.test_cookie_llm.test_serializer_preserves_zero_extra_tags messages_tests.test_cookie_llm.test_signer_roundtrip_preserves_falsey_extra_tags
+coverage json -o coverage.json
+: '>>>>> End Test Output'

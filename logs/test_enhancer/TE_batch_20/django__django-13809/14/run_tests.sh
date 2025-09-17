@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.setUp admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_inner_run_called_via_handle_with_skip_checks_triggers_migrations admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_multiple_invocations_with_skip_checks_consistent admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_skip_checks_affects_only_system_checks admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_skip_checks_call_command_invokes_check_migrations admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_skip_checks_call_command_with_addrport_invokes_check_migrations admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_skip_checks_explicit_false_still_performs_system_checks admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_skip_checks_inner_run_invokes_check_migrations admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_skip_checks_inner_run_no_skipping_message admin_scripts.tests_llm.RunserverSkipChecksRegressionTests.test_skip_checks_no_color_option_still_checks_migrations
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,128 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests assert that GROUP BY SQL generation behaves correctly with respect to ordering and annotations. They verify that Meta.ordering (default ordering) does not implicitly add its fields to the GROUP BY clause, that explicit order_by() expressions do add their necessary GROUP BY expressions, that ordering by annotated/select-referenced columns does not force additional GROUP BY columns, that functions used in ordering are represented in GROUP BY when appropriate, and that related-field ordering is handled properly. The tests examine the generated SQL (via str(query)) to ensure the GROUP BY clause contains or omits expected fragments. These tests would fail for the candidate patch (which alters the logic for including ORDER BY expressions into GROUP BY, using stringified expressions and an explicit_group_by heuristic) but pass for the corrected (gold) patch which simply skips adding order_by-derived group-by columns when meta ordering is used.
+test_code: |
+  from datetime import datetime
+  import re
+  from django.db.models import Count, Value, CharField
+  from django.db.models.functions import Upper
+  from django.test import TestCase
+  from .models import Article, Author
+  
+  
+  def _extract_group_by(sql):
+      """
+      Extract the GROUP BY clause (uppercased) from a SQL string.
+      Returns the text of the GROUP BY clause (after 'GROUP BY ') or an
+      empty string if no GROUP BY is present.
+      """
+      s = sql.upper()
+      m = re.search(r'\bGROUP BY\b(.*?)(\bHAVING\b|\bORDER BY\b|$)', s, re.S)
+      if not m:
+          return ''
+      return m.group(1).strip()
+  
+  
+  class GroupBySQLTests(TestCase):
+      @classmethod
+      def setUpTestData(cls):
+          cls.author_1 = Author.objects.create(name="Name 1")
+          cls.author_2 = Author.objects.create(name="Name 2")
+          # Create articles with different headlines and pub_dates
+          cls.a1 = Article.objects.create(headline="Article 1", pub_date=datetime(2005, 7, 26), author=cls.author_1)
+          cls.a2 = Article.objects.create(headline="Article 2", pub_date=datetime(2005, 7, 27), author=cls.author_1)
+          cls.a3 = Article.objects.create(headline="Article 3", pub_date=datetime(2005, 7, 27), author=cls.author_2)
+          cls.a4 = Article.objects.create(headline="Article 4", pub_date=datetime(2005, 7, 28))
+  
+      def test_default_ordering_does_not_add_meta_fields_to_group_by_sql(self):
+          # Use values() + annotate(), no explicit order_by() so Meta.ordering applies.
+          qs = Article.objects.values('author').annotate(count=Count('author'))
+          sql = str(qs.query)
+          group_by = _extract_group_by(sql)
+          # The GROUP BY should only contain the author column (the values() target).
+          self.assertIn('AUTHOR', group_by)
+          self.assertNotIn('PUB_DATE', group_by)
+          self.assertNotIn('HEADLINE', group_by)
+  
+      def test_explicit_order_by_adds_to_group_by_sql(self):
+          # Explicit ordering by headline should force headline into GROUP BY.
+          qs = Article.objects.values('author').annotate(count=Count('author')).order_by('headline')
+          sql = str(qs.query)
+          group_by = _extract_group_by(sql)
+          # Expect headline to be present in GROUP BY when explicitly ordering by it.
+          self.assertIn('HEADLINE', group_by)
+  
+      def test_explicit_order_by_desc_adds_to_group_by_sql(self):
+          qs = Article.objects.values('author').annotate(count=Count('author')).order_by('-headline')
+          sql = str(qs.query)
+          group_by = _extract_group_by(sql)
+          self.assertIn('HEADLINE', group_by)
+  
+      def test_order_by_function_added_to_group_by_sql(self):
+          # Ordering by a function over a related field (Upper(author__name))
+          qs = Article.objects.values('author').annotate(count=Count('author')).order_by(Upper('author__name'))
+          sql = str(qs.query).upper()
+          group_by = _extract_group_by(sql)
+          # The GROUP BY should include the UPPER(...) expression (or at least the function name).
+          self.assertTrue('UPPER' in group_by)
+  
+      def test_annotated_constant_order_by_not_added_to_group_by_sql(self):
+          # Annotate a constant into the SELECT and order by that annotation.
+          # This should be treated as a reference to the select clause and should
+          # not force a GROUP BY inclusion.
+          qs = Article.objects.annotate(
+              constant=Value('1', output_field=CharField())
+          ).values('author').annotate(count=Count('author')).order_by('constant')
+          sql = str(qs.query)
+          group_by = _extract_group_by(sql)
+          # The alias 'CONSTANT' should not be added to the GROUP BY clause.
+          self.assertNotIn('CONSTANT', group_by)
+  
+      def test_order_by_annotation_masked_out_of_select_does_not_harm_group_by(self):
+          # When ordering by an annotation that isn't part of the grouping target,
+          # it should be resolved and included properly, not incorrectly string-compared.
+          qs = Article.objects.annotate(
+              ann=Value('x', output_field=CharField())
+          ).values('author').annotate(count=Count('author')).order_by('ann')
+          sql = str(qs.query)
+          group_by = _extract_group_by(sql)
+          # The annotation alias 'ANN' should not appear in the GROUP BY (it's a reference).
+          self.assertNotIn('ANN', group_by)
+  
+      def test_group_by_with_related_field_values_and_order_by(self):
+          # values() on a related field followed by ordering on that related field
+          qs = Article.objects.values('author__name').annotate(count=Count('author__name')).order_by('author__name')
+          sql = str(qs.query).upper()
+          group_by = _extract_group_by(sql)
+          # Expect related field column to appear in GROUP BY (author name).
+          self.assertIn('NAME', group_by)
+  
+      def test_group_by_contains_no_duplicate_entries(self):
+          # Ensure the GROUP BY clause does not contain duplicate column references.
+          qs = Article.objects.values('author').annotate(count=Count('author')).order_by('headline', 'headline')
+          sql = str(qs.query).upper()
+          group_by = _extract_group_by(sql)
+          # Count occurrences of 'AUTHOR' in GROUP BY; should be exactly 1.
+          self.assertEqual(group_by.count('AUTHOR'), 1)
+  
+      def test_group_by_for_function_and_explicit_values(self):
+          # When values() explicitly requests a field, and order_by uses a function,
+          # both are respected in the GROUP BY clause (function as ordering and the requested field).
+          qs = Article.objects.values('author').annotate(count=Count('author')).order_by(Upper('headline'))
+          sql = str(qs.query).upper()
+          group_by = _extract_group_by(sql)
+          self.assertIn('AUTHOR', group_by)
+          self.assertIn('UPPER', group_by)
+  
+      def test_extra_order_by_table_field_affects_group_by(self):
+          # Using .extra(order_by=...) with a table-qualified column should add that
+          # column to GROUP BY when explicit ORDER BY is present.
+          qs = Article.objects.extra(order_by=['ordering_article.headline']).values('author').annotate(count=Count('author'))
+          # Ensure the ORM produces a GROUP BY that includes the qualified headline reference.
+          sql = str(qs.query).upper()
+          group_by = _extract_group_by(sql)
+          self.assertIn('HEADLINE', group_by)
+new_imports_code: |
+  import re
+  from django.db.models import Count, Value, CharField
+  from django.db.models.functions import Upper

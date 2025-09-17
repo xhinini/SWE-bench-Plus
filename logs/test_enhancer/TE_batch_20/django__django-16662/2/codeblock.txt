@@ -1,0 +1,340 @@
+from django.db.migrations.serializer import BaseSerializer
+from unittest import mock
+
+import datetime
+import re
+
+from django.db import migrations, models
+from django.db.migrations.serializer import BaseSerializer
+from django.db.migrations.writer import MigrationWriter
+from django.test import SimpleTestCase
+
+class CustomImportRegressionTests(SimpleTestCase):
+    def make_and_register_serializer(self, cls, imports):
+        """
+        Register a serializer for 'cls' that returns the given imports set.
+        Returns a cleanup function to unregister the serializer.
+        """
+        class CustomSerializer(BaseSerializer):
+            def serialize(self):
+                # Return a dummy string and the provided imports set
+                return "%s()" % cls.__name__, set(imports)
+
+        MigrationWriter.register_serializer(cls, CustomSerializer)
+        self.addCleanup(MigrationWriter.unregister_serializer, cls)
+
+    def make_migration_with_default(self, default_value):
+        """
+        Build a minimal migration that includes a field with the given default.
+        """
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "app",
+                        "f",
+                        models.CharField(default=default_value),
+                    )
+                ],
+                "dependencies": [],
+            },
+        )
+        return migration
+
+    def test_includes_nonstandard_import(self):
+        """
+        A serializer may return import-like strings that don't begin with
+        'import ' or 'from '. These should still appear in the generated
+        migration output.
+        """
+        class Weird:
+            pass
+
+        self.make_and_register_serializer(Weird, ["custom_import mymodule"])
+        migration = self.make_migration_with_default(Weird())
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        self.assertIn("custom_import mymodule", output)
+
+    def test_includes_nonstandard_import_among_standard_imports_and_froms(self):
+        """
+        Ensure nonstandard import lines are preserved alongside standard
+        'import' and 'from' lines, and appear in the imports section.
+        """
+        class Weird:
+            pass
+
+        # This serializer adds a custom import line in addition to a datetime
+        # dependency produced by the datetime default below.
+        self.make_and_register_serializer(Weird, ["custom_import othermodule"])
+        # Create a migration having two operations so that "import datetime"
+        # is included by the other operation's default value.
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "app",
+                        "dtime",
+                        models.DateTimeField(default=datetime.datetime(2012, 1, 1)),
+                    ),
+                    migrations.AddField(
+                        "app",
+                        "weird",
+                        models.CharField(default=Weird()),
+                    ),
+                ],
+                "dependencies": [],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        # All three import-like strings should be present.
+        self.assertIn("import datetime", output)
+        self.assertIn("custom_import othermodule", output)
+        # And the "from django.db import migrations" (or merged variant) should also be present.
+        self.assertRegex(output, r"from django.db import migrations(?:, models)?")
+
+    def test_multiple_nonstandard_imports_sorted_by_second_token(self):
+        """
+        Multiple nonstandard import lines should be included and sorted
+        deterministically by the token after the first whitespace.
+        """
+        class A: pass
+        class B: pass
+
+        # Provide two custom imports where the second token determines order
+        self.make_and_register_serializer(A, ["x_import zmod"])
+        self.make_and_register_serializer(B, ["x_import amod"])
+
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "app",
+                        "a",
+                        models.CharField(default=A()),
+                    ),
+                    migrations.AddField(
+                        "app",
+                        "b",
+                        models.CharField(default=B()),
+                    ),
+                ],
+                "dependencies": [],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        # Ensure both custom import lines appear and 'amod' comes before 'zmod'
+        pos_amod = output.find("x_import amod")
+        pos_zmod = output.find("x_import zmod")
+        self.assertTrue(pos_amod != -1 and pos_zmod != -1)
+        self.assertLess(pos_amod, pos_zmod)
+
+    def test_leading_whitespace_import_preserved(self):
+        """
+        Import strings that start with whitespace should not be dropped.
+        (Candidate patch drops them due to startswith checks.)
+        """
+        class W:
+            pass
+
+        # Leading space intentionally included
+        self.make_and_register_serializer(W, [" custom_import spaced"])
+        migration = self.make_migration_with_default(W())
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        self.assertIn("custom_import spaced", output)
+
+    def test_fromlike_prefix_preserved(self):
+        """
+        Lines that look like they have a 'from' prefix but don't exactly
+        start with 'from ' (e.g. 'fromX modul') should still be preserved.
+        """
+        class F:
+            pass
+
+        self.make_and_register_serializer(F, ["fromX some_mod"])
+        migration = self.make_migration_with_default(F())
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        self.assertIn("fromX some_mod", output)
+
+    def test_models_merge_with_custom_imports_present(self):
+        """
+        If 'from django.db import models' is present, it should be merged
+        into 'from django.db import migrations, models' even when custom
+        import lines exist.
+        """
+        class M:
+            pass
+
+        self.make_and_register_serializer(M, ["custom_import foo"])
+        # Create an operation that triggers adding 'from django.db import models'
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "app",
+                        "m",
+                        models.TextField(null=True, blank=True),
+                    ),
+                    migrations.AddField(
+                        "app",
+                        "weird",
+                        models.CharField(default=M()),
+                    ),
+                ],
+                "dependencies": [],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        # The merged import must be present
+        self.assertIn("from django.db import migrations, models", output)
+        # Custom import must also be present
+        self.assertIn("custom_import foo", output)
+
+    def test_migration_imports_comment_preserved_with_custom_imports(self):
+        """
+        Migration file imports that include an 'import package.0001' style
+        line should be recognised and a manual copying comment produced,
+        independent of any custom import lines.
+        """
+        class MI:
+            pass
+
+        # Serializer that injects a migration-style import and a custom one.
+        self.make_and_register_serializer(
+            MI, ["import some_package.0001_init", "custom_special_import x"]
+        )
+        migration = self.make_migration_with_default(MI())
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        # The special comment header for functions in other migrations should be present.
+        self.assertIn("Functions from the following migrations need manual copying.", output)
+        # Custom import must be included too
+        self.assertIn("custom_special_import x", output)
+
+    def test_custom_imports_not_dropped_when_using_operation_writer(self):
+        """
+        Ensure OperationWriter/serialize path does not drop custom import lines
+        returned by serializers for argument values.
+        """
+        class OP:
+            pass
+
+        self.make_and_register_serializer(OP, ["odd_import opmod"])
+        # Use an operation that accepts an argument so OperationWriter.serialize()
+        # will call MigrationWriter.serialize on our OP() instance.
+        op = migrations.RunPython(lambda apps, schema_editor: None)
+        # Monkeypatch deconstruct to include our custom object in kwargs for the op
+        orig_deconstruct = op.deconstruct
+        def deconstruct_with_custom():
+            name, args, kwargs = orig_deconstruct()
+            kwargs = dict(kwargs)
+            kwargs["weird"] = OP()
+            return name, args, kwargs
+        op.deconstruct = deconstruct_with_custom
+
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [op],
+                "dependencies": [],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        self.assertIn("odd_import opmod", output)
+
+    def test_custom_imports_with_args_and_kwargs(self):
+        """
+        Ensure custom imports are preserved when values appear as positional
+        and keyword arguments.
+        """
+        class P:
+            pass
+        class Q:
+            pass
+
+        self.make_and_register_serializer(P, ["p_import pmod"])
+        self.make_and_register_serializer(Q, ["q_import qmod"])
+
+        # Use a custom operation type that exposes both args and kwargs via deconstruct.
+        class DummyOp:
+            def __init__(self, a, b=None):
+                self.a = a
+                self.b = b
+            def deconstruct(self):
+                return ("DummyOp", (self.a,), {"b": self.b})
+
+        dummy = DummyOp(P(), b=Q())
+        # Monkeypatch migrations to include this class so OperationWriter picks it up
+        # We can simulate by setting the class module to a known module path.
+        DummyOp.__module__ = "custom_migration_operations.operations"
+
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [dummy],
+                "dependencies": [],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        self.assertIn("p_import pmod", output)
+        self.assertIn("q_import qmod", output)
+
+    def test_mixed_case_custom_imports_sorted_consistently(self):
+        """
+        Ensure mixed-case or unusual custom import lines are retained and
+        appear in a deterministic order relative to standard imports.
+        """
+        class U1: pass
+        class U2: pass
+
+        self.make_and_register_serializer(U1, ["customX beta"])
+        self.make_and_register_serializer(U2, ["customY alpha"])
+        # include a standard datetime import as well
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "app",
+                        "dt",
+                        models.DateTimeField(default=datetime.datetime(2013, 1, 1)),
+                    ),
+                    migrations.AddField(
+                        "app",
+                        "u1",
+                        models.CharField(default=U1()),
+                    ),
+                    migrations.AddField(
+                        "app",
+                        "u2",
+                        models.CharField(default=U2()),
+                    ),
+                ],
+                "dependencies": [],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        # Ensure custom imports are present and appear in deterministic order by token
+        pos_alpha = output.find("customY alpha")
+        pos_beta = output.find("customX beta")
+        self.assertTrue(pos_alpha != -1 and pos_beta != -1)
+        self.assertLess(pos_alpha, pos_beta)

@@ -1,0 +1,183 @@
+from django.apps.registry import apps
+from django.db import connections
+from unittest import mock
+from django.db.utils import IntegrityError
+from django.contrib.contenttypes import management as contenttypes_management
+from django.contrib.contenttypes.models import ContentType
+from django.db import migrations
+
+from django.test import TransactionTestCase
+
+
+class RenameContentTypeDirectTests(TransactionTestCase):
+    databases = {'default', 'other'}
+    available_apps = [
+        'contenttypes_tests',
+        'django.contrib.contenttypes',
+    ]
+
+    def test_direct_rename_updates_correct_db(self):
+        # Ensure a content type exists in the 'other' DB and is renamed there,
+        # not in the default DB.
+        ContentType.objects.using('other').filter(app_label='contenttypes_tests').delete()
+        ContentType.objects.using('default').filter(app_label='contenttypes_tests').delete()
+        ct = ContentType.objects.using('other').create(app_label='contenttypes_tests', model='foo')
+
+        conn = connections['other']
+        rename_op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+        with conn.schema_editor() as schema_editor:
+            rename_op._rename(apps, schema_editor, 'foo', 'renamedfoo')
+
+        self.assertTrue(
+            ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='renamedfoo').exists()
+        )
+        self.assertFalse(
+            ContentType.objects.using('default').filter(app_label='contenttypes_tests', model='renamedfoo').exists()
+        )
+
+    def test_direct_rename_backward_updates_correct_db(self):
+        # Test the reverse rename path writes to the correct DB.
+        ContentType.objects.using('other').filter(app_label='contenttypes_tests').delete()
+        ContentType.objects.using('other').create(app_label='contenttypes_tests', model='renamedfoo')
+
+        conn = connections['other']
+        rename_op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+        # Simulate backward rename: renamedfoo -> foo
+        with conn.schema_editor() as schema_editor:
+            rename_op._rename(apps, schema_editor, 'renamedfoo', 'foo')
+
+        self.assertTrue(
+            ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='foo').exists()
+        )
+        self.assertFalse(
+            ContentType.objects.using('default').filter(app_label='contenttypes_tests', model='foo').exists()
+        )
+
+    def test_no_contenttype_does_nothing_on_other_db(self):
+        # If the content type is missing in the targeted DB, nothing happens.
+        ContentType.objects.using('other').filter(app_label='contenttypes_tests').delete()
+        conn = connections['other']
+        rename_op = contenttypes_management.RenameContentType('contenttypes_tests', 'doesnotexist', 'nomatter')
+        with conn.schema_editor() as schema_editor:
+            # Should not raise
+            rename_op._rename(apps, schema_editor, 'doesnotexist', 'nomatter')
+        # Default DB should remain untouched
+        self.assertFalse(
+            ContentType.objects.using('default').filter(app_label='contenttypes_tests', model='nomatter').exists()
+        )
+
+    def test_allow_migrate_model_false_no_action(self):
+        # If router disallows migration for ContentType on this DB, nothing should be done.
+        ContentType.objects.using('other').filter(app_label='contenttypes_tests').delete()
+        ct = ContentType.objects.using('other').create(app_label='contenttypes_tests', model='foo')
+
+        conn = connections['other']
+        rename_op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+        with mock.patch('django.db.router.allow_migrate_model', return_value=False):
+            with conn.schema_editor() as schema_editor:
+                rename_op._rename(apps, schema_editor, 'foo', 'renamedfoo')
+
+        # Should remain unchanged in 'other'
+        self.assertTrue(
+            ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='foo').exists()
+        )
+
+    def test_save_called_with_using_kwarg(self):
+        # Patch ContentType.save to assert the 'using' kwarg is set to the target DB.
+        ContentType.objects.using('other').filter(app_label='contenttypes_tests').delete()
+        ContentType.objects.using('other').create(app_label='contenttypes_tests', model='foo')
+
+        conn = connections['other']
+        rename_op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+
+        original_save = ContentType.save
+
+        def assert_using_save(self, *args, **kwargs):
+            # Ensure the save is called with using='other'
+            self.assertIn('using', kwargs)
+            self.assertEqual(kwargs['using'], 'other')
+            return original_save(self, *args, **kwargs)
+
+        with mock.patch.object(ContentType, 'save', new=assert_using_save):
+            with conn.schema_editor() as schema_editor:
+                # If the save is called without using, the assert in our patched save will fail.
+                rename_op._rename(apps, schema_editor, 'foo', 'renamedfoo')
+
+        # Confirm the rename actually happened in 'other'
+        self.assertTrue(
+            ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='renamedfoo').exists()
+        )
+
+    def test_conflict_restores_old_model_and_does_not_clear_cache(self):
+        # Simulate an IntegrityError during save (as if a stale content type conflict occurred).
+        ContentType.objects.using('other').filter(app_label='contenttypes_tests').delete()
+        ct = ContentType.objects.using('other').create(app_label='contenttypes_tests', model='foo')
+
+        conn = connections['other']
+        rename_op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+
+        # Patch save to raise IntegrityError when attempting to save to 'other'
+        original_save = ContentType.save
+
+        def raise_on_other_save(self, *args, **kwargs):
+            if kwargs.get('using') == 'other':
+                raise IntegrityError("simulated conflict")
+            return original_save(self, *args, **kwargs)
+
+        with mock.patch.object(ContentType, 'save', new=raise_on_other_save):
+            with mock.patch.object(ContentType.objects, 'clear_cache') as mock_clear_cache:
+                with conn.schema_editor() as schema_editor:
+                    # Should handle IntegrityError gracefully and not call clear_cache.
+                    rename_op._rename(apps, schema_editor, 'foo', 'renamedfoo')
+                # clear_cache should not be called on conflict
+                mock_clear_cache.assert_not_called()
+
+        # Database should still have the old model value (the save failed).
+        self.assertTrue(
+            ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='foo').exists()
+        )
+
+    def test_get_contenttypes_and_models_respects_router(self):
+        # When router disallows migration for ContentType, get_contenttypes_and_models returns (None, None)
+        ContentTypeModel = apps.get_model('contenttypes', 'ContentType')
+        with mock.patch('django.db.router.allow_migrate_model', return_value=False):
+            cts, models_map = contenttypes_management.get_contenttypes_and_models(
+                apps.get_app_config('contenttypes_tests'), 'other', ContentTypeModel
+            )
+        self.assertIsNone(cts)
+        self.assertIsNone(models_map)
+
+    def test_create_contenttypes_uses_correct_db(self):
+        # Ensure create_contenttypes bulk_creates on the specified DB ('other') and not on default.
+        # Remove any existing content types for this app on both DBs.
+        ContentType.objects.using('other').filter(app_label='contenttypes_tests').delete()
+        ContentType.objects.using('default').filter(app_label='contenttypes_tests').delete()
+
+        app_config = apps.get_app_config('contenttypes_tests')
+        # Call the helper that should create missing ContentType rows in 'other'.
+        contenttypes_management.create_contenttypes(app_config, verbosity=0, interactive=False, using='other', apps=apps)
+
+        # The created content types should be in 'other' DB and not in default.
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='contenttypes_tests').exists())
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='contenttypes_tests').exists())
+
+    def test_inject_rename_contenttypes_operations_inserts_after_rename_model(self):
+        # Build a fake migration plan and ensure inject_rename_contenttypes_operations
+        # inserts a RenameContentType operation immediately after any RenameModel operations.
+        migration = migrations.Migration('0001', 'someapp')
+        # Use a RenameModel operation to trigger insertion.
+        rename_model_op = migrations.RenameModel('FooModel', 'BarModel')
+        migration.operations = [rename_model_op]
+        plan = [(migration, False)]
+
+        # Ensure ContentType model is available and router allows migration on 'default'
+        ContentTypeModel = apps.get_model('contenttypes', 'ContentType')
+        with mock.patch('django.db.router.allow_migrate_model', return_value=True):
+            contenttypes_management.inject_rename_contenttypes_operations(plan=plan, apps=apps, using='default')
+
+        # After injection, the migration.operations should contain the original RenameModel
+        # followed by a RenameContentType operation.
+        self.assertEqual(len(migration.operations), 2)
+        first_op, second_op = migration.operations
+        self.assertIs(first_op, rename_model_op)
+        self.assertIsInstance(second_op, contenttypes_management.RenameContentType)

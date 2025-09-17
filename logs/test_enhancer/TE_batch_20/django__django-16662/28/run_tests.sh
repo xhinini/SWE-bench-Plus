@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_writer_llm.AdditionalWriterTests._expected_import_block migrations.test_writer_llm.AdditionalWriterTests._run_with_sentinels migrations.test_writer_llm.AdditionalWriterTests.setUp migrations.test_writer_llm.AdditionalWriterTests.tearDown migrations.test_writer_llm.AdditionalWriterTests.test_dotted_module_variations migrations.test_writer_llm.AdditionalWriterTests.test_from_and_import_same_base_module migrations.test_writer_llm.AdditionalWriterTests.test_imports_and_froms_with_dots migrations.test_writer_llm.AdditionalWriterTests.test_imports_with_similar_prefixes migrations.test_writer_llm.AdditionalWriterTests.test_long_list_of_imports migrations.test_writer_llm.AdditionalWriterTests.test_many_imports_ordering migrations.test_writer_llm.AdditionalWriterTests.test_migration_imports_comment_present_for_numbered_imports migrations.test_writer_llm.AdditionalWriterTests.test_mixed_imports_and_froms migrations.test_writer_llm.AdditionalWriterTests.test_multiple_froms_sorted_by_module migrations.test_writer_llm.AdditionalWriterTests.test_unicode_like_module_names migrations.test_writer_llm.FakeOperation.__init__ migrations.test_writer_llm.FakeOperation.deconstruct migrations.test_writer_llm.ImportSentinel.__init__ migrations.test_writer_llm.ImportSentinel.__repr__
+coverage json -o coverage.json
+: '>>>>> End Test Output'

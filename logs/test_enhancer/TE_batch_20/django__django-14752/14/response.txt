@@ -1,0 +1,223 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that AutocompleteJsonView uses the serialize_result() hook when producing JSON results. They check that overriding serialize_result affects the JSON output (extra fields, different types, different shapes), that it's invoked once per returned object and with the expected to_field_name, that pagination interacts with serialize_result correctly, that exceptions raised in the serializer propagate, and that the serializer is invoked for various relation types (FK, MTI). These would fail if the view serialized results inline (ignoring serialize_result) and pass with the provided patch.
+test_code: |
+  def test_serialize_result_adds_extra_key_override(self):
+      """
+      Overriding serialize_result should allow adding extra keys to the result.
+      """
+      class AddExtraFieldView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              base = super().serialize_result(obj, to_field_name)
+              base['extra'] = 'X'
+              return base
+
+      Question.objects.create(question='Only one')
+      request = self.factory.get(self.url, {'term': 'only', **self.opts})
+      request.user = self.superuser
+      response = AddExtraFieldView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertIn('extra', data['results'][0])
+      self.assertEqual(data['results'][0]['extra'], 'X')
+
+  def test_serialize_result_called_for_each_object(self):
+      """
+      serialize_result should be called once per returned object.
+      """
+      called = []
+
+      class CountingView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              called.append(obj.pk)
+              return super().serialize_result(obj, to_field_name)
+
+      Question.objects.bulk_create(Question(question=f'Q{i}') for i in range(3))
+      request = self.factory.get(self.url, {'term': 'q', **self.opts})
+      request.user = self.superuser
+      response = CountingView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      # Ensure serialize_result was called for each returned object
+      self.assertEqual(len(called), 3)
+
+  def test_serialize_result_receives_custom_to_field(self):
+      """
+      When the field defines a custom to_field (question_with_to_field), the
+      to_field_name passed to serialize_result should reflect the resolved attname.
+      """
+      seen = []
+
+      class CaptureToFieldView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              seen.append(to_field_name)
+              return super().serialize_result(obj, to_field_name)
+
+      Question.objects.create(question='Has uuid')
+      opts = {
+          'app_label': Question._meta.app_label,
+          'model_name': Question._meta.model_name,
+          'field_name': 'question_with_to_field',
+      }
+      request = self.factory.get(self.url, {'term': 'has', **opts})
+      request.user = self.superuser
+      response = CaptureToFieldView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      # The to_field for question_with_to_field resolves to the UUID field's attname
+      expected = Question._meta.get_field('uuid').attname
+      self.assertTrue(seen)
+      self.assertEqual(seen[0], expected)
+
+  def test_serialize_result_on_mti_models(self):
+      """
+      serialize_result should be used for MTI target models (WorkHour -> Employee).
+      """
+      class ExtraMTIView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              res = super().serialize_result(obj, to_field_name)
+              res['marker'] = 'mtitest'
+              return res
+
+      # Create an Employee (Target) instance used by WorkHour (Remote)
+      emp = Employee.objects.create(name="Frida Kahlo", gender=2, code="painter", alive=False)
+      opts = {
+          'app_label': WorkHour._meta.app_label,
+          'model_name': WorkHour._meta.model_name,
+          'field_name': 'employee',
+      }
+      request = self.factory.get(self.url, {'term': 'frida', **opts})
+      request.user = self.superuser
+      response = ExtraMTIView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertEqual(data['results'][0]['marker'], 'mtitest')
+
+  def test_serialize_result_on_fk_pk(self):
+      """
+      serialize_result should be used for FK-to-custom-pk situations (Toy -> PKChild).
+      """
+      class FKPKView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              r = super().serialize_result(obj, to_field_name)
+              r['label'] = str(obj)
+              return r
+
+      p = Parent.objects.create(name="Bertie")
+      c = PKChild.objects.create(parent=p, name="Anna")
+      opts = {
+          'app_label': Toy._meta.app_label,
+          'model_name': Toy._meta.model_name,
+          'field_name': 'child',
+      }
+      request = self.factory.get(self.url, {'term': 'anna', **opts})
+      request.user = self.superuser
+      response = FKPKView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertEqual(data['results'][0]['label'], str(c))
+
+  def test_serialize_result_respects_pagination(self):
+      """
+      serialize_result should only be called for the objects in the current page.
+      """
+      calls_page1 = []
+      calls_page2 = []
+
+      class CapturePageView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              # Decide which page by checking if we've already filled page1
+              if len(calls_page1) < PAGINATOR_SIZE:
+                  calls_page1.append(obj.pk)
+              else:
+                  calls_page2.append(obj.pk)
+              return super().serialize_result(obj, to_field_name)
+
+      # Ensure deterministic ordering by PK
+      class PKOrderingQuestionAdmin(QuestionAdmin):
+          ordering = ['pk']
+
+      Question.objects.bulk_create(Question(question=str(i)) for i in range(PAGINATOR_SIZE + 5))
+      request = self.factory.get(self.url, {'term': '', **self.opts})
+      request.user = self.superuser
+      with model_admin(Question, PKOrderingQuestionAdmin):
+          response = CapturePageView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      # First page should have PAGINATOR_SIZE calls
+      self.assertEqual(len(calls_page1), PAGINATOR_SIZE)
+
+      # Second page
+      request = self.factory.get(self.url, {'term': '', 'page': '2', **self.opts})
+      request.user = self.superuser
+      with model_admin(Question, PKOrderingQuestionAdmin):
+          response = CapturePageView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      # Remaining objects went through serialize_result as well
+      # Calls for page2 should be > 0
+      self.assertTrue(len(calls_page2) > 0)
+
+  def test_serialize_result_can_return_non_string_values(self):
+      """
+      serialize_result may return non-string values which should be preserved in JSON.
+      """
+      class NonStringView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              return {'id': obj.pk, 'text': obj.question, 'num': 123}
+
+      Question.objects.create(question='Numeric test')
+      request = self.factory.get(self.url, {'term': 'numeric', **self.opts})
+      request.user = self.superuser
+      response = NonStringView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertIsInstance(data['results'][0]['num'], int)
+      self.assertEqual(data['results'][0]['num'], 123)
+
+  def test_serialize_result_exception_propagates(self):
+      """
+      If serialize_result raises an exception, it should propagate (resulting
+      in an error) rather than being silently ignored.
+      """
+      class ErroringView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              raise ValueError('boom')
+
+      Question.objects.create(question='Will error')
+      request = self.factory.get(self.url, {'term': 'will', **self.opts})
+      request.user = self.superuser
+      with self.assertRaises(ValueError):
+          ErroringView.as_view(**self.as_view_args)(request)
+
+  def test_serialize_result_called_with_model_instance(self):
+      """
+      serialize_result should receive actual model instances (not dicts or pks).
+      """
+      seen = []
+
+      class TypeCheckView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              seen.append(isinstance(obj, Question))
+              return super().serialize_result(obj, to_field_name)
+
+      Question.objects.create(question='Type check')
+      request = self.factory.get(self.url, {'term': 'type', **self.opts})
+      request.user = self.superuser
+      response = TypeCheckView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      self.assertTrue(all(seen))
+
+  def test_serialize_result_allows_arbitrary_shape(self):
+      """
+      serialize_result can return a completely different shape and it will be
+      used as-is in the JSON results.
+      """
+      class ArbitraryShapeView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              return {'foo': 'bar', 'pk': obj.pk}
+
+      q = Question.objects.create(question='Shape')
+      request = self.factory.get(self.url, {'term': 'shape', **self.opts})
+      request.user = self.superuser
+      response = ArbitraryShapeView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertEqual(data['results'][0], {'foo': 'bar', 'pk': q.pk})
+new_imports_code: ""

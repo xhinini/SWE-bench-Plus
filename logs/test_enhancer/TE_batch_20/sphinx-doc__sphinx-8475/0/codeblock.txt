@@ -1,0 +1,252 @@
+# No additional top-level imports required beyond those in the test module.
+import re
+import queue
+import types
+from requests.exceptions import HTTPError, TooManyRedirects
+import pytest
+import json
+from sphinx.builders.linkcheck import CheckExternalLinksBuilder
+import sphinx.builders.linkcheck as linkcheck_module
+from types import SimpleNamespace
+
+class DummyResponse:
+    def __init__(self, url, status_code=200, history=None, content=b'', iter_unicode=True):
+        self.url = url
+        self.status_code = status_code
+        self.history = history or []
+        self._content = content
+        self._iter_unicode = iter_unicode
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            # mimic requests' HTTPError with .response attribute
+            err = HTTPError(f"{self.status_code} Client Error: for url: {self.url}")
+            err.response = SimpleNamespace(status_code=self.status_code)
+            raise err
+
+    def iter_content(self, chunk_size=4096, decode_unicode=False):
+        # yield either bytes or str depending on decode_unicode or iter_unicode flag
+        if decode_unicode or self._iter_unicode:
+            if isinstance(self._content, bytes):
+                yield self._content.decode('utf-8', errors='ignore')
+            else:
+                yield self._content
+        else:
+            if isinstance(self._content, bytes):
+                yield self._content
+            else:
+                yield self._content.encode('utf-8')
+
+class FakeApp:
+    def __init__(self):
+        cfg = SimpleNamespace()
+        cfg.linkcheck_timeout = None
+        cfg.linkcheck_anchors = True
+        cfg.linkcheck_anchors_ignore = ["^!"]
+        cfg.linkcheck_request_headers = {}
+        cfg.linkcheck_retries = 1
+        cfg.linkcheck_workers = 1
+        self.config = cfg
+        self.quiet = False
+        self.warningiserror = False
+        self.statuscode = 0
+
+class FakeEnv:
+    def __init__(self):
+        self.found_docs = set(['index'])
+    def doc2path(self, docname, _=None):
+        return "index.rst"
+
+def make_builder():
+    builder = CheckExternalLinksBuilder(None, None)
+    # set minimal attributes expected by check_thread
+    builder.app = FakeApp()
+    builder.config = builder.app.config
+    builder.env = FakeEnv()
+    builder.to_ignore = []
+    builder.anchors_ignore = []
+    builder.auth = []
+    builder.good = set()
+    builder.broken = {}
+    builder.redirected = {}
+    builder.wqueue = queue.Queue()
+    builder.rqueue = queue.Queue()
+    return builder
+
+def run_check(builder):
+    # run the check_thread code in current thread; it will exit when sentinel seen
+    builder.check_thread()
+    # fetch result from rqueue
+    return builder.rqueue.get()
+
+def test_head_toomanyredirects_falls_back_to_get_and_marks_working(monkeypatch):
+    builder = make_builder()
+    # simulate HEAD raising TooManyRedirects for any URL
+    def fake_head(url, **kwargs):
+        raise TooManyRedirects("too many redirects on HEAD")
+    def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+        return DummyResponse(url, status_code=200)
+    monkeypatch.setattr(linkcheck_module, 'requests', linkcheck_module.requests)
+    monkeypatch.setattr(linkcheck_module.requests, 'head', fake_head)
+    monkeypatch.setattr(linkcheck_module.requests, 'get', fake_get)
+
+    uri = "http://example.com/"
+    builder.wqueue.put((uri, 'index', 1))
+    builder.wqueue.put((None, None, None))
+    result = run_check(builder)
+    # result: (uri, docname, lineno, status, info, code)
+    assert result[0] == uri
+    assert result[3] == 'working'
+    assert result[4] == ''
+    assert result[5] == 0
+
+def test_head_toomanyredirects_falls_back_to_get_and_503_is_ignored(monkeypatch):
+    builder = make_builder()
+    def fake_head(url, **kwargs):
+        raise TooManyRedirects("too many redirects on HEAD")
+    def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+        # simulate GET returning 503 -> raise HTTPError with response.status_code 503
+        resp = DummyResponse(url, status_code=503)
+        try:
+            resp.raise_for_status()
+        except HTTPError as err:
+            # attach response to mimic requests' HTTPError
+            err.response = SimpleNamespace(status_code=503)
+            raise err
+    monkeypatch.setattr(linkcheck_module.requests, 'head', fake_head)
+    monkeypatch.setattr(linkcheck_module.requests, 'get', fake_get)
+
+    uri = "http://example.com/service"
+    builder.wqueue.put((uri, 'index', 1))
+    builder.wqueue.put((None, None, None))
+    result = run_check(builder)
+    assert result[3] == 'ignored'
+    assert '503' in result[4] or 'Service Unavailable' in result[4]
+
+def test_head_toomanyredirects_falls_back_to_get_and_404_is_broken(monkeypatch):
+    builder = make_builder()
+    def fake_head(url, **kwargs):
+        raise TooManyRedirects("too many redirects on HEAD")
+    def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+        resp = DummyResponse(url, status_code=404)
+        try:
+            resp.raise_for_status()
+        except HTTPError as err:
+            err.response = SimpleNamespace(status_code=404)
+            raise err
+    monkeypatch.setattr(linkcheck_module.requests, 'head', fake_head)
+    monkeypatch.setattr(linkcheck_module.requests, 'get', fake_get)
+
+    uri = "http://example.com/notfound"
+    builder.wqueue.put((uri, 'index', 1))
+    builder.wqueue.put((None, None, None))
+    result = run_check(builder)
+    assert result[3] == 'broken'
+    assert '404' in result[4] or 'Not Found' in result[4]
+
+def test_head_toomanyredirects_and_get_toomanyredirects_results_in_broken(monkeypatch):
+    builder = make_builder()
+    def fake_head(url, **kwargs):
+        raise TooManyRedirects("too many redirects on HEAD")
+    def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+        raise TooManyRedirects("too many redirects on GET")
+    monkeypatch.setattr(linkcheck_module.requests, 'head', fake_head)
+    monkeypatch.setattr(linkcheck_module.requests, 'get', fake_get)
+
+    uri = "http://example.com/loop"
+    builder.wqueue.put((uri, 'index', 1))
+    builder.wqueue.put((None, None, None))
+    result = run_check(builder)
+    assert result[3] == 'broken'
+    assert 'too many redirects' in result[4].lower()
+
+def test_head_raises_http_401_and_get_401_results_in_unauthorized_working(monkeypatch):
+    builder = make_builder()
+    def fake_head(url, **kwargs):
+        # causing retry path, either raise HTTPError or TooManyRedirects
+        err = HTTPError("401 Client Error")
+        erresp = SimpleNamespace(status_code=401)
+        err.response = erresp
+        raise err
+    def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+        err = HTTPError("401 Client Error")
+        err.response = SimpleNamespace(status_code=401)
+        raise err
+    monkeypatch.setattr(linkcheck_module.requests, 'head', fake_head)
+    monkeypatch.setattr(linkcheck_module.requests, 'get', fake_get)
+
+    uri = "http://example.com/protected"
+    builder.wqueue.put((uri, 'index', 1))
+    builder.wqueue.put((None, None, None))
+    result = run_check(builder)
+    assert result[3] == 'working'
+    assert 'unauthorized' in result[4] or result[4].strip() == ' - unauthorized'
+
+def test_head_return_redirect_response_marks_redirected_with_code_from_history(monkeypatch):
+    builder = make_builder()
+    # HEAD returns a response whose URL is different and has history with a code
+    def fake_head(url, **kwargs):
+        hist_resp = SimpleNamespace(status_code=301)
+        return DummyResponse("http://example.com/new", status_code=200, history=[hist_resp])
+    monkeypatch.setattr(linkcheck_module.requests, 'head', fake_head)
+    # GET should not be called but provide default
+    monkeypatch.setattr(linkcheck_module.requests, 'get', lambda *a, **k: DummyResponse("http://example.com/new", status_code=200))
+
+    uri = "http://example.com/old"
+    builder.wqueue.put((uri, 'index', 1))
+    builder.wqueue.put((None, None, None))
+    result = run_check(builder)
+    assert result[3] == 'redirected'
+    assert result[4].startswith('http://example.com/new')
+    assert result[5] == 301
+
+def test_anchor_check_uses_get_and_detects_anchor(monkeypatch):
+    builder = make_builder()
+    # HEAD should not be used when there's an anchor and linkcheck_anchors is True
+    def fake_head(url, **kwargs):
+        raise AssertionError("HEAD should not be called for anchors")
+    def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+        # return HTML that contains an element with id 'top'
+        return DummyResponse(url, status_code=200, content='<div id="top"></div>', iter_unicode=True)
+    monkeypatch.setattr(linkcheck_module.requests, 'head', fake_head)
+    monkeypatch.setattr(linkcheck_module.requests, 'get', fake_get)
+
+    uri = "http://example.com/page#top"
+    builder.wqueue.put((uri, 'index', 1))
+    builder.wqueue.put((None, None, None))
+    result = run_check(builder)
+    assert result[3] == 'working'
+
+def test_get_called_with_auth_info_when_auth_matches(monkeypatch):
+    builder = make_builder()
+    # set up auth pattern that matches any uri
+    builder.auth = [(re.compile(r'.*'), ('user', 'pass'))]
+    def fake_head(url, **kwargs):
+        raise TooManyRedirects("too many redirects on HEAD")
+    captured = {}
+    def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+        captured['auth'] = auth
+        return DummyResponse(url, status_code=200)
+    monkeypatch.setattr(linkcheck_module.requests, 'head', fake_head)
+    monkeypatch.setattr(linkcheck_module.requests, 'get', fake_get)
+    uri = "http://example.com/secure"
+    builder.wqueue.put((uri, 'index', 1))
+    builder.wqueue.put((None, None, None))
+    result = run_check(builder)
+    assert result[3] == 'working'
+    assert captured.get('auth') == ('user', 'pass')
+
+def test_anchor_iter_content_bytes_are_decoded_and_found(monkeypatch):
+    builder = make_builder()
+    def fake_head(url, **kwargs):
+        raise AssertionError("HEAD should not be called for anchors")
+    # return bytes in iter_content; check_anchor should decode it
+    def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+        return DummyResponse(url, status_code=200, content=b'<a id="myanchor"></a>', iter_unicode=False)
+    monkeypatch.setattr(linkcheck_module.requests, 'head', fake_head)
+    monkeypatch.setattr(linkcheck_module.requests, 'get', fake_get)
+    uri = "http://example.com/page#myanchor"
+    builder.wqueue.put((uri, 'index', 1))
+    builder.wqueue.put((None, None, None))
+    result = run_check(builder)
+    assert result[3] == 'working'

@@ -1,0 +1,147 @@
+import pytest
+import warnings
+import numpy as np
+
+from sklearn.utils._testing import assert_array_equal, assert_allclose
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import IsolationForest
+from sklearn.utils import check_random_state
+from scipy.sparse import csc_matrix, csr_matrix
+from unittest.mock import patch
+
+from sklearn.ensemble._iforest import get_chunk_n_rows as _get_chunk_n_rows
+
+
+def _compare_dense_and_sparse_predictions(X_train, X_test, **clf_kwargs):
+    # Train on dense
+    clf_dense = IsolationForest(random_state=0, **clf_kwargs).fit(X_train)
+    dense_pred = clf_dense.predict(X_test)
+    dense_scores = clf_dense.score_samples(X_test)
+
+    # Train on CSC sparse
+    X_train_csc = csc_matrix(X_train)
+    X_test_csc = csc_matrix(X_test)
+    clf_csc = IsolationForest(random_state=0, **clf_kwargs).fit(X_train_csc)
+    csc_pred = clf_csc.predict(X_test_csc)
+    csc_scores = clf_csc.score_samples(X_test_csc)
+
+    # Train on CSR sparse
+    X_train_csr = csr_matrix(X_train)
+    X_test_csr = csr_matrix(X_test)
+    clf_csr = IsolationForest(random_state=0, **clf_kwargs).fit(X_train_csr)
+    csr_pred = clf_csr.predict(X_test_csr)
+    csr_scores = clf_csr.score_samples(X_test_csr)
+
+    # Compare predictions and scores
+    assert_array_equal(dense_pred, csc_pred)
+    assert_array_equal(dense_pred, csr_pred)
+    assert_allclose(dense_scores, csc_scores, atol=1e-7)
+    assert_allclose(dense_scores, csr_scores, atol=1e-7)
+
+    return clf_dense, clf_csc, clf_csr
+
+
+def test_csc_vs_dense_predictions_equal_default(global_random_seed):
+    rng = check_random_state(global_random_seed)
+    X = rng.randn(80, 5)
+    X_train, X_test = train_test_split(X, random_state=rng)
+    _compare_dense_and_sparse_predictions(X_train, X_test, n_estimators=10, max_samples=30)
+
+
+def test_csr_vs_dense_predictions_equal_default(global_random_seed):
+    rng = check_random_state(global_random_seed)
+    X = rng.randn(60, 4)
+    X_train, X_test = train_test_split(X, random_state=rng)
+    _compare_dense_and_sparse_predictions(X_train, X_test, n_estimators=7, max_samples=20)
+
+
+def test_sparse_with_feature_subsampling_matches_dense(global_random_seed):
+    rng = check_random_state(global_random_seed)
+    X = rng.randn(120, 8)
+    X_train, X_test = train_test_split(X, random_state=rng)
+    # Ensure feature subsampling is used
+    _compare_dense_and_sparse_predictions(
+        X_train, X_test, n_estimators=15, max_samples=0.6, max_features=0.5, bootstrap=False
+    )
+
+
+def test_score_and_decision_consistency_for_sparse(global_random_seed):
+    rng = check_random_state(global_random_seed)
+    X = rng.randn(50, 6)
+    X_train, X_test = train_test_split(X, random_state=rng)
+    clf = IsolationForest(n_estimators=20, random_state=0, contamination=0.1).fit(
+        csc_matrix(X_train)
+    )
+
+    # For CSC and CSR inputs, score_samples == decision_function + offset_
+    for X_in in (csc_matrix(X_test), csr_matrix(X_test)):
+        scores = clf.score_samples(X_in)
+        dec = clf.decision_function(X_in)
+        assert_allclose(scores, dec + clf.offset_, atol=1e-7)
+
+        # shape sanity
+        assert scores.shape[0] == X_test.shape[0]
+
+
+def test_chunked_score_equivalence_for_sparse(global_random_seed):
+    # Force chunking by mocking get_chunk_n_rows to small value and ensure
+    # sparse and dense scoring match
+    rng = check_random_state(global_random_seed)
+    X = rng.randn(70, 7)
+    X_train, X_test = train_test_split(X, random_state=rng)
+
+    clf = IsolationForest(n_estimators=12, random_state=0).fit(X_train)
+
+    with patch("sklearn.ensemble._iforest.get_chunk_n_rows", return_value=3) as mocked:
+        scores_dense = clf.score_samples(X_test)
+        scores_csc = clf.score_samples(csc_matrix(X_test))
+        scores_csr = clf.score_samples(csr_matrix(X_test))
+
+        assert_allclose(scores_dense, scores_csc, atol=1e-7)
+        assert_allclose(scores_dense, scores_csr, atol=1e-7)
+        # Ensure get_chunk_n_rows was called (i.e. chunking path exercised)
+        assert mocked.called
+
+
+def test_estimators_features_consistent_between_dense_and_csc(global_random_seed):
+    rng = check_random_state(global_random_seed)
+    X = rng.randn(90, 10)
+    X_train, X_test = train_test_split(X, random_state=rng)
+    clf_dense = IsolationForest(n_estimators=8, max_features=0.6, random_state=0).fit(X_train)
+    clf_csc = IsolationForest(n_estimators=8, max_features=0.6, random_state=0).fit(
+        csc_matrix(X_train)
+    )
+
+    # For each estimator, the feature indices used should be identical
+    assert len(clf_dense.estimators_features_) == len(clf_csc.estimators_features_)
+    for f_dense, f_csc in zip(clf_dense.estimators_features_, clf_csc.estimators_features_):
+        # compare as sets (order is not important)
+        assert set(f_dense) == set(f_csc)
+
+
+def test_fit_preserves_feature_names_when_contamination_is_float(global_random_seed):
+    pd = pytest.importorskip("pandas")
+    rng = check_random_state(global_random_seed)
+    X = pd.DataFrame(rng.randn(6, 1), columns=["a"])
+    clf = IsolationForest(random_state=0, contamination=0.1)
+    # Ensure no UserWarning is emitted during fit (feature names must be preserved)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        clf.fit(X)
+
+    # feature names must be present and correct
+    assert hasattr(clf, "feature_names_in_")
+    assert list(clf.feature_names_in_) == ["a"]
+
+
+def test_warm_start_with_sparse_does_not_overwrite_estimators(global_random_seed):
+    rng = check_random_state(global_random_seed)
+    X = rng.randn(30, 3)
+    clf = IsolationForest(n_estimators=5, max_samples=30, random_state=0, warm_start=True)
+    clf.fit(csc_matrix(X))
+    first_tree = clf.estimators_[0]
+    clf.set_params(n_estimators=10)
+    clf.fit(csc_matrix(X))
+    assert len(clf.estimators_) == 10
+    # ensure the first estimator was not overwritten
+    assert clf.estimators_[0] is first_tree

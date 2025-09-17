@@ -1,0 +1,1560 @@
+import pytest
+from urllib.parse import urlparse
+import asyncio
+import types
+from urllib.parse import urlparse
+import pytest
+from django.conf import settings
+from django.core.handlers.exception import response_for_exception
+from django.http import Http404
+import django.contrib.staticfiles.handlers as handlers
+
+@pytest.mark.asyncio
+async def test_get_response_async_calls_sync_to_async_on_success(monkeypatch):
+    called = []
+    inst = DummyHandler()
+    inst.base_url = urlparse('/static/')
+    async_wrappers = {}
+
+    def fake_sync_to_async(func):
+        called.append(func)
+
+        async def _inner(*args, **kwargs):
+            return func(*args, **kwargs)
+        async_wrappers[func] = _inner
+        return _inner
+    monkeypatch.setattr(handlers, 'sync_to_async', fake_sync_to_async)
+
+    def serve(request):
+        return 'served'
+    inst.serve = serve
+    result = await inst.get_response_async('req')
+    assert result == 'served'
+    assert serve in called
+
+@pytest.mark.asyncio
+async def test_get_response_async_uses_sync_to_async_for_404(monkeypatch):
+    called = []
+    inst = DummyHandler()
+    inst.base_url = urlparse('/static/')
+
+    def fake_sync_to_async(func):
+        called.append(func)
+
+        async def _inner(*args, **kwargs):
+            return func(*args, **kwargs)
+        return _inner
+    monkeypatch.setattr(handlers, 'sync_to_async', fake_sync_to_async)
+
+    def serve(request):
+        raise Http404('not found')
+    inst.serve = serve
+
+    def fake_response_for_exception(request, exc):
+        return 'handled-404'
+    monkeypatch.setattr(handlers, 'response_for_exception', fake_response_for_exception)
+    result = await inst.get_response_async('req')
+    assert result == 'handled-404'
+    assert any((func is serve for func in called))
+    assert any((func is fake_response_for_exception for func in called))
+
+def test_get_response_calls_serve_on_success(monkeypatch):
+    inst = DummyHandler()
+    inst.base_url = urlparse('/static/')
+
+    def serve(request):
+        return 'ok'
+    inst.serve = serve
+    result = inst.get_response('req')
+    assert result == 'ok'
+
+def test_get_response_sync_handles_http404(monkeypatch):
+    inst = DummyHandler()
+    inst.base_url = urlparse('/static/')
+
+    def serve(request):
+        raise Http404('gone')
+    inst.serve = serve
+
+    def fake_response_for_exception(request, exc):
+        return 'handled-sync-404'
+    monkeypatch.setattr(handlers, 'response_for_exception', fake_response_for_exception)
+    result = inst.get_response('req')
+    assert result == 'handled-sync-404'
+
+def test_file_path_converts_url_to_path_correctly():
+    inst = DummyHandler()
+    inst.base_url = urlparse('/static/')
+    assert inst.file_path('/static/foo.txt') == 'foo.txt'
+    assert inst.file_path('/static/') == ''
+
+def test__should_handle_false_when_netloc_present():
+    inst = DummyHandler()
+    inst.base_url = urlparse('http://example.com/static/')
+    assert not inst._should_handle('/static/file')
+
+def test__should_handle_true_for_exact_match():
+    inst = DummyHandler()
+    inst.base_url = urlparse('/static/')
+    assert inst._should_handle('/static/')
+    assert inst._should_handle('/static/foo')
+
+def test_get_base_url_checks_settings(monkeypatch):
+    called = {}
+
+    def fake_check_settings():
+        called['ok'] = True
+    monkeypatch.setattr(handlers.utils, 'check_settings', fake_check_settings)
+    monkeypatch.setattr(settings, 'STATIC_URL', '/static-url/')
+    inst = DummyHandler()
+    assert inst.get_base_url() == '/static-url/'
+    assert called.get('ok', False) is True
+
+@pytest.mark.asyncio
+async def test_get_response_async_propagates_non_http404_exceptions():
+    inst = DummyHandler()
+    inst.base_url = urlparse('/static/')
+
+    def serve(request):
+        raise ValueError('boom')
+    inst.serve = serve
+    with pytest.raises(ValueError):
+        await inst.get_response_async('req')
+
+import asyncio
+import threading
+import types
+import pytest
+from django.http import Http404
+from django.contrib.staticfiles import handlers as handlers_mod
+from django.contrib.staticfiles.handlers import StaticFilesHandlerMixin
+import asyncio
+import threading
+import types
+import pytest
+from django.http import Http404
+from django.contrib.staticfiles import handlers as handlers_mod
+from django.contrib.staticfiles.handlers import StaticFilesHandlerMixin
+
+@pytest.mark.asyncio
+async def test_get_response_async_runs_serve_in_thread_on_success():
+    """serve should be executed in a thread (not main thread) and return its value."""
+
+    class H(StaticFilesHandlerMixin):
+
+        def __init__(self):
+            self.recorded_thread = None
+
+        def serve(self, request):
+            self.recorded_thread = threading.current_thread()
+            return 'OK-' + request.name
+    req = DummyRequest('a')
+    h = H()
+    result = await h.get_response_async(req)
+    assert result == 'OK-a'
+    assert h.recorded_thread is not None
+    assert h.recorded_thread is not threading.main_thread(), 'serve executed on main thread'
+
+@pytest.mark.asyncio
+async def test_get_response_async_runs_serve_in_thread_when_raises_http404():
+    """When serve raises Http404, response_for_exception should be executed in a thread."""
+    serve_thread = None
+    resp_exc_thread = None
+    captured_args = {}
+
+    class H(StaticFilesHandlerMixin):
+
+        def serve(self, request):
+            nonlocal serve_thread
+            serve_thread = threading.current_thread()
+            raise Http404('not found')
+
+    def fake_response_for_exception(request, exc):
+        nonlocal resp_exc_thread, captured_args
+        resp_exc_thread = threading.current_thread()
+        captured_args['request'] = request
+        captured_args['exc'] = exc
+        return 'RESP-FROM-EXC'
+    original = handlers_mod.response_for_exception
+    handlers_mod.response_for_exception = fake_response_for_exception
+    try:
+        h = H()
+        req = DummyRequest('b')
+        result = await h.get_response_async(req)
+        assert result == 'RESP-FROM-EXC'
+        assert serve_thread is not None
+        assert resp_exc_thread is not None
+        assert serve_thread is not threading.main_thread(), 'serve executed on main thread'
+        assert resp_exc_thread is not threading.main_thread(), 'response_for_exception executed on main thread'
+        assert captured_args['request'] is req
+        assert isinstance(captured_args['exc'], Http404)
+    finally:
+        handlers_mod.response_for_exception = original
+
+@pytest.mark.asyncio
+async def test_get_response_async_returns_value_from_serve_and_threaded():
+    """Return value from serve should be propagated and serve executed off main thread."""
+
+    class H(StaticFilesHandlerMixin):
+
+        def __init__(self):
+            self.recorded_thread = None
+
+        def serve(self, request):
+            self.recorded_thread = threading.current_thread()
+            return {'ok': request.name}
+    req = DummyRequest('c')
+    h = H()
+    result = await h.get_response_async(req)
+    assert result == {'ok': 'c'}
+    assert h.recorded_thread is not threading.main_thread()
+
+@pytest.mark.asyncio
+async def test_get_response_async_handles_none_and_runs_in_thread():
+    """If serve returns None, get_response_async should return None, and serve runs off main thread."""
+
+    class H(StaticFilesHandlerMixin):
+
+        def __init__(self):
+            self.recorded_thread = None
+
+        def serve(self, request):
+            self.recorded_thread = threading.current_thread()
+            return None
+    req = DummyRequest('d')
+    h = H()
+    result = await h.get_response_async(req)
+    assert result is None
+    assert h.recorded_thread is not threading.main_thread()
+
+@pytest.mark.asyncio
+async def test_get_response_async_passes_request_to_serve_and_threaded():
+    """Ensure the request object is passed unchanged to serve and serve runs in threadpool thread."""
+
+    class H(StaticFilesHandlerMixin):
+
+        def __init__(self):
+            self.received = None
+            self.recorded_thread = None
+
+        def serve(self, request):
+            self.received = request
+            self.recorded_thread = threading.current_thread()
+            return 'done'
+    req = DummyRequest('e')
+    h = H()
+    result = await h.get_response_async(req)
+    assert result == 'done'
+    assert h.received is req
+    assert h.recorded_thread is not threading.main_thread()
+
+@pytest.mark.asyncio
+async def test_get_response_async_response_for_exception_runs_in_thread_and_gets_args():
+    """response_for_exception should receive the exact request and exception and run off main thread."""
+    serve_thread = None
+    resp_exc_thread = None
+    captured = {}
+
+    class H(StaticFilesHandlerMixin):
+
+        def serve(self, request):
+            nonlocal serve_thread
+            serve_thread = threading.current_thread()
+            raise Http404('missing')
+
+    def fake_response_for_exception(request, exc):
+        nonlocal resp_exc_thread, captured
+        resp_exc_thread = threading.current_thread()
+        captured['request'] = request
+        captured['exc'] = exc
+        return 'handled'
+    original = handlers_mod.response_for_exception
+    handlers_mod.response_for_exception = fake_response_for_exception
+    try:
+        h = H()
+        req = DummyRequest('f')
+        result = await h.get_response_async(req)
+        assert result == 'handled'
+        assert serve_thread is not threading.main_thread()
+        assert resp_exc_thread is not threading.main_thread()
+        assert captured['request'] is req
+        assert isinstance(captured['exc'], Http404)
+    finally:
+        handlers_mod.response_for_exception = original
+
+@pytest.mark.asyncio
+async def test_get_response_async_multiple_calls_use_threadpool_threads_not_main():
+    """Multiple concurrent calls should each execute serve off the main thread."""
+
+    class H(StaticFilesHandlerMixin):
+
+        def __init__(self, ident):
+            self.ident = ident
+            self.recorded_thread = None
+
+        def serve(self, request):
+            self.recorded_thread = threading.current_thread()
+            return (self.ident, request.name)
+    handlers = [H(i) for i in range(5)]
+    reqs = [DummyRequest(str(i)) for i in range(5)]
+    results = await asyncio.gather(*(h.get_response_async(r) for h, r in zip(handlers, reqs)))
+    for i, (h, r) in enumerate(zip(handlers, reqs)):
+        assert results[i] == (h.ident, r.name)
+        assert h.recorded_thread is not threading.main_thread()
+
+@pytest.mark.asyncio
+async def test_get_response_async_multiple_invocations_threadpool_not_main():
+    """Repeated invocations on the same handler should execute serve off-main-thread each time."""
+
+    class H(StaticFilesHandlerMixin):
+
+        def __init__(self):
+            self.threads = []
+
+        def serve(self, request):
+            self.threads.append(threading.current_thread())
+            return request.name
+    h = H()
+    reqs = [DummyRequest(str(i)) for i in range(3)]
+    res = []
+    for r in reqs:
+        res.append(await h.get_response_async(r))
+    assert res == [r.name for r in reqs]
+    assert all((t is not threading.main_thread() for t in h.threads))
+
+@pytest.mark.asyncio
+async def test_get_response_async_non_http_exception_propagates_but_serve_ran_in_thread():
+    """Non-Http404 exceptions should propagate, but serve must have been executed off main thread."""
+    serve_thread = None
+
+    class H(StaticFilesHandlerMixin):
+
+        def serve(self, request):
+            nonlocal serve_thread
+            serve_thread = threading.current_thread()
+            raise ValueError('boom')
+    h = H()
+    with pytest.raises(ValueError):
+        await h.get_response_async(DummyRequest('x'))
+    assert serve_thread is not None
+    assert serve_thread is not threading.main_thread()
+
+@pytest.mark.asyncio
+async def test_get_response_async_concurrent_exception_and_success_threads_not_main():
+    """Mix of calls where some raise Http404 and some return successfully - all serve executions are off main thread."""
+    resp_exc_threads = []
+    serve_threads = []
+
+    class H(StaticFilesHandlerMixin):
+
+        def __init__(self, will_raise=False):
+            self.will_raise = will_raise
+
+        def serve(self, request):
+            t = threading.current_thread()
+            if self.will_raise:
+                serve_threads.append(t)
+                raise Http404('miss')
+            serve_threads.append(t)
+            return request.name
+
+    def fake_response_for_exception(request, exc):
+        resp_exc_threads.append(threading.current_thread())
+        return f'handled-{request.name}'
+    original = handlers_mod.response_for_exception
+    handlers_mod.response_for_exception = fake_response_for_exception
+    try:
+        handlers = [H(will_raise=i % 2 == 0) for i in range(6)]
+        reqs = [DummyRequest(str(i)) for i in range(6)]
+        results = await asyncio.gather(*(h.get_response_async(r) for h, r in zip(handlers, reqs)))
+        for i, h in enumerate(handlers):
+            if i % 2 == 0:
+                assert results[i] == f'handled-{reqs[i].name}'
+            else:
+                assert results[i] == reqs[i].name
+        assert all((t is not threading.main_thread() for t in serve_threads))
+        assert all((t is not threading.main_thread() for t in resp_exc_threads))
+    finally:
+        handlers_mod.response_for_exception = original
+
+import asyncio
+import threading
+import time
+import types
+from types import SimpleNamespace
+import pytest
+from django.http import Http404
+from django.contrib.staticfiles.handlers import StaticFilesHandlerMixin
+import django.contrib.staticfiles.handlers as handlers_mod
+import asyncio
+import threading
+import time
+import types
+from types import SimpleNamespace
+import pytest
+from django.http import Http404
+from django.contrib.staticfiles.handlers import StaticFilesHandlerMixin
+import django.contrib.staticfiles.handlers as handlers_mod
+
+def _make_request(path='/static/test.txt'):
+    return SimpleNamespace(path=path)
+
+def _bind_serve(handler, func):
+    handler.serve = types.MethodType(func, handler)
+    return handler
+
+@pytest.mark.asyncio
+async def test_get_response_async_runs_serve_in_different_thread():
+    handler = StaticFilesHandlerMixin()
+    recorded = {}
+
+    def serve(self, request):
+        recorded['thread'] = threading.get_ident()
+        return 'ok'
+    _bind_serve(handler, serve)
+    main_thread = threading.get_ident()
+    res = await handler.get_response_async(_make_request())
+    assert res == 'ok'
+    assert 'thread' in recorded, 'serve was not called'
+    assert recorded['thread'] != main_thread, 'serve ran on the event loop thread'
+
+@pytest.mark.asyncio
+async def test_get_response_async_returns_value_and_threads_differ():
+    handler = StaticFilesHandlerMixin()
+    recorded = {}
+
+    def serve(self, request):
+        recorded['thread'] = threading.get_ident()
+        return {'status': 200, 'data': 'hello'}
+    _bind_serve(handler, serve)
+    main_thread = threading.get_ident()
+    res = await handler.get_response_async(_make_request())
+    assert isinstance(res, dict) and res['status'] == 200
+    assert recorded['thread'] != main_thread
+
+@pytest.mark.asyncio
+async def test_get_response_async_handles_http404_in_different_thread(monkeypatch):
+    handler = StaticFilesHandlerMixin()
+
+    def serve(self, request):
+        raise Http404('not found')
+    _bind_serve(handler, serve)
+    recorded = {}
+
+    def fake_response_for_exception(request, exc):
+        recorded['thread'] = threading.get_ident()
+        return 'http404-response'
+    monkeypatch.setattr(handlers_mod, 'response_for_exception', fake_response_for_exception)
+    main_thread = threading.get_ident()
+    res = await handler.get_response_async(_make_request())
+    assert res == 'http404-response'
+    assert recorded['thread'] != main_thread
+
+@pytest.mark.asyncio
+async def test_get_response_async_propagates_non_http_exceptions():
+    handler = StaticFilesHandlerMixin()
+
+    def serve(self, request):
+        raise ValueError('boom')
+    _bind_serve(handler, serve)
+    with pytest.raises(ValueError):
+        await handler.get_response_async(_make_request())
+
+@pytest.mark.asyncio
+async def test_get_response_async_does_not_block_event_loop_for_single_call():
+    handler = StaticFilesHandlerMixin()
+
+    def serve(self, request):
+        time.sleep(0.06)
+        return 'done'
+    _bind_serve(handler, serve)
+    flag = {'ran': False}
+
+    async def set_flag_after_delay():
+        await asyncio.sleep(0.01)
+        flag['ran'] = True
+    task = asyncio.create_task(handler.get_response_async(_make_request()))
+    flag_task = asyncio.create_task(set_flag_after_delay())
+    res = await task
+    await flag_task
+    assert res == 'done'
+    assert flag['ran'], 'Event loop task did not run while serve was executing'
+
+@pytest.mark.asyncio
+async def test_get_response_async_concurrent_calls_run_concurrently():
+    handler = StaticFilesHandlerMixin()
+
+    def serve(self, request):
+        time.sleep(0.07)
+        return threading.get_ident()
+    _bind_serve(handler, serve)
+    start = time.time()
+    res1_task = asyncio.create_task(handler.get_response_async(_make_request('/static/a')))
+    res2_task = asyncio.create_task(handler.get_response_async(_make_request('/static/b')))
+    r1, r2 = await asyncio.gather(res1_task, res2_task)
+    duration = time.time() - start
+    assert isinstance(r1, int) and isinstance(r2, int)
+    assert duration < 0.2, f'Took too long ({duration:.2f}s), likely running serially on event loop'
+
+@pytest.mark.asyncio
+async def test_get_response_async_response_for_exception_does_not_block_event_loop(monkeypatch):
+    handler = StaticFilesHandlerMixin()
+
+    def serve(self, request):
+        raise Http404('not found')
+    _bind_serve(handler, serve)
+    recorded = {}
+
+    def slow_response_for_exception(request, exc):
+        time.sleep(0.06)
+        recorded['thread'] = threading.get_ident()
+        return 'handled'
+    monkeypatch.setattr(handlers_mod, 'response_for_exception', slow_response_for_exception)
+    flag = {'ran': False}
+
+    async def set_flag_after_delay():
+        await asyncio.sleep(0.01)
+        flag['ran'] = True
+    task = asyncio.create_task(handler.get_response_async(_make_request()))
+    flag_task = asyncio.create_task(set_flag_after_delay())
+    res = await task
+    await flag_task
+    assert res == 'handled'
+    assert flag['ran'], 'Event loop task did not run while response_for_exception was executing'
+    assert recorded['thread'] != threading.get_ident()
+
+@pytest.mark.asyncio
+async def test_get_response_async_multiple_concurrent_response_for_exception_calls(monkeypatch):
+    handler = StaticFilesHandlerMixin()
+
+    def serve(self, request):
+        raise Http404('not found')
+    _bind_serve(handler, serve)
+    record = {'threads': []}
+
+    def response_for_exception(request, exc):
+        time.sleep(0.05)
+        record['threads'].append(threading.get_ident())
+        return 'ex'
+    monkeypatch.setattr(handlers_mod, 'response_for_exception', response_for_exception)
+    tasks = [asyncio.create_task(handler.get_response_async(_make_request(f'/static/{i}'))) for i in range(3)]
+    results = await asyncio.gather(*tasks)
+    assert results == ['ex', 'ex', 'ex']
+    main = threading.get_ident()
+    assert all((tid != main for tid in record['threads']))
+    assert len(set(record['threads'])) >= 1
+
+@pytest.mark.asyncio
+async def test_get_response_async_immediate_return_runs_off_event_loop_thread():
+    handler = StaticFilesHandlerMixin()
+    recorded = {}
+
+    def serve(self, request):
+        recorded['thread'] = threading.get_ident()
+        return 'immediate'
+    _bind_serve(handler, serve)
+    main_thread = threading.get_ident()
+    res = await handler.get_response_async(_make_request())
+    assert res == 'immediate'
+    assert recorded['thread'] != main_thread
+
+import threading
+import inspect
+import pytest
+from urllib.parse import urlparse
+from django.http import Http404, HttpResponse
+import django.contrib.staticfiles.handlers as handlers_module
+from django.contrib.staticfiles.handlers import StaticFilesHandlerMixin, ASGIStaticFilesHandler
+import threading
+import inspect
+import pytest
+from urllib.parse import urlparse
+from django.http import Http404, HttpResponse
+import django.contrib.staticfiles.handlers as handlers_module
+from django.contrib.staticfiles.handlers import StaticFilesHandlerMixin, ASGIStaticFilesHandler
+
+@pytest.mark.asyncio
+async def test_mixin_get_response_async_runs_serve_in_thread_on_success():
+    handler = StaticFilesHandlerMixin.__new__(StaticFilesHandlerMixin)
+    handler.base_url = urlparse('/static/')
+    recorded = {}
+
+    def serve(req):
+        recorded['thread'] = threading.get_ident()
+        return HttpResponse('ok')
+    handler.serve = serve
+    request = DummyRequest('/static/test.txt')
+    main_thread = threading.get_ident()
+    response = await handler.get_response_async(request)
+    assert isinstance(response, HttpResponse)
+    assert recorded.get('thread') is not None
+    assert recorded['thread'] != main_thread
+
+@pytest.mark.asyncio
+async def test_mixin_get_response_async_runs_response_for_exception_in_thread_on_404(monkeypatch):
+    handler = StaticFilesHandlerMixin.__new__(StaticFilesHandlerMixin)
+    handler.base_url = urlparse('/static/')
+    recorded = {}
+
+    def serve(req):
+        raise Http404()
+
+    def fake_response_for_exception(request, exc):
+        recorded['thread'] = threading.get_ident()
+        return HttpResponse('not found', status=404)
+    handler.serve = serve
+    request = DummyRequest('/static/missing.txt')
+    monkeypatch.setattr(handlers_module, 'response_for_exception', fake_response_for_exception)
+    main_thread = threading.get_ident()
+    response = await handler.get_response_async(request)
+    assert response.status_code == 404
+    assert recorded.get('thread') is not None
+    assert recorded['thread'] != main_thread
+
+@pytest.mark.asyncio
+async def test_asgi_handler_get_response_async_runs_serve_in_thread_on_success():
+    handler = ASGIStaticFilesHandler.__new__(ASGIStaticFilesHandler)
+    handler.base_url = urlparse('/static/')
+    recorded = {}
+
+    def serve(req):
+        recorded['thread'] = threading.get_ident()
+        return HttpResponse('ok')
+    handler.serve = serve
+    request = DummyRequest('/static/test.txt')
+    main_thread = threading.get_ident()
+    response = await handler.get_response_async(request)
+    assert isinstance(response, HttpResponse)
+    assert recorded.get('thread') is not None
+    assert recorded['thread'] != main_thread
+
+@pytest.mark.asyncio
+async def test_asgi_handler_get_response_async_runs_response_for_exception_in_thread_on_404(monkeypatch):
+    handler = ASGIStaticFilesHandler.__new__(ASGIStaticFilesHandler)
+    handler.base_url = urlparse('/static/')
+    recorded = {}
+
+    def serve(req):
+        raise Http404()
+
+    def fake_response_for_exception(request, exc):
+        recorded['thread'] = threading.get_ident()
+        return HttpResponse('not found', status=404)
+    handler.serve = serve
+    monkeypatch.setattr(handlers_module, 'response_for_exception', fake_response_for_exception)
+    request = DummyRequest('/static/missing.txt')
+    main_thread = threading.get_ident()
+    response = await handler.get_response_async(request)
+    assert response.status_code == 404
+    assert recorded.get('thread') is not None
+    assert recorded['thread'] != main_thread
+
+def test_load_middleware_has_no_extra_parameters():
+    sig = inspect.signature(StaticFilesHandlerMixin.load_middleware)
+    params = list(sig.parameters.keys())
+    assert params == ['self'], 'load_middleware signature changed; unexpected parameters: %r' % params
+
+def test_file_path_decodes_percent_encoding():
+    handler = StaticFilesHandlerMixin.__new__(StaticFilesHandlerMixin)
+    handler.base_url = urlparse('/static/')
+    result = handler.file_path('/static/foo%20bar.txt')
+    assert result == 'foo bar.txt'
+
+def test_should_handle_returns_false_if_netloc_present():
+    handler = StaticFilesHandlerMixin.__new__(StaticFilesHandlerMixin)
+    handler.base_url = urlparse('https://example.com/static/')
+    assert not handler._should_handle('/static/test.txt')
+
+def test_should_handle_returns_true_when_path_under_base_and_no_netloc():
+    handler = StaticFilesHandlerMixin.__new__(StaticFilesHandlerMixin)
+    handler.base_url = urlparse('/static/')
+    assert handler._should_handle('/static/test.txt')
+
+def test_file_path_returns_empty_for_exact_base_url():
+    handler = StaticFilesHandlerMixin.__new__(StaticFilesHandlerMixin)
+    handler.base_url = urlparse('/static/')
+    result = handler.file_path('/static/')
+    assert result == ''
+
+import asyncio
+import inspect
+from urllib.parse import urlparse
+from django.http import Http404
+from django.contrib.staticfiles import handlers
+import inspect
+import asyncio
+from urllib.parse import urlparse
+from django.http import Http404
+import django
+import pytest
+from django.contrib.staticfiles import handlers
+
+def test_get_response_async_calls_sync_to_async_for_success(monkeypatch):
+    dummy = DummyHandler()
+
+    def serve(request):
+        return 'served-result'
+    dummy.serve = serve
+    called = []
+
+    def sync_to_async_spy(fn):
+        called.append(fn)
+
+        async def runner(*args, **kwargs):
+            return fn(*args, **kwargs)
+        return runner
+    monkeypatch.setattr(handlers, 'sync_to_async', sync_to_async_spy)
+    result = asyncio.run(dummy.get_response_async(request='req'))
+    assert result == 'served-result'
+    assert called == [serve]
+
+def test_get_response_async_passes_request_argument_to_serve(monkeypatch):
+    dummy = DummyHandler()
+    received = {}
+
+    def serve(request):
+        received['request'] = request
+        return 'ok'
+    dummy.serve = serve
+
+    def sync_to_async_spy(fn):
+
+        async def runner(*args, **kwargs):
+            return fn(*args, **kwargs)
+        return runner
+    monkeypatch.setattr(handlers, 'sync_to_async', sync_to_async_spy)
+    res = asyncio.run(dummy.get_response_async('my-request'))
+    assert res == 'ok'
+    assert received['request'] == 'my-request'
+
+def test_get_response_async_calls_sync_to_async_for_http404_and_uses_response_for_exception(monkeypatch):
+    dummy = DummyHandler()
+
+    def serve(request):
+        raise Http404('not found')
+    dummy.serve = serve
+    wrapped = []
+
+    def sync_to_async_spy(fn):
+        wrapped.append(fn)
+
+        async def runner(*args, **kwargs):
+            return fn(*args, **kwargs)
+        return runner
+
+    def fake_response_for_exception(request, exc):
+        return 'handled-404'
+    monkeypatch.setattr(handlers, 'sync_to_async', sync_to_async_spy)
+    monkeypatch.setattr(handlers, 'response_for_exception', fake_response_for_exception)
+    res = asyncio.run(dummy.get_response_async('req'))
+    assert res == 'handled-404'
+    assert serve in wrapped
+    assert fake_response_for_exception in wrapped
+
+def test_get_response_async_calls_sync_to_async_exact_times_on_success(monkeypatch):
+    dummy = DummyHandler()
+
+    def serve(request):
+        return 'ok'
+    dummy.serve = serve
+    call_count = {'n': 0}
+
+    def sync_to_async_spy(fn):
+        call_count['n'] += 1
+
+        async def runner(*args, **kwargs):
+            return fn(*args, **kwargs)
+        return runner
+    monkeypatch.setattr(handlers, 'sync_to_async', sync_to_async_spy)
+    res = asyncio.run(dummy.get_response_async(None))
+    assert res == 'ok'
+    assert call_count['n'] == 1
+
+def test_get_response_async_calls_sync_to_async_exact_times_on_http404(monkeypatch):
+    dummy = DummyHandler()
+
+    def serve(request):
+        raise Http404('no')
+    dummy.serve = serve
+    call_list = []
+
+    def sync_to_async_spy(fn):
+        call_list.append(fn)
+
+        async def runner(*args, **kwargs):
+            return fn(*args, **kwargs)
+        return runner
+
+    def fake_response_for_exception(request, exc):
+        return 'resp'
+    monkeypatch.setattr(handlers, 'sync_to_async', sync_to_async_spy)
+    monkeypatch.setattr(handlers, 'response_for_exception', fake_response_for_exception)
+    res = asyncio.run(dummy.get_response_async('req'))
+    assert res == 'resp'
+    assert len(call_list) == 2
+    assert call_list[0] is serve
+    assert call_list[1] is fake_response_for_exception
+
+def test_get_response_async_uses_wrapper_coroutine_when_awaited(monkeypatch):
+    dummy = DummyHandler()
+
+    def serve(request):
+        return 'done'
+    dummy.serve = serve
+    marker = {'awaited': False}
+
+    def sync_to_async_spy(fn):
+
+        async def runner(*args, **kwargs):
+            marker['awaited'] = True
+            return fn(*args, **kwargs)
+        return runner
+    monkeypatch.setattr(handlers, 'sync_to_async', sync_to_async_spy)
+    res = asyncio.run(dummy.get_response_async(None))
+    assert res == 'done'
+    assert marker['awaited'] is True
+
+def test_load_middleware_signature_not_changed():
+    sig = inspect.signature(handlers.StaticFilesHandlerMixin.load_middleware)
+    params = list(sig.parameters.values())
+    assert len(params) == 1
+    assert params[0].name == 'self'
+
+def test__should_handle_respects_netloc_in_base_url():
+    dummy = DummyHandler()
+    dummy.base_url = urlparse('http://example.com/static/')
+    assert dummy._should_handle('/static/index.html') is False
+    dummy.base_url = urlparse('/static/')
+    assert dummy._should_handle('/static/index.html') is True
+
+def test_file_path_decodes_url_to_pathname():
+    dummy = DummyHandler()
+    dummy.base_url = urlparse('/static/')
+    path = dummy.file_path('/static/foo%20bar.txt')
+    assert ' ' in path and path.endswith('foo bar.txt')
+
+import pytest
+import types
+from django.http import Http404
+from django.contrib.staticfiles import handlers as handlers_module
+
+@pytest.mark.asyncio
+async def test_get_response_async_uses_sync_to_async_on_success(monkeypatch):
+    calls = []
+
+    def make_sync_to_async(calls):
+
+        def sync_to_async(func):
+            calls.append(('wrap', func))
+
+            async def wrapper(*args, **kwargs):
+                calls.append(('call', func, args, kwargs))
+                return func(*args, **kwargs)
+            return wrapper
+        return sync_to_async
+    monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+    handler = DummyHandler()
+    handler.serve = lambda request: 'served-' + str(request)
+    result = await handler.get_response_async('REQ')
+    assert result == 'served-REQ'
+    assert any((entry[0] == 'wrap' and entry[1] == handler.serve for entry in calls))
+    assert any((entry[0] == 'call' and entry[1] == handler.serve for entry in calls))
+
+@pytest.mark.asyncio
+async def test_get_response_async_uses_sync_to_async_for_http404(monkeypatch):
+    calls = []
+
+    def make_sync_to_async(calls, response_value='ERR'):
+
+        def sync_to_async(func):
+            calls.append(('wrap', func))
+
+            async def wrapper(*args, **kwargs):
+                calls.append(('call', func, args, kwargs))
+                return func(*args, **kwargs)
+            return wrapper
+        return sync_to_async
+    monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+
+    def fake_response_for_exception(request, exc):
+        return 'handled-' + str(exc)
+    monkeypatch.setattr(handlers_module, 'response_for_exception', fake_response_for_exception)
+    handler = DummyHandler()
+
+    def serve_raises(request):
+        raise Http404('not found')
+    handler.serve = serve_raises
+    result = await handler.get_response_async('REQ')
+    assert result == 'handled-404: not found' or result == "handled-Http404('not found')" or result == 'handled-{}'.format(Http404('not found'))
+    wrapped_funcs = [entry[1] for entry in calls if entry[0] == 'wrap']
+    assert handler.serve in wrapped_funcs
+    assert handlers_module.response_for_exception in wrapped_funcs
+
+@pytest.mark.asyncio
+async def test_get_response_async_passes_request_to_wrapped_serve(monkeypatch):
+    calls = []
+
+    def make_sync_to_async(calls):
+
+        def sync_to_async(func):
+
+            async def wrapper(*args, **kwargs):
+                calls.append((func, args, kwargs))
+                return func(*args, **kwargs)
+            return wrapper
+        return sync_to_async
+    monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+    handler = DummyHandler()
+    handler.serve = lambda request: f'ok-{request}'
+    request_obj = object()
+    result = await handler.get_response_async(request_obj)
+    assert result == f'ok-{request_obj}'
+    assert any((entry[0] == handler.serve and entry[1] == (request_obj,) for entry in calls))
+
+@pytest.mark.asyncio
+async def test_get_response_async_propagates_non_http404_and_uses_sync_to_async(monkeypatch):
+    calls = []
+
+    def make_sync_to_async(calls):
+
+        def sync_to_async(func):
+
+            async def wrapper(*args, **kwargs):
+                calls.append(('call', func))
+                return func(*args, **kwargs)
+            return wrapper
+        return sync_to_async
+    monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+    handler = DummyHandler()
+
+    class CustomError(RuntimeError):
+        pass
+
+    def serve_raise_custom(request):
+        raise CustomError('boom')
+    handler.serve = serve_raise_custom
+    with pytest.raises(CustomError):
+        await handler.get_response_async('REQ')
+    assert any((entry == ('call', handler.serve) for entry in calls))
+
+@pytest.mark.asyncio
+async def test_get_response_async_wraps_response_for_exception(monkeypatch):
+    calls = []
+
+    def make_sync_to_async(calls):
+
+        def sync_to_async(func):
+            calls.append(('wrap', func))
+
+            async def wrapper(*args, **kwargs):
+                calls.append(('call', func))
+                return func(*args, **kwargs)
+            return wrapper
+        return sync_to_async
+    monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+
+    def fake_response_for_exception(request, exc):
+        return 'fake-exc'
+    monkeypatch.setattr(handlers_module, 'response_for_exception', fake_response_for_exception)
+    handler = DummyHandler()
+
+    def serve_raises(request):
+        raise Http404('not found')
+    handler.serve = serve_raises
+    result = await handler.get_response_async('REQ')
+    assert result == 'fake-exc'
+    wrapped = [f for tag, f in calls if tag == 'wrap']
+    assert handlers_module.response_for_exception in wrapped
+    assert handler.serve in wrapped
+
+@pytest.mark.asyncio
+async def test_get_response_async_called_multiple_times_uses_sync_to_async_each_time(monkeypatch):
+    calls = []
+
+    def make_sync_to_async(calls):
+
+        def sync_to_async(func):
+            calls.append(('wrap', func))
+
+            async def wrapper(*args, **kwargs):
+                calls.append(('call', func))
+                return func(*args, **kwargs)
+            return wrapper
+        return sync_to_async
+    monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+    handler = DummyHandler()
+    handler.serve = lambda request: f'ok-{request}'
+    r1 = await handler.get_response_async('A')
+    r2 = await handler.get_response_async('B')
+    assert r1 == 'ok-A' and r2 == 'ok-B'
+    wrap_entries = [entry for entry in calls if entry[0] == 'wrap' and entry[1] == handler.serve]
+    assert len(wrap_entries) >= 2
+
+@pytest.mark.asyncio
+async def test_get_response_async_with_unusual_request_object(monkeypatch):
+    calls = []
+
+    def make_sync_to_async(calls):
+
+        def sync_to_async(func):
+            calls.append(('wrap', func))
+
+            async def wrapper(*args, **kwargs):
+                calls.append(('call', func, args))
+                return func(*args, **kwargs)
+            return wrapper
+        return sync_to_async
+    monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+    handler = DummyHandler()
+    handler.serve = lambda req: ('served', req)
+
+    class WeirdReq:
+
+        def __repr__(self):
+            return '<weird>'
+    req = WeirdReq()
+    res = await handler.get_response_async(req)
+    assert res == ('served', req)
+    assert any((entry[0] == 'call' and entry[1] == handler.serve and (entry[2] == (req,)) for entry in calls))
+
+@pytest.mark.asyncio
+async def test_get_response_async_does_not_suppress_errors_raised_by_response_for_exception_wrapper(monkeypatch):
+    calls = []
+
+    def make_sync_to_async(calls):
+
+        def sync_to_async(func):
+            calls.append(('wrap', func))
+
+            async def wrapper(*args, **kwargs):
+                calls.append(('call', func))
+                return func(*args, **kwargs)
+            return wrapper
+        return sync_to_async
+    monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+
+    def bad_response_for_exception(request, exc):
+        raise RuntimeError('bad handler')
+    monkeypatch.setattr(handlers_module, 'response_for_exception', bad_response_for_exception)
+    handler = DummyHandler()
+
+    def serve_raises(request):
+        raise Http404('not found')
+    handler.serve = serve_raises
+    with pytest.raises(RuntimeError):
+        await handler.get_response_async('REQ')
+    wrapped = [entry for entry in calls if entry[0] == 'wrap']
+    funcs = [f for _, f in wrapped]
+    assert handler.serve in funcs and handlers_module.response_for_exception in funcs
+
+@pytest.mark.asyncio
+async def test_get_response_async_called_on_different_handler_instances(monkeypatch):
+    calls = []
+
+    def make_sync_to_async(calls):
+
+        def sync_to_async(func):
+            calls.append(('wrap', func))
+
+            async def wrapper(*args, **kwargs):
+                calls.append(('call', func, args))
+                return func(*args, **kwargs)
+            return wrapper
+        return sync_to_async
+    monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+    h1 = DummyHandler()
+    h2 = DummyHandler()
+    h1.serve = lambda r: 'h1-' + str(r)
+    h2.serve = lambda r: 'h2-' + str(r)
+    r1 = await h1.get_response_async('1')
+    r2 = await h2.get_response_async('2')
+    assert r1 == 'h1-1' and r2 == 'h2-2'
+    wraps = [entry for entry in calls if entry[0] == 'wrap']
+    funcs_wrapped = [f for _, f in wraps]
+    assert h1.serve in funcs_wrapped and h2.serve in funcs_wrapped
+
+@pytest.mark.asyncio
+async def test_get_response_async_called_after_monkeypatching_back_original_sync_to_async(monkeypatch):
+    real_sync = handlers_module.sync_to_async
+    calls = []
+
+    def recording_sync_to_async(func):
+        calls.append(('wrap', func))
+        wrapped = real_sync(func)
+
+        async def wrapper(*args, **kwargs):
+            calls.append(('call', func))
+            return await wrapped(*args, **kwargs)
+        return wrapper
+    monkeypatch.setattr(handlers_module, 'sync_to_async', recording_sync_to_async)
+    handler = DummyHandler()
+    handler.serve = lambda r: 'ok-' + str(r)
+    res = await handler.get_response_async('X')
+    assert res == 'ok-X'
+    assert any((c[0] == 'wrap' and c[1] == handler.serve for c in calls))
+
+import asyncio
+import threading
+from urllib.parse import urlparse
+import pytest
+from django.http import Http404
+from django.contrib.staticfiles import handlers as handlers_module
+import asyncio
+import threading
+from urllib.parse import urlparse
+import pytest
+from django.http import Http404
+from django.contrib.staticfiles import handlers as handlers_module
+
+def make_dummy(path_prefix='/static/'):
+    """Create a simple instance of the mixin with base_url set."""
+    Dummy = type('Dummy', (handlers_module.StaticFilesHandlerMixin,), {})
+    inst = Dummy()
+    inst.base_url = urlparse(path_prefix)
+    return inst
+
+def make_request(path):
+    return type('R', (), {'path': path})()
+
+def test_get_response_async_runs_serve_in_thread_success(monkeypatch):
+    """
+    Ensure get_response_async runs the blocking serve in a background thread
+    (so the serve callable is executed in a non-main thread).
+    """
+    inst = make_dummy()
+    request = make_request('/static/hello.txt')
+
+    def fake_serve(request_arg, path_arg, insecure=False):
+        if threading.current_thread() is threading.main_thread():
+            raise RuntimeError('serve executed in main thread')
+        return 'OK'
+    monkeypatch.setattr(handlers_module, 'serve', fake_serve)
+    result = asyncio.run(inst.get_response_async(request))
+    assert result == 'OK'
+
+def test_get_response_async_handles_Http404_with_response_for_exception_in_thread(monkeypatch):
+    """
+    If serve raises Http404, get_response_async should call response_for_exception
+    in a background thread and return its result.
+    """
+    inst = make_dummy()
+    request = make_request('/static/missing.txt')
+
+    def fake_serve(request_arg, path_arg, insecure=False):
+        if threading.current_thread() is threading.main_thread():
+            raise RuntimeError('serve executed in main thread')
+        raise Http404('not found')
+
+    def fake_response_for_exception(request_arg, exc):
+        if threading.current_thread() is threading.main_thread():
+            raise RuntimeError('response_for_exception executed in main thread')
+        return 'HANDLED'
+    monkeypatch.setattr(handlers_module, 'serve', fake_serve)
+    monkeypatch.setattr(handlers_module, 'response_for_exception', fake_response_for_exception)
+    result = asyncio.run(inst.get_response_async(request))
+    assert result == 'HANDLED'
+
+def test_get_response_async_propagates_non_Http404_exceptions(monkeypatch):
+    """
+    Non-Http404 exceptions raised by serve should propagate out of get_response_async.
+    """
+    inst = make_dummy()
+    request = make_request('/static/bad.txt')
+
+    def fake_serve(request_arg, path_arg, insecure=False):
+        raise ValueError('boom')
+    monkeypatch.setattr(handlers_module, 'serve', fake_serve)
+    with pytest.raises(ValueError):
+        asyncio.run(inst.get_response_async(request))
+
+def test_get_response_uses_file_path_for_serve(monkeypatch):
+    """
+    The serve callable should receive the path returned by file_path().
+    """
+    inst = make_dummy()
+    request = make_request('/static/dir/name.txt')
+    captured = {}
+
+    def fake_serve(request_arg, path_arg, insecure=False):
+        captured['path'] = path_arg
+        return 'OK'
+    monkeypatch.setattr(handlers_module, 'serve', fake_serve)
+    result = asyncio.run(inst.get_response_async(request))
+    assert result == 'OK'
+    assert captured['path'] == 'dir/name.txt'
+
+def test_file_path_strips_base_url_and_converts(monkeypatch):
+    """
+    file_path should remove the base_url prefix and return a local path string.
+    """
+    inst = make_dummy()
+    assert inst.file_path('/static/abc/def.txt') == 'abc/def.txt'
+
+def test__should_handle_false_when_base_url_has_netloc():
+    """
+    If the base URL includes a netloc (host), _should_handle must return False.
+    """
+    inst = make_dummy('http://example.com/static/')
+    assert inst._should_handle('/static/foo.txt') is False
+
+def test__should_handle_true_when_path_under_base_and_no_netloc():
+    inst = make_dummy('/static/')
+    assert inst._should_handle('/static/foo.txt') is True
+
+def test_serve_passes_insecure_flag(monkeypatch):
+    """
+    The mixin.serve wrapper must pass insecure=True to the underlying serve().
+    """
+    inst = make_dummy()
+    request = make_request('/static/a.txt')
+
+    def fake_serve(request_arg, path_arg, insecure=False):
+        return insecure
+    monkeypatch.setattr(handlers_module, 'serve', fake_serve)
+    assert inst.serve(request) is True
+
+def test_get_response_handles_Http404_synchronously(monkeypatch):
+    """
+    The synchronous get_response should return response_for_exception() when serve raises Http404.
+    """
+    inst = make_dummy()
+    request = make_request('/static/miss.txt')
+
+    def fake_serve(request_arg, path_arg, insecure=False):
+        raise Http404('nope')
+
+    def fake_response_for_exception(request_arg, exc):
+        return 'SYNC_HANDLED'
+    monkeypatch.setattr(handlers_module, 'serve', fake_serve)
+    monkeypatch.setattr(handlers_module, 'response_for_exception', fake_response_for_exception)
+    result = inst.get_response(request)
+    assert result == 'SYNC_HANDLED'
+
+def test_get_response_async_propagates_response_for_exception_errors(monkeypatch):
+    """
+    If response_for_exception itself raises in worker thread, the error should propagate.
+    """
+    inst = make_dummy()
+    request = make_request('/static/miss.txt')
+
+    def fake_serve(request_arg, path_arg, insecure=False):
+        raise Http404('nope')
+
+    def bad_response_for_exception(request_arg, exc):
+        raise RuntimeError('response handling failed')
+    monkeypatch.setattr(handlers_module, 'serve', fake_serve)
+    monkeypatch.setattr(handlers_module, 'response_for_exception', bad_response_for_exception)
+    with pytest.raises(RuntimeError):
+        asyncio.run(inst.get_response_async(request))
+
+import asyncio
+import types
+from urllib.parse import urlparse
+import pytest
+from django.http import Http404
+from django.contrib.staticfiles import handlers as handlers_module
+import asyncio
+import types
+from urllib.parse import urlparse
+import pytest
+from django.http import Http404
+from django.contrib.staticfiles import handlers as handlers_module
+
+def make_spy_sync_to_async(calls):
+    """
+    Return a sync_to_async replacement that records the passed-in function
+    objects (bound/unbound) in 'calls' in the order they are wrapped, and
+    returns an async wrapper that calls the original function.
+    """
+
+    def spy(func):
+
+        async def wrapper(*args, **kwargs):
+            calls.append(func)
+            return func(*args, **kwargs)
+        return wrapper
+    return spy
+
+def test_get_response_async_uses_sync_to_async_on_success():
+    handler = DummyHandler()
+    request = DummyRequest('/static/test.txt')
+
+    def serve(req):
+        return 'served-ok'
+    handler.serve = serve
+    calls = []
+    original_sync_to_async = handlers_module.sync_to_async
+    handlers_module.sync_to_async = make_spy_sync_to_async(calls)
+    try:
+        result = asyncio.run(handler.get_response_async(request))
+        assert result == 'served-ok'
+        assert len(calls) == 1
+        assert calls[0].__name__ == 'serve'
+    finally:
+        handlers_module.sync_to_async = original_sync_to_async
+
+def test_get_response_async_returns_value_from_serve_bound_method():
+    handler = DummyHandler()
+    request = DummyRequest('/static/foo')
+
+    def serve_bound(req):
+        return 'bound-result'
+    handler.serve = types.MethodType(serve_bound, handler)
+    calls = []
+    original_sync_to_async = handlers_module.sync_to_async
+    handlers_module.sync_to_async = make_spy_sync_to_async(calls)
+    try:
+        result = asyncio.run(handler.get_response_async(request))
+        assert result == 'bound-result'
+        assert len(calls) == 1
+        assert getattr(calls[0], '__self__', None) is handler
+    finally:
+        handlers_module.sync_to_async = original_sync_to_async
+
+def test_get_response_async_calls_response_for_exception_on_http404():
+    handler = DummyHandler()
+    request = DummyRequest('/static/missing')
+
+    def serve_404(req):
+        raise Http404('not found')
+    handler.serve = serve_404
+    original_rfe = handlers_module.response_for_exception
+    handlers_module.response_for_exception = lambda req, exc: 'handled-404'
+    calls = []
+    original_sync_to_async = handlers_module.sync_to_async
+    handlers_module.sync_to_async = make_spy_sync_to_async(calls)
+    try:
+        result = asyncio.run(handler.get_response_async(request))
+        assert result == 'handled-404'
+        assert len(calls) == 2
+        assert calls[0].__name__ == 'serve_404' or calls[0] is serve_404
+        assert calls[1] is handlers_module.response_for_exception
+    finally:
+        handlers_module.sync_to_async = original_sync_to_async
+        handlers_module.response_for_exception = original_rfe
+
+def test_get_response_async_propagates_non_http404_exception():
+    handler = DummyHandler()
+    request = DummyRequest('/static/error')
+
+    def serve_error(req):
+        raise ValueError('boom')
+    handler.serve = serve_error
+    calls = []
+    original_sync_to_async = handlers_module.sync_to_async
+    handlers_module.sync_to_async = make_spy_sync_to_async(calls)
+    try:
+        with pytest.raises(ValueError):
+            asyncio.run(handler.get_response_async(request))
+        assert len(calls) == 1
+        assert calls[0] is serve_error
+    finally:
+        handlers_module.sync_to_async = original_sync_to_async
+
+def test_get_response_async_uses_sync_to_async_for_response_for_exception():
+    """
+    Similar to previous, but assert that response_for_exception is indeed wrapped
+    and called through sync_to_async (i.e., appears in calls list).
+    """
+    handler = DummyHandler()
+    request = DummyRequest('/static/missing2')
+
+    def serve_404(req):
+        raise Http404()
+    handler.serve = serve_404
+    original_rfe = handlers_module.response_for_exception
+    handlers_module.response_for_exception = lambda req, exc: 'handled-404-2'
+    calls = []
+    original_sync_to_async = handlers_module.sync_to_async
+    handlers_module.sync_to_async = make_spy_sync_to_async(calls)
+    try:
+        result = asyncio.run(handler.get_response_async(request))
+        assert result == 'handled-404-2'
+        assert calls[0] is serve_404
+        assert calls[1] is handlers_module.response_for_exception
+    finally:
+        handlers_module.sync_to_async = original_sync_to_async
+        handlers_module.response_for_exception = original_rfe
+
+def test__should_handle_respects_host_in_base_url():
+    handler = DummyHandler(base_url='http://example.com/static/')
+    assert handler._should_handle('/static/file') is False
+    handler_no_host = DummyHandler(base_url='/static/')
+    assert handler_no_host._should_handle('/static/file') is True
+
+def test__should_handle_accepts_paths_equal_to_base_path():
+    handler = DummyHandler(base_url='/static/')
+    assert handler._should_handle('/static/') is True
+    assert handler._should_handle('/other/static/') is False
+
+def test_file_path_converts_url_to_path():
+    handler = DummyHandler(base_url='/static/')
+    url = '/static/foo/bar/baz.txt'
+    rel = handler.file_path(url)
+    assert rel.endswith('foo/bar/baz.txt')
+
+def test_asgi_handler_pass_through_for_non_matching_scope():
+
+    async def dummy_app(scope, receive, send):
+        return 'app-result'
+    handler = object.__new__(handlers_module.ASGIStaticFilesHandler)
+    handler.application = dummy_app
+    handler.base_url = urlparse('/static/')
+    scope_non_http = {'type': 'websocket', 'path': '/static/test.txt'}
+    result = asyncio.run(handler.__call__(scope_non_http, None, None))
+    assert result == 'app-result'
+    scope_non_matching = {'type': 'http', 'path': '/not-static/foo'}
+    result2 = asyncio.run(handler.__call__(scope_non_matching, None, None))
+    assert result2 == 'app-result'
+
+import asyncio
+import threading
+import time
+import pytest
+from django.http import Http404
+from django.contrib.staticfiles import handlers as handlers_module
+import asyncio
+import threading
+import time
+import pytest
+from django.http import Http404
+from django.contrib.staticfiles import handlers as handlers_module
+
+@pytest.mark.asyncio
+async def test_get_response_async_runs_serve_in_thread_different_thread_for_success():
+    handler = DummyHandler()
+    main_thread = threading.get_ident()
+    result = await handler.get_response_async('request1')
+    assert result == 'ok:request1'
+    assert handler.serve_thread_id is not None
+    assert handler.serve_thread_id != main_thread
+
+@pytest.mark.asyncio
+async def test_get_response_async_runs_response_for_exception_in_thread_on_http404(monkeypatch):
+    handler = DummyHandler(raise_exc=True)
+    main_thread = threading.get_ident()
+
+    def fake_response_for_exception(request, exc):
+        handler.response_for_exception_thread_id = threading.get_ident()
+        handler.captured_exception = exc
+        return 'handled:' + str(request)
+    monkeypatch.setattr(handlers_module, 'response_for_exception', fake_response_for_exception)
+    res = await handler.get_response_async('request-exc')
+    assert res == 'handled:request-exc'
+    assert handler.response_for_exception_thread_id is not None
+    assert handler.response_for_exception_thread_id != main_thread
+    assert isinstance(handler.captured_exception, Http404)
+
+@pytest.mark.asyncio
+async def test_get_response_async_sequential_calls_all_use_threadpool():
+    handler1 = DummyHandler()
+    handler2 = DummyHandler()
+    main_thread = threading.get_ident()
+    r1 = await handler1.get_response_async('a')
+    r2 = await handler2.get_response_async('b')
+    assert r1 == 'ok:a'
+    assert r2 == 'ok:b'
+    assert handler1.serve_thread_id != main_thread
+    assert handler2.serve_thread_id != main_thread
+
+@pytest.mark.asyncio
+async def test_get_response_async_concurrent_calls_all_use_threadpool():
+    handlers = [DummyHandler() for _ in range(5)]
+    main_thread = threading.get_ident()
+    results = await asyncio.gather(*(h.get_response_async(f'c{i}') for i, h in enumerate(handlers)))
+    assert results == [f'ok:c{i}' for i in range(5)]
+    for h in handlers:
+        assert h.serve_thread_id is not None
+        assert h.serve_thread_id != main_thread
+
+@pytest.mark.asyncio
+async def test_get_response_async_with_blocking_serve_does_not_block_event_loop():
+    handler = DummyHandler(delay=0.15)
+    main_thread = threading.get_ident()
+
+    async def waiter():
+        await asyncio.sleep(0.01)
+        return 'fast'
+    task = asyncio.create_task(handler.get_response_async('slow'))
+    fast = await waiter()
+    res = await task
+    assert fast == 'fast'
+    assert res == 'ok:slow'
+    assert handler.serve_thread_id != main_thread
+
+@pytest.mark.asyncio
+async def test_get_response_async_exception_path_preserves_exception_instance(monkeypatch):
+    handler = DummyHandler(raise_exc=True)
+    recorded = {}
+
+    def fake_response_for_exception(request, exc):
+        recorded['exc'] = exc
+        recorded['thread'] = threading.get_ident()
+        return 'handled-ex'
+    monkeypatch.setattr(handlers_module, 'response_for_exception', fake_response_for_exception)
+    main_thread = threading.get_ident()
+    res = await handler.get_response_async('req-exact')
+    assert res == 'handled-ex'
+    assert isinstance(recorded['exc'], Http404)
+    assert recorded['thread'] != main_thread
+
+@pytest.mark.asyncio
+async def test_get_response_async_propagates_non_http404_exceptions():
+
+    class BadHandler(DummyHandler):
+
+        def serve(self, request):
+            raise ValueError('boom')
+    bad = BadHandler()
+    with pytest.raises(ValueError):
+        await bad.get_response_async('boom')
+
+@pytest.mark.asyncio
+async def test_get_response_async_multiple_exception_calls_dont_share_state(monkeypatch):
+    handler_a = DummyHandler(raise_exc=True)
+    handler_b = DummyHandler(raise_exc=True)
+    recorded = []
+
+    def fake_response_for_exception(request, exc):
+        recorded.append((request, exc, threading.get_ident()))
+        return 'ok-ex'
+    monkeypatch.setattr(handlers_module, 'response_for_exception', fake_response_for_exception)
+    main_thread = threading.get_ident()
+    ra, rb = await asyncio.gather(handler_a.get_response_async('ra'), handler_b.get_response_async('rb'))
+    assert ra == 'ok-ex' and rb == 'ok-ex'
+    assert len(recorded) == 2
+    for _, _, tid in recorded:
+        assert tid != main_thread
+
+@pytest.mark.asyncio
+async def test_get_response_async_works_with_dummy_request_objects():
+
+    class ReqObj:
+
+        def __init__(self, name):
+            self.name = name
+
+        def __str__(self):
+            return f'Req({self.name})'
+    handler = DummyHandler()
+    res = await handler.get_response_async(ReqObj('xyz'))
+    assert res == 'ok:Req(xyz)'
+    assert handler.serve_thread_id != threading.get_ident()
+
+@pytest.mark.asyncio
+async def test_get_response_async_response_for_exception_receives_arguments_in_threadpool(monkeypatch):
+    handler = DummyHandler(raise_exc=True)
+    captured = {}
+
+    def fake_response_for_exception(request, exc):
+        captured['request'] = request
+        captured['exc'] = exc
+        captured['thread'] = threading.get_ident()
+        return 'rfe'
+    monkeypatch.setattr(handlers_module, 'response_for_exception', fake_response_for_exception)
+    main_thread = threading.get_ident()
+    out = await handler.get_response_async('reqX')
+    assert out == 'rfe'
+    assert captured['request'] == 'reqX'
+    assert isinstance(captured['exc'], Http404)
+    assert captured['thread'] != main_thread

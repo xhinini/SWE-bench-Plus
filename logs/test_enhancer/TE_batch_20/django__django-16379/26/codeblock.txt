@@ -1,0 +1,141 @@
+import os
+import shutil
+import tempfile
+from unittest import mock
+from django.conf import settings
+from django.test import override_settings, TestCase
+from django.test.signals import setting_changed
+from django.core.cache import cache, caches
+@override_settings(
+    CACHES={
+        "default": {
+            "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
+        },
+    }
+)
+class FileBasedHasKeyRaceTests(TestCase):
+    def setUp(self):
+        super().setUp()
+        self.dirname = tempfile.mkdtemp()
+        # Update the CACHES LOCATION to our temp dir and notify settings change.
+        for cache_params in settings.CACHES.values():
+            cache_params["LOCATION"] = self.dirname
+        setting_changed.send(self.__class__, setting="CACHES", enter=False)
+
+    def tearDown(self):
+        super().tearDown()
+        shutil.rmtree(self.dirname)
+
+    def test_has_key_handles_race_when_file_disappears(self):
+        """If os.path.exists says the file exists but open() raises FileNotFoundError,
+        has_key() should return False and not raise."""
+        cache.set("race1", "value")
+        fname = cache._key_to_file("race1")
+        with mock.patch("os.path.exists", return_value=True), mock.patch(
+            "builtins.open", side_effect=FileNotFoundError()
+        ) as mocked_open:
+            # No exception should be raised; has_key should return False.
+            self.assertIs(cache.has_key("race1"), False)
+            mocked_open.assert_called()
+
+    def test_has_key_handles_race_with_version(self):
+        cache.set("racever", "value", version=5)
+        fname = cache._key_to_file("racever", version=5)
+        # Simulate a race where exists() returns True but open fails.
+        with mock.patch("os.path.exists", return_value=True), mock.patch(
+            "builtins.open", side_effect=FileNotFoundError()
+        ):
+            self.assertIs(cache.has_key("racever", version=5), False)
+
+    def test_has_key_handles_race_for_unicode_key(self):
+        key = "ключ-测试-ñ"
+        cache.set(key, "unicode")
+        with mock.patch("os.path.exists", return_value=True), mock.patch(
+            "builtins.open", side_effect=FileNotFoundError()
+        ):
+            self.assertIs(cache.has_key(key), False)
+
+    def test_has_key_does_not_affect_other_keys_when_one_races(self):
+        # Create two keys. Simulate open() raising only for the first key.
+        cache.set("good", "v1")
+        cache.set("bad", "v2")
+        bad_fname = cache._key_to_file("bad")
+
+        real_open = open
+
+        def fake_open(path, mode="rb", *args, **kwargs):
+            if os.path.abspath(path) == os.path.abspath(bad_fname):
+                raise FileNotFoundError()
+            return real_open(path, mode, *args, **kwargs)
+
+        with mock.patch("os.path.exists", return_value=True), mock.patch(
+            "builtins.open", side_effect=fake_open
+        ):
+            # The bad key should report False (race), the good key should still be found.
+            self.assertIs(cache.has_key("bad"), False)
+            self.assertIs(cache.has_key("good"), True)
+
+    def test_has_key_propagates_other_exceptions(self):
+        """Only FileNotFoundError should be swallowed; other errors should propagate."""
+        cache.set("explode", "value")
+        with mock.patch("os.path.exists", return_value=True), mock.patch(
+            "builtins.open", side_effect=OSError("disk error")
+        ):
+            with self.assertRaises(OSError):
+                cache.has_key("explode")
+
+    def test_has_key_calls_open_with_expected_filename(self):
+        cache.set("checkopen", "value")
+        expected_fname = cache._key_to_file("checkopen")
+
+        def open_side_effect(path, mode="rb", *args, **kwargs):
+            # Ensure the path passed to open is the md5-based filename.
+            self.assertEqual(os.path.abspath(path), os.path.abspath(expected_fname))
+            raise FileNotFoundError()
+
+        with mock.patch("os.path.exists", return_value=True), mock.patch(
+            "builtins.open", side_effect=open_side_effect
+        ):
+            self.assertIs(cache.has_key("checkopen"), False)
+
+    def test_has_key_race_after_delete_returns_false(self):
+        # Create a key then actually delete the file to simulate an external
+        # process removing it between an existence check and open().
+        cache.set("delrace", "value")
+        fname = cache._key_to_file("delrace")
+        # Remove the file on disk.
+        os.remove(fname)
+        # Simulate os.path.exists returning True (stale info) but open raising.
+        with mock.patch("os.path.exists", return_value=True), mock.patch(
+            "builtins.open", side_effect=FileNotFoundError()
+        ):
+            self.assertIs(cache.has_key("delrace"), False)
+
+    def test_has_key_with_spaces_and_unicode_handles_race(self):
+        key = "key with spaces and 清"
+        cache.set(key, "v")
+        with mock.patch("os.path.exists", return_value=True), mock.patch(
+            "builtins.open", side_effect=FileNotFoundError()
+        ):
+            self.assertIs(cache.has_key(key), False)
+
+    def test_has_key_multiple_consecutive_race_calls(self):
+        """Multiple calls during a race should consistently return False."""
+        cache.set("multirace", "value")
+        with mock.patch("os.path.exists", return_value=True), mock.patch(
+            "builtins.open", side_effect=FileNotFoundError()
+        ):
+            for _ in range(3):
+                self.assertIs(cache.has_key("multirace"), False)
+
+    def test_has_key_race_does_not_remove_cache_dir(self):
+        """Ensure the race handling doesn't remove the cache directory as a side-effect."""
+        cache.set("keepdir", "value")
+        # Ensure dir exists before the race.
+        self.assertTrue(os.path.exists(self.dirname))
+        with mock.patch("os.path.exists", return_value=True), mock.patch(
+            "builtins.open", side_effect=FileNotFoundError()
+        ):
+            self.assertIs(cache.has_key("keepdir"), False)
+        # Directory should still exist after the operation.
+        self.assertTrue(os.path.exists(self.dirname))

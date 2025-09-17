@@ -1,0 +1,204 @@
+from unittest import mock
+from requests.exceptions import HTTPError
+import pytest
+from unittest import mock
+from requests.exceptions import HTTPError
+
+# Helper fake response to simulate requests responses used by linkcheck
+class FakeResponse:
+    def __init__(self, url, status_code=200, headers=None, content_chunks=None,
+                 history=None, method='GET'):
+        self.url = url
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._content_chunks = content_chunks or []
+        self.history = history or (history or [])
+        self.request = mock.MagicMock()
+        self.request.method = method
+
+    def iter_content(self, chunk_size=4096, decode_unicode=False):
+        # Return chunks as-is (strings) so the code path that checks
+        # for bytes doesn't need to decode in the tests.
+        for chunk in self._content_chunks:
+            yield chunk
+
+    def raise_for_status(self):
+        if 400 <= self.status_code:
+            err = HTTPError(f"{self.status_code} Client Error: Not Found for url: {self.url}")
+            err.response = self
+            raise err
+
+def enqueue_and_get_result(builder, uri, timeout=2.0):
+    # send one work item and wait for result from builder's workers
+    builder.wqueue.put((uri, 'docname', 1))
+    # read result
+    return builder.rqueue.get(timeout=timeout)
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_missing_when_head_reports_text_plain_but_get_has_no_anchor(app):
+    """
+    HEAD reports text/plain (non-HTML). The candidate patch incorrectly
+    returned 'working' without checking the anchor; the correct behavior
+    (gold patch) should GET and report anchor not found.
+    """
+    # HEAD returns text/plain, GET returns HTML without the anchor
+    head_resp = FakeResponse('https://example.com/page', status_code=200,
+                             headers={'content-type': 'text/plain'}, method='HEAD')
+    get_resp = FakeResponse('https://example.com/page', status_code=200,
+                            headers={'content-type': 'text/html'},
+                            content_chunks=['<html><body>No anchor here</body></html>'],
+                            method='GET')
+
+    with mock.patch('sphinx.builders.linkcheck.requests.head', return_value=head_resp), \
+         mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp):
+        uri = 'https://example.com/page#myanchor'
+        result = enqueue_and_get_result(app.builder, uri)
+        # result is (uri, docname, lineno, status, info, code)
+        assert result[0] == uri
+        assert result[3] == 'broken'
+        assert "Anchor 'myanchor' not found" in result[4]
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_missing_when_head_reports_text_plain_and_get_returns_404(app):
+    """
+    HEAD reports text/plain, GET returns 404. Gold patch will call raise_for_status()
+    on the GET and report the HTTP 404; the candidate incorrectly short-circuits and
+    returns 'working'.
+    """
+    head_resp = FakeResponse('https://example.com/data', status_code=200,
+                             headers={'content-type': 'text/plain'}, method='HEAD')
+    get_resp = FakeResponse('https://example.com/data', status_code=404,
+                            headers={'content-type': 'text/html'},
+                            content_chunks=['Not found'],
+                            method='GET')
+
+    with mock.patch('sphinx.builders.linkcheck.requests.head', return_value=head_resp), \
+         mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp):
+        uri = 'https://example.com/data#frag'
+        result = enqueue_and_get_result(app.builder, uri)
+        assert result[0] == uri
+        assert result[3] == 'broken'
+        # ensure we see HTTP error information (404) rather than an "Anchor '...' not found"
+        assert '404' in result[4]
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_head_raises_and_get_is_text_plain_missing_anchor(app):
+    """
+    If HEAD raises an HTTPError (so GET is used), and GET returns text/plain
+    without the anchor, gold patch (and original intended behavior) should check
+    the GET body and declare the anchor missing. Candidate incorrectly returns
+    'working' in this case.
+    """
+    # HEAD raising an HTTPError
+    head_exc = HTTPError("405 Method Not Allowed")
+    # create a fake response to attach to the exception (some code inspects err.response)
+    head_resp_for_exc = FakeResponse('https://example.com/res', status_code=405, method='HEAD')
+    head_exc.response = head_resp_for_exc
+
+    get_resp = FakeResponse('https://example.com/res', status_code=200,
+                            headers={'content-type': 'text/plain'},
+                            content_chunks=['plain text no anchor'], method='GET')
+
+    with mock.patch('sphinx.builders.linkcheck.requests.head', side_effect=head_exc), \
+         mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp):
+        uri = 'https://example.com/res#x'
+        result = enqueue_and_get_result(app.builder, uri)
+        assert result[0] == uri
+        assert result[3] == 'broken'
+        assert "Anchor 'x' not found" in result[4]
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_head_raises_and_get_returns_404(app):
+    """
+    HEAD raises, GET returns 404. The builder should propagate the HTTP 404
+    (gold behavior). Candidate incorrectly returns 'working' in some paths.
+    """
+    head_exc = HTTPError("405 Method Not Allowed")
+    head_resp_for_exc = FakeResponse('https://example.com/res2', status_code=405, method='HEAD')
+    head_exc.response = head_resp_for_exc
+
+    get_resp = FakeResponse('https://example.com/res2', status_code=404,
+                            headers={'content-type': 'text/html'},
+                            content_chunks=['Not found'], method='GET')
+
+    with mock.patch('sphinx.builders.linkcheck.requests.head', side_effect=head_exc), \
+         mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp):
+        uri = 'https://example.com/res2#f'
+        result = enqueue_and_get_result(app.builder, uri)
+        assert result[0] == uri
+        assert result[3] == 'broken'
+        assert '404' in result[4]
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_present_in_get_even_if_head_reports_text_plain(app):
+    """
+    HEAD reports text/plain, GET returns HTML that contains the anchor. Gold
+    behavior should find the anchor and return 'working'. Candidate may skip
+    checking and still return 'working' (so this test checks correctness).
+    """
+    head_resp = FakeResponse('https://example.com/ok', status_code=200,
+                             headers={'content-type': 'text/plain'}, method='HEAD')
+    get_resp = FakeResponse('https://example.com/ok', status_code=200,
+                            headers={'content-type': 'text/html'},
+                            content_chunks=['<a id="found"></a>'], method='GET')
+
+    with mock.patch('sphinx.builders.linkcheck.requests.head', return_value=head_resp), \
+         mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp):
+        uri = 'https://example.com/ok#found'
+        result = enqueue_and_get_result(app.builder, uri)
+        assert result[0] == uri
+        assert result[3] == 'working'
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_direct_get_anchor_missing_reports_anchor_not_found(app):
+    """
+    When check logic uses GET directly for anchor checking (the original/gold behavior),
+    and the GET returns 200 HTML without the anchor, we must get 'broken' with
+    anchor-not-found message.
+    """
+    get_resp = FakeResponse('https://example.org/page', status_code=200,
+                            headers={'content-type': 'text/html'},
+                            content_chunks=['<html><body>no such anchor</body></html>'],
+                            method='GET')
+    with mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp), \
+         mock.patch('sphinx.builders.linkcheck.requests.head', side_effect=HTTPError("simulate")):
+        uri = 'https://example.org/page#missing'
+        result = enqueue_and_get_result(app.builder, uri)
+        assert result[3] == 'broken'
+        assert "Anchor 'missing' not found" in result[4]
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_head_response_with_html_and_method_head_triggers_get_and_anchor_missing(app):
+    """
+    If a HEAD returns content-type text/html, candidate re-fetches with GET and
+    checks anchor; gold behavior will also check anchor. This test checks that
+    a HEAD->GET roundtrip and missing anchor results in 'broken'.
+    """
+    head_resp = FakeResponse('https://example.org/h', status_code=200,
+                             headers={'content-type': 'text/html'}, method='HEAD')
+    get_resp = FakeResponse('https://example.org/h', status_code=200,
+                            headers={'content-type': 'text/html'},
+                            content_chunks=['<html><body>no anchor here</body></html>'],
+                            method='GET')
+    with mock.patch('sphinx.builders.linkcheck.requests.head', return_value=head_resp), \
+         mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp):
+        uri = 'https://example.org/h#nope'
+        result = enqueue_and_get_result(app.builder, uri)
+        assert result[3] == 'broken'
+        assert "Anchor 'nope' not found" in result[4]
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_present_on_html_get_only(app):
+    """
+    When only GET is used to check the anchor and the anchor exists, status
+    should be 'working'.
+    """
+    get_resp = FakeResponse('https://example.org/onlyget', status_code=200,
+                            headers={'content-type': 'text/html'},
+                            content_chunks=['<div id="exists"></div>'],
+                            method='GET')
+    with mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp), \
+         mock.patch('sphinx.builders.linkcheck.requests.head', side_effect=HTTPError("simulate")):
+        uri = 'https://example.org/onlyget#exists'
+        result = enqueue_and_get_result(app.builder, uri)
+        assert result[3] == 'working'

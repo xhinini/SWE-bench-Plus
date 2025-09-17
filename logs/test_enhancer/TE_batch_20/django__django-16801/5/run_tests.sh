@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 model_fields.test_imagefield_llm.ImageFieldNoDimensionsRegressionTests.test_assign_file_instance_updates_dimensions model_fields.test_imagefield_llm.ImageFieldNoDimensionsRegressionTests.test_assign_none_clears_dimensions model_fields.test_imagefield_llm.ImageFieldNoDimensionsRegressionTests.test_assignment_opens_file model_fields.test_imagefield_llm.ImageFieldNoDimensionsRegressionTests.test_assignment_sets_image_attributes model_fields.test_imagefield_llm.ImageFieldNoDimensionsRegressionTests.test_constructor_opens_file model_fields.test_imagefield_llm.ImageFieldNoDimensionsRegressionTests.test_constructor_sets_image_attributes model_fields.test_imagefield_llm.ImageFieldNoDimensionsRegressionTests.test_create_sets_image_attributes model_fields.test_imagefield_llm.ImageFieldNoDimensionsRegressionTests.test_delete_clears_dimensions model_fields.test_imagefield_llm.ImageFieldNoDimensionsRegressionTests.test_post_init_not_connected_regression model_fields.test_imagefield_llm.ImageFieldNoDimensionsRegressionTests.test_save_sets_image_attributes
+coverage json -o coverage.json
+: '>>>>> End Test Output'

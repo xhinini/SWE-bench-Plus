@@ -1,0 +1,233 @@
+pytest
+asyncio
+threading
+time
+types
+from urllib.parse import urlparse
+from django.http import Http404
+import django
+from django.contrib.staticfiles import handlers as handlers_module
+from django.contrib.staticfiles.handlers import ASGIStaticFilesHandler, StaticFilesHandlerMixin
+import asyncio
+import threading
+import time
+import types
+import pytest
+from urllib.parse import urlparse
+from django.http import Http404
+import django
+from django.contrib.staticfiles import handlers as handlers_module
+from django.contrib.staticfiles.handlers import ASGIStaticFilesHandler, StaticFilesHandlerMixin
+
+# Ensure Django is configured minimally for imports (no DB needed for these tests)
+# If Django is already configured in the test environment this is a noop.
+try:
+    django.setup()
+except Exception:
+    # ignore if already configured or not necessary
+    pass
+
+@pytest.mark.asyncio
+async def test_mixin_get_response_async_runs_serve_in_threadpool():
+    class DummyHandler(StaticFilesHandlerMixin):
+        pass
+    handler = DummyHandler()
+    handler.base_url = urlparse('/static/')
+    request = types.SimpleNamespace(path='/static/file.txt')
+
+    def serve_fn(req):
+        # Record whether this ran on the main thread
+        req.called_in_main_thread = threading.current_thread() is threading.main_thread()
+        return "served-ok"
+
+    handler.serve = serve_fn
+    result = await handler.get_response_async(request)
+    assert result == "served-ok"
+    # The synchronous serve should be executed off the main thread (in a threadpool)
+    assert request.called_in_main_thread is False
+
+@pytest.mark.asyncio
+async def test_mixin_get_response_async_uses_thread_for_response_for_exception():
+    class DummyHandler(StaticFilesHandlerMixin):
+        pass
+    handler = DummyHandler()
+    handler.base_url = urlparse('/static/')
+    request = types.SimpleNamespace(path='/static/missing.txt')
+
+    def serve_fn(req):
+        # Raise the Django Http404 to force the exception handling path
+        raise Http404("not found")
+
+    # Replace the serve implementation
+    handler.serve = serve_fn
+
+    # Monkeypatch the response_for_exception used by the handlers module so we can inspect thread
+    called = {}
+    def fake_response_for_exception(req, exc):
+        # Record whether this ran on the main thread
+        called['in_main_thread'] = threading.current_thread() is threading.main_thread()
+        return "handled-404"
+
+    # Temporary patch the handler's reference to response_for_exception
+    original = handlers_module.response_for_exception
+    handlers_module.response_for_exception = fake_response_for_exception
+    try:
+        result = await handler.get_response_async(request)
+    finally:
+        handlers_module.response_for_exception = original
+    assert result == "handled-404"
+    # The exception handler should be invoked off the main thread (in a threadpool)
+    assert called['in_main_thread'] is False
+
+@pytest.mark.asyncio
+async def test_asgi_handler_get_response_async_runs_serve_in_threadpool():
+    # ASGIStaticFilesHandler wraps another app but exposes get_response_async via the mixin
+    async def dummy_app(scope, receive, send):
+        # not used in this test
+        return None
+    handler = ASGIStaticFilesHandler(dummy_app)
+    handler.base_url = urlparse('/static/')
+    request = types.SimpleNamespace(path='/static/asset.txt')
+
+    def serve_fn(req):
+        req.called_in_main_thread = threading.current_thread() is threading.main_thread()
+        return "asgi-served"
+
+    handler.serve = serve_fn
+    result = await handler.get_response_async(request)
+    assert result == "asgi-served"
+    assert request.called_in_main_thread is False
+
+@pytest.mark.asyncio
+async def test_asgi_handler_get_response_async_handles_404_in_threadpool():
+    async def dummy_app(scope, receive, send):
+        return None
+    handler = ASGIStaticFilesHandler(dummy_app)
+    handler.base_url = urlparse('/static/')
+    request = types.SimpleNamespace(path='/static/missing.txt')
+
+    def serve_fn(req):
+        raise Http404("not found")
+    handler.serve = serve_fn
+
+    called = {}
+    def fake_response_for_exception(req, exc):
+        called['in_main_thread'] = threading.current_thread() is threading.main_thread()
+        return "asgi-handled-404"
+
+    original = handlers_module.response_for_exception
+    handlers_module.response_for_exception = fake_response_for_exception
+    try:
+        result = await handler.get_response_async(request)
+    finally:
+        handlers_module.response_for_exception = original
+    assert result == "asgi-handled-404"
+    assert called['in_main_thread'] is False
+
+def test_get_response_runs_serve_on_main_thread_sync():
+    # The synchronous get_response should call serve on the calling thread (main thread).
+    class DummyHandler(StaticFilesHandlerMixin):
+        pass
+    handler = DummyHandler()
+    handler.base_url = urlparse('/static/')
+    request = types.SimpleNamespace(path='/static/file.txt')
+
+    def serve_fn(req):
+        req.called_in_main_thread = threading.current_thread() is threading.main_thread()
+        return "sync-served"
+
+    handler.serve = serve_fn
+    result = handler.get_response(request)
+    assert result == "sync-served"
+    # sync get_response should run on the main thread
+    assert request.called_in_main_thread is True
+
+def test_asgi_handler_get_response_runs_serve_on_main_thread_sync():
+    # The mixin's synchronous get_response should still execute on the main thread
+    async def dummy_app(scope, receive, send):
+        return None
+    handler = ASGIStaticFilesHandler(dummy_app)
+    handler.base_url = urlparse('/static/')
+    request = types.SimpleNamespace(path='/static/file2.txt')
+
+    def serve_fn(req):
+        req.called_in_main_thread = threading.current_thread() is threading.main_thread()
+        return "asgi-sync-served"
+
+    handler.serve = serve_fn
+    result = handler.get_response(request)
+    assert result == "asgi-sync-served"
+    assert request.called_in_main_thread is True
+
+@pytest.mark.asyncio
+async def test_concurrent_get_response_async_does_not_block_event_loop():
+    # Ensure that a long blocking serve scheduled via get_response_async does not block the event loop.
+    class DummyHandler(StaticFilesHandlerMixin):
+        pass
+    handler = DummyHandler()
+    handler.base_url = urlparse('/static/')
+
+    # Long blocking serve: simulates a slow disk operation by sleeping
+    def long_serve(req):
+        req.thread_name = threading.current_thread().name
+        time.sleep(0.25)
+        return "long-done"
+
+    # Short serve returns immediately
+    def short_serve(req):
+        req.thread_name = threading.current_thread().name
+        return "short-done"
+
+    # We'll run both in parallel and ensure the short one finishes before the long one completes.
+    handler_long = DummyHandler()
+    handler_long.base_url = urlparse('/static/')
+    handler_long.serve = long_serve
+    handler_short = DummyHandler()
+    handler_short.base_url = urlparse('/static/')
+    handler_short.serve = short_serve
+
+    req_long = types.SimpleNamespace(path='/static/long.txt')
+    req_short = types.SimpleNamespace(path='/static/short.txt')
+
+    task_long = asyncio.create_task(handler_long.get_response_async(req_long))
+    # small delay to ensure long task has been scheduled
+    await asyncio.sleep(0.01)
+    task_short = asyncio.create_task(handler_short.get_response_async(req_short))
+
+    done, pending = await asyncio.wait({task_long, task_short}, timeout=1.0)
+    assert task_short in done, "short task should complete promptly (not blocked by long serve)"
+    assert task_long in done, "long task should eventually complete"
+    assert task_short.result() == "short-done"
+    assert task_long.result() == "long-done"
+    # Both serves should run off the main thread (threadpool), so thread names shouldn't be "MainThread"
+    assert req_short.thread_name != "MainThread"
+    assert req_long.thread_name != "MainThread"
+
+@pytest.mark.asyncio
+async def test_exception_response_for_exception_threading_multiple_calls():
+    # Ensure repeated exception handling calls are executed off the main thread
+    class DummyHandler(StaticFilesHandlerMixin):
+        pass
+    handler = DummyHandler()
+    handler.base_url = urlparse('/static/')
+
+    def serve_fn(req):
+        raise Http404("boom")
+    handler.serve = serve_fn
+
+    thread_names = []
+    def fake_response_for_exception(req, exc):
+        thread_names.append(threading.current_thread().name)
+        return f"handled-{len(thread_names)}"
+
+    original = handlers_module.response_for_exception
+    handlers_module.response_for_exception = fake_response_for_exception
+    try:
+        # make multiple concurrent calls
+        tasks = [asyncio.create_task(handler.get_response_async(types.SimpleNamespace(path=f'/static/{i}'))) for i in range(3)]
+        results = await asyncio.gather(*tasks)
+    finally:
+        handlers_module.response_for_exception = original
+    assert results == ["handled-1", "handled-2", "handled-3"]
+    # All response_for_exception calls should run in worker threads (not main thread)
+    assert all(name != "MainThread" for name in thread_names)

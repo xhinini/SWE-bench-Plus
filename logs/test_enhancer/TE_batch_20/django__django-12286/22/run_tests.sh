@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 check_framework.test_translation_llm.TranslationConsistencyImportIsolationTests._call_check_with_broken_trans_real check_framework.test_translation_llm.TranslationConsistencyImportIsolationTests.test_case_insensitive_region_matches check_framework.test_translation_llm.TranslationConsistencyImportIsolationTests.test_empty_languages_is_inconsistent check_framework.test_translation_llm.TranslationConsistencyImportIsolationTests.test_exact_match_language_is_considered_consistent check_framework.test_translation_llm.TranslationConsistencyImportIsolationTests.test_missing_language_in_languages_is_inconsistent check_framework.test_translation_llm.TranslationConsistencyImportIsolationTests.test_multiple_languages_list_includes_target check_framework.test_translation_llm.TranslationConsistencyImportIsolationTests.test_multiple_languages_list_missing_target check_framework.test_translation_llm.TranslationConsistencyImportIsolationTests.test_primary_language_matches_when_languages_contains_region_variant check_framework.test_translation_llm.TranslationConsistencyImportIsolationTests.test_region_code_case_normalization check_framework.test_translation_llm.TranslationConsistencyImportIsolationTests.test_script_subtag_matches check_framework.test_translation_llm.TranslationConsistencyImportIsolationTests.test_variant_tag_matches
+coverage json -o coverage.json
+: '>>>>> End Test Output'

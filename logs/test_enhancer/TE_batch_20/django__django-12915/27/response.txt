@@ -1,0 +1,247 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests verify the async path of StaticFilesHandlerMixin.get_response_async uses
+  asgiref.sync.sync_to_async to run the synchronous serving and exception-handling
+  functions. The model-generated patch omitted wrapping calls with sync_to_async; the
+  tests detect that by monkeypatching the module-level sync_to_async with a wrapper
+  that records which callables were wrapped and what arguments were passed. The tests
+  cover successful responses, Http404 handling (which should invoke response_for_exception
+  via sync_to_async), propagation of non-Http404 exceptions, handling of async serve
+  callables, and repeated calls/counting. Under the incorrect model patch the assertions
+  about sync_to_async usage will fail; under the correct patch they pass.
+test_code: |
+  import asyncio
+  import importlib
+  from types import SimpleNamespace
+  import pytest
+  from django.http import Http404
+  
+  handlers = importlib.import_module("django.contrib.staticfiles.handlers")
+  
+  class DummyHandler(handlers.StaticFilesHandlerMixin):
+      def __init__(self):
+          # base_url is used as self.base_url[2] for the path and self.base_url[1] for netloc.
+          # Provide a simple 3-tuple compatible with parsing results.
+          self.base_url = ("", "", "/static/")
+  
+  def make_request(path="/static/test.txt"):
+      return SimpleNamespace(path=path)
+  
+  # Helper to create a fake sync_to_async that records calls and returns an awaitable wrapper.
+  def make_recording_sync_to_async(record):
+      def fake_sync_to_async(func):
+          # Store the original function for identification
+          record.append(("wrapped", func))
+          def wrapper(*args, **kwargs):
+              # When the returned callable is invoked, record the call and return a coroutine
+              record.append(("called", func, args, kwargs))
+              async def coro():
+                  # Indicate execution when awaited
+                  record.append(("awaited", func))
+                  return func(*args, **kwargs)
+              return coro()
+          return wrapper
+      return fake_sync_to_async
+  
+  def test_get_response_async_calls_sync_to_async_on_success():
+      record = []
+      # Patch module-level sync_to_async
+      handlers.sync_to_async = make_recording_sync_to_async(record)
+  
+      handler = DummyHandler()
+  
+      def serve(request):
+          return "OK"
+      handler.serve = serve
+  
+      resp = asyncio.get_event_loop().run_until_complete(handler.get_response_async(make_request()))
+      assert resp == "OK"
+      # Ensure sync_to_async wrapped the serve function and that it was called & awaited
+      # First entry: wrapped, then called, then awaited
+      types = [r[0] for r in record]
+      assert "wrapped" in types
+      assert "called" in types
+      assert "awaited" in types
+      # Confirm the wrapped function is our serve
+      wrapped_funcs = [r[1] for r in record if r[0] == "wrapped"]
+      assert serve in wrapped_funcs
+  
+  def test_get_response_async_uses_sync_to_async_for_http404_and_calls_response_for_exception():
+      record = []
+      handlers.sync_to_async = make_recording_sync_to_async(record)
+  
+      handler = DummyHandler()
+  
+      def serve(request):
+          raise Http404("not found")
+      handler.serve = serve
+  
+      # Patch response_for_exception to return a specific sentinel
+      def fake_response_for_exception(request, exc):
+          return "NOTFOUND"
+      handlers.response_for_exception = fake_response_for_exception
+  
+      resp = asyncio.get_event_loop().run_until_complete(handler.get_response_async(make_request()))
+      assert resp == "NOTFOUND"
+      # Expect sync_to_async to have wrapped both serve and response_for_exception
+      wrapped = [r[1] for r in record if r[0] == "wrapped"]
+      assert serve in wrapped
+      assert fake_response_for_exception in wrapped
+      # Also expect that response_for_exception was invoked with the request and the exception
+      called = [r for r in record if r[0] == "called" and r[1] is fake_response_for_exception]
+      assert called, "response_for_exception was not wrapped/called via sync_to_async"
+      # Check the args include a request-like object and an Http404 instance
+      _, _, args, kwargs = called[0]
+      assert isinstance(args[0], SimpleNamespace)
+      assert isinstance(args[1], Http404)
+  
+  def test_get_response_async_propagates_non_http404_exceptions_and_still_uses_sync_to_async():
+      record = []
+      handlers.sync_to_async = make_recording_sync_to_async(record)
+  
+      handler = DummyHandler()
+  
+      def serve(request):
+          raise ValueError("boom")
+      handler.serve = serve
+  
+      with pytest.raises(ValueError):
+          asyncio.get_event_loop().run_until_complete(handler.get_response_async(make_request()))
+  
+      # Even though an exception propagated, sync_to_async should have been used to run serve
+      wrapped_funcs = [r[1] for r in record if r[0] == "wrapped"]
+      assert serve in wrapped_funcs
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_async_serve_callable_is_still_wrapped_by_sync_to_async():
+      record = []
+      handlers.sync_to_async = make_recording_sync_to_async(record)
+  
+      handler = DummyHandler()
+  
+      async def serve(request):
+          return "ASYNC_OK"
+      # Even if serve is async, the implementation should still call sync_to_async on it.
+      handler.serve = serve
+  
+      resp = await handler.get_response_async(make_request())
+      assert resp == "ASYNC_OK"
+      wrapped_funcs = [r[1] for r in record if r[0] == "wrapped"]
+      assert serve in wrapped_funcs
+  
+  def test_multiple_consecutive_calls_record_all_sync_to_async_usages():
+      record = []
+      handlers.sync_to_async = make_recording_sync_to_async(record)
+  
+      handler = DummyHandler()
+  
+      def serve(request):
+          return "X"
+      handler.serve = serve
+  
+      loop = asyncio.get_event_loop()
+      res1 = loop.run_until_complete(handler.get_response_async(make_request()))
+      res2 = loop.run_until_complete(handler.get_response_async(make_request("/static/other")))
+      assert res1 == "X" and res2 == "X"
+      # Two calls to serve should have been recorded
+      called_wrappers = [r for r in record if r[0] == "called" and r[1] is serve]
+      assert len(called_wrappers) == 2
+  
+  def test_response_for_exception_arguments_are_preserved_through_sync_to_async_wrapper():
+      record = []
+      handlers.sync_to_async = make_recording_sync_to_async(record)
+  
+      handler = DummyHandler()
+  
+      def serve(request):
+          raise Http404("missing file")
+      handler.serve = serve
+  
+      def fake_response_for_exception(request, exc):
+          # inspect and return a tuple of (path, exc_msg)
+          return (request.path, str(exc))
+      handlers.response_for_exception = fake_response_for_exception
+  
+      resp = asyncio.get_event_loop().run_until_complete(handler.get_response_async(make_request("/static/a")))
+      assert resp == ("/static/a", "missing file")
+      # Ensure response_for_exception was wrapped and awaited
+      called = [r for r in record if r[0] == "called" and r[1] is fake_response_for_exception]
+      assert called, "response_for_exception not invoked via sync_to_async"
+  
+  def test_get_response_async_does_not_call_response_for_exception_on_success():
+      record = []
+      handlers.sync_to_async = make_recording_sync_to_async(record)
+  
+      handler = DummyHandler()
+  
+      def serve(request):
+          return "OKAY"
+      handler.serve = serve
+  
+      # Ensure response_for_exception is a sentinel that would fail if called
+      def fail_response_for_exception(request, exc):
+          raise AssertionError("response_for_exception should not be called")
+      handlers.response_for_exception = fail_response_for_exception
+  
+      resp = asyncio.get_event_loop().run_until_complete(handler.get_response_async(make_request()))
+      assert resp == "OKAY"
+      # Ensure response_for_exception was not wrapped/called
+      wrapped_funcs = [r[1] for r in record if r[0] == "wrapped"]
+      assert fail_response_for_exception not in wrapped_funcs
+  
+  def test_get_response_async_receives_correct_request_object_and_path():
+      record = []
+      handlers.sync_to_async = make_recording_sync_to_async(record)
+  
+      handler = DummyHandler()
+  
+      def serve(request):
+          # return the path it received so we can verify the request passed through
+          return getattr(request, "path", None)
+      handler.serve = serve
+  
+      req = make_request("/static/special.txt")
+      resp = asyncio.get_event_loop().run_until_complete(handler.get_response_async(req))
+      assert resp == "/static/special.txt"
+      # Ensure serve was wrapped via sync_to_async
+      wrapped_funcs = [r[1] for r in record if r[0] == "wrapped"]
+      assert serve in wrapped_funcs
+  
+  def test_get_response_async_records_wrapping_order_when_exception_then_response_for_exception():
+      """
+      Confirm that when serve raises Http404 the order of wrapping is:
+      - serve wrapped and invoked
+      - response_for_exception wrapped and invoked
+      This ensures both are executed via sync_to_async under the correct patch.
+      """
+      record = []
+      handlers.sync_to_async = make_recording_sync_to_async(record)
+  
+      handler = DummyHandler()
+  
+      def serve(request):
+          raise Http404("ouch")
+      handler.serve = serve
+  
+      def fake_response_for_exception(request, exc):
+          return "HANDLED"
+      handlers.response_for_exception = fake_response_for_exception
+  
+      resp = asyncio.get_event_loop().run_until_complete(handler.get_response_async(make_request()))
+      assert resp == "HANDLED"
+      # Build the sequence of event types to check ordering
+      seq = [r[0] for r in record]
+      # Expect at least: wrapped (serve), called (serve), awaited (serve), wrapped (response_for_exception), called (response_for_exception), awaited (response_for_exception)
+      assert "wrapped" in seq
+      assert "called" in seq
+      assert "awaited" in seq
+      # Verify that the first wrapped corresponds to serve
+      first_wrapped = record[0][1]
+      assert first_wrapped is serve
+new_imports_code: |
+  import asyncio
+  import importlib
+  from types import SimpleNamespace
+  import pytest
+  from django.http import Http404

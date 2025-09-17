@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_after_full_clean_direct_call forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_called_twice_returns_same_instance forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_identity_on_formset_with_non_form_error forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_identity_on_valid_formset forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_mutation_reflects_internal_on_formset_with_non_form_error forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_mutation_reflects_internal_on_valid_formset forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_on_missing_management_form_keeps_instance forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_preserves_custom_errorclass_instance forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_non_form_errors_preserves_custom_errorclass_mutation
+coverage json -o coverage.json
+: '>>>>> End Test Output'

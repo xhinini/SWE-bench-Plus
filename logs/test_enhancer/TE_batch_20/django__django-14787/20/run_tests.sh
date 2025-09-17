@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 decorators.tests_llm.MethodDecoratorFunctionTypeTests.test_class_level_name_decoration_receives_function_for_various_kinds decorators.tests_llm.MethodDecoratorFunctionTypeTests.test_decorator_receives_function_for___call__special_method decorators.tests_llm.MethodDecoratorFunctionTypeTests.test_decorator_receives_function_for_classmethod decorators.tests_llm.MethodDecoratorFunctionTypeTests.test_decorator_receives_function_for_instance_method decorators.tests_llm.MethodDecoratorFunctionTypeTests.test_decorator_receives_function_for_staticmethod decorators.tests_llm.MethodDecoratorFunctionTypeTests.test_decorator_receives_function_when_decorating_on_class_via_name decorators.tests_llm.MethodDecoratorFunctionTypeTests.test_decorator_receives_function_with_descriptor_wrappers decorators.tests_llm.MethodDecoratorFunctionTypeTests.test_instance_of_callable_decorator_receives_function decorators.tests_llm.MethodDecoratorFunctionTypeTests.test_tuple_of_decorators_each_receive_function decorators.tests_llm.MethodDecoratorFunctionTypeTests.test_wraps_based_decorator_sets_wrapped_to_a_function
+coverage json -o coverage.json
+: '>>>>> End Test Output'

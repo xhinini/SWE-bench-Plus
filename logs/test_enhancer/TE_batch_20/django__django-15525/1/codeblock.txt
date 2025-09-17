@@ -1,0 +1,187 @@
+from types import SimpleNamespace
+import unittest
+from django.core.serializers.base import build_instance
+from types import SimpleNamespace
+import unittest
+
+from django.core.serializers.base import build_instance
+
+class DummyDoesNotExist(Exception):
+    pass
+
+def make_fake_model(
+    *,
+    pk_attname="id",
+    pk_to_python=lambda v: int(v),
+    manager_has_get_by_natural_key=True,
+    manager_result_pk="123",
+    manager_raises_doesnotexist=False,
+    natural_key_func=None,
+):
+    """
+    Returns (ModelClass, manager_instance) where:
+    - ModelClass._meta.pk.attname == pk_attname
+    - ModelClass._meta.pk.to_python calls pk_to_python
+    - ModelClass._meta.default_manager implements db_manager(...).get_by_natural_key(...)
+    - natural_key_func(instance) is used for natural_key (if provided),
+      else returns tuple ('nk',)
+    """
+    class FakePK:
+        def __init__(self, attname, to_python_func):
+            self.attname = attname
+            self._to_python = to_python_func
+
+        def to_python(self, value):
+            return self._to_python(value)
+
+    class Manager:
+        def __init__(self):
+            self.db = None
+            self.last_args = None
+
+        def db_manager(self, db):
+            self.db = db
+            return self
+
+        if manager_has_get_by_natural_key:
+            def get_by_natural_key(self, *args):
+                self.last_args = args
+                if manager_raises_doesnotexist:
+                    raise DummyDoesNotExist()
+                return SimpleNamespace(pk=manager_result_pk)
+
+    class Meta:
+        pass
+
+    def default_natural_key(self):
+        if natural_key_func is not None:
+            return natural_key_func(self)
+        return ("nk",)
+
+    class FakeModel:
+        DoesNotExist = DummyDoesNotExist
+        _meta = Meta()
+        _meta.default_manager = Manager()
+        _meta.pk = FakePK(pk_attname, pk_to_python)
+
+        def __init__(self, **kwargs):
+            # mimic Django model state attribute used in the patch
+            self._state = SimpleNamespace(db=None)
+            for k, v in kwargs.items():
+                setattr(self, k, v)
+
+        natural_key = default_natural_key
+
+    return FakeModel, FakeModel._meta.default_manager
+
+class BuildInstanceTests(unittest.TestCase):
+    def test_pk_present_no_natural_key_called(self):
+        # If pk present, natural_key should not be called.
+        called = {"nk": False}
+        def nk(self):
+            called["nk"] = True
+            return ("should_not",)
+        Model, manager = make_fake_model(natural_key_func=nk)
+        data = {"id": 999, "name": "obj"}
+        inst = build_instance(Model, data.copy(), db="default")
+        self.assertEqual(getattr(inst, "id"), 999)
+        self.assertFalse(called["nk"])
+
+    def test_pk_missing_with_natural_key_uses_db_and_sets_pk(self):
+        # natural_key uses self._state.db and would error if _state.db is None.
+        def nk(self):
+            # Will raise AttributeError if _state.db is None because None.upper() fails.
+            return (self._state.db.upper(), getattr(self, "name", "no_name"))
+        Model, manager = make_fake_model(
+            natural_key_func=nk,
+            manager_result_pk="42",
+            pk_to_python=lambda v: int(v),
+        )
+        data = {"name": "example"}
+        inst = build_instance(Model, data, db="otherdb")
+        # pk should have been set from manager result and converted by to_python
+        self.assertEqual(getattr(inst, "id"), 42)
+        # manager.db_manager should have been called with provided db
+        self.assertEqual(manager.db, "otherdb")
+        # manager.get_by_natural_key should have been passed natural key that uses the db
+        self.assertEqual(manager.last_args[0], "OTHERDB")
+
+    def test_default_manager_without_get_by_natural_key(self):
+        # If default_manager lacks get_by_natural_key, build_instance should return Model(**data)
+        Model, manager = make_fake_model(manager_has_get_by_natural_key=False)
+        data = {"name": "no_pk_here"}
+        inst = build_instance(Model, data.copy(), db="any")
+        # No id attribute set (pk missing)
+        self.assertFalse(hasattr(inst, "id"))
+
+    def test_get_by_natural_key_raises_doesnotexist_is_handled(self):
+        # If manager raises DoesNotExist, build_instance should ignore and return instance without pk set.
+        Model, manager = make_fake_model(
+            manager_raises_doesnotexist=True,
+            natural_key_func=lambda self: ("nk",)
+        )
+        data = {"name": "abc"}
+        inst = build_instance(Model, data.copy(), db="any")
+        self.assertFalse(hasattr(inst, "id"))
+
+    def test_to_python_called_on_pk(self):
+        captured = {"called_with": None}
+        def to_python(v):
+            captured["called_with"] = v
+            return int(v) + 1
+        Model, manager = make_fake_model(pk_to_python=to_python, manager_result_pk="7")
+        data = {"name": "nm"}
+        inst = build_instance(Model, data, db="db1")
+        # to_python must have been called with the raw manager pk
+        self.assertEqual(captured["called_with"], "7")
+        # Converted value applied to instance
+        self.assertEqual(getattr(inst, "id"), 8)
+
+    def test_natural_key_exception_other_than_attribute_propagates(self):
+        # If natural_key raises ValueError, it should propagate (not be swallowed).
+        def nk(self):
+            raise ValueError("boom")
+        Model, manager = make_fake_model(natural_key_func=nk)
+        with self.assertRaises(ValueError):
+            build_instance(Model, {}, db="dbx")
+
+    def test_calls_db_manager_with_provided_db(self):
+        # Ensure db_manager is called with provided db name
+        Model, manager = make_fake_model(natural_key_func=lambda self: ("n",))
+        data = {"name": "n"}
+        build_instance(Model, data, db="somedb")
+        self.assertEqual(manager.db, "somedb")
+
+    def test_natural_key_with_multiple_values_passed_to_get_by_natural_key(self):
+        # natural_key returns multiple components; ensure they're forwarded
+        def nk(self):
+            return ("one", "two", "three")
+        Model, manager = make_fake_model(natural_key_func=nk)
+        data = {"name": "n"}
+        build_instance(Model, data, db="dbx")
+        self.assertEqual(manager.last_args, ("one", "two", "three"))
+
+    def test_build_instance_mutates_data_with_converted_pk(self):
+        # data dict passed in should be mutated to include converted pk
+        Model, manager = make_fake_model(manager_result_pk="55", pk_to_python=lambda v: int(v))
+        data = {"name": "mut"}
+        returned = build_instance(Model, data, db="dbz")
+        # data should now contain id field set
+        self.assertIn("id", data)
+        self.assertEqual(data["id"], 55)
+        self.assertEqual(getattr(returned, "id"), 55)
+
+    def test_natural_key_accessing_state_db_without_setting_would_fail_but_build_instance_sets_it(self):
+        # A natural_key that uses self._state.db (calling upper()) would raise when _state.db is None.
+        # build_instance should set _state.db so natural_key succeeds.
+        def nk(self):
+            # If self._state.db is None, this would raise AttributeError.
+            return (self._state.db.upper(),)
+        Model, manager = make_fake_model(natural_key_func=nk, manager_result_pk="9", pk_to_python=lambda v: int(v))
+        data = {}
+        inst = build_instance(Model, data, db="mydb")
+        # Should have set pk and not raised AttributeError
+        self.assertEqual(getattr(inst, "id"), 9)
+
+if __name__ == "__main__":
+    unittest.main()

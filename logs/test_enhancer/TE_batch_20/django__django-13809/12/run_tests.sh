@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.ManageRunserverSkipChecksTests.setUp admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_inner_run_direct_no_skip_calls_both admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_inner_run_direct_skip_calls_check_migrations admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_no_skip_calls_both_checks_nonreloader admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_no_skip_with_reloader_calls_both_checks admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_parser_has_skip_checks_option admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_skip_checks_calls_check_migrations_when_skipped admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_skip_checks_does_not_print_skipping_message_with_reloader admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_skip_checks_inner_run_does_not_call_check_but_calls_check_migrations admin_scripts.tests_llm.ManageRunserverSkipChecksTests.test_skip_checks_with_reloader_calls_check_migrations
+coverage json -o coverage.json
+: '>>>>> End Test Output'

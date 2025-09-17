@@ -1,0 +1,152 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests assert that iter_modules_and_files() and sys_path_directories()
+  tolerate Path.resolve() raising ValueError (e.g. due to embedded null bytes or
+  other ValueError messages) and continue processing other paths rather than
+  propagating the exception. The golden patch swallows ValueError and logs it;
+  the candidate (model) patch re-raises ValueError unless its message is
+  'embedded null byte'. The tests simulate various ValueError messages and
+  path sources (extra_files as strings, Path instances, module origins and
+  sys.path entries) to ensure the functions ignore problematic paths and
+  still return expected results for valid paths.
+test_code: |
+  import sys
+  import tempfile
+  import os
+  import types
+  from pathlib import Path
+  from unittest import mock
+  
+  from django.test import SimpleTestCase
+  from django.test.utils import extend_sys_path
+  from django.utils import autoreload
+  
+  
+  class ValueErrorPathHandlingTests(SimpleTestCase):
+      def setUp(self):
+          # Ensure cache doesn't interfere between tests.
+          autoreload.iter_modules_and_files.cache_clear()
+  
+      def tearDown(self):
+          autoreload.iter_modules_and_files.cache_clear()
+  
+      def _patch_resolve_to_raise_for_null(self, message):
+          """
+          Patch Path.resolve so that it raises ValueError(message) for paths
+          containing a null byte and delegates to the real resolve otherwise.
+          """
+          original_resolve = Path.resolve
+  
+          def _side_effect(self, *args, **kwargs):
+              if "\x00" in str(self):
+                  raise ValueError(message)
+              return original_resolve(self, *args, **kwargs)
+  
+          return mock.patch.object(Path, "resolve", side_effect=_side_effect)
+  
+      def test_iter_modules_and_files_ignores_value_error_for_string_extra(self):
+          bad_path = "/tmp/bad\0file.py"
+          # Pass the bad path as a string in extra_files.
+          with self._patch_resolve_to_raise_for_null("some random error"):
+              # Should not raise and should return a frozenset (empty since file isn't real).
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+          self.assertEqual(result, frozenset())
+  
+      def test_iter_modules_and_files_ignores_value_error_for_path_extra(self):
+          bad_path = Path("/tmp/bad\0file.py")
+          with self._patch_resolve_to_raise_for_null("another message"):
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+          self.assertEqual(result, frozenset())
+  
+      def test_iter_modules_and_files_ignores_value_error_from_module_origin(self):
+          # Create a fake module whose __spec__.origin contains a null byte.
+          fake_module = types.ModuleType("fake_module")
+          fake_spec = types.SimpleNamespace(has_location=True, origin="/tmp/bad\0origin.py", loader=object())
+          fake_module.__spec__ = fake_spec
+          with self._patch_resolve_to_raise_for_null("module origin error"):
+              result = autoreload.iter_modules_and_files((fake_module,), frozenset())
+          self.assertEqual(result, frozenset())
+  
+      def test_iter_modules_and_files_keeps_good_paths_when_others_raise(self):
+          # Create a temporary file that resolves correctly.
+          tmpdir = tempfile.TemporaryDirectory()
+          try:
+              good_file = Path(tmpdir.name) / "good.py"
+              good_file.parent.mkdir(parents=True, exist_ok=True)
+              good_file.write_text("# good")
+              bad_path = "/tmp/bad\0file.py"
+              with self._patch_resolve_to_raise_for_null("mix error"):
+                  # Pass both a good Path and a bad string; result should contain the good one.
+                  result = autoreload.iter_modules_and_files((), frozenset([str(good_file), bad_path]))
+              self.assertIn(good_file.resolve(), result)
+          finally:
+              tmpdir.cleanup()
+  
+      def test_sys_path_directories_ignores_value_error_for_string_entry(self):
+          bad_entry = "/tmp/bad\0entry"
+          # Add also a valid temporary directory to ensure it is returned.
+          tmpdir = tempfile.TemporaryDirectory()
+          try:
+              good_dir = Path(tmpdir.name).resolve()
+              with mock.patch.object(sys, "path", sys.path + [bad_entry, str(good_dir)]):
+                  with self._patch_resolve_to_raise_for_null("sys.path error"):
+                      dirs = list(autoreload.sys_path_directories())
+              # The bad entry should be ignored and no exception should be raised.
+              self.assertIn(good_dir, dirs)
+              self.assertTrue(all(isinstance(p, Path) for p in dirs))
+          finally:
+              tmpdir.cleanup()
+  
+      def test_sys_path_directories_ignores_value_error_with_different_message(self):
+          bad_entry = "/tmp/other\0bad"
+          tmpdir = tempfile.TemporaryDirectory()
+          try:
+              good_dir = Path(tmpdir.name).resolve()
+              # Use a different ValueError message to ensure arbitrary messages are tolerated.
+              with mock.patch.object(sys, "path", sys.path + [bad_entry, str(good_dir)]):
+                  with self._patch_resolve_to_raise_for_null("totally unrelated message"):
+                      dirs = list(autoreload.sys_path_directories())
+              self.assertIn(good_dir, dirs)
+          finally:
+              tmpdir.cleanup()
+  
+      def test_sys_path_directories_swallows_embedded_null_byte_message(self):
+          # Specifically test the classic embedded null byte message.
+          bad_entry = "/tmp/embedded\0null"
+          tmpdir = tempfile.TemporaryDirectory()
+          try:
+              good_dir = Path(tmpdir.name).resolve()
+              # Simulate ValueError('embedded null byte')
+              with mock.patch.object(sys, "path", sys.path + [bad_entry, str(good_dir)]):
+                  with self._patch_resolve_to_raise_for_null("embedded null byte"):
+                      dirs = list(autoreload.sys_path_directories())
+              self.assertIn(good_dir, dirs)
+          finally:
+              tmpdir.cleanup()
+  
+      def test_iter_modules_and_files_ignores_value_error_with_embedded_null_byte_message(self):
+          # Ensure embedded null byte message is also tolerated for iter_modules_and_files.
+          bad_path = Path("/tmp/embedded\0file.py")
+          with self._patch_resolve_to_raise_for_null("embedded null byte"):
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+          self.assertEqual(result, frozenset())
+  
+      def test_iter_modules_and_files_returns_nonempty_when_some_paths_ok(self):
+          # Ensure that when one path raises and another is valid, the valid one is returned.
+          tmpdir = tempfile.TemporaryDirectory()
+          try:
+              good_file = Path(tmpdir.name) / "ok.py"
+              good_file.write_text("x=1")
+              bad_path = Path("/tmp/bad\0file.py")
+              with self._patch_resolve_to_raise_for_null("mixed cases"):
+                  result = autoreload.iter_modules_and_files((), frozenset([good_file, bad_path]))
+              self.assertIn(good_file.resolve(), result)
+          finally:
+              tmpdir.cleanup()
+new_imports_code: |
+  import sys
+  from pathlib import Path
+  import types
+  import tempfile
+  from unittest import mock

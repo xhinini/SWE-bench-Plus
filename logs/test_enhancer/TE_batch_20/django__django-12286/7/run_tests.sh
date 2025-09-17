@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 check_framework.test_translation_llm.TranslationConsistencyImportTests._assert_consistent_result check_framework.test_translation_llm.TranslationConsistencyImportTests._make_fallback_get_supported_language_variant check_framework.test_translation_llm.TranslationConsistencyImportTests._reload_checks_with_trans_real_missing_symbol check_framework.test_translation_llm.TranslationConsistencyImportTests._restore_modules_and_reload_checks check_framework.test_translation_llm.TranslationConsistencyImportTests.test_supported_language_in_languages_ca_es_valencia check_framework.test_translation_llm.TranslationConsistencyImportTests.test_supported_language_in_languages_en check_framework.test_translation_llm.TranslationConsistencyImportTests.test_supported_language_in_languages_en_us check_framework.test_translation_llm.TranslationConsistencyImportTests.test_supported_language_in_languages_fr_ca check_framework.test_translation_llm.TranslationConsistencyImportTests.test_supported_language_in_languages_zh_hans check_framework.test_translation_llm.TranslationConsistencyImportTests.test_supported_language_not_in_languages_es_419 check_framework.test_translation_llm.TranslationConsistencyImportTests.test_supported_language_not_in_languages_fr check_framework.test_translation_llm.TranslationConsistencyImportTests.test_supported_language_not_in_languages_mas check_framework.test_translation_llm.TranslationConsistencyImportTests.test_supported_language_not_in_languages_sgn_ase
+coverage json -o coverage.json
+: '>>>>> End Test Output'

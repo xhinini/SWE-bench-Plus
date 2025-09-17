@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.UserCreationFormM2MTests.test_accepts_int_and_string_ids_for_m2m_input auth_tests.test_forms_llm.UserCreationFormM2MTests.test_empty_m2m_input_results_in_no_relations auth_tests.test_forms_llm.UserCreationFormM2MTests.test_no_exception_and_no_m2m_saved_when_save_m2m_absent_but_field_present auth_tests.test_forms_llm.UserCreationFormM2MTests.test_password_is_hashed_on_save auth_tests.test_forms_llm.UserCreationFormM2MTests.test_save_commit_false_then_manual_save_m2m auth_tests.test_forms_llm.UserCreationFormM2MTests.test_save_m2m_called_after_instance_saved auth_tests.test_forms_llm.UserCreationFormM2MTests.test_save_without_m2m_method_does_not_raise auth_tests.test_forms_llm.UserCreationFormM2MTests.test_saves_many_to_many_field_on_commit_true auth_tests.test_forms_llm.UserCreationFormM2MTests.test_saves_multiple_m2m_values
+coverage json -o coverage.json
+: '>>>>> End Test Output'

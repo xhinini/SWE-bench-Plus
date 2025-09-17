@@ -1,0 +1,265 @@
+# No additional top-level imports required; tests use existing imports and standard library.
+from types import SimpleNamespace
+from unittest import mock
+
+from django.test import SimpleTestCase
+from django.db.backends.base.creation import BaseDatabaseCreation
+
+
+def _make_cm_tracker(calls):
+    """
+    Return a callable that provides a context manager which updates the
+    calls dict on __enter__/__exit__ so tests can assert the order.
+    """
+    def _cm():
+        class CM:
+            def __enter__(self_inner):
+                calls['entered'] += 1
+                calls['order'].append('enter')
+                return None
+            def __exit__(self_inner, exc_type, exc, tb):
+                calls['exited'] += 1
+                calls['order'].append('exit')
+                return False
+        return CM()
+    return _cm
+
+
+class TestDeserializeDbFromStringConstraintBehavior(SimpleTestCase):
+    databases = {'default'}
+
+    @mock.patch('django.core.serializers.deserialize')
+    def test_constraint_checks_disabled_called_single_object(self, mock_deserialize):
+        calls = {'entered': 0, 'exited': 0, 'order': []}
+        cm_provider = _make_cm_tracker(calls)
+
+        saved = []
+
+        class FakeObj:
+            def save(self_inner):
+                # Ensure the constraint context was entered before save
+                self.assertGreater(calls['entered'], 0)
+                saved.append('saved')
+
+        # Serializer yields a single object
+        mock_deserialize.side_effect = lambda *args, **kwargs: (o for o in [FakeObj()])
+
+        conn = SimpleNamespace(
+            alias='default',
+            constraint_checks_disabled=cm_provider,
+            check_constraints=mock.Mock(),
+        )
+        BaseDatabaseCreation(conn).deserialize_db_from_string('[]')
+
+        # Context entered and exited exactly once; check_constraints called once.
+        self.assertEqual(calls['entered'], 1)
+        self.assertEqual(calls['exited'], 1)
+        conn.check_constraints.assert_called_once()
+        self.assertEqual(saved, ['saved'])
+
+    @mock.patch('django.core.serializers.deserialize')
+    def test_check_constraints_called_single_object(self, mock_deserialize):
+        calls = {'entered': 0, 'exited': 0, 'order': []}
+        cm_provider = _make_cm_tracker(calls)
+
+        saved = []
+
+        class FakeObj:
+            def save(self_inner):
+                saved.append('ok')
+
+        mock_deserialize.side_effect = lambda *args, **kwargs: (o for o in [FakeObj()])
+
+        conn = SimpleNamespace(
+            alias='default',
+            constraint_checks_disabled=cm_provider,
+            check_constraints=mock.Mock(),
+        )
+        BaseDatabaseCreation(conn).deserialize_db_from_string('[]')
+
+        conn.check_constraints.assert_called_once()
+        self.assertEqual(saved, ['ok'])
+
+    @mock.patch('django.core.serializers.deserialize')
+    def test_both_methods_called_for_multiple_objects(self, mock_deserialize):
+        calls = {'entered': 0, 'exited': 0, 'order': []}
+        cm_provider = _make_cm_tracker(calls)
+
+        saved = []
+
+        class FakeObj:
+            def __init__(self, idx):
+                self.idx = idx
+            def save(self_inner):
+                # Ensure constraint context active
+                self.assertGreater(calls['entered'], 0)
+                saved.append(self_inner.idx)
+
+        objs = [FakeObj(i) for i in range(3)]
+        mock_deserialize.side_effect = lambda *args, **kwargs: (o for o in objs)
+
+        conn = SimpleNamespace(
+            alias='default',
+            constraint_checks_disabled=cm_provider,
+            check_constraints=mock.Mock(),
+        )
+        BaseDatabaseCreation(conn).deserialize_db_from_string('[]')
+
+        conn.check_constraints.assert_called_once()
+        self.assertEqual(saved, [0, 1, 2])
+
+    @mock.patch('django.core.serializers.deserialize')
+    def test_empty_iterable_still_calls_context_and_check_constraints(self, mock_deserialize):
+        calls = {'entered': 0, 'exited': 0, 'order': []}
+        cm_provider = _make_cm_tracker(calls)
+
+        # Empty generator
+        mock_deserialize.side_effect = lambda *args, **kwargs: (o for o in [])
+
+        conn = SimpleNamespace(
+            alias='default',
+            constraint_checks_disabled=cm_provider,
+            check_constraints=mock.Mock(),
+        )
+        BaseDatabaseCreation(conn).deserialize_db_from_string('[]')
+
+        # Even with no objects, the constraint-disabling context should be used
+        # and check_constraints should be invoked afterward.
+        self.assertEqual(calls['entered'], 1)
+        self.assertEqual(calls['exited'], 1)
+        conn.check_constraints.assert_called_once()
+
+    @mock.patch('django.core.serializers.deserialize')
+    def test_serializers_receive_correct_using_argument(self, mock_deserialize):
+        # Ensure the 'using' argument passed to serializers.deserialize matches alias
+        def fake_deserialize(*args, **kwargs):
+            # The code under test passes using=self.connection.alias
+            self.assertIn('using', kwargs)
+            self.assertEqual(kwargs['using'], 'default')
+            return (o for o in [])
+
+        mock_deserialize.side_effect = fake_deserialize
+
+        conn = SimpleNamespace(
+            alias='default',
+            constraint_checks_disabled=_make_cm_tracker({'entered': 0, 'exited': 0, 'order': []}),
+            check_constraints=mock.Mock(),
+        )
+        BaseDatabaseCreation(conn).deserialize_db_from_string('[]')
+
+    @mock.patch('django.core.serializers.deserialize')
+    def test_objects_saved_in_order(self, mock_deserialize):
+        calls = {'entered': 0, 'exited': 0, 'order': []}
+        cm_provider = _make_cm_tracker(calls)
+
+        saved = []
+
+        class FakeObj:
+            def __init__(self, name):
+                self.name = name
+            def save(self_inner):
+                # verify context entered
+                self.assertGreater(calls['entered'], 0)
+                saved.append(self_inner.name)
+
+        objs = [FakeObj('a'), FakeObj('b'), FakeObj('c')]
+        # Return a list iterator to mimic streaming behaviour
+        mock_deserialize.side_effect = lambda *args, **kwargs: iter(objs)
+
+        conn = SimpleNamespace(
+            alias='default',
+            constraint_checks_disabled=cm_provider,
+            check_constraints=mock.Mock(),
+        )
+        BaseDatabaseCreation(conn).deserialize_db_from_string('[]')
+
+        self.assertEqual(saved, ['a', 'b', 'c'])
+        conn.check_constraints.assert_called_once()
+
+    @mock.patch('django.core.serializers.deserialize')
+    def test_check_constraints_called_only_once_even_with_many_objects(self, mock_deserialize):
+        calls = {'entered': 0, 'exited': 0, 'order': []}
+        cm_provider = _make_cm_tracker(calls)
+
+        saved_count = 0
+
+        class FakeObj:
+            def save(self_inner):
+                nonlocal saved_count
+                saved_count += 1
+                # ensure inside context
+                self.assertGreater(calls['entered'], 0)
+
+        objs = [FakeObj() for _ in range(5)]
+        mock_deserialize.side_effect = lambda *args, **kwargs: (o for o in objs)
+
+        conn = SimpleNamespace(
+            alias='default',
+            constraint_checks_disabled=cm_provider,
+            check_constraints=mock.Mock(),
+        )
+        BaseDatabaseCreation(conn).deserialize_db_from_string('[]')
+
+        conn.check_constraints.assert_called_once()
+        self.assertEqual(saved_count, 5)
+
+    @mock.patch('django.core.serializers.deserialize')
+    def test_constraint_entered_before_each_save(self, mock_deserialize):
+        # Ensure the context manager __enter__ is called before any object's save
+        calls = {'entered': 0, 'exited': 0, 'order': []}
+        cm_provider = _make_cm_tracker(calls)
+
+        observed = []
+
+        class FakeObj:
+            def __init__(self, idx):
+                self.idx = idx
+            def save(self_inner):
+                # record whether enter occurred
+                observed.append(calls['entered'] > 0)
+
+        objs = [FakeObj(i) for i in range(3)]
+        mock_deserialize.side_effect = lambda *args, **kwargs: (o for o in objs)
+
+        conn = SimpleNamespace(
+            alias='default',
+            constraint_checks_disabled=cm_provider,
+            check_constraints=mock.Mock(),
+        )
+        BaseDatabaseCreation(conn).deserialize_db_from_string('[]')
+
+        # All saves should observe that the constraint context was entered
+        self.assertEqual(observed, [True, True, True])
+
+    @mock.patch('django.core.serializers.deserialize')
+    def test_generator_deserialize_consumed_and_context_exited(self, mock_deserialize):
+        # Use an explicit generator to ensure lazy consumption still triggers context enter/exit
+        calls = {'entered': 0, 'exited': 0, 'order': []}
+        cm_provider = _make_cm_tracker(calls)
+
+        saved = []
+
+        class FakeObj:
+            def __init__(self, i):
+                self.i = i
+            def save(self_inner):
+                saved.append(self_inner.i)
+
+        def gen():
+            for i in range(4):
+                yield FakeObj(i)
+
+        mock_deserialize.side_effect = lambda *args, **kwargs: gen()
+
+        conn = SimpleNamespace(
+            alias='default',
+            constraint_checks_disabled=cm_provider,
+            check_constraints=mock.Mock(),
+        )
+        BaseDatabaseCreation(conn).deserialize_db_from_string('[]')
+
+        # Ensure generator was fully consumed and context manager exited afterwards
+        self.assertEqual(saved, [0, 1, 2, 3])
+        self.assertEqual(calls['entered'], 1)
+        self.assertEqual(calls['exited'], 1)
+        conn.check_constraints.assert_called_once()

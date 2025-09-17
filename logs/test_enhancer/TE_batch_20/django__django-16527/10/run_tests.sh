@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_views.test_templatetags_llm.SubmitRowShowSaveAsNewTests.assert_matches_expected admin_views.test_templatetags_llm.SubmitRowShowSaveAsNewTests.expected_show_save_as_new admin_views.test_templatetags_llm.SubmitRowShowSaveAsNewTests.make_context admin_views.test_templatetags_llm.SubmitRowShowSaveAsNewTests.test_add_permission_only_all_flags_true admin_views.test_templatetags_llm.SubmitRowShowSaveAsNewTests.test_both_add_and_change_permissions admin_views.test_templatetags_llm.SubmitRowShowSaveAsNewTests.test_change_flag_required admin_views.test_templatetags_llm.SubmitRowShowSaveAsNewTests.test_change_only_no_add_permission admin_views.test_templatetags_llm.SubmitRowShowSaveAsNewTests.test_context_object_with_add_only admin_views.test_templatetags_llm.SubmitRowShowSaveAsNewTests.test_is_popup_prevents_show_save_as_new admin_views.test_templatetags_llm.SubmitRowShowSaveAsNewTests.test_neither_add_nor_change_permissions admin_views.test_templatetags_llm.SubmitRowShowSaveAsNewTests.test_save_as_flag_required admin_views.test_templatetags_llm.SubmitRowShowSaveAsNewTests.test_truthy_add_permission_value admin_views.test_templatetags_llm.SubmitRowShowSaveAsNewTests.test_unrelated_flags_do_not_affect_show_save_as_new
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,189 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests verify the behavior of django.core.management.base.OutputWrapper and BaseCommand
+  around writing, styling, flushing, attribute forwarding, and transaction wrapping of output.
+  They exercise:
+  - write() appending endings and respecting the explicit ending argument,
+  - write() using an explicit style_func,
+  - style_func setter honoring isatty(),
+  - flush() forwarding to the underlying stream when present and being no-op when absent,
+  - __getattr__ forwarding arbitrary attributes/methods to the underlying stream,
+  - disabling styling by assigning None to style_func,
+  - run_from_argv handling CommandError (printing to stderr and exiting with returncode),
+  - execute() wrapping output in transaction SQL when output_transaction=True.
+test_code: |
+  import io
+  import importlib
+  import types
+  import pytest
+
+  base = importlib.import_module('django.core.management.base')
+  CommandError = base.CommandError
+  BaseCommand = base.BaseCommand
+  OutputWrapper = base.OutputWrapper
+  DEFAULT_DB_ALIAS = base.DEFAULT_DB_ALIAS
+
+  def test_write_appends_ending():
+      out = io.StringIO()
+      w = OutputWrapper(out)
+      w.write('hello')
+      assert out.getvalue() == 'hello\n'
+
+  def test_write_respects_explicit_ending():
+      out = io.StringIO()
+      w = OutputWrapper(out)
+      w.write('no-newline', ending='')
+      assert out.getvalue() == 'no-newline'
+      # When ending is provided and the message already ends with it,
+      # it should not duplicate it.
+      w.write('already\n', ending='\n')
+      assert out.getvalue().endswith('already\n')
+
+  def test_write_uses_passed_style_func():
+      out = io.StringIO()
+      w = OutputWrapper(out)
+      # style_func should transform the message regardless of wrapper's style
+      w.write('abc', style_func=lambda s: s.upper())
+      assert out.getvalue() == 'ABC\n'
+
+  def test_style_func_setter_honors_isatty(monkeypatch):
+      class FakeOut:
+          def __init__(self, isatty_value):
+              self._isatty = isatty_value
+              self.written = ''
+          def isatty(self):
+              return self._isatty
+          def write(self, s):
+              self.written += s
+
+      # When isatty is True, provided style_func should be used.
+      f1 = FakeOut(True)
+      w1 = OutputWrapper(f1)
+      w1.style_func = lambda s: 'X' + s
+      w1.write('a')
+      assert f1.written == 'Xa\n'
+
+      # When isatty is False, style_func should be ignored and identity used.
+      f2 = FakeOut(False)
+      w2 = OutputWrapper(f2)
+      w2.style_func = lambda s: 'X' + s
+      w2.write('a')
+      assert f2.written == 'a\n'
+
+  def test_flush_calls_underlying_flush():
+      called = {'n': 0}
+      class FakeOut:
+          def write(self, s):
+              pass
+          def flush(self):
+              called['n'] += 1
+      f = FakeOut()
+      w = OutputWrapper(f)
+      w.flush()
+      assert called['n'] == 1
+
+  def test_flush_no_error_when_no_flush():
+      class FakeOutNoFlush:
+          def write(self, s):
+              pass
+      f = FakeOutNoFlush()
+      w = OutputWrapper(f)
+      # Should not raise
+      w.flush()
+
+  def test___getattr_forwards_methods():
+      class FakeOut:
+          def __init__(self):
+              self.called_with = None
+          def write(self, s):
+              # ensure write is forwarded
+              self.called_with = s
+          def custom_method(self, x):
+              return f"got-{x}"
+      f = FakeOut()
+      w = OutputWrapper(f)
+      # __getattr__ should forward custom_method
+      result = w.custom_method(123)
+      assert result == "got-123"
+      w.write("hi")
+      assert f.called_with.endswith("hi\n")
+
+  def test_style_func_set_to_none_disables_styling():
+      class FakeOut:
+          def __init__(self):
+              self._data = ''
+          def isatty(self):
+              return True
+          def write(self, s):
+              self._data += s
+      f = FakeOut()
+      w = OutputWrapper(f)
+      # Start with a styling function active
+      w.style_func = lambda s: '!' + s
+      w.write('x')
+      assert f._data.endswith('!x\n')
+      # Setting style_func to None should disable styling (identity)
+      w.style_func = None
+      w.write('y')
+      assert f._data.endswith('y\n')
+
+  def test_run_from_argv_handles_CommandError_without_traceback(monkeypatch):
+      # Create a command whose execute raises CommandError
+      class BadCommand(BaseCommand):
+          def execute(self, *args, **options):
+              raise CommandError("boom", returncode=3)
+
+      stdout = io.StringIO()
+      stderr = io.StringIO()
+      cmd = BadCommand(stdout=stdout, stderr=stderr)
+      # run_from_argv constructs parser from argv[0] and argv[1]
+      argv = ['manage.py', 'sub']
+      with pytest.raises(SystemExit) as excinfo:
+          cmd.run_from_argv(argv)
+      assert excinfo.value.code == 3
+      # stderr should contain the formatted exception text
+      err = stderr.getvalue()
+      assert 'CommandError' in err and 'boom' in err
+
+  def test_execute_wraps_output_in_transaction_when_requested(monkeypatch):
+      # Prepare a command that outputs SQL and requests transaction wrapping
+      class SQLCommand(BaseCommand):
+          output_transaction = True
+          def handle(self, *args, **options):
+              return "SELECT 1;"
+
+      # Fake connection ops to provide start/end transaction SQL.
+      class FakeOps:
+          def start_transaction_sql(self):
+              return "BEGIN;"
+          def end_transaction_sql(self):
+              return "COMMIT;"
+
+      class FakeConnection:
+          def __init__(self):
+              self.ops = FakeOps()
+
+      fake_conn = FakeConnection()
+      # Monkeypatch the connections mapping in the module to return our fake connection
+      monkeypatch.setattr(base, 'connections', {DEFAULT_DB_ALIAS: fake_conn})
+
+      # Monkeypatch style to provide SQL_KEYWORD wrapper
+      class Style:
+          def SQL_KEYWORD(self, s):
+              return f"[{s}]"
+      monkeypatch.setattr(base, 'color_style', lambda force_color=False: Style())
+      monkeypatch.setattr(base, 'no_style', lambda: Style())
+
+      stdout = io.StringIO()
+      stderr = io.StringIO()
+      cmd = SQLCommand(stdout=stdout, stderr=stderr)
+      # Call execute directly; provide skip_checks to avoid running system checks
+      output = cmd.execute(skip_checks=True, stdout=stdout, stderr=stderr, force_color=False, no_color=False)
+      # The returned output should be wrapped by the style applied to the start/end SQL
+      expected = "[BEGIN;]\nSELECT 1;\n[COMMIT;]"
+      assert output == expected
+new_imports_code: |
+  import io
+  import importlib
+  import pytest

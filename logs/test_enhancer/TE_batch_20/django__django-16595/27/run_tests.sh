@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_optimizer_llm.OptimizerTests.test_alter_then_remove_collapses_to_remove_case_insensitive migrations.test_optimizer_llm.OptimizerTests.test_alterfields_case_insensitive_field_name_collapsed migrations.test_optimizer_llm.OptimizerTests.test_alterfields_case_insensitive_model_name_collapsed migrations.test_optimizer_llm.OptimizerTests.test_alterfields_different_fields_not_collapsed migrations.test_optimizer_llm.OptimizerTests.test_alterfields_different_models_not_collapsed migrations.test_optimizer_llm.OptimizerTests.test_alterfields_only_sequence_collapses_without_preceding_addfield migrations.test_optimizer_llm.OptimizerTests.test_remove_then_alter_does_not_optimize migrations.test_optimizer_llm.OptimizerTests.test_three_alterfields_collapsed_to_last migrations.test_optimizer_llm.OptimizerTests.test_two_alterfields_collapsed_to_second
+coverage json -o coverage.json
+: '>>>>> End Test Output'

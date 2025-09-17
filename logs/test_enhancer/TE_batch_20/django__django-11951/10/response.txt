@@ -1,0 +1,106 @@
+language: Python
+number_of_tests: 10
+test_behavior: These 10 tests verify that bulk_create caps the user-supplied batch_size to the backend-reported maximum batch size (connection.ops.bulk_batch_size). They monkeypatch bulk_batch_size to predictable values and assert the number of SQL queries performed matches ceil(number_of_objects / max_batch_size). This would fail with the original buggy implementation that used the provided batch_size without capping it, but passes with the patched implementation.
+test_code: |
+  from math import ceil
+  from unittest.mock import patch
+
+  from django.db import connection
+  from django.test import TestCase, skipUnlessDBFeature
+
+  from .models import Country, State, TwoFields, NoFields, Restaurant
+
+  @skipUnlessDBFeature('has_bulk_insert')
+  class BulkCreateBatchSizeTests(TestCase):
+      def test_batch_size_capped_for_all_without_pk(self):
+          objs = [Country(name="C%s" % i, iso_two_letter="X%s" % i) for i in range(10)]
+          with patch.object(connection.ops, 'bulk_batch_size', return_value=3):
+              max_batch_size = max(connection.ops.bulk_batch_size(['name', 'iso_two_letter', 'description'], objs), 1)
+              expected = ceil(len(objs) / max_batch_size)
+              with self.assertNumQueries(expected):
+                  Country.objects.bulk_create(objs, batch_size=100)
+
+      def test_batch_size_capped_for_all_with_pk(self):
+          # State uses a non-auto primary key (two_letter_code)
+          objs = [State(two_letter_code=str(i)) for i in range(10)]
+          with patch.object(connection.ops, 'bulk_batch_size', return_value=2):
+              max_batch_size = max(connection.ops.bulk_batch_size(['two_letter_code'], objs), 1)
+              expected = ceil(len(objs) / max_batch_size)
+              with self.assertNumQueries(expected):
+                  State.objects.bulk_create(objs, batch_size=100)
+
+      def test_batch_size_capped_for_mixed_pk(self):
+          # Alternate objects: some with pk set and some without
+          objs = [TwoFields(id=i if i % 2 == 0 else None, f1=i, f2=i + 1) for i in range(10)]
+          # Partition sizes: 5 with pk, 5 without
+          with patch.object(connection.ops, 'bulk_batch_size', return_value=3):
+              max_batch_size = max(connection.ops.bulk_batch_size(['f1', 'f2'], objs), 1)
+              num_with_pk = len([o for o in objs if o.pk is not None])
+              num_without_pk = len([o for o in objs if o.pk is None])
+              expected = ceil(num_with_pk / max_batch_size) + ceil(num_without_pk / max_batch_size)
+              with self.assertNumQueries(expected):
+                  TwoFields.objects.bulk_create(objs, batch_size=100)
+
+      def test_nofields_batch_size_capped(self):
+          objs = [NoFields() for _ in range(5)]
+          with patch.object(connection.ops, 'bulk_batch_size', return_value=2):
+              max_batch_size = max(connection.ops.bulk_batch_size([], objs), 1)
+              expected = ceil(len(objs) / max_batch_size)
+              with self.assertNumQueries(expected):
+                  NoFields.objects.bulk_create(objs, batch_size=50)
+
+      def test_restaurant_batch_size_capped(self):
+          objs = [Restaurant(name="R%s" % i) for i in range(7)]
+          with patch.object(connection.ops, 'bulk_batch_size', return_value=4):
+              max_batch_size = max(connection.ops.bulk_batch_size(['name'], objs), 1)
+              expected = ceil(len(objs) / max_batch_size)
+              with self.assertNumQueries(expected):
+                  Restaurant.objects.bulk_create(objs, batch_size=1000)
+
+      def test_batch_size_none_uses_backend_max(self):
+          objs = [Country(name="Cn%s" % i, iso_two_letter="Z%s" % i) for i in range(9)]
+          with patch.object(connection.ops, 'bulk_batch_size', return_value=3):
+              max_batch_size = max(connection.ops.bulk_batch_size(['name', 'iso_two_letter', 'description'], objs), 1)
+              expected = ceil(len(objs) / max_batch_size)
+              with self.assertNumQueries(expected):
+                  # batch_size omitted (None) should use backend max
+                  Country.objects.bulk_create(objs)
+
+      def test_batch_size_capped_when_max_is_one(self):
+          objs = [Country(name="Single%s" % i, iso_two_letter="S%s" % i) for i in range(5)]
+          with patch.object(connection.ops, 'bulk_batch_size', return_value=1):
+              max_batch_size = max(connection.ops.bulk_batch_size(['name', 'iso_two_letter', 'description'], objs), 1)
+              expected = ceil(len(objs) / max_batch_size)
+              with self.assertNumQueries(expected):
+                  Country.objects.bulk_create(objs, batch_size=1000000)
+
+      def test_explicit_small_batch_less_than_max_uses_provided(self):
+          objs = [TwoFields(f1=i, f2=i) for i in range(8)]
+          with patch.object(connection.ops, 'bulk_batch_size', return_value=10):
+              # Provided batch_size is smaller than backend max, so provided value should be used.
+              provided_bs = 3
+              expected = ceil(len(objs) / provided_bs)
+              with self.assertNumQueries(expected):
+                  TwoFields.objects.bulk_create(objs, batch_size=provided_bs)
+
+      def test_mixed_different_counts_respected(self):
+          # 11 objects: 4 with pk, 7 without pk
+          objs = [TwoFields(id=i if i < 8 and i % 2 == 0 else None, f1=i, f2=i + 1) for i in range(11)]
+          num_with_pk = len([o for o in objs if o.pk is not None])
+          num_without_pk = len([o for o in objs if o.pk is None])
+          with patch.object(connection.ops, 'bulk_batch_size', return_value=3):
+              max_batch_size = max(connection.ops.bulk_batch_size(['f1', 'f2'], objs), 1)
+              expected = ceil(num_with_pk / max_batch_size) + ceil(num_without_pk / max_batch_size)
+              with self.assertNumQueries(expected):
+                  TwoFields.objects.bulk_create(objs, batch_size=9999)
+
+      def test_batch_size_capped_large_scale_simulation(self):
+          # Simulate larger batch but small for test duration (20 objects)
+          objs = [Country(name="LargeSim%s" % i, iso_two_letter="LS%s" % i) for i in range(20)]
+          with patch.object(connection.ops, 'bulk_batch_size', return_value=6):
+              max_batch_size = max(connection.ops.bulk_batch_size(['name', 'iso_two_letter', 'description'], objs), 1)
+              expected = ceil(len(objs) / max_batch_size)
+              with self.assertNumQueries(expected):
+                  Country.objects.bulk_create(objs, batch_size=10000)
+new_imports_code: |
+  from unittest.mock import patch

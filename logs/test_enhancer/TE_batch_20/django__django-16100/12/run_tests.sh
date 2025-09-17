@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.tests_llm.TransactionUsingTests._post_list_editable_and_assert_atomic_using admin_changelist.tests_llm.TransactionUsingTests.setUpTestData admin_changelist.tests_llm.TransactionUsingTests.test_atomic_using_called_alias_config admin_changelist.tests_llm.TransactionUsingTests.test_atomic_using_called_alias_custom admin_changelist.tests_llm.TransactionUsingTests.test_atomic_using_called_alias_default admin_changelist.tests_llm.TransactionUsingTests.test_atomic_using_called_alias_legacy admin_changelist.tests_llm.TransactionUsingTests.test_atomic_using_called_alias_other admin_changelist.tests_llm.TransactionUsingTests.test_atomic_using_called_alias_primary admin_changelist.tests_llm.TransactionUsingTests.test_atomic_using_called_alias_replica admin_changelist.tests_llm.TransactionUsingTests.test_atomic_using_called_alias_secondary admin_changelist.tests_llm.TransactionUsingTests.test_atomic_using_called_alias_users admin_changelist.tests_llm.TransactionUsingTests.test_atomic_using_called_alias_write
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,180 @@
+import asyncio
+from urllib.parse import urlparse
+from types import SimpleNamespace
+import inspect
+from unittest import mock
+from asgiref import sync as asgiref_sync
+import pytest
+import asyncio
+import inspect
+from types import SimpleNamespace
+from unittest import mock
+
+import pytest
+
+from urllib.parse import urlparse
+
+from django.core.handlers.exception import response_for_exception
+from django.http import Http404
+
+import django.contrib.staticfiles.handlers as handlers
+from asgiref import sync as asgiref_sync
+
+# Helper dummy class that uses the mixin but avoids any settings dependency
+class DummyMixin(handlers.StaticFilesHandlerMixin):
+    def __init__(self, base_url):
+        # base_url as a string that urlparse understands
+        self.base_url = urlparse(base_url)
+
+def test_should_handle_true_and_false():
+    h = DummyMixin('/static/')
+    assert h._should_handle('/static/abc') is True
+    assert h._should_handle('/other/abc') is False
+
+def test_should_handle_with_host_in_base_url():
+    # If STATIC_URL includes a host, netloc (base_url[1]) is non-empty and should not handle
+    h = DummyMixin('http://example.com/static/')
+    assert h.base_url[1] == 'example.com'
+    assert h._should_handle('/static/abc') is False
+
+def test_file_path_converts_url_to_relative_path():
+    h = DummyMixin('/static/')
+    assert h.file_path('/static/dir/file.txt') == 'dir/file.txt'
+    # when url equals base path exactly (no trailing component)
+    assert h.file_path('/static/') == ''
+
+def test_serve_delegates_to_serve_with_insecure_flag(monkeypatch):
+    h = DummyMixin('/static/')
+    request = SimpleNamespace(path='/static/hello.txt')
+    called = {}
+
+    def fake_serve(req, path, insecure=False):
+        called['req'] = req
+        called['path'] = path
+        called['insecure'] = insecure
+        return 'SERVED'
+
+    monkeypatch.setattr(handlers, 'serve', fake_serve)
+    resp = h.serve(request)
+    assert resp == 'SERVED'
+    assert called['req'] is request
+    assert called['path'] == 'hello.txt'
+    assert called['insecure'] is True
+
+def test_get_response_handles_Http404_and_uses_response_for_exception(monkeypatch):
+    h = DummyMixin('/static/')
+    request = SimpleNamespace(path='/static/notfound.txt')
+
+    def raising_serve(req, path, insecure=False):
+        raise Http404("nope")
+
+    monkeypatch.setattr(handlers, 'serve', raising_serve)
+    monkeypatch.setattr(handlers, 'response_for_exception', lambda req, exc: 'EXC_RESP')
+    resp = h.get_response(request)
+    assert resp == 'EXC_RESP'
+
+def test_get_response_async_calls_sync_to_async_on_success(monkeypatch):
+    h = DummyMixin('/static/')
+    request = SimpleNamespace(path='/static/ok.txt')
+
+    # Original serve to be wrapped
+    def real_serve(req, path, insecure=False):
+        assert req is request
+        assert path == 'ok.txt'
+        return 'ASYNC_OK'
+
+    # Record what sync_to_async is called with and provide a wrapper that awaits and calls original
+    calls = []
+    def fake_sync_to_async(func):
+        calls.append(func)
+        async def runner(*a, **kw):
+            return func(*a, **kw)
+        return runner
+
+    monkeypatch.setattr(handlers, 'serve', real_serve)
+    monkeypatch.setattr(asgiref_sync, 'sync_to_async', fake_sync_to_async)
+
+    # Ensure we await the coroutine properly
+    resp = asyncio.get_event_loop().run_until_complete(h.get_response_async(request))
+    assert resp == 'ASYNC_OK'
+    # Ensure sync_to_async was used to offload the serve call
+    assert any(c is real_serve for c in calls)
+
+def test_get_response_async_handles_Http404_and_uses_response_for_exception_async(monkeypatch):
+    h = DummyMixin('/static/')
+    request = SimpleNamespace(path='/static/missing.txt')
+
+    def raising_serve(req, path, insecure=False):
+        raise Http404("nope")
+
+    def fake_response_for_exception(req, exc):
+        return 'ASYNC_EXC'
+
+    calls = []
+    def fake_sync_to_async(func):
+        # record functions wrapped
+        calls.append(func)
+        async def runner(*a, **kw):
+            return func(*a, **kw)
+        return runner
+
+    monkeypatch.setattr(handlers, 'serve', raising_serve)
+    monkeypatch.setattr(handlers, 'response_for_exception', fake_response_for_exception)
+    monkeypatch.setattr(asgiref_sync, 'sync_to_async', fake_sync_to_async)
+
+    resp = asyncio.get_event_loop().run_until_complete(h.get_response_async(request))
+    assert resp == 'ASYNC_EXC'
+    # sync_to_async should have been used for both serve and response_for_exception
+    assert raising_serve in calls
+    assert fake_response_for_exception in calls
+
+@pytest.mark.asyncio
+async def test_asgi_handler_hands_off_non_http_scope(monkeypatch):
+    # Prevent get_base_url from touching settings during init
+    monkeypatch.setattr(handlers.StaticFilesHandlerMixin, 'get_base_url', lambda self: '/static/')
+    called = {}
+    async def dummy_app(scope, receive, send):
+        called['scope'] = scope
+        return 'APP_CALLED'
+
+    h = handlers.ASGIStaticFilesHandler(dummy_app)
+    # Non-http scope must be passed to the wrapped application
+    scope = {'type': 'websocket', 'path': '/static/xyz'}
+    # run the handler
+    result = await h(scope, None, None)
+    # Our dummy_app returns None (no explicit return in ASGI apps usually),
+    # but we can assert that the application was invoked by inspecting called dict
+    assert called.get('scope') == scope
+
+@pytest.mark.asyncio
+async def test_asgi_handler_uses_super_call_for_http_and_matching_path(monkeypatch):
+    # Prevent get_base_url from touching settings during init
+    monkeypatch.setattr(handlers.StaticFilesHandlerMixin, 'get_base_url', lambda self: '/static/')
+    # Patch ASGIHandler.__call__ (the superclass method) to ensure it's awaited when path matches
+    original_super_call = handlers.ASGIStaticFilesHandler.__mro__[1].__call__
+    async def fake_super_call(self, scope, receive, send):
+        # indicate super was used
+        return 'SUPER_CALLED'
+
+    monkeypatch.setattr(handlers.ASGIStaticFilesHandler.__mro__[1], '__call__', fake_super_call)
+
+    # Build handler and call with an HTTP scope that should be handled
+    async def dummy_app(scope, receive, send):
+        raise RuntimeError("should not be called")
+
+    h = handlers.ASGIStaticFilesHandler(dummy_app)
+    # ensure _should_handle returns True for the test path
+    monkeypatch.setattr(h, '_should_handle', lambda path: True)
+    scope = {'type': 'http', 'path': '/static/abc'}
+    result = await h(scope, None, None)
+    assert result == 'SUPER_CALLED'
+    # restore original to avoid side-effects if needed
+    monkeypatch.setattr(handlers.ASGIStaticFilesHandler.__mro__[1], '__call__', original_super_call)
+
+def test_load_middleware_signature_has_not_changed():
+    # The public load_middleware API should accept only 'self' (no extra required parameters).
+    sig = inspect.signature(handlers.StaticFilesHandlerMixin.load_middleware)
+    params = list(sig.parameters.values())
+    # Only one parameter: self
+    assert len(params) == 1
+    assert params[0].name == 'self'

@@ -1,0 +1,150 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that sqlmigrate only wraps SQL output in BEGIN/COMMIT (transaction wrappers) when the migration is atomic AND the database connection reports that it supports transactional DDL (connection.features.can_rollback_ddl). They patch the MigrationExecutor used by the command to control the migration.atomic flag and assert presence/absence and ordering of transaction wrapper SQL. These tests would fail on the original (buggy) implementation that ignored can_rollback_ddl, and pass with the patched code.
+test_code: |
+  import io
+  import types
+  from unittest import mock
+
+  from django.core.management import call_command
+  from django.test import TestCase
+
+  # Target module where MigrationExecutor is referenced in the command.
+  EXECUTOR_PATH = 'django.core.management.commands.sqlmigrate.MigrationExecutor'
+
+  class SqlMigrateOutputTransactionTests(TestCase):
+      """
+      Tests to ensure transaction wrappers are only output when both the
+      migration is atomic and the database supports transactional DDL.
+      """
+
+      def _make_executor_factory(self, atomic, sql_stmts):
+          """
+          Return a factory function that will be used to patch the MigrationExecutor
+          import in the sqlmigrate module. The factory takes a connection and
+          returns an executor with a loader and collect_sql implementation.
+          """
+          def factory(connection):
+              class FakeLoader:
+                  migrated_apps = {'migrations'}
+
+                  def get_migration_by_prefix(self, app_label, migration_name):
+                      # Return a migration-like object
+                      return types.SimpleNamespace(name='0001_initial', atomic=atomic)
+
+                  # graph.nodes is keyed by (app_label, migration.name)
+                  graph = types.SimpleNamespace(nodes={('migrations', '0001_initial'): 'node'})
+
+              class FakeExecutor:
+                  def __init__(self, connection):
+                      self.loader = FakeLoader()
+                      self.connection = connection
+
+                  def collect_sql(self, plan):
+                      # Return the SQL statements for the migration operations
+                      return list(sql_stmts)
+
+              return FakeExecutor(connection)
+          return factory
+
+      def _run_sqlmigrate(self, atomic, can_rollback_ddl, backwards=False, sql_stmts=None, database='default'):
+          if sql_stmts is None:
+              sql_stmts = ['-- operation description', 'CREATE TABLE example (id integer);']
+          factory = self._make_executor_factory(atomic, sql_stmts)
+          with mock.patch(EXECUTOR_PATH, new=factory):
+              # Patch the connection feature on the connection used by the command
+              # The command retrieves the connection via connections[database], but mocking
+              # the feature on the real connection object is sufficient here.
+              from django.core.management.commands import sqlmigrate as sqlmigrate_module
+              conn = sqlmigrate_module.connections[database]
+              with mock.patch.object(conn.features, 'can_rollback_ddl', new=can_rollback_ddl):
+                  out = io.StringIO()
+                  call_command('sqlmigrate', 'migrations', '0001', stdout=out, backwards=backwards, database=database)
+                  return out.getvalue().lower()
+
+      def test_atomic_and_ddl_supported_adds_transaction_wrappers(self):
+          output = self._run_sqlmigrate(atomic=True, can_rollback_ddl=True)
+          from django.db import connection
+          start_sql = connection.ops.start_transaction_sql()
+          end_sql = connection.ops.end_transaction_sql()
+          # Only assert presence if the backend provides a start transaction SQL.
+          if start_sql:
+              self.assertIn(start_sql.lower(), output)
+          self.assertIn(end_sql.lower(), output)
+
+      def test_atomic_but_ddl_not_supported_no_wrappers(self):
+          output = self._run_sqlmigrate(atomic=True, can_rollback_ddl=False)
+          from django.db import connection
+          start_sql = connection.ops.start_transaction_sql()
+          end_sql = connection.ops.end_transaction_sql()
+          if start_sql:
+              self.assertNotIn(start_sql.lower(), output)
+          self.assertNotIn(end_sql.lower(), output)
+
+      def test_non_atomic_but_ddl_supported_no_wrappers(self):
+          output = self._run_sqlmigrate(atomic=False, can_rollback_ddl=True)
+          from django.db import connection
+          start_sql = connection.ops.start_transaction_sql()
+          end_sql = connection.ops.end_transaction_sql()
+          if start_sql:
+              self.assertNotIn(start_sql.lower(), output)
+          self.assertNotIn(end_sql.lower(), output)
+
+      def test_non_atomic_and_ddl_not_supported_no_wrappers(self):
+          output = self._run_sqlmigrate(atomic=False, can_rollback_ddl=False)
+          from django.db import connection
+          start_sql = connection.ops.start_transaction_sql()
+          end_sql = connection.ops.end_transaction_sql()
+          if start_sql:
+              self.assertNotIn(start_sql.lower(), output)
+          self.assertNotIn(end_sql.lower(), output)
+
+      def test_backwards_with_atomic_and_ddl_supported_wrappers_and_order(self):
+          sql_stmts = ['-- alter unique_together', 'DROP TABLE example;']
+          output = self._run_sqlmigrate(atomic=True, can_rollback_ddl=True, backwards=True, sql_stmts=sql_stmts)
+          from django.db import connection
+          start_sql = connection.ops.start_transaction_sql()
+          end_sql = connection.ops.end_transaction_sql()
+          # If start_sql is provided, ensure ordering: start before first op, end after last op.
+          if start_sql:
+              start_idx = output.find(start_sql.lower())
+              first_op_idx = output.find(sql_stmts[0].lower())
+              self.assertGreater(start_idx, -1)
+              self.assertGreater(first_op_idx, start_idx)
+          end_idx = output.find(end_sql.lower())
+          last_op_idx = output.rfind(sql_stmts[-1].lower())
+          self.assertGreater(end_idx, last_op_idx)
+
+      def test_command_output_transaction_attribute_true_when_atomic_and_ddl_supported(self):
+          """
+          Directly call handle() to ensure the Command.output_transaction attribute
+          is set appropriately (True) when both atomic and can_rollback_ddl are True.
+          """
+          factory = self._make_executor_factory(True, ['-- op'])
+          with mock.patch(EXECUTOR_PATH, new=factory):
+              from django.core.management.commands.sqlmigrate import Command
+              from django.core.management.commands import sqlmigrate as sqlmigrate_module
+              conn = sqlmigrate_module.connections['default']
+              with mock.patch.object(conn.features, 'can_rollback_ddl', new=True):
+                  cmd = Command()
+                  result = cmd.handle(app_label='migrations', migration_name='0001', database='default', backwards=False)
+                  # handle() returns the SQL (joined) but should also set output_transaction attribute
+                  self.assertTrue(cmd.output_transaction)
+                  self.assertIn('-- op', result)
+
+      def test_command_output_transaction_attribute_false_when_ddl_not_supported(self):
+          """
+          Ensure Command.output_transaction is False when the DB doesn't support
+          transactional DDL even if migration.atomic is True.
+          """
+          factory = self._make_executor_factory(True, ['-- op'])
+          with mock.patch(EXECUTOR_PATH, new=factory):
+              from django.core.management.commands.sqlmigrate import Command
+              from django.core.management.commands import sqlmigrate as sqlmigrate_module
+              conn = sqlmigrate_module.connections['default']
+              with mock.patch.object(conn.features, 'can_rollback_ddl', new=False):
+                  cmd = Command()
+                  _ = cmd.handle(app_label='migrations', migration_name='0001', database='default', backwards=False)
+                  self.assertFalse(cmd.output_transaction)
+test_imports_code: |
+  import types

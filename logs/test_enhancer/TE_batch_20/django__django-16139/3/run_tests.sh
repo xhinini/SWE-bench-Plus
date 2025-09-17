@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_anchor_href_starts_with_double_dot_slash auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_helptext_consistency_on_multiple_instantiations auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_helptext_html_contains_anchor_tag auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_helptext_present_when_form_is_bound auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_no_exception_rendering_helptext_for_unsaved_instance auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_password_helptext_contains_instance_pk auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_password_helptext_differs_for_different_users auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_password_helptext_does_not_contain_old_relative_path auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_password_link_joined_with_admin_change_url_pk auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_password_link_joined_with_admin_change_url_to_field
+coverage json -o coverage.json
+: '>>>>> End Test Output'

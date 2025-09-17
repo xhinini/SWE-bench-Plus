@@ -1,0 +1,177 @@
+# No additional imports required beyond the standard library and django.core.serializers.base.
+from types import SimpleNamespace
+import unittest
+
+from django.core.serializers.base import build_instance
+
+def make_fake_model(natural_key_func, pk_value, pk_conv=lambda v: v, remote_field_names=()):
+    """
+    Build a fake Model class compatible with build_instance.
+    natural_key_func: function(self) -> tuple used as natural_key.
+    pk_value: value that default_manager.get_by_natural_key should return as .pk
+    pk_conv: function applied by _meta.pk.to_python
+    remote_field_names: iterable of field names that should be considered relational
+    """
+    class FakePK:
+        attname = "id"
+
+        def to_python(self, value):
+            return pk_conv(value)
+
+    class FakeField:
+        def __init__(self, name):
+            # remote_field is non-None for relational fields
+            self.remote_field = object() if name in remote_field_names else None
+            self.name = name
+
+    class DefaultManager:
+        def db_manager(self, using):
+            # Return self; get_by_natural_key will be resolved on this
+            self._used_db = using
+            return self
+
+        def get_by_natural_key(self, *args):
+            # Return an object-like with pk attribute
+            return SimpleNamespace(pk=pk_value)
+
+    class Meta:
+        pk = FakePK()
+        default_manager = DefaultManager()
+        app_label = "app"
+        model_name = "model"
+
+        def get_field(self, name):
+            return FakeField(name)
+
+    # The Model class itself
+    class Model:
+        _meta = Meta()
+        DoesNotExist = Exception
+
+        def __init__(self, **data):
+            # Set provided attributes on the instance
+            for k, v in data.items():
+                setattr(self, k, v)
+            # Initially db state is None; build_instance (gold patch) will set this before calling natural_key
+            self._state = SimpleNamespace(db=None)
+
+        def natural_key(self):
+            return natural_key_func(self)
+
+    return Model
+
+class BuildInstanceTests(unittest.TestCase):
+    def test_sets_pk_and_uses_db_state(self):
+        # natural_key requires that _state.db is set to the db arg
+        def nk(self):
+            if getattr(self._state, "db", None) != "other":
+                raise RuntimeError("db not set correctly")
+            return (getattr(self, "name", None),)
+
+        Model = make_fake_model(nk, pk_value="42", pk_conv=int)
+        obj = build_instance(Model, {"name": "alice"}, db="other")
+        # After build_instance, returned object should have id converted by to_python
+        self.assertEqual(getattr(obj, "id"), 42)
+
+    def test_natural_key_reads_relational_field_set_by_init(self):
+        # natural_key depends on an attribute that is set by Model(**data)
+        def nk(self):
+            # expects author_id to be present
+            return (self.author_id,)
+
+        Model = make_fake_model(nk, pk_value="7", pk_conv=int, remote_field_names=("author",))
+        # Provide author_id in data -- gold patch uses Model(**data) before natural_key,
+        # so attribute should be present. Candidate patch that doesn't set relational
+        # fields for the temporary instance will cause natural_key to fail.
+        obj = build_instance(Model, {"author_id": 5}, db="default")
+        self.assertEqual(getattr(obj, "id"), 7)
+
+    def test_natural_key_uses_nested_related_attribute(self):
+        # natural_key inspects a nested attribute (e.g., a related object's attribute)
+        def nk(self):
+            # expects an 'author' object with attribute 'name'
+            return (self.author.name,)
+
+        # Simulate that 'author' is a relational field (so candidate patch might skip setting it)
+        Model = make_fake_model(nk, pk_value="99", pk_conv=int, remote_field_names=("author",))
+        # Provide the 'author' object in data; gold patch's Model(**data) will set it,
+        # candidate patch's temporary instance won't get it set.
+        obj = build_instance(Model, {"author": SimpleNamespace(name="Tolkien")}, db="default")
+        self.assertEqual(getattr(obj, "id"), 99)
+
+    def test_to_python_conversion_applied_to_pk(self):
+        # Ensure _meta.pk.to_python is applied to the returned pk
+        def nk(self):
+            if getattr(self._state, "db", None) is None:
+                raise RuntimeError("db missing")
+            return ("nk",)
+
+        # to_python will convert string->int after lookup
+        Model = make_fake_model(nk, pk_value="123", pk_conv=lambda v: int(v))
+        obj = build_instance(Model, {"name": "x"}, db="default")
+        self.assertEqual(getattr(obj, "id"), 123)
+
+    def test_multiple_element_natural_key_with_relational_component(self):
+        # natural_key returns multiple elements including a relational component
+        def nk(self):
+            return (self.name, self.related_id)
+
+        Model = make_fake_model(nk, pk_value="8", pk_conv=int, remote_field_names=("related",))
+        obj = build_instance(Model, {"name": "n", "related_id": 55}, db="default")
+        self.assertEqual(getattr(obj, "id"), 8)
+
+    def test_natural_key_raises_if_db_not_set(self):
+        # If natural_key requires db and db is not set, gold patch prevents this error.
+        def nk(self):
+            if getattr(self._state, "db", None) is None:
+                raise AttributeError("db not present")
+            return (self.name,)
+
+        Model = make_fake_model(nk, pk_value="21", pk_conv=int)
+        # With gold patch this succeeds; candidate patch (which doesn't set _state.db)
+        # will cause AttributeError during natural_key invocation and thus the test would fail.
+        obj = build_instance(Model, {"name": "set"}, db="mydb")
+        self.assertEqual(getattr(obj, "id"), 21)
+
+    def test_relational_field_name_variants(self):
+        # natural_key depends on a field named 'author' while data provides 'author_id'
+        # The temporary instance created by Model(**data) should have the provided attribute.
+        def nk(self):
+            # prefer author_id if available
+            return (getattr(self, "author_id", None),)
+
+        Model = make_fake_model(nk, pk_value="15", pk_conv=int, remote_field_names=("author",))
+        obj = build_instance(Model, {"author_id": 77}, db="default")
+        self.assertEqual(getattr(obj, "id"), 15)
+
+    def test_natural_key_with_non_string_elements(self):
+        # natural_key returns non-string elements, ensure they're forwarded to get_by_natural_key
+        def nk(self):
+            return (42,)
+
+        Model = make_fake_model(nk, pk_value="300", pk_conv=int)
+        obj = build_instance(Model, {}, db="default")
+        self.assertEqual(getattr(obj, "id"), 300)
+
+    def test_natural_key_combines_non_relational_and_relational(self):
+        # natural_key uses both a plain field and a relational id field
+        def nk(self):
+            return (self.slug, self.owner_id)
+
+        Model = make_fake_model(nk, pk_value="88", pk_conv=int, remote_field_names=("owner",))
+        obj = build_instance(Model, {"slug": "s", "owner_id": 9}, db="default")
+        self.assertEqual(getattr(obj, "id"), 88)
+
+    def test_db_alias_propagated_for_lookup(self):
+        # Ensure that the db alias passed to build_instance is used (natural_key needs _state.db set)
+        def nk(self):
+            if getattr(self._state, "db", None) != "custom":
+                raise RuntimeError("wrong db")
+            return ("k",)
+
+        Model = make_fake_model(nk, pk_value="66", pk_conv=int)
+        obj = build_instance(Model, {"name": "n"}, db="custom")
+        self.assertEqual(getattr(obj, "id"), 66)
+
+if __name__ == "__main__":
+    unittest.main()

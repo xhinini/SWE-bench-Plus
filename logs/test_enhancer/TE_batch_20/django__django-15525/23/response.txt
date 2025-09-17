@@ -1,0 +1,185 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise build_instance() behavior when a model defines a natural_key() that depends on instance state (._state.db) and on relation-like fields being set on initialization. The original bug called natural_key() on a fresh instance without setting _state.db (or, in the candidate patch, constructed an instance but failed to set relation attributes), causing AttributeError or incorrect behavior. Each test constructs lightweight fake model/metadata/manager objects to simulate Django models/managers and asserts that build_instance populates the primary key in the input data by resolving the natural key via the model's manager using the provided db argument. These tests will FAIL against the candidate incorrect patch (which either doesn't set _state.db before calling natural_key or constructs an instance without relation attributes) and PASS with the gold patch.
+test_code: |
+  import unittest
+  from types import SimpleNamespace
+  from django.core.serializers.base import build_instance
+  
+  
+  def make_manager(return_pk):
+      class DefaultManager:
+          def db_manager(self, db):
+              # return a manager-like object that ignores db for this fake manager
+              return self
+          
+          def get_by_natural_key(self, *args):
+              o = SimpleNamespace(pk=return_pk)
+              return o
+      return DefaultManager()
+  
+  
+  class FakePK:
+      def __init__(self, attname="id"):
+          self.attname = attname
+      def to_python(self, value):
+          return int(value)
+  
+  
+  class FakeField:
+      def __init__(self, remote_field=False):
+          # remote_field truthiness is used by candidate patch to decide which attrs to set
+          self.remote_field = remote_field
+  
+  
+  class BuildInstanceTests(unittest.TestCase):
+      def _make_meta(self, manager_pk, relational_names=()):
+          meta = SimpleNamespace()
+          meta.default_manager = make_manager(manager_pk)
+          meta.pk = FakePK(attname="id")
+  
+          def get_field(name):
+              # If field name is in relational_names, mark it as a relation (remote_field truthy)
+              return FakeField(remote_field=(name in relational_names))
+  
+          meta.get_field = get_field
+          return meta
+  
+      def _make_model_class(self, meta, natural_key_getter):
+          # Create a fresh Model class for each test so state is isolated.
+          class Model:
+              _meta = meta
+              DoesNotExist = Exception
+              def __init__(self, **data):
+                  # emulate Django's _state attribute
+                  self._state = SimpleNamespace(db=None)
+                  # Set all passed-in attributes (Model(**data) behavior)
+                  for k, v in data.items():
+                      setattr(self, k, v)
+              def natural_key(self):
+                  # natural_key depends on _state.db being set (this is what the bug patch missed)
+                  if getattr(self._state, "db", None) is None:
+                      raise AttributeError("._state.db not set")
+                  return natural_key_getter(self)
+          return Model
+  
+      def test_sets_pk_when_natural_key_uses_relation_field_author(self):
+          # natural_key returns (author,) and author must be set on the instance
+          meta = self._make_meta(manager_pk="101", relational_names=("author",))
+          def nk(self): return (self.author,)
+          Model = self._make_model_class(meta, nk)
+  
+          data = {"author": "alice"}
+          result = build_instance(Model, data, db="other_db")
+          # build_instance mutates data to add the pk value
+          self.assertEqual(data["id"], 101)
+  
+      def test_sets_pk_when_natural_key_uses_multiple_fields(self):
+          # natural_key uses both title and owner (owner is relation-like)
+          meta = self._make_meta(manager_pk="202", relational_names=("owner",))
+          def nk(self): return (self.title, self.owner)
+          Model = self._make_model_class(meta, nk)
+  
+          data = {"title": "The Book", "owner": "bob"}
+          result = build_instance(Model, data, db="db_xyz")
+          self.assertEqual(data["id"], 202)
+  
+      def test_sets_pk_with_integer_like_natural_key_component(self):
+          # natural_key returns numeric-looking component in tuple
+          meta = self._make_meta(manager_pk="303", relational_names=("user",))
+          def nk(self): return (int(self.user),)
+          Model = self._make_model_class(meta, nk)
+  
+          data = {"user": "7"}
+          result = build_instance(Model, data, db="db_int")
+          self.assertEqual(data["id"], 303)
+  
+      def test_sets_pk_with_nested_natural_key_tuple(self):
+          # natural_key returns a nested tuple; build_instance should pass through to manager
+          meta = self._make_meta(manager_pk="404", relational_names=("author", "title"))
+          def nk(self): return (self.title, (self.author,))
+          Model = self._make_model_class(meta, nk)
+  
+          data = {"title": "Nested", "author": "carol"}
+          result = build_instance(Model, data, db="nested_db")
+          self.assertEqual(data["id"], 404)
+  
+      def test_multiple_relation_field_names(self):
+          # natural_key uses one of several possible relation-like fields
+          meta = self._make_meta(manager_pk="505", relational_names=("owner", "editor"))
+          def nk(self): return (self.editor,)
+          Model = self._make_model_class(meta, nk)
+  
+          data = {"editor": "dana", "owner": "someone_else"}
+          result = build_instance(Model, data, db="some_db")
+          self.assertEqual(data["id"], 505)
+  
+      def test_different_attname_for_pk(self):
+          # pk attname is not "id" in this case
+          meta = SimpleNamespace()
+          meta.default_manager = make_manager("606")
+          meta.pk = FakePK(attname="pk_field")
+          def get_field(name): return FakeField(remote_field=(name == "rel"))
+          meta.get_field = get_field
+          def nk(self): return (self.rel,)
+          class Model:
+              _meta = meta
+              DoesNotExist = Exception
+              def __init__(self, **data):
+                  self._state = SimpleNamespace(db=None)
+                  for k, v in data.items():
+                      setattr(self, k, v)
+              def natural_key(self):
+                  if getattr(self._state, "db", None) is None:
+                      raise AttributeError("._state.db not set")
+                  return nk(self)
+  
+          data = {"rel": "x"}
+          result = build_instance(Model, data, db="db_custom")
+          self.assertEqual(data["pk_field"], 606)
+  
+      def test_natural_key_with_multiple_component_types(self):
+          # natural_key returns mixed types
+          meta = self._make_meta(manager_pk="707", relational_names=("ref",))
+          def nk(self): return (self.title, int(self.ref))
+          Model = self._make_model_class(meta, nk)
+  
+          data = {"title": "Mixed", "ref": "9"}
+          result = build_instance(Model, data, db="mixed_db")
+          self.assertEqual(data["id"], 707)
+  
+      def test_natural_key_relying_on_non_string_db_identifier(self):
+          # use a non-string db identifier to ensure it's passed through
+          meta = self._make_meta(manager_pk="808", relational_names=("who",))
+          def nk(self): return (self.who,)
+          Model = self._make_model_class(meta, nk)
+  
+          data = {"who": "zeta"}
+          result = build_instance(Model, data, db=12345)
+          self.assertEqual(data["id"], 808)
+  
+      def test_natural_key_uses_relation_name_that_is_python_keyword_like(self):
+          # field name that could be special (e.g., 'class') - ensure attributes are set normally
+          meta = self._make_meta(manager_pk="909", relational_names=("clazz",))
+          def nk(self): return (self.clazz,)
+          Model = self._make_model_class(meta, nk)
+  
+          data = {"clazz": "kw"}
+          result = build_instance(Model, data, db="db_kw")
+          self.assertEqual(data["id"], 909)
+  
+      def test_build_instance_calls_natural_key_and_resolves_pk_even_if_other_fields_present(self):
+          # Ensure presence of many other fields doesn't affect resolution
+          meta = self._make_meta(manager_pk="1001", relational_names=("target",))
+          def nk(self): return (self.target,)
+          Model = self._make_model_class(meta, nk)
+  
+          data = {"a": 1, "b": 2, "c": 3, "target": "ultimate"}
+          result = build_instance(Model, data, db="big_db")
+          self.assertEqual(data["id"], 1001)
+  
+  
+  if __name__ == "__main__":
+      unittest.main()
+new_imports_code: |-
+  # No new module-level imports required beyond test module.

@@ -1,0 +1,178 @@
+# No additional imports required outside the test file. The test file imports/monkeypatches
+# module-level names from django.contrib.staticfiles.handlers as needed.
+import asyncio
+import time
+from urllib.parse import urlparse
+from types import SimpleNamespace
+
+import django
+from django.conf import settings
+from django.http import Http404
+
+import django.contrib.staticfiles.handlers as handlers
+from django.contrib.staticfiles.handlers import StaticFilesHandlerMixin
+
+# Ensure STATIC_URL is present for get_base_url tests
+settings.STATIC_URL = '/static/'
+
+class DummyHandler(StaticFilesHandlerMixin):
+    def __init__(self, base_url):
+        # base_url should be a URL string like '/static/' or 'http://example.com/static/'
+        self.base_url = urlparse(base_url)
+
+def test_get_response_async_runs_serve_in_thread():
+    """
+    If the synchronous serve function blocks (time.sleep), get_response_async must not block
+    the event loop — serve should be executed in a thread via sync_to_async. We detect this
+    by running a background coroutine that expects to make progress while serve is sleeping.
+    """
+    handler = DummyHandler('/static/')
+
+    def serve(request):
+        # Blocking operation that would block the event loop if not run in a thread
+        time.sleep(0.15)
+        return 'served-success'
+
+    handler.serve = serve
+    counter = []
+
+    async def main():
+        async def background():
+            # Attempt to make background progress periodically
+            for _ in range(30):
+                counter.append(1)
+                await asyncio.sleep(0.01)
+        # Run get_response_async concurrently with background
+        res, _ = await asyncio.gather(handler.get_response_async(SimpleNamespace(path='/static/foo')), background())
+        return res
+
+    result = asyncio.run(main())
+    assert result == 'served-success'
+    # If serve blocked the event loop, background would not have been able to append many items.
+    assert len(counter) >= 5
+
+def test_get_response_async_handles_exception_without_blocking():
+    """
+    When serve raises Http404, get_response_async should call response_for_exception using
+    sync_to_async so that any blocking work in response_for_exception does not block the event loop.
+    We monkeypatch the module-level response_for_exception to block and verify background progress.
+    """
+    handler = DummyHandler('/static/')
+
+    def serve_raising(request):
+        raise Http404("not found")
+
+    handler.serve = serve_raising
+    counter = []
+
+    # Monkeypatch the module-level response_for_exception to a blocking function
+    orig_rf = handlers.response_for_exception
+    def blocking_response(request, exc):
+        time.sleep(0.15)
+        return 'handled-error'
+    handlers.response_for_exception = blocking_response
+
+    try:
+        async def main():
+            async def background():
+                for _ in range(30):
+                    counter.append(1)
+                    await asyncio.sleep(0.01)
+            res, _ = await asyncio.gather(handler.get_response_async(SimpleNamespace(path='/static/missing')), background())
+            return res
+        result = asyncio.run(main())
+        assert result == 'handled-error'
+        # Ensure background had a chance to run while response_for_exception executed
+        assert len(counter) >= 5
+    finally:
+        handlers.response_for_exception = orig_rf
+
+def test_file_path_decodes_percent_encoding():
+    handler = DummyHandler('/static/')
+    path = '/static/foo%20bar.txt'
+    result = handler.file_path(path)
+    # url2pathname should decode %20 to a space
+    assert result == 'foo bar.txt'
+
+def test__should_handle_respects_netloc():
+    # If STATIC_URL contains a host (netloc), the handler should not handle plain paths
+    handler = DummyHandler('http://example.com/static/')
+    assert handler._should_handle('/static/file.txt') is False
+
+def test__should_handle_accepts_exact_base_path_equal():
+    handler = DummyHandler('/static/')
+    # path equal to base_url[2] should be considered handled
+    assert handler._should_handle('/static/') is True
+
+def test_file_path_empty_relative():
+    handler = DummyHandler('/static/')
+    # When the URL equals the base, the relative path should be an empty string
+    assert handler.file_path('/static/') == ''
+
+def test_serve_calls_module_serve_with_insecure_flag():
+    # Monkeypatch the module-level serve to capture arguments
+    orig_serve = handlers.serve
+    captured = {}
+    def fake_serve(request, path, insecure=False):
+        captured['request'] = request
+        captured['path'] = path
+        captured['insecure'] = insecure
+        return 'ok'
+    handlers.serve = fake_serve
+    try:
+        handler = DummyHandler('/static/')
+        # Create a fake request object with a path attribute
+        request = SimpleNamespace(path='/static/subdir/file.txt')
+        response = handler.serve(request)
+        assert response == 'ok'
+        # The file_path relative portion should be passed to module-level serve
+        assert captured['path'] == 'subdir/file.txt'
+        assert captured['insecure'] is True
+    finally:
+        handlers.serve = orig_serve
+
+def test_get_base_url_checks_settings():
+    # Ensure utils.check_settings is invoked and STATIC_URL is returned
+    orig_check = handlers.utils.check_settings
+    called = {'flag': False}
+    def fake_check():
+        called['flag'] = True
+    handlers.utils.check_settings = fake_check
+    try:
+        handler = DummyHandler('/static/')
+        # get_base_url uses the project's settings.STATIC_URL; it calls check_settings first
+        assert handler.get_base_url() == settings.STATIC_URL
+        assert called['flag'] is True
+    finally:
+        handlers.utils.check_settings = orig_check
+
+def test_get_response_returns_response_for_exception_sync():
+    """
+    Synchronous get_response should return whatever response_for_exception returns
+    when serve raises Http404.
+    """
+    handler = DummyHandler('/static/')
+    def serve_raising(request):
+        raise Http404("boom")
+    handler.serve = serve_raising
+    # Monkeypatch the response_for_exception to a sentinel value
+    orig_rf = handlers.response_for_exception
+    def fake_rf(request, exc):
+        return 'sync-error'
+    handlers.response_for_exception = fake_rf
+    try:
+        result = handler.get_response(SimpleNamespace(path='/static/x'))
+        assert result == 'sync-error'
+    finally:
+        handlers.response_for_exception = orig_rf
+
+def test_get_response_async_returns_response_when_not_404():
+    """
+    Simple sanity test that get_response_async returns the value from serve for non-exceptional cases.
+    """
+    handler = DummyHandler('/static/')
+    def serve_ok(request):
+        return 'async-ok'
+    handler.serve = serve_ok
+    result = asyncio.run(handler.get_response_async(SimpleNamespace(path='/static/x')))
+    assert result == 'async-ok'

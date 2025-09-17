@@ -1,0 +1,192 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  Ten unit tests that exercise QuerySet._batched_insert behavior with respect to
+  honoring the maximum batch size returned by connection.ops.bulk_batch_size().
+  These tests monkeypatch connection.ops.bulk_batch_size and QuerySet._insert to
+  avoid hitting the database while asserting that the batching logic splits the
+  input objects into the expected number of batches. Additional tests cover
+  edge cases (empty input, bulk_batch_size returning 0 -> treated as at least 1,
+  ignore_conflicts not supported raising NotSupportedError, behavior when the
+  backend reports can_return_rows_from_bulk_insert True/False).
+test_code: |
+  from math import ceil
+  from django.db import NotSupportedError, connection
+  from django.test import TestCase, override_settings
+  from django.db.models.query import QuerySet
+  from .models import TwoFields, Country, State
+  
+  
+  class BatchedInsertBatchingTests(TestCase):
+      def _run_batched_insert_with_fake_insert(self, model_cls, num_objs, fake_max_batch, requested_batch_size, expect_calls, bulk_return=True):
+          qs = model_cls.objects
+          objs = [model_cls(f1=i, f2=i) if hasattr(model_cls, 'f1') else model_cls() for i in range(num_objs)]
+          fields = qs.model._meta.concrete_fields
+  
+          # Save originals
+          orig_bulk_batch_size = connection.ops.bulk_batch_size
+          orig_insert = QuerySet._insert
+          orig_can_return = connection.features.can_return_rows_from_bulk_insert
+  
+          calls = []
+  
+          def fake_bulk_batch_size(fields_arg, objs_arg):
+              return fake_max_batch
+  
+          def fake_insert(self, items, fields_arg, *args, **kwargs):
+              # Record the batch (as a list copy) and return a list to simulate
+              # a backend that returns inserted rows.
+              calls.append(list(items))
+              # Simulate returned_columns per item (could be tuples or lists).
+              return [[getattr(i, 'pk', None)] for i in items]
+  
+          try:
+              # Patch
+              connection.ops.bulk_batch_size = fake_bulk_batch_size
+              connection.features.can_return_rows_from_bulk_insert = bulk_return
+              QuerySet._insert = fake_insert
+  
+              result = qs._batched_insert(objs, fields, requested_batch_size)
+  
+              # Number of times fake_insert was called should equal expect_calls
+              self.assertEqual(len(calls), expect_calls)
+  
+              # If backend reports it can return rows, the returned rows accumulator
+              # should contain num_objs elements (one per object).
+              if bulk_return and num_objs:
+                  # Flatten inserted rows count
+                  total_returned = sum(len(r) for r in result)
+                  self.assertEqual(total_returned, num_objs)
+              elif not bulk_return:
+                  self.assertEqual(result, [])
+  
+          finally:
+              # Restore
+              connection.ops.bulk_batch_size = orig_bulk_batch_size
+              QuerySet._insert = orig_insert
+              connection.features.can_return_rows_from_bulk_insert = orig_can_return
+  
+      def test_requested_larger_than_max_is_clamped_to_max(self):
+          # fake_max_batch = 1, requested_batch_size = 100 -> expect one object per batch
+          self._run_batched_insert_with_fake_insert(
+              TwoFields, num_objs=10, fake_max_batch=1, requested_batch_size=100, expect_calls=10
+          )
+  
+      def test_requested_smaller_than_max_uses_requested(self):
+          # fake_max_batch = 10, requested_batch_size = 3 -> expect ceil(9/3)=3 calls
+          self._run_batched_insert_with_fake_insert(
+              TwoFields, num_objs=9, fake_max_batch=10, requested_batch_size=3, expect_calls=3
+          )
+  
+      def test_none_batch_size_uses_backend_max(self):
+          # requested_batch_size None should use backend max (fake_max_batch=4)
+          self._run_batched_insert_with_fake_insert(
+              TwoFields, num_objs=9, fake_max_batch=4, requested_batch_size=None, expect_calls=ceil(9/4)
+          )
+  
+      def test_batch_size_larger_than_needed_but_clamped(self):
+          # fake_max_batch=2, requested_batch_size=100, num_objs=5 -> ceil(5/2)=3
+          self._run_batched_insert_with_fake_insert(
+              TwoFields, num_objs=5, fake_max_batch=2, requested_batch_size=100, expect_calls=3
+          )
+  
+      def test_batch_size_equal_to_max_behaves_normally(self):
+          # fake_max_batch=5, requested=5, num_objs=12 -> ceil(12/5)=3
+          self._run_batched_insert_with_fake_insert(
+              TwoFields, num_objs=12, fake_max_batch=5, requested_batch_size=5, expect_calls=ceil(12/5)
+          )
+  
+      def test_backend_bulk_batch_size_zero_treated_as_at_least_one(self):
+          # If backend returns 0, the code normalizes to at least 1
+          self._run_batched_insert_with_fake_insert(
+              TwoFields, num_objs=6, fake_max_batch=0, requested_batch_size=10, expect_calls=6
+          )
+  
+      def test_empty_objs_results_in_no_calls(self):
+          # No objects -> no insert calls regardless of batch size
+          self._run_batched_insert_with_fake_insert(
+              TwoFields, num_objs=0, fake_max_batch=3, requested_batch_size=100, expect_calls=0
+          )
+  
+      def test_not_supported_ignore_conflicts_raises(self):
+          qs = TwoFields.objects
+          objs = [TwoFields(f1=i, f2=i) for i in range(5)]
+          fields = qs.model._meta.concrete_fields
+          # Save original support flag and bulk_batch_size
+          orig_support = connection.features.supports_ignore_conflicts
+          orig_bulk_batch_size = connection.ops.bulk_batch_size
+          try:
+              # Simulate backend not supporting ignore_conflicts
+              connection.features.supports_ignore_conflicts = False
+              connection.ops.bulk_batch_size = lambda fields_arg, objs_arg: 2
+              with self.assertRaises(NotSupportedError):
+                  qs._batched_insert(objs, fields, batch_size=10, ignore_conflicts=True)
+          finally:
+              connection.features.supports_ignore_conflicts = orig_support
+              connection.ops.bulk_batch_size = orig_bulk_batch_size
+  
+      def test_bulk_return_false_collects_no_returned_rows(self):
+          # When backend cannot return rows, _batched_insert should return []
+          qs = TwoFields.objects
+          objs = [TwoFields(f1=i, f2=i) for i in range(7)]
+          fields = qs.model._meta.concrete_fields
+  
+          orig_bulk_batch_size = connection.ops.bulk_batch_size
+          orig_insert = QuerySet._insert
+          orig_can_return = connection.features.can_return_rows_from_bulk_insert
+          calls = []
+  
+          def fake_bulk_batch_size(fields_arg, objs_arg):
+              return 3
+  
+          def fake_insert(self, items, fields_arg, *args, **kwargs):
+              calls.append(list(items))
+              return [[getattr(i, 'pk', None)] for i in items]
+  
+          try:
+              connection.ops.bulk_batch_size = fake_bulk_batch_size
+              connection.features.can_return_rows_from_bulk_insert = False
+              QuerySet._insert = fake_insert
+              result = qs._batched_insert(objs, fields, batch_size=100)
+              # Should have been split into ceil(7/3)=3 batches
+              self.assertEqual(len(calls), ceil(7/3))
+              # But since bulk_return is False, result must be an empty list
+              self.assertEqual(result, [])
+          finally:
+              connection.ops.bulk_batch_size = orig_bulk_batch_size
+              QuerySet._insert = orig_insert
+              connection.features.can_return_rows_from_bulk_insert = orig_can_return
+  
+      def test_non_auto_pk_model_respects_max_batch_size(self):
+          # Use State model (non auto-increment PK) to confirm logic is model-agnostic
+          qs = State.objects
+          objs = [State(two_letter_code=str(i)) for i in range(20)]
+          fields = qs.model._meta.concrete_fields
+  
+          orig_bulk_batch_size = connection.ops.bulk_batch_size
+          orig_insert = QuerySet._insert
+          orig_can_return = connection.features.can_return_rows_from_bulk_insert
+          calls = []
+  
+          def fake_bulk_batch_size(fields_arg, objs_arg):
+              return 4
+  
+          def fake_insert(self, items, fields_arg, *args, **kwargs):
+              calls.append(list(items))
+              return [[getattr(i, 'pk', None)] for i in items]
+  
+          try:
+              connection.ops.bulk_batch_size = fake_bulk_batch_size
+              connection.features.can_return_rows_from_bulk_insert = True
+              QuerySet._insert = fake_insert
+              result = qs._batched_insert(objs, fields, batch_size=100)
+              self.assertEqual(len(calls), ceil(len(objs) / 4))
+              # Verify returned rows total matches number of input objects
+              total_returned = sum(len(r) for r in result)
+              self.assertEqual(total_returned, len(objs))
+          finally:
+              connection.ops.bulk_batch_size = orig_bulk_batch_size
+              QuerySet._insert = orig_insert
+              connection.features.can_return_rows_from_bulk_insert = orig_can_return
+new_imports_code: |
+  from django.db.models.query import QuerySet

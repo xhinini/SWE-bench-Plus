@@ -1,0 +1,284 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests exercise create_new_paste and the pastebin plugin's integration points introduced/affected by the patch that ensures the 'text' lexer is used when posting session output. They verify that:
+  - The POST payload sent to the remote service uses the 'text' lexer and is ASCII-encodable.
+  - Contents (bytes and unicode) are correctly included and percent-encoded in the request body.
+  - The internal tee_write used when --pastebin=all writes UTF-8 encoded bytes to a binary temporary file.
+  - pytest_configure (when pastebin=all) creates the binary temporary file and patches the terminal writer.
+  - pytest_unconfigure reads the buffer, deletes the attribute, restores the original write attribute and calls create_new_paste, writing the summary lines.
+  - pytest_terminal_summary only runs when configured for 'failed', extracts a message for each failed report (both via reprtraceback and fallback), uses a terminal writer to capture report output, and calls create_new_paste with that captured output.
+test_code: |
+  # -*- coding: utf-8 -*-
+  from __future__ import absolute_import, division, print_function
+  import io
+  import sys
+  import types
+  import pytest
+  import _pytest.pastebin as pastebin
+  import _pytest.config as _pytest_config
+  import six
+  
+  # Helpers to patch urlopen in both py2 and py3
+  def _monkeypatch_urlopen(monkeypatch, response_bytes, capture_list):
+      def mocked(url, data):
+          capture_list.append((url, data))
+          class DummyFile(object):
+              def read(self):
+                  return response_bytes
+          return DummyFile()
+  
+      if sys.version_info < (3, 0):
+          import urllib
+          monkeypatch.setattr(urllib, "urlopen", mocked)
+      else:
+          import urllib.request
+          monkeypatch.setattr(urllib.request, "urlopen", mocked)
+  
+  def test_create_new_paste_sends_text_lexer_for_bytes(monkeypatch):
+      calls = []
+      # Return a HTML that contains a raw id matching the regex
+      _monkeypatch_urlopen(monkeypatch, b'blah href="/raw/XYZ123abc" blah', calls)
+      res = pastebin.create_new_paste(b"simple-content")
+      assert res == "https://bpaste.net/show/XYZ123abc"
+      assert len(calls) == 1
+      url, data = calls[0]
+      assert url == "https://bpaste.net"
+      assert isinstance(data, bytes)
+      decoded = data.decode("ascii")
+      # must use the text lexer
+      assert "lexer=text" in decoded
+      # and include the code payload
+      assert "code=simple-content" in decoded
+      assert "expiry=1week" in decoded
+  
+  def test_create_new_paste_accepts_unicode_and_percent_encodes(monkeypatch):
+      calls = []
+      # return a raw id to get a success path
+      _monkeypatch_urlopen(monkeypatch, b'href="/raw/abcd1234"', calls)
+      # pass a unicode string (text_type)
+      content = six.text_type("hello \u2603")  # snowman
+      res = pastebin.create_new_paste(content)
+      assert res == "https://bpaste.net/show/abcd1234"
+      assert len(calls) == 1
+      _, data = calls[0]
+      # data is ascii-encoded after urlencode; non-ascii should be percent-encoded as %E2%98%83 or similar
+      assert isinstance(data, bytes)
+      decoded = data.decode("ascii")
+      # ensure the UTF-8 bytes for the snowman were percent-encoded in the ASCII payload
+      assert "%E2%98%83" in decoded.upper()
+  
+  def test_create_new_paste_preserves_plus_and_space_encoding(monkeypatch):
+      calls = []
+      _monkeypatch_urlopen(monkeypatch, b'href="/raw/PPP"', calls)
+      # plus and space should be encoded so that '+' becomes %2B and spaces become '+'
+      content = "a+b c"
+      res = pastebin.create_new_paste(content)
+      assert res == "https://bpaste.net/show/PPP"
+      assert len(calls) == 1
+      _, data = calls[0]
+      decoded = data.decode("ascii")
+      # urlencode('a+b c') -> a%2Bb+c
+      assert "a%2Bb+c" in decoded
+  
+  def test_create_new_paste_data_is_ascii_bytes(monkeypatch):
+      calls = []
+      _monkeypatch_urlopen(monkeypatch, b'href="/raw/AAA"', calls)
+      pastebin.create_new_paste(b"bytes-are-ok")
+      _, data = calls[0]
+      # ensure the bytes passed to urlopen are ASCII-only (urlencode(...).encode('ascii'))
+      assert all(b < 128 for b in data)
+  
+  def test_pytest_configure_all_creates_pastebinfile_and_patches_writer(monkeypatch):
+      # create a fake config and terminalreporter with a simple writer object
+      class DummyTW(object):
+          def __init__(self):
+              self.written = []
+          def write(self, s, **kwargs):
+              # original write just records
+              self.written.append(("orig", s))
+      class DummyTR(object):
+          def __init__(self):
+              self._tw = DummyTW()
+      dummy_tr = DummyTR()
+      class DummyPM(object):
+          def getplugin(self, name):
+              if name == "terminalreporter":
+                  return dummy_tr
+              return None
+      class DummyOptions(object):
+          def __init__(self):
+              self.pastebin = "all"
+      class DummyConfig(object):
+          def __init__(self):
+              self.option = DummyOptions()
+              self.pluginmanager = DummyPM()
+      config = DummyConfig()
+      # monkeypatch TemporaryFile to return an io.BytesIO we can inspect
+      buffer = io.BytesIO()
+      monkeypatch.setattr(pastebin.tempfile, "TemporaryFile", lambda mode: buffer)
+      # Run configure
+      pastebin.pytest_configure(config)
+      # now _pastebinfile should exist and tr._tw.write should be patched
+      assert hasattr(config, "_pastebinfile")
+      assert hasattr(dummy_tr._tw, "write")
+      # Call the patched write with a unicode string; it should write UTF-8 bytes to the buffer
+      dummy_tr._tw.write(six.text_type("héllo"))
+      # cursor in buffer currently at end; inspect contents
+      buffer.seek(0)
+      data = buffer.read()
+      assert b"\xc3\xa9" in data  # é encoded as UTF-8
+      # Also test writing bytes directly should be written unchanged
+      dummy_tr._tw.write(b"bytes")
+      buffer.seek(0)
+      assert b"bytes" in buffer.read()
+  
+  def test_pytest_unconfigure_restores_and_calls_create_new_paste(monkeypatch):
+      # Prepare a fake config with a _pastebinfile containing some bytes
+      buffer = io.BytesIO()
+      buffer.write(b"session content")
+      buffer.seek(0)
+      class DummyTW(object):
+          def __init__(self):
+              # create a write attribute in __dict__ so del tr._tw.__dict__['write'] works
+              self.write = lambda s, **kwargs: None
+      class DummyTR(object):
+          def __init__(self):
+              self._tw = DummyTW()
+              self.written = []
+          def write_sep(self, char, msg):
+              self.written.append(("sep", char, msg))
+          def write_line(self, line):
+              self.written.append(("line", line))
+      dummy_tr = DummyTR()
+      class DummyPM(object):
+          def getplugin(self, name):
+              if name == "terminalreporter":
+                  return dummy_tr
+              return None
+      class DummyOptions(object):
+          def __init__(self):
+              self.pastebin = "all"
+      class DummyConfig(object):
+          def __init__(self):
+              self.option = DummyOptions()
+              self.pluginmanager = DummyPM()
+      config = DummyConfig()
+      config._pastebinfile = buffer
+      # monkeypatch create_new_paste to capture the sessionlog and return a fake URL
+      captured = {}
+      def fake_create_new_paste(contents):
+          captured['contents'] = contents
+          return "https://bpaste.net/show/FAKE"
+      monkeypatch.setattr(pastebin, "create_new_paste", fake_create_new_paste)
+      # Run unconfigure
+      pastebin.pytest_unconfigure(config)
+      # _pastebinfile attribute should be removed
+      assert not hasattr(config, "_pastebinfile")
+      # create_new_paste should have been called with the bytes we had
+      assert captured['contents'] == b"session content"
+      # terminal reporter should have received write_sep and write_line calls
+      assert any(call[0] == "sep" for call in dummy_tr.written)
+      assert any(call[0] == "line" for call in dummy_tr.written)
+  
+  def test_pytest_terminal_summary_noop_when_not_failed():
+      # terminalreporter with option.pastebin not 'failed' should do nothing
+      class DummyConfig(object):
+          def __init__(self):
+              class Opts: pastebin = "all"
+              self.option = Opts()
+      tr = types.SimpleNamespace(config=DummyConfig(), stats={})
+      # should simply return and not raise
+      pastebin.pytest_terminal_summary(tr)
+  
+  def test_pytest_terminal_summary_posts_failed_reports(monkeypatch):
+      # Prepare a terminalreporter configured for 'failed'
+      class DummyOptions:
+          pastebin = "failed"
+      class DummyConfig:
+          def __init__(self):
+              self.option = DummyOptions()
+      # Create a fake report object:
+      class FakeReprEntry(object):
+          def __init__(self):
+              self.reprfileloc = "file.py:10"
+      class FakeLongRepr(object):
+          def __init__(self):
+              self.reprtraceback = types.SimpleNamespace(reprentries=[FakeReprEntry()])
+      class FakeRep(object):
+          def __init__(self):
+              self.longrepr = FakeLongRepr()
+          def toterminal(self, tw):
+              # simulate writing to the terminal writer's stringio
+              tw.stringio.write("failure-output")
+      # fake create_terminal_writer to return an object with stringio
+      def fake_create_terminal_writer(config, stringio=True):
+          class TW(object):
+              def __init__(self):
+                  self.stringio = io.StringIO()
+          return TW()
+      monkeypatch.setattr(_pytest_config, "create_terminal_writer", fake_create_terminal_writer)
+      # monkeypatch create_new_paste to capture contents
+      captured = {}
+      def fake_create_new_paste(contents):
+          captured['s'] = contents
+          return "https://bpaste.net/show/ZZZ"
+      monkeypatch.setattr(pastebin, "create_new_paste", fake_create_new_paste)
+      # Fake terminalreporter with stats containing one failed rep
+      tr = types.SimpleNamespace(config=DummyConfig(), stats={"failed": [FakeRep()]})
+      # capture lines written by terminalreporter
+      written = []
+      def write_sep(char, msg):
+          written.append(("sep", msg))
+      def write_line(line):
+          written.append(("line", line))
+      tr.write_sep = write_sep
+      tr.write_line = write_line
+      # run summary
+      pastebin.pytest_terminal_summary(tr)
+      # ensure create_new_paste was called with the failure output
+      assert captured['s'] == "failure-output"
+      # ensure terminalreporter wrote the summary lines
+      assert any(w[0] == "sep" for w in written)
+      assert any(w[0] == "line" for w in written)
+  
+  def test_pytest_terminal_summary_uses_getfailureheadline_fallback(monkeypatch):
+      # if reprtraceback is not present, fallback to _getfailureheadline
+      class DummyOptions:
+          pastebin = "failed"
+      class DummyConfig:
+          def __init__(self):
+              self.option = DummyOptions()
+      class FakeRep(object):
+          def __init__(self):
+              # longrepr without reprtraceback to force AttributeError
+              self.longrepr = object()
+          def toterminal(self, tw):
+              tw.stringio.write("fallback-output")
+      # patch create_terminal_writer
+      def fake_create_terminal_writer(config, stringio=True):
+          class TW(object):
+              def __init__(self):
+                  self.stringio = io.StringIO()
+          return TW()
+      monkeypatch.setattr(_pytest_config, "create_terminal_writer", fake_create_terminal_writer)
+      captured = {}
+      def fake_create_new_paste(contents):
+          captured['s'] = contents
+          return "https://bpaste.net/show/YYY"
+      monkeypatch.setattr(pastebin, "create_new_paste", fake_create_new_paste)
+      tr = types.SimpleNamespace(config=DummyConfig(), stats={"failed": [FakeRep()]})
+      # set _getfailureheadline on tr and capture writes
+      tr._getfailureheadline = lambda rep: "headline"
+      written = []
+      tr.write_sep = lambda char, msg: written.append(("sep", msg))
+      tr.write_line = lambda line: written.append(("line", line))
+      pastebin.pytest_terminal_summary(tr)
+      assert captured['s'] == "fallback-output"
+      # ensure the msg used in write_line contains our headline
+      assert any("headline" in (w[1] if w[0] == "sep" else w[1]) for w in written)
+new_imports_code: |
+  import io
+  import types
+  import six
+  import _pytest.config as _pytest_config

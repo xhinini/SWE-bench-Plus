@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.tests_llm.ChangeListAtomicUsingTests._post_swallow_list_editable_and_assert_atomic_using admin_changelist.tests_llm.ChangeListAtomicUsingTests.test_atomic_called_with_using_even_when_action_selected admin_changelist.tests_llm.ChangeListAtomicUsingTests.test_atomic_called_with_using_on_list_editable_save_multiple_changes admin_changelist.tests_llm.ChangeListAtomicUsingTests.test_atomic_called_with_using_on_list_editable_save_single_change admin_changelist.tests_llm.ChangeListAtomicUsingTests.test_atomic_called_with_using_when_log_change_raises admin_changelist.tests_llm.ChangeListAtomicUsingTests.test_atomic_called_with_using_when_no_forms_changed admin_changelist.tests_llm.ChangeListAtomicUsingTests.test_atomic_called_with_using_when_second_log_change_raises admin_changelist.tests_llm.ChangeListAtomicUsingTests.test_atomic_called_with_using_with_different_ordering_param admin_changelist.tests_llm.ChangeListAtomicUsingTests.test_atomic_called_with_using_with_follow_true
+coverage json -o coverage.json
+: '>>>>> End Test Output'

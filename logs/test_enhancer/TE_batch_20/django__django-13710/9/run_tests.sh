@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_inlines.tests_llm.VerboseNamePluralRegressionTests._make_inline_and_get_plural admin_inlines.tests_llm.VerboseNamePluralRegressionTests.make_dummy_model admin_inlines.tests_llm.VerboseNamePluralRegressionTests.test_category_irregular_plural_uses_inline_verbose_name admin_inlines.tests_llm.VerboseNamePluralRegressionTests.test_child_irregular_plural_uses_inline_verbose_name admin_inlines.tests_llm.VerboseNamePluralRegressionTests.test_leaf_irregular_plural_uses_inline_verbose_name admin_inlines.tests_llm.VerboseNamePluralRegressionTests.test_person_irregular_plural_uses_inline_verbose_name admin_inlines.tests_llm.VerboseNamePluralRegressionTests.test_phrase_verbose_name_uses_inline_verbose_name admin_inlines.tests_llm.VerboseNamePluralRegressionTests.test_verbose_name_numeric_like_uses_inline_verbose_name admin_inlines.tests_llm.VerboseNamePluralRegressionTests.test_verbose_name_with_spaces_uses_inline_verbose_name admin_inlines.tests_llm.VerboseNamePluralRegressionTests.test_verbose_name_with_uppercase_uses_inline_verbose_name
+coverage json -o coverage.json
+: '>>>>> End Test Output'

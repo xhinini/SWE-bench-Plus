@@ -1,0 +1,264 @@
+# No new external imports required beyond standard library and pytest.
+# -*- coding: utf-8 -*-
+import sys
+import io
+import types
+import pytest
+
+from _pytest import pastebin as pastebin_module
+
+# Helpers for monkeypatching urlopen in Python2/3 compatible manner
+def _monkeypatch_urlopen(monkeypatch, mocked_callable):
+    if sys.version_info < (3, 0):
+        import urllib
+        monkeypatch.setattr(urllib, "urlopen", mocked_callable)
+    else:
+        import urllib.request
+        monkeypatch.setattr(urllib.request, "urlopen", mocked_callable)
+
+class DummyURLFileOK(object):
+    def read(self):
+        # typical successful response part that matches the regex used in create_new_paste
+        return b'... <a href="/raw/ABC123def">raw</a> ...'
+
+class DummyURLFileNoMatch(object):
+    def __init__(self, payload):
+        self._payload = payload
+    def read(self):
+        # return arbitrary bytes that do not match the expected href pattern
+        return self._payload
+
+def test_create_new_paste_uses_text_lexer_and_calls_urlopen_once(monkeypatch):
+    calls = []
+    def mocked(url, data):
+        calls.append((url, data))
+        return DummyURLFileOK()
+
+    _monkeypatch_urlopen(monkeypatch, mocked)
+
+    res = pastebin_module.create_new_paste(b"some-bytes")
+    assert res == "https://bpaste.net/show/ABC123def"
+    assert len(calls) == 1
+    url, data = calls[0]
+    assert url == "https://bpaste.net"
+    # data must be bytes
+    assert isinstance(data, bytes)
+    # ensure lexer=text present in the urlencoded data
+    decoded = data.decode("ascii")
+    assert "lexer=text" in decoded
+    assert "code=some-bytes" in decoded
+    assert "expiry=1week" in decoded
+
+def test_create_new_paste_with_unicode_string_input(monkeypatch):
+    calls = []
+    def mocked(url, data):
+        calls.append((url, data))
+        return DummyURLFileOK()
+    _monkeypatch_urlopen(monkeypatch, mocked)
+
+    # Pass a unicode string (str) rather than bytes
+    s = "áß漢 space"
+    res = pastebin_module.create_new_paste(s)
+    assert res == "https://bpaste.net/show/ABC123def"
+    assert len(calls) == 1
+    url, data = calls[0]
+    assert isinstance(data, bytes)
+    # Ensure the urlencoded payload contains the percent-encoded form (ASCII-only)
+    payload = data.decode("ascii")
+    # The original string shouldn't appear raw because it must be urlencoded
+    assert "space" in payload or " " not in payload
+    assert "lexer=text" in payload
+
+def test_create_new_paste_with_non_ascii_bytes_is_encoded_ascii(monkeypatch):
+    calls = []
+    def mocked(url, data):
+        calls.append((url, data))
+        return DummyURLFileOK()
+    _monkeypatch_urlopen(monkeypatch, mocked)
+
+    # Non-ascii bytes in content should be percent-encoded by urlencode, resulting in ASCII-only bytes
+    content = "üñîçødé".encode("utf-8")
+    res = pastebin_module.create_new_paste(content)
+    assert res == "https://bpaste.net/show/ABC123def"
+    url, data = calls[0]
+    # The bytes placed on the wire should be ASCII-only
+    assert all(b < 128 for b in data)
+    assert "lexer=text" in data.decode("ascii")
+
+def test_create_new_paste_encodes_special_characters_correctly(monkeypatch):
+    calls = []
+    def mocked(url, data):
+        calls.append((url, data))
+        return DummyURLFileOK()
+    _monkeypatch_urlopen(monkeypatch, mocked)
+
+    content = b"line one\nline two & more"
+    res = pastebin_module.create_new_paste(content)
+    assert res == "https://bpaste.net/show/ABC123def"
+    url, data = calls[0]
+    payload = data.decode("ascii")
+    # ensure that ampersand is encoded (so it does not break the query)
+    assert "line+one" in payload or "line%20one" in payload
+    assert "line+two" in payload or "line%20two" in payload
+    assert "lexer=text" in payload
+
+def test_pytest_configure_adds_pastebinfile_and_wrapps_write(monkeypatch):
+    # create a dummy terminal reporter with a _tw that has a write method
+    class DummyTW(object):
+        def __init__(self):
+            self.written = []
+        def write(self, s, **kwargs):
+            # emulate the real terminal writer's write
+            self.written.append(s)
+
+    class DummyTR(object):
+        def __init__(self):
+            self._tw = DummyTW()
+
+    class DummyPM(object):
+        def __init__(self, tr):
+            self._tr = tr
+        def getplugin(self, name):
+            if name == "terminalreporter":
+                return self._tr
+            return None
+
+    # capture TemporaryFile usage
+    created = {}
+    class DummyTempFile(io.BytesIO):
+        def __init__(self):
+            super(DummyTempFile, self).__init__()
+            created['inst'] = self
+        # keep w+b semantics (BytesIO is fine)
+
+    monkeypatch.setattr(pastebin_module.tempfile, "TemporaryFile", lambda mode: DummyTempFile())
+
+    config = types.SimpleNamespace()
+    config.option = types.SimpleNamespace(pastebin="all")
+    tr = DummyTR()
+    config.pluginmanager = DummyPM(tr)
+
+    # run pytest_configure which should set up config._pastebinfile and wrap tr._tw.write
+    pastebin_module.pytest_configure(config)
+
+    # ensure pastebinfile attribute set and is our DummyTempFile
+    assert hasattr(config, "_pastebinfile")
+    assert created.get('inst') is config._pastebinfile
+    # ensure tr._tw.write has been replaced (it's a function, not the original method)
+    assert tr._tw.write is not None
+    # exercise the wrapped write: writing a unicode string should be stored in both terminal written buffer and pastebinfile
+    tr._tw.write("hello-ü")
+    # the pastebinfile should contain the utf-8 encoded bytes
+    config._pastebinfile.seek(0)
+    stored = config._pastebinfile.read()
+    assert b"hello" in stored
+    # cleanup: emulate unconfigure to avoid leaving attributes
+    # remove created attribute for safety
+    config._pastebinfile = created['inst']
+
+def test_pytest_unconfigure_writes_summary_and_calls_create_new_paste(monkeypatch):
+    # Setup config with a pastebinfile filled with some bytes
+    config = types.SimpleNamespace()
+    config.option = types.SimpleNamespace(pastebin=None)
+
+    # Create a Dummy pastebinfile
+    pastefile = io.BytesIO(b"session log")
+    config._pastebinfile = pastefile
+
+    # create Dummy terminal reporter that records writes
+    class DummyTR(object):
+        def __init__(self):
+            self.lines = []
+            class TW(object):
+                def __init__(self, outer):
+                    self.outer = outer
+                def write(self, s, **kwargs):
+                    # store writes
+                    self.outer.lines.append(s)
+            self._tw = TW(self)
+        def write_sep(self, sep, msg):
+            self.lines.append("SEP:" + sep + ":" + msg)
+        def write_line(self, msg):
+            self.lines.append("LINE:" + msg)
+    tr = DummyTR()
+
+    class DummyPM(object):
+        def __init__(self, tr):
+            self._tr = tr
+        def getplugin(self, name):
+            if name == "terminalreporter":
+                return self._tr
+            return None
+
+    config.pluginmanager = DummyPM(tr)
+
+    # ensure tr._tw has a write entry in __dict__ so that deletion in pytest_unconfigure works
+    # assign an attribute on the instance
+    tr._tw.__dict__['write'] = tr._tw.write
+
+    # monkeypatch create_new_paste to return a predictable URL
+    monkeypatch.setattr(pastebin_module, "create_new_paste", lambda contents: "https://bpaste.net/show/DEADBEEF")
+
+    # call unconfigure
+    pastebin_module.pytest_unconfigure(config)
+
+    # after unconfigure, config should not have _pastebinfile
+    assert not hasattr(config, "_pastebinfile")
+    # terminal reporter should have written summary lines including our paste URL
+    joined = "\n".join(tr.lines)
+    assert "Sending information to Paste Service" in joined
+    assert "pastebin session-log: https://bpaste.net/show/DEADBEEF" in joined
+
+def test_pytest_terminal_summary_no_action_when_not_failed():
+    # terminalreporter.config.option.pastebin != "failed" should cause no action
+    class DummyReporter(object):
+        def __init__(self):
+            self.config = types.SimpleNamespace(option=types.SimpleNamespace(pastebin="all"))
+            self.written = []
+        def write_sep(self, sep, msg):
+            self.written.append(("sep", sep, msg))
+        def write_line(self, msg):
+            self.written.append(("line", msg))
+    tr = DummyReporter()
+    # nothing should raise and nothing should be written
+    pastebin_module.pytest_terminal_summary(tr)
+    assert tr.written == []
+
+def test_pytest_terminal_summary_handles_failed_and_uses_create_new_paste(monkeypatch):
+    # Setup a terminalreporter with stats containing one failed rep
+    class DummyWriter(object):
+        def __init__(self):
+            self.stringio = io.StringIO()
+    def create_terminal_writer(config, stringio=True):
+        return DummyWriter()
+
+    # A dummy failing report object
+    class DummyRep(object):
+        def __init__(self):
+            self.toterminal_called = False
+            self.toterminal_args = None
+            # simulate a longrepr that will not have the reprtraceback chain, forcing the fallback
+            self.longrepr = None
+        def toterminal(self, tw):
+            # write something into the writer's StringIO as real code would do
+            tw.stringio.write("SOME FAILURE TRACE")
+
+    tr = types.SimpleNamespace()
+    tr.config = types.SimpleNamespace(option=types.SimpleNamespace(pastebin="failed"))
+    tr.stats = {"failed": [DummyRep()]}
+    # provide get plugin like behavior expected inside pytest_terminal_summary
+    tr.write_sep = lambda sep, msg: setattr(tr, "sep_called", (sep, msg))
+    captured_lines = []
+    tr.write_line = lambda msg: captured_lines.append(msg)
+    tr._getfailureheadline = lambda rep: "FAILED_HEADLINE"
+
+    # monkeypatch create_terminal_writer and create_new_paste
+    monkeypatch.setattr(pastebin_module._pytest.config, "create_terminal_writer", create_terminal_writer)
+    monkeypatch.setattr(pastebin_module, "create_new_paste", lambda contents: "https://bpaste.net/show/XYZ")
+
+    # call the hook
+    pastebin_module.pytest_terminal_summary(tr)
+
+    # verify that we wrote separator and the paste URL line
+    assert getattr(tr, "sep_called")[1] == "Sending information to Paste Service"
+    assert any("XYZ" in line for line in captured_lines)

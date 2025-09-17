@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_aware_microseconds_and_seconds_ignored utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_depth_with_aware_datetimes utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_months_edge_cases_with_tz utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_thousand_years_ago_aware utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timesince_aware_day_greater_results_in_weeks utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timesince_aware_leap_year_boundary_with_different_tz utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timesince_aware_years_months_fixed_tz utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timesince_aware_years_months_utc utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timesince_different_aware_timezones utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timeuntil_aware_matches_timesince
+coverage json -o coverage.json
+: '>>>>> End Test Output'

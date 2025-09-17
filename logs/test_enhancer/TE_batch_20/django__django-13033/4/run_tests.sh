@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 ordering.test_models_llm.FindOrderingNameRegressionTests._ordering_sql_and_params ordering.test_models_llm.FindOrderingNameRegressionTests.assertOrderingEqual ordering.test_models_llm.FindOrderingNameRegressionTests.setUpTestData ordering.test_models_llm.FindOrderingNameRegressionTests.test_article_order_by_author_editor_desc_then_headline_vs_id_variant ordering.test_models_llm.FindOrderingNameRegressionTests.test_article_order_by_author_editor_then_pub_date_vs_id_variant ordering.test_models_llm.FindOrderingNameRegressionTests.test_article_order_by_author_editor_vs_author_editor_id ordering.test_models_llm.FindOrderingNameRegressionTests.test_article_order_by_chain_author_editor_editor_vs_id_variant ordering.test_models_llm.FindOrderingNameRegressionTests.test_article_order_by_minus_author_editor_vs_minus_author_editor_id ordering.test_models_llm.FindOrderingNameRegressionTests.test_article_order_by_mixed_fields_with_id_variant ordering.test_models_llm.FindOrderingNameRegressionTests.test_article_order_by_second_author_editor_vs_second_author_editor_id ordering.test_models_llm.FindOrderingNameRegressionTests.test_orderedbyauthorarticle_order_by_article_author_vs_article_author_id ordering.test_models_llm.FindOrderingNameRegressionTests.test_orderedbyauthorarticle_order_by_author_and_second_author_id_equivalence ordering.test_models_llm.FindOrderingNameRegressionTests.test_reference_order_by_article_author_desc_vs_id_variant
+coverage json -o coverage.json
+: '>>>>> End Test Output'

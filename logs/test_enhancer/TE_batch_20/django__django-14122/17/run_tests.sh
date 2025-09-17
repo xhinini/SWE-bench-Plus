@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 ordering.tests_llm.GroupByOrderingTests.setUpTestData ordering.tests_llm.GroupByOrderingTests.test_annotate_constant_then_values_then_annotate_group_by ordering.tests_llm.GroupByOrderingTests.test_childarticle_order_by_ptr_with_meta_ordering ordering.tests_llm.GroupByOrderingTests.test_having_expressions_are_added_to_group_by ordering.tests_llm.GroupByOrderingTests.test_order_by_annotation_reference_is_skipped_in_group_by ordering.tests_llm.GroupByOrderingTests.test_order_by_cleared_with_order_by_empty_uses_meta_ordering_and_does_not_affect_group_by ordering.tests_llm.GroupByOrderingTests.test_order_by_rawsql_table_col_with_meta_ordering ordering.tests_llm.GroupByOrderingTests.test_values_annotate_with_explicit_order_by_adds_order_by_cols_to_group_by ordering.tests_llm.GroupByOrderingTests.test_values_annotate_with_meta_ordering_only_groups_by_values_field ordering.tests_llm.GroupByOrderingTests.test_values_with_multiple_fields_and_meta_ordering ordering.tests_llm._group_by_columns_from_sql
+coverage json -o coverage.json
+: '>>>>> End Test Output'

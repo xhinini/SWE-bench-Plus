@@ -1,0 +1,164 @@
+# No additional module-level imports required; tests import locally as needed.
+from io import StringIO
+import errno
+import sys
+from unittest import mock
+
+from django.test import SimpleTestCase
+from django.core.management.commands.runserver import Command as RunserverCommand
+
+class RunserverInnerRunTests(SimpleTestCase):
+    """
+    Regression tests for runserver inner_run address formatting and error
+    handling. These tests mock run() and other side effects to assert the
+    exact text written to stdout/stderr.
+    """
+
+    def setUp(self):
+        # Create an instance of the command with StringIO streams.
+        self.stdout = StringIO()
+        self.stderr = StringIO()
+        self.cmd = RunserverCommand(stdout=self.stdout, stderr=self.stderr)
+        # Prevent autoreload from raising any exceptions in the test environment.
+        patcher = mock.patch("django.utils.autoreload.raise_last_exception", lambda: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @mock.patch("django.core.servers.basehttp.run")
+    @mock.patch("django.core.management.base.BaseCommand.check_migrations")
+    @mock.patch("django.core.management.base.BaseCommand.check")
+    def test_zero_ip_addr_with_checks(self, mocked_check, mocked_check_mig, mocked_run):
+        """
+        If addr is '0', the help output should show 0.0.0.0 in the server URL
+        whether or not checks are performed.
+        """
+        self.cmd.addr = "0"
+        self.cmd.port = "8000"
+        self.cmd.use_ipv6 = False
+        self.cmd._raw_ipv6 = False
+        # run() is mocked out to avoid binding to sockets.
+        self.cmd.inner_run(None, use_threading=True, use_reloader=False, skip_checks=False)
+        out = self.stdout.getvalue()
+        self.assertIn("Starting development server at http://0.0.0.0:8000/", out)
+
+    @mock.patch("django.core.servers.basehttp.run")
+    def test_raw_ipv6_address_is_bracketed(self, mocked_run):
+        """
+        A raw IPv6 address (when _raw_ipv6 is True) should be shown bracketed
+        in the URL that is printed to stdout.
+        """
+        self.cmd.addr = "2001:db8::1"
+        self.cmd.port = "8000"
+        self.cmd.use_ipv6 = True
+        self.cmd._raw_ipv6 = True
+        self.cmd.inner_run(None, use_threading=False, use_reloader=False, skip_checks=True)
+        out = self.stdout.getvalue()
+        self.assertIn("Starting development server at http://[2001:db8::1]:8000/", out)
+
+    @mock.patch("django.core.servers.basehttp.run")
+    def test_default_ipv6_is_bracketed(self, mocked_run):
+        """
+        When using IPv6 defaults (e.g. ::1) the printed address should be bracketed.
+        """
+        self.cmd.addr = "::1"
+        self.cmd.port = "8000"
+        self.cmd.use_ipv6 = True
+        self.cmd._raw_ipv6 = True
+        self.cmd.inner_run(None, use_threading=False, use_reloader=False, skip_checks=True)
+        out = self.stdout.getvalue()
+        self.assertIn("Starting development server at http://[::1]:8000/", out)
+
+    @mock.patch("django.core.servers.basehttp.run")
+    def test_hostname_not_bracketed(self, mocked_run):
+        """
+        Regular hostnames must not be bracketed in the printed server URL.
+        """
+        self.cmd.addr = "localhost"
+        self.cmd.port = "8000"
+        self.cmd.use_ipv6 = False
+        self.cmd._raw_ipv6 = False
+        self.cmd.inner_run(None, use_threading=False, use_reloader=False, skip_checks=True)
+        out = self.stdout.getvalue()
+        self.assertIn("Starting development server at http://localhost:8000/", out)
+        self.assertNotIn("[localhost]", out)
+
+    @mock.patch("django.core.servers.basehttp.run")
+    def test_default_ipv4_address_printed(self, mocked_run):
+        """
+        When IPv6 is not used, ensure the default IPv4 loopback address is printed.
+        """
+        self.cmd.addr = "127.0.0.1"
+        self.cmd.port = "8000"
+        self.cmd.use_ipv6 = False
+        self.cmd._raw_ipv6 = False
+        self.cmd.inner_run(None, use_threading=False, use_reloader=False, skip_checks=True)
+        out = self.stdout.getvalue()
+        self.assertIn("Starting development server at http://127.0.0.1:8000/", out)
+
+    @mock.patch("django.core.servers.basehttp.run")
+    def test_quit_command_for_windows_platform(self, mocked_run):
+        """
+        The quit command label varies by platform; on Windows it should be CTRL-BREAK.
+        """
+        with mock.patch("sys.platform", "win32"):
+            self.cmd.addr = "127.0.0.1"
+            self.cmd.port = "8000"
+            self.cmd.use_ipv6 = False
+            self.cmd._raw_ipv6 = False
+            self.cmd.inner_run(None, use_threading=False, use_reloader=False, skip_checks=True)
+            out = self.stdout.getvalue()
+            self.assertIn("Quit the server with CTRL-BREAK.", out)
+
+    def test_keyboard_interrupt_prints_shutdown_message(self):
+        """
+        If run() raises KeyboardInterrupt, the provided shutdown_message
+        should be written to stdout and a SystemExit should follow.
+        """
+        # Patch run to raise KeyboardInterrupt.
+        with mock.patch("django.core.servers.basehttp.run", side_effect=KeyboardInterrupt):
+            self.cmd.addr = "127.0.0.1"
+            self.cmd.port = "8000"
+            self.cmd.use_ipv6 = False
+            self.cmd._raw_ipv6 = False
+            # run inner_run and catch the SystemExit triggered by sys.exit(0).
+            with self.assertRaises(SystemExit) as cm:
+                self.cmd.inner_run(None, use_threading=False, use_reloader=False, shutdown_message="\nServer stopped.\n", skip_checks=True)
+            # Ensure shutdown message was printed.
+            self.assertIn("Server stopped.", self.stdout.getvalue())
+            # Exit code should be 0.
+            self.assertEqual(cm.exception.code, 0)
+
+    def test_oserror_port_in_use_writes_helpful_message(self):
+        """
+        If run() raises an OSError with errno.EADDRINUSE, a helpful stderr
+        message should be written. os._exit is patched to raise SystemExit to
+        avoid terminating the test process.
+        """
+        err = OSError("Address already in use")
+        err.errno = errno.EADDRINUSE
+        with mock.patch("django.core.servers.basehttp.run", side_effect=err):
+            with mock.patch("os._exit", side_effect=SystemExit(1)):
+                self.cmd.addr = "127.0.0.1"
+                self.cmd.port = "8000"
+                self.cmd.use_ipv6 = False
+                self.cmd._raw_ipv6 = False
+                with self.assertRaises(SystemExit):
+                    self.cmd.inner_run(None, use_threading=False, use_reloader=False, skip_checks=True)
+                self.assertIn("That port is already in use.", self.stderr.getvalue())
+
+    def test_oserror_unknown_errno_prints_exception(self):
+        """
+        If run() raises an OSError with an unrecognized errno, the raw
+        exception should be written to stderr.
+        """
+        err = OSError("something went wrong")
+        err.errno = 9999
+        with mock.patch("django.core.servers.basehttp.run", side_effect=err):
+            with mock.patch("os._exit", side_effect=SystemExit(1)):
+                self.cmd.addr = "127.0.0.1"
+                self.cmd.port = "8000"
+                self.cmd.use_ipv6 = False
+                self.cmd._raw_ipv6 = False
+                with self.assertRaises(SystemExit):
+                    self.cmd.inner_run(None, use_threading=False, use_reloader=False, skip_checks=True)
+                self.assertIn("something went wrong", self.stderr.getvalue())

@@ -1,0 +1,140 @@
+import sklearn.cluster
+import numpy as np
+import pytest
+from sklearn.preprocessing import KBinsDiscretizer
+from sklearn.utils.testing import assert_array_equal, assert_warns_message
+import sklearn.cluster
+
+# Helper fake KMeans that returns reversed (unsorted) centers deliberately.
+class FakeKMeans:
+    def __init__(self, n_clusters, init=None, n_init=None):
+        self.n_clusters = n_clusters
+        # store init just to mimic real signature
+        self.init = init
+        self.n_init = n_init
+
+    def fit(self, X):
+        # X is (n_samples, 1) for our use case
+        col_min = X.min()
+        col_max = X.max()
+        # create evenly spaced centers but reversed to simulate unsorted output
+        centers = np.linspace(col_min, col_max, self.n_clusters)[::-1]
+        # store as column vector like real KMeans.cluster_centers_
+        self.cluster_centers_ = centers.reshape(-1, 1)
+        return self
+
+def compute_expected_bins_from_centers(X_col, centers_sorted):
+    """Replicate KBinsDiscretizer bin assignment logic for 1D column."""
+    # centers_sorted: 1D array of centers sorted ascending
+    n_clusters = centers_sorted.shape[0]
+    # bin edges as in code: first is col_min, last is col_max
+    internal_edges = (centers_sorted[1:] + centers_sorted[:-1]) * 0.5
+    bin_edges = np.r_[X_col.min(), internal_edges, X_col.max()]
+    # same eps logic as transform
+    rtol = 1.e-5
+    atol = 1.e-8
+    eps = atol + rtol * np.abs(X_col)
+    bins = np.digitize(X_col + eps, bin_edges[1:])
+    # clip
+    bins = np.clip(bins, 0, n_clusters - 1)
+    return bins
+
+@pytest.fixture(autouse=True)
+def patch_kmeans(monkeypatch):
+    # Monkeypatch sklearn.cluster.KMeans to our FakeKMeans for the duration
+    # of each test (autouse fixture).
+    monkeypatch.setattr(sklearn.cluster, "KMeans", FakeKMeans)
+    yield
+
+def test_kmeans_unsorted_centers_monotonic_bin_edges_single_feature():
+    X = np.array([0, 0.5, 2, 3, 9, 10]).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=3, strategy="kmeans", encode="ordinal")
+    est.fit(X)
+    # bin_edges_ for each feature must be strictly increasing
+    for edges in est.bin_edges_:
+        # For kmeans, edges are finite and should be strictly increasing
+        assert np.all(np.diff(edges) > 0)
+
+def test_kmeans_unsorted_centers_transform_matches_expected_single_feature():
+    X = np.array([0, 0.5, 2, 3, 9, 10]).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=3, strategy="kmeans", encode="ordinal")
+    Xt = est.fit_transform(X)
+    # Reconstruct what centers would be (FakeKMeans uses linspace reversed,
+    # but KBinsDiscretizer should sort them)
+    fake_centers_rev = np.linspace(X.min(), X.max(), 3)[::-1]
+    centers_sorted = np.sort(fake_centers_rev)
+    expected = compute_expected_bins_from_centers(X.ravel(), centers_sorted)
+    assert_array_equal(expected.reshape(-1, 1), Xt)
+
+def test_kmeans_unsorted_centers_multi_feature_monotonic():
+    # two features with different ranges
+    X1 = np.array([0, 1, 2, 3, 4, 5])
+    X2 = np.array([10, 10.5, 11, 12, 15, 20])
+    X = np.vstack([X1, X2]).T
+    est = KBinsDiscretizer(n_bins=[3, 4], strategy="kmeans", encode="ordinal")
+    est.fit(X)
+    # Each feature's bin edges should be strictly increasing
+    for edges in est.bin_edges_:
+        assert np.all(np.diff(edges) > 0)
+
+def test_kmeans_unsorted_centers_with_onehot_encode_inverse():
+    X = np.array([0, 0.5, 2, 3, 9, 10]).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=3, strategy="kmeans", encode="onehot")
+    Xt = est.fit_transform(X)
+    # ensure sparse output and that inverse_transform + transform roundtrip works
+    Xinv = est.inverse_transform(Xt)
+    Xt2 = est.transform(Xinv)
+    # After inverse + transform we should recover the same bin indices
+    # Convert sparse to dense if necessary (OneHotEncoder inverse returns dense)
+    assert_array_equal(Xt.todense() if hasattr(Xt, "todense") else Xt,
+                       Xt2.todense() if hasattr(Xt2, "todense") else Xt2)
+
+def test_kmeans_unsorted_centers_with_onehot_dense_encode():
+    X = np.array([0, 0.5, 2, 3, 9, 10]).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=5, strategy="kmeans", encode="onehot-dense")
+    Xt = est.fit_transform(X)
+    # Check shape: n_bins columns
+    assert Xt.shape[1] == 5
+    # Ensure values are 0/1 in one-hot encoding
+    unique_vals = np.unique(Xt)
+    assert set(unique_vals).issubset({0.0, 1.0})
+
+def test_transform_outside_range_with_unsorted_centers():
+    # Ensure values outside the fit range are clipped to [0, n_bins-1]
+    X = np.array([0, 1, 2, 3])[:, None]
+    est = KBinsDiscretizer(n_bins=4, strategy="kmeans", encode="ordinal")
+    est.fit(X)
+    X2 = np.array([-100, 1000])[:, None]
+    X2t = est.transform(X2)
+    assert_array_equal(X2t.max(axis=0) + 1, est.n_bins_)
+    assert_array_equal(X2t.min(axis=0), np.zeros_like(est.n_bins_))
+
+def test_constant_feature_with_kmeans_warns_and_replaced():
+    warnings_msg = "Feature 0 is constant and will be replaced with 0."
+    X = np.array([[1.0, 0.0], [1.0, 1.0], [1.0, 2.0]])
+    # We expect a warning for constant column 0 for any strategy including kmeans
+    est = KBinsDiscretizer(n_bins=3, strategy="kmeans", encode="ordinal")
+    # Fit should warn about the constant feature
+    assert_warns_message(UserWarning, "Feature 0 is constant and will be replaced with 0.", est.fit, X)
+    est.fit(X)
+    # First feature should have n_bins_ == 1 and bin_edges_ == [-inf, inf]
+    assert est.n_bins_[0] == 1
+    assert_array_equal(est.bin_edges_[0], np.array([-np.inf, np.inf]))
+
+def test_kmeans_unsorted_centers_n_bins_array_accepts_per_feature():
+    X = np.column_stack([np.linspace(0, 10, 10), np.linspace(-5, 5, 10)])
+    est = KBinsDiscretizer(n_bins=[3, 4], strategy="kmeans", encode="ordinal")
+    est.fit(X)
+    assert est.n_bins_.shape[0] == X.shape[1]
+    # verify monotonicity of edges for both features
+    for edges in est.bin_edges_:
+        assert np.all(np.diff(edges) > 0)
+
+def test_kmeans_unsorted_centers_numeric_stability_small_scales():
+    # Ensure numeric stability for tiny magnitudes when using kmeans strategy
+    X_init = np.array([2., 4., 6., 8., 10.]).reshape(-1, 1)
+    expected = np.array([0, 0, 1, 1, 1]).reshape(-1, 1)
+    for i in range(1, 6):
+        X = X_init / 10.**i
+        Xt = KBinsDiscretizer(n_bins=2, encode='ordinal', strategy='kmeans').fit_transform(X)
+        assert_array_equal(expected, Xt)

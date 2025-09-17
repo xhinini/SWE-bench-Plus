@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.test_autoreloader_llm.make_backend template_tests.test_autoreloader_llm.test_combined_engine_and_loader_dirs template_tests.test_autoreloader_llm.test_ignore_empty_string_from_loader_get_dirs template_tests.test_autoreloader_llm.test_ignore_empty_string_in_engine_dirs template_tests.test_autoreloader_llm.test_ignore_none_from_loader_get_dirs template_tests.test_autoreloader_llm.test_ignore_none_in_engine_dirs template_tests.test_autoreloader_llm.test_include_relative_engine_dir template_tests.test_autoreloader_llm.test_include_relative_loader_dir template_tests.test_autoreloader_llm.test_template_changed_ignores_python_files template_tests.test_autoreloader_llm.test_template_changed_resets_for_non_py_file_inside_template_dir template_tests.test_autoreloader_llm.test_watch_for_template_changes_with_loader_dirs
+coverage json -o coverage.json
+: '>>>>> End Test Output'

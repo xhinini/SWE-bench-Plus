@@ -1,0 +1,205 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests exercise the linkcheck builder's behavior when a HEAD request
+  raises TooManyRedirects (infinite redirect loop) or an HTTP error. The
+  intended behavior (as fixed by the patch) is to catch TooManyRedirects
+  (and HTTPError from HEAD) and retry using GET. If GET succeeds (200), the
+  link should be considered "working". If GET fails (404/500/etc.) the link
+  should be "broken". Additional tests assert that auth and custom request
+  headers are still applied when the fallback to GET happens and that
+  retries configuration does not interfere.
+test_code: |
+  import json
+  import time
+  import http.server
+  import pytest
+  
+  from .utils import http_server, https_server
+  
+  # Helper factory: HEAD will redirect to same URL (causing TooManyRedirects)
+  # GET will respond with the provided status and optional body.
+  def make_redirect_loop_handler(get_status=200, get_body=b"ok\n"):
+      class Handler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              # Redirect to same URL -> can cause TooManyRedirects in requests
+              self.send_response(302, "Found")
+              self.send_header("Location", f"http://{self.server.server_address[0]}:{self.server.server_address[1]}{self.path}")
+              self.end_headers()
+  
+          def do_GET(self):
+              self.send_response(get_status, "OK" if get_status < 400 else "Error")
+              self.end_headers()
+              if get_body:
+                  self.wfile.write(get_body)
+  
+          def log_date_time_string(self):
+              return ""
+      return Handler
+  
+  # Similar factory but for HTTPS server's Location should point to https
+  def make_redirect_loop_handler_https(get_status=200, get_body=b"ok\n"):
+      class Handler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              self.send_response(302, "Found")
+              self.send_header("Location", f"https://{self.server.server_address[0]}:{self.server.server_address[1]}{self.path}")
+              self.end_headers()
+  
+          def do_GET(self):
+              self.send_response(get_status, "OK" if get_status < 400 else "Error")
+              self.end_headers()
+              if get_body:
+                  self.wfile.write(get_body)
+  
+          def log_date_time_string(self):
+              return ""
+      return Handler
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_toomanyredirects_fallback_to_get_http_ok(app):
+      # HEAD loops, GET returns 200 -> should be working
+      with http_server(make_redirect_loop_handler(get_status=200)):
+          app.builder.build_all()
+      content = (app.outdir / 'output.json').read_text().splitlines()[0]
+      row = json.loads(content)
+      assert row["status"] == "working"
+      assert row["uri"].startswith("http://")
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_toomanyredirects_fallback_to_get_http_notfound(app):
+      # HEAD loops, GET returns 404 -> should be broken
+      with http_server(make_redirect_loop_handler(get_status=404, get_body=b"notfound")):
+          app.builder.build_all()
+      # parse first JSON line
+      content = (app.outdir / 'output.json').read_text().splitlines()[0]
+      row = json.loads(content)
+      assert row["status"] == "broken"
+      assert "404 Client Error" in row["info"]
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver-https', freshenv=True)
+  def test_head_toomanyredirects_fallback_to_get_https_ok_with_tls_verify_false(app):
+      # For HTTPS, ensure TLS verification is disabled so GET can succeed
+      app.config.tls_verify = False
+      with https_server(make_redirect_loop_handler_https(get_status=200)):
+          app.builder.build_all()
+      content = (app.outdir / 'output.json').read_text().splitlines()[0]
+      row = json.loads(content)
+      assert row["status"] == "working"
+      assert row["uri"].startswith("https://")
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver-https', freshenv=True)
+  def test_head_toomanyredirects_fallback_to_get_https_notfound_with_tls_verify_false(app):
+      app.config.tls_verify = False
+      with https_server(make_redirect_loop_handler_https(get_status=404)):
+          app.builder.build_all()
+      content = (app.outdir / 'output.json').read_text().splitlines()[0]
+      row = json.loads(content)
+      assert row["status"] == "broken"
+      assert "404 Client Error" in row["info"]
+  
+  @pytest.mark.sphinx(
+      'linkcheck', testroot='linkcheck-localserver', freshenv=True,
+      confoverrides={'linkcheck_auth': [(r'^http://localhost:7777/$', ('user1', 'password'))]})
+  def test_head_toomanyredirects_with_auth_falls_back_and_sends_auth(app, capsys):
+      # Handler will redirect on HEAD and on GET will print headers (including Authorization).
+      class HeadersOnGetHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              self.send_response(302, "Found")
+              self.send_header("Location", f"http://{self.server.server_address[0]}:{self.server.server_address[1]}{self.path}")
+              self.end_headers()
+  
+          def do_GET(self):
+              self.send_response(200, "OK")
+              self.end_headers()
+              # print headers to stdout so capsys can capture them (consistent with other tests)
+              print(self.headers.as_string())
+  
+          def log_date_time_string(self):
+              return ""
+  
+      with http_server(HeadersOnGetHandler):
+          app.builder.build_all()
+      stdout, _stderr = capsys.readouterr()
+      assert "Authorization: Basic " in stdout
+      # ensure overall link status recorded as working
+      content = (app.outdir / 'output.json').read_text().splitlines()[0]
+      row = json.loads(content)
+      assert row["status"] == "working"
+  
+  @pytest.mark.sphinx(
+      'linkcheck', testroot='linkcheck-localserver', freshenv=True,
+      confoverrides={'linkcheck_request_headers': {
+          "http://localhost:7777/": {"X-Test-Header": "value"},
+      }})
+  def test_head_toomanyredirects_preserves_request_headers_on_get(app, capsys):
+      # Ensure custom headers are applied on the fallback GET
+      class DumpHeadersHandler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              self.send_response(302, "Found")
+              self.send_header("Location", f"http://{self.server.server_address[0]}:{self.server.server_address[1]}{self.path}")
+              self.end_headers()
+  
+          def do_GET(self):
+              self.send_response(200, "OK")
+              self.end_headers()
+              print(self.headers.as_string())
+  
+          def log_date_time_string(self):
+              return ""
+  
+      with http_server(DumpHeadersHandler):
+          app.builder.build_all()
+      stdout, _stderr = capsys.readouterr()
+      assert "X-Test-Header: value" in stdout
+      content = (app.outdir / 'output.json').read_text().splitlines()[0]
+      row = json.loads(content)
+      assert row["status"] == "working"
+  
+  @pytest.mark.sphinx(
+      'linkcheck', testroot='linkcheck-localserver', freshenv=True,
+      confoverrides={'linkcheck_retries': 3})
+  def test_head_toomanyredirects_with_retries_get_ok(app):
+      # Even with multiple retries configured, fallback to GET should yield "working"
+      with http_server(make_redirect_loop_handler(get_status=200)):
+          app.builder.build_all()
+      content = (app.outdir / 'output.json').read_text().splitlines()[0]
+      row = json.loads(content)
+      assert row["status"] == "working"
+  
+  @pytest.mark.sphinx(
+      'linkcheck', testroot='linkcheck-localserver', freshenv=True,
+      confoverrides={'linkcheck_retries': 2})
+  def test_head_toomanyredirects_with_retries_get_notfound(app):
+      # retries shouldn't hide a GET 404 result
+      with http_server(make_redirect_loop_handler(get_status=404)):
+          app.builder.build_all()
+      content = (app.outdir / 'output.json').read_text().splitlines()[0]
+      row = json.loads(content)
+      assert row["status"] == "broken"
+      assert "404 Client Error" in row["info"]
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_returns_http_error_but_get_ok(app):
+      # If HEAD returns an HTTP error (500), the code should retry with GET which succeeds.
+      class Head500Get200Handler(http.server.BaseHTTPRequestHandler):
+          def do_HEAD(self):
+              self.send_response(500, "Internal Server Error")
+              self.end_headers()
+  
+          def do_GET(self):
+              self.send_response(200, "OK")
+              self.end_headers()
+  
+          def log_date_time_string(self):
+              return ""
+  
+      with http_server(Head500Get200Handler):
+          app.builder.build_all()
+      content = (app.outdir / 'output.json').read_text().splitlines()[0]
+      row = json.loads(content)
+      assert row["status"] == "working"
+new_imports_code: |
+  import json
+  import http.server
+  import pytest
+  from .utils import http_server, https_server

@@ -1,0 +1,145 @@
+import numpy as np
+import sklearn.cluster as sk_cluster
+import pytest
+import scipy.sparse as sp
+from sklearn.preprocessing import KBinsDiscretizer
+from sklearn.utils.testing import assert_array_equal
+import numpy as np
+import scipy.sparse as sp
+import pytest
+import sklearn.cluster as sk_cluster
+from sklearn.preprocessing import KBinsDiscretizer
+from sklearn.utils.testing import assert_array_equal
+
+# A fake KMeans that returns descending cluster centers to simulate an unsorted result
+class FakeKMeans:
+    def __init__(self, n_clusters, init=None, n_init=None):
+        self.n_clusters = n_clusters
+        self.init = init
+        self.n_init = n_init
+
+    def fit(self, X):
+        # X is (n_samples, 1) for our usage; create descending centers
+        col_min, col_max = X.min(), X.max()
+        # create centers in descending order
+        centers_desc = np.linspace(col_max, col_min, self.n_clusters)
+        # cluster_centers_ should be shape (n_clusters, n_features)
+        self.cluster_centers_ = centers_desc.reshape(-1, 1)
+        return self
+
+@pytest.fixture(autouse=True)
+def patch_kmeans(monkeypatch):
+    """Patch sklearn.cluster.KMeans for the duration of each test."""
+    monkeypatch.setattr(sk_cluster, "KMeans", FakeKMeans)
+    yield
+
+def assert_monotonic_increasing(arr):
+    # Allow equality at endpoints for degenerate cases, but require non-decreasing
+    diff = np.diff(arr)
+    assert np.all(diff >= 0), "Array is not non-decreasing: %r" % (arr,)
+
+def compute_expected_edges_from_linspace(X, n_bins):
+    # If centers become evenly spaced after sorting (linspace), the resulting edges
+    # will be the uniform partition edges (use min/max and centers arithmetic)
+    col_min, col_max = X.min(), X.max()
+    centers = np.linspace(col_min, col_max, n_bins)
+    inner = (centers[1:] + centers[:-1]) * 0.5
+    return np.r_[col_min, inner, col_max]
+
+def compute_expected_ordinal(X, n_bins):
+    edges = compute_expected_edges_from_linspace(X, n_bins)
+    # digitize with edges[1:] (as KBinsDiscretizer uses)
+    bins = np.digitize(X.ravel(), edges[1:])
+    np.clip(bins, 0, n_bins - 1, out=bins)
+    return bins.reshape(-1, 1)
+
+def test_kmeans_bin_edges_monotonic_single_feature_n2():
+    X = np.array([0., 1., 2., 3.]).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=2, strategy='kmeans', encode='ordinal')
+    est.fit(X)
+    edges = est.bin_edges_[0]
+    assert_monotonic_increasing(edges)
+    # Also ensure n_bins_ is correct
+    assert est.n_bins_[0] == 2
+
+def test_kmeans_bin_edges_monotonic_single_feature_n3():
+    X = np.array([0., 0.5, 1., 1.5, 2.]).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+    est.fit(X)
+    edges = est.bin_edges_[0]
+    assert_monotonic_increasing(edges)
+    # expected edges if centers are sorted linspace
+    expected = compute_expected_edges_from_linspace(X, 3)
+    # edges should match expected for our FakeKMeans construction
+    assert_array_equal(edges, expected)
+
+def test_kmeans_bin_edges_monotonic_single_feature_n5():
+    X = np.linspace(0., 10., 11).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=5, strategy='kmeans', encode='ordinal')
+    est.fit(X)
+    edges = est.bin_edges_[0]
+    assert_monotonic_increasing(edges)
+    expected = compute_expected_edges_from_linspace(X, 5)
+    assert_array_equal(edges, expected)
+
+def test_kmeans_bin_edges_monotonic_multi_feature():
+    # Multiple features; each should have monotonic bin edges
+    rng = np.random.RandomState(0)
+    X = rng.rand(50, 3) * 10.0
+    est = KBinsDiscretizer(n_bins=[3, 4, 2], strategy='kmeans', encode='ordinal')
+    est.fit(X)
+    for j in range(3):
+        edges = est.bin_edges_[j]
+        assert_monotonic_increasing(edges)
+
+def test_kmeans_transform_matches_expected_for_linspace_centers():
+    # Given FakeKMeans that will produce descending centers which, after sorting,
+    # become linspace centers, the ordinal transform should match the uniform partition
+    X = np.array([0, 0.5, 2, 3, 9, 10.]).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+    Xt = est.fit_transform(X)
+    expected = compute_expected_ordinal(X, 3)
+    assert_array_equal(Xt, expected)
+
+def test_kmeans_transform_outside_fit_range_clipped():
+    X = np.array([0., 1., 2., 3.]).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=4, strategy='kmeans', encode='ordinal')
+    est.fit(X)
+    X2 = np.array([-10., 100.]).reshape(-1, 1)
+    Xt = est.transform(X2)
+    # Values should be clipped between 0 and n_bins - 1
+    assert Xt.min() == 0
+    assert Xt.max() == 3
+
+def test_kmeans_onehot_encode_shape_and_inverse():
+    X = np.array([0., 1., 2., 3.]).reshape(-1, 1)
+    est = KBinsDiscretizer(n_bins=4, strategy='kmeans', encode='onehot')
+    Xt = est.fit_transform(X)
+    # Should return a sparse matrix
+    assert sp.issparse(Xt)
+    # Shape should be (n_samples, sum(n_bins))
+    assert Xt.shape[1] == int(est.n_bins_.sum())
+    # inverse_transform should convert back to ordinal-like centers then to original binned space
+    Xinv = est.inverse_transform(Xt)
+    # After inverse transform, re-discretizing should recover same bin indices
+    Xt2 = est.transform(Xinv)
+    # For sparse input, transform returns dense ordinal; ensure values are same
+    assert_array_equal(Xt2, est._encoder.inverse_transform(Xt))
+
+def test_kmeans_inverse_transform_round_trip_ordinal():
+    rng = np.random.RandomState(42)
+    X = rng.randn(100, 2)
+    est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+    Xt = est.fit_transform(X)
+    Xinv = est.inverse_transform(Xt)
+    Xt2 = est.transform(Xinv)
+    assert_array_equal(Xt, Xt2)
+
+def test_kmeans_repeated_fits_are_consistent():
+    # Ensure multiple fits produce identical bin_edges_ (no internal state leak)
+    X = np.linspace(0., 5., 21).reshape(-1, 1)
+    est1 = KBinsDiscretizer(n_bins=4, strategy='kmeans', encode='ordinal')
+    est1.fit(X)
+    est2 = KBinsDiscretizer(n_bins=4, strategy='kmeans', encode='ordinal')
+    est2.fit(X)
+    assert_array_equal(est1.bin_edges_[0], est2.bin_edges_[0])

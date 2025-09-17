@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 staticfiles_tests.test_storage_llm.TestZeroMaxPostProcess.run_post_process_and_assert_no_error staticfiles_tests.test_storage_llm.TestZeroMaxPostProcess.setUp staticfiles_tests.test_storage_llm.TestZeroMaxPostProcess.test_zero_max_passes_consistent_hashed_files_updated staticfiles_tests.test_storage_llm.TestZeroMaxPostProcess.test_zero_max_passes_css_with_fragment_like_names staticfiles_tests.test_storage_llm.TestZeroMaxPostProcess.test_zero_max_passes_import_replacement staticfiles_tests.test_storage_llm.TestZeroMaxPostProcess.test_zero_max_passes_multiple_files staticfiles_tests.test_storage_llm.TestZeroMaxPostProcess.test_zero_max_passes_non_adjustable_file staticfiles_tests.test_storage_llm.TestZeroMaxPostProcess.test_zero_max_passes_process_css staticfiles_tests.test_storage_llm.TestZeroMaxPostProcess.test_zero_max_passes_process_js staticfiles_tests.test_storage_llm.TestZeroMaxPostProcess.test_zero_max_passes_relative_paths staticfiles_tests.test_storage_llm.TestZeroMaxPostProcess.test_zero_max_passes_source_map_js staticfiles_tests.test_storage_llm.TestZeroMaxPostProcess.test_zero_max_passes_url_handling
+coverage json -o coverage.json
+: '>>>>> End Test Output'

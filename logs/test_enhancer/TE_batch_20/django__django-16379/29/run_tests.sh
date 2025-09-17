@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.setUp cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.tearDown cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_does_not_swallow_generic_oserror cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_handles_filenotfound_during_open cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_handles_filenotfound_for_version cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_handles_os_path_exists_true_race cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_opens_correct_file cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_propagates_permissionerror_during_open cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_returns_false_for_expired_value cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_returns_true_for_non_expired_value cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_with_pathlib_key_to_file_handles_filenotfound
+coverage json -o coverage.json
+: '>>>>> End Test Output'

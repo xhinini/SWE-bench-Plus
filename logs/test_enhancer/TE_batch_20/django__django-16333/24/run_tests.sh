@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.NoSaveM2MUserCreationForm.__getattribute__ auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.create_and_save_user auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_without_save_m2m_guard_alpha auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_without_save_m2m_guard_email_like auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_without_save_m2m_guard_long_username auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_without_save_m2m_guard_mixed_case auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_without_save_m2m_guard_numeric auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_without_save_m2m_guard_short_username auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_without_save_m2m_guard_trailing_space_username auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_without_save_m2m_guard_unicode auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_without_save_m2m_guard_with_dash auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_without_save_m2m_guard_with_underscore
+coverage json -o coverage.json
+: '>>>>> End Test Output'

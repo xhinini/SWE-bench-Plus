@@ -1,0 +1,346 @@
+language: Python
+number_of_tests: 10
+test_behavior: These 10 tests create temporary app packages/modules with various combinations of __file__ and __path__ characteristics (regular package, namespace package, package with __file__ removed, migrations module as a plain file, __path__ as tuple, __path__ as custom iterable, __path__ as list subclass, missing Migration class). They then run MigrationLoader.load_disk()/build_graph() (via creating a MigrationLoader) and assert whether the app is treated as migrated (migrations discovered) or unmigrated (ignored). The tests reproduce tricky edge cases around handling of __file__ and __path__ that the provided patch addresses, ensuring proper behavior and guarding against regressions introduced by the model patch.
+test_code: |
+  import os
+  import sys
+  import tempfile
+  import shutil
+  import textwrap
+  from importlib import import_module
+  from types import ModuleType
+  from django.test import override_settings, modify_settings, TestCase
+  from django.db.migrations.loader import MigrationLoader
+  from django.db.migrations.loader import MIGRATIONS_MODULE_NAME
+  from django.core.management import call_command
+
+  class LoaderEdgeCaseTests(TestCase):
+      """
+      Additional tests for MigrationLoader edge cases around __file__ / __path__
+      and module/package differences.
+      """
+
+      def _make_package(self, pkg_name, with_init=True, migrations_files=None):
+          """
+          Create a package directory in a temporary directory and insert it into sys.path.
+          Returns the tempdir path and package path.
+          """
+          tmp_dir = tempfile.mkdtemp()
+          pkg_dir = os.path.join(tmp_dir, pkg_name)
+          os.makedirs(pkg_dir)
+          if with_init:
+              with open(os.path.join(pkg_dir, '__init__.py'), 'w') as f:
+                  f.write('# package init\n')
+          # Create migrations package or module
+          migrations_dir = os.path.join(pkg_dir, MIGRATIONS_MODULE_NAME)
+          os.makedirs(migrations_dir)
+          # Make it a package (with __init__.py) by default
+          with open(os.path.join(migrations_dir, '__init__.py'), 'w') as f:
+              f.write('# migrations package\n')
+          if migrations_files is None:
+              migrations_files = {
+                  '0001_initial.py': textwrap.dedent('''\
+                      from django.db.migrations import Migration
+                      class Migration(Migration):
+                          dependencies = []
+                          operations = []
+                  '''),
+              }
+          for name, content in migrations_files.items():
+              with open(os.path.join(migrations_dir, name), 'w') as f:
+                  f.write(content)
+          sys.path.insert(0, tmp_dir)
+          return tmp_dir, pkg_dir
+
+      def _cleanup_package(self, tmp_dir):
+          if tmp_dir in sys.path:
+              sys.path.remove(tmp_dir)
+          shutil.rmtree(tmp_dir)
+
+      @override_settings(INSTALLED_APPS=['edgecase_pkg'])
+      @override_settings(MIGRATION_MODULES={'edgecase_pkg': 'edgecase_pkg.migrations'})
+      def test_namespace_package_without___init___is_ignored(self):
+          """
+          A migrations directory without __init__.py (namespace package) should
+          be ignored (treated as unmigrated).
+          """
+          tmp_dir = tempfile.mkdtemp()
+          pkg_dir = os.path.join(tmp_dir, 'edgecase_pkg')
+          os.makedirs(pkg_dir)
+          # Do NOT create __init__.py for migrations -> namespace package
+          migrations_dir = os.path.join(pkg_dir, MIGRATIONS_MODULE_NAME)
+          os.makedirs(migrations_dir)
+          # No __init__.py in migrations (namespace package)
+          # Add a migration file (should be ignored)
+          with open(os.path.join(migrations_dir, '0001_initial.py'), 'w') as f:
+              f.write(textwrap.dedent('''\
+                  from django.db.migrations import Migration
+                  class Migration(Migration):
+                      dependencies = []
+                      operations = []
+              '''))
+          sys.path.insert(0, tmp_dir)
+          try:
+              loader = MigrationLoader(connection=None)
+              loader.load_disk()
+              # Ensure namespace migrations are ignored
+              self.assertIn('edgecase_pkg', loader.unmigrated_apps)
+              self.assertNotIn(('edgecase_pkg', '0001_initial'), loader.disk_migrations)
+          finally:
+              if tmp_dir in sys.path:
+                  sys.path.remove(tmp_dir)
+              shutil.rmtree(tmp_dir)
+
+      @override_settings(INSTALLED_APPS=['edgecase_pkg2'])
+      @override_settings(MIGRATION_MODULES={'edgecase_pkg2': 'edgecase_pkg2.migrations'})
+      def test_package_without___file___is_supported(self):
+          """
+          Regular packages that are missing __file__ (frozen-style) should still
+          be treated as proper packages and their migrations discovered.
+          """
+          tmp_dir, pkg_dir = self._make_package('edgecase_pkg2')
+          try:
+              # Import package and remove __file__ to simulate frozen package
+              pkg = import_module('edgecase_pkg2.migrations')
+              # Keep a record to restore later
+              had_file = hasattr(pkg, '__file__')
+              old_file = getattr(pkg, '__file__', None)
+              old_spec = getattr(pkg, '__spec__', None)
+              # Remove __file__ and make spec indicate no origin
+              if hasattr(pkg, '__file__'):
+                  delattr(pkg, '__file__')
+              if hasattr(pkg, '__spec__'):
+                  pkg.__spec__.origin = None
+                  pkg.__spec__.has_location = False
+              loader = MigrationLoader(connection=None)
+              loader.load_disk()
+              migrations = [name for app, name in loader.disk_migrations if app == 'edgecase_pkg2']
+              self.assertIn('0001_initial', migrations)
+          finally:
+              # Restore and cleanup
+              if 'edgecase_pkg2.migrations' in sys.modules:
+                  del sys.modules['edgecase_pkg2.migrations']
+              self._cleanup_package(tmp_dir)
+
+      @override_settings(INSTALLED_APPS=['edgecase_pkg3'])
+      @override_settings(MIGRATION_MODULES={'edgecase_pkg3': 'edgecase_pkg3.migrations'})
+      def test_migrations_as_module_file_are_ignored(self):
+          """
+          If the migrations module is a single file (migrations.py), it should be
+          treated as unmigrated.
+          """
+          tmp_dir = tempfile.mkdtemp()
+          pkg_dir = os.path.join(tmp_dir, 'edgecase_pkg3')
+          os.makedirs(pkg_dir)
+          # Create a migrations.py file instead of migrations package
+          with open(os.path.join(pkg_dir, '__init__.py'), 'w') as f:
+              f.write('# package init\n')
+          with open(os.path.join(pkg_dir, 'migrations.py'), 'w') as f:
+              f.write(textwrap.dedent('''\
+                  # single-file migrations module
+              '''))
+          sys.path.insert(0, tmp_dir)
+          try:
+              loader = MigrationLoader(connection=None)
+              loader.load_disk()
+              self.assertIn('edgecase_pkg3', loader.unmigrated_apps)
+          finally:
+              if tmp_dir in sys.path:
+                  sys.path.remove(tmp_dir)
+              shutil.rmtree(tmp_dir)
+
+      @override_settings(INSTALLED_APPS=['edgecase_pkg4'])
+      @override_settings(MIGRATION_MODULES={'edgecase_pkg4': 'edgecase_pkg4.migrations'})
+      def test_custom___path___tuple_is_treated_as_namespace(self):
+          """
+          If a migrations package has a __path__ that is a tuple (not list),
+          it should be treated as a namespace package (ignored).
+          """
+          tmp_dir = tempfile.mkdtemp()
+          pkg_dir = os.path.join(tmp_dir, 'edgecase_pkg4')
+          os.makedirs(pkg_dir)
+          # Create normal package __init__ for top-level package
+          with open(os.path.join(pkg_dir, '__init__.py'), 'w') as f:
+              f.write('# package init\n')
+          # Create migrations package (with __init__.py to make it a real package)
+          migrations_dir = os.path.join(pkg_dir, MIGRATIONS_MODULE_NAME)
+          os.makedirs(migrations_dir)
+          with open(os.path.join(migrations_dir, '__init__.py'), 'w') as f:
+              f.write('# migrations init\n')
+          # Add a migration file
+          with open(os.path.join(migrations_dir, '0001_initial.py'), 'w') as f:
+              f.write(textwrap.dedent('''\
+                  from django.db.migrations import Migration
+                  class Migration(Migration):
+                      dependencies = []
+                      operations = []
+              '''))
+          sys.path.insert(0, tmp_dir)
+          try:
+              # Import the migrations package and set __path__ to a tuple
+              mod = import_module('edgecase_pkg4.migrations')
+              mod.__path__ = tuple(mod.__path__)
+              # Now load disk
+              loader = MigrationLoader(connection=None)
+              loader.load_disk()
+              # __path__ as tuple => treated as namespace => ignored
+              self.assertIn('edgecase_pkg4', loader.unmigrated_apps)
+              self.assertNotIn(('edgecase_pkg4', '0001_initial'), loader.disk_migrations)
+          finally:
+              if 'edgecase_pkg4.migrations' in sys.modules:
+                  del sys.modules['edgecase_pkg4.migrations']
+              if tmp_dir in sys.path:
+                  sys.path.remove(tmp_dir)
+              shutil.rmtree(tmp_dir)
+
+      @override_settings(INSTALLED_APPS=['edgecase_pkg5'])
+      @override_settings(MIGRATION_MODULES={'edgecase_pkg5': 'edgecase_pkg5.migrations'})
+      def test_custom___path___object_iterable_is_treated_as_namespace(self):
+          """
+          A migrations package whose __path__ is a custom iterable object
+          (not a list) should be treated as a namespace package (ignored).
+          """
+          tmp_dir = tempfile.mkdtemp()
+          pkg_dir = os.path.join(tmp_dir, 'edgecase_pkg5')
+          os.makedirs(pkg_dir)
+          with open(os.path.join(pkg_dir, '__init__.py'), 'w') as f:
+              f.write('# package init\n')
+          migrations_dir = os.path.join(pkg_dir, MIGRATIONS_MODULE_NAME)
+          os.makedirs(migrations_dir)
+          with open(os.path.join(migrations_dir, '__init__.py'), 'w') as f:
+              f.write('# migrations init\n')
+          with open(os.path.join(migrations_dir, '0001_initial.py'), 'w') as f:
+              f.write(textwrap.dedent('''\
+                  from django.db.migrations import Migration
+                  class Migration(Migration):
+                      dependencies = []
+                      operations = []
+              '''))
+          sys.path.insert(0, tmp_dir)
+          try:
+              mod = import_module('edgecase_pkg5.migrations')
+              class PathLike:
+                  def __init__(self, data):
+                      self._data = list(data)
+                  def __iter__(self):
+                      return iter(self._data)
+                  def __repr__(self):
+                      return "PathLike(%r)" % (self._data,)
+              mod.__path__ = PathLike(mod.__path__)
+              loader = MigrationLoader(connection=None)
+              loader.load_disk()
+              # __path__ being a custom iterable => namespace package => ignored
+              self.assertIn('edgecase_pkg5', loader.unmigrated_apps)
+              self.assertNotIn(('edgecase_pkg5', '0001_initial'), loader.disk_migrations)
+          finally:
+              if 'edgecase_pkg5.migrations' in sys.modules:
+                  del sys.modules['edgecase_pkg5.migrations']
+              if tmp_dir in sys.path:
+                  sys.path.remove(tmp_dir)
+              shutil.rmtree(tmp_dir)
+
+      @override_settings(INSTALLED_APPS=['edgecase_pkg6'])
+      @override_settings(MIGRATION_MODULES={'edgecase_pkg6': 'edgecase_pkg6.migrations'})
+      def test___path___is_list_subclass_still_recognised_as_package(self):
+          """
+          If __path__ is a list subclass, it should still be treated as a regular
+          package and migrations should be discovered.
+          """
+          tmp_dir = tempfile.mkdtemp()
+          pkg_dir = os.path.join(tmp_dir, 'edgecase_pkg6')
+          os.makedirs(pkg_dir)
+          with open(os.path.join(pkg_dir, '__init__.py'), 'w') as f:
+              f.write('# package init\n')
+          migrations_dir = os.path.join(pkg_dir, MIGRATIONS_MODULE_NAME)
+          os.makedirs(migrations_dir)
+          with open(os.path.join(migrations_dir, '__init__.py'), 'w') as f:
+              f.write('# migrations init\n')
+          with open(os.path.join(migrations_dir, '0001_initial.py'), 'w') as f:
+              f.write(textwrap.dedent('''\
+                  from django.db.migrations import Migration
+                  class Migration(Migration):
+                      dependencies = []
+                      operations = []
+              '''))
+          sys.path.insert(0, tmp_dir)
+          try:
+              mod = import_module('edgecase_pkg6.migrations')
+              class MyList(list):
+                  pass
+              mod.__path__ = MyList(mod.__path__)
+              loader = MigrationLoader(connection=None)
+              loader.load_disk()
+              self.assertNotIn('edgecase_pkg6', loader.unmigrated_apps)
+              self.assertIn(('edgecase_pkg6', '0001_initial'), loader.disk_migrations)
+          finally:
+              if 'edgecase_pkg6.migrations' in sys.modules:
+                  del sys.modules['edgecase_pkg6.migrations']
+              if tmp_dir in sys.path:
+                  sys.path.remove(tmp_dir)
+              shutil.rmtree(tmp_dir)
+
+      @override_settings(INSTALLED_APPS=['edgecase_pkg7'])
+      @override_settings(MIGRATION_MODULES={'edgecase_pkg7': 'edgecase_pkg7.migrations'})
+      def test_missing_Migration_class_raises_BadMigrationError(self):
+          """
+          If a migration file does not define a Migration class, BadMigrationError is raised.
+          """
+          from django.db.migrations.exceptions import BadMigrationError
+          tmp_dir = tempfile.mkdtemp()
+          pkg_dir = os.path.join(tmp_dir, 'edgecase_pkg7')
+          os.makedirs(pkg_dir)
+          with open(os.path.join(pkg_dir, '__init__.py'), 'w') as f:
+              f.write('# package init\n')
+          migrations_dir = os.path.join(pkg_dir, MIGRATIONS_MODULE_NAME)
+          os.makedirs(migrations_dir)
+          with open(os.path.join(migrations_dir, '__init__.py'), 'w') as f:
+              f.write('# migrations init\n')
+          with open(os.path.join(migrations_dir, '0001_initial.py'), 'w') as f:
+              f.write(textwrap.dedent('''\
+                  # Missing Migration class
+                  SOME_VAR = 1
+              '''))
+          sys.path.insert(0, tmp_dir)
+          try:
+              with self.assertRaises(BadMigrationError):
+                  MigrationLoader(connection=None)
+          finally:
+              if tmp_dir in sys.path:
+                  sys.path.remove(tmp_dir)
+              shutil.rmtree(tmp_dir)
+
+      @override_settings(INSTALLED_APPS=['edgecase_pkg8'])
+      @override_settings(MIGRATION_MODULES={'edgecase_pkg8': 'edgecase_pkg8.migrations'})
+      def test_import_error_with_bad_magic_is_reworded(self):
+          """
+          If importing a migration raises ImportError containing 'bad magic number',
+          the loader should raise an ImportError with a helpful message.
+          We simulate this by creating a module that raises ImportError('bad magic number')
+          when imported. This should exercise the special-case message path.
+          """
+          tmp_dir = tempfile.mkdtemp()
+          pkg_dir = os.path.join(tmp_dir, 'edgecase_pkg8')
+          os.makedirs(pkg_dir)
+          with open(os.path.join(pkg_dir, '__init__.py'), 'w') as f:
+              f.write('# package init\n')
+          migrations_dir = os.path.join(pkg_dir, MIGRATIONS_MODULE_NAME)
+          os.makedirs(migrations_dir)
+          with open(os.path.join(migrations_dir, '__init__.py'), 'w') as f:
+              f.write('# migrations init\n')
+          # Create a migration module file that will raise on import by raising in top-level
+          with open(os.path.join(migrations_dir, '0001_initial.py'), 'w') as f:
+              f.write(textwrap.dedent('''\
+                  raise ImportError("bad magic number")
+              '''))
+          sys.path.insert(0, tmp_dir)
+          try:
+              with self.assertRaisesRegex(ImportError, r"stale \.pyc file"):
+                  MigrationLoader(connection=None)
+          finally:
+              if tmp_dir in sys.path:
+                  sys.path.remove(tmp_dir)
+              shutil.rmtree(tmp_dir)
+new_imports_code: |
+  import tempfile
+  import shutil
+  import textwrap

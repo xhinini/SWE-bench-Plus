@@ -1,0 +1,209 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify the async behavior of StaticFilesHandlerMixin.get_response_async. They detect whether synchronous serve/response_for_exception calls are delegated to a thread via sync_to_async (the correct behavior) or are executed directly in the running event loop (the faulty behavior introduced by the candidate patch). The tests check normal return values, exception handling for Http404, that non-Http404 exceptions propagate, and concurrency behavior (ensuring blocking serve calls run concurrently when executed via threads).
+test_code: |
+  import importlib
+  import asyncio
+  import time
+  import threading
+  from types import SimpleNamespace
+  
+  import pytest
+  
+  handlers = importlib.import_module("django.contrib.staticfiles.handlers")
+  Http404 = importlib.import_module("django.http").Http404
+  
+  class DummyHandler(handlers.StaticFilesHandlerMixin):
+      """
+      Minimal concrete class to exercise StaticFilesHandlerMixin methods without
+      depending on WSGI/ASGI frameworks. Instances will have serve monkeypatched
+      in tests.
+      """
+      def __init__(self):
+          # base_url is a tuple-like structure used in the mixin methods,
+          # but get_response_async only calls self.serve, so keep simple.
+          self.base_url = (None, None, "/static/")
+  
+  # Helper request object (not used by our dummy serve implementations)
+  Request = SimpleNamespace()
+  
+  # 1) When serve is executed, it should run in a worker thread (no running loop).
+  def test_get_response_async_runs_serve_in_thread_when_no_exception():
+      instance = DummyHandler()
+  
+      def serve_check_loop(request):
+          # If there's a running event loop in the current thread, return True.
+          # Otherwise, return False.
+          try:
+              asyncio.get_running_loop()
+              return True
+          except RuntimeError:
+              return False
+  
+      instance.serve = serve_check_loop
+      result = asyncio.run(instance.get_response_async(Request))
+      # Correct behavior: serve should be executed in a thread where no running loop exists.
+      assert result is False
+  
+  # 2) When serve raises Http404, response_for_exception should be executed in a worker thread.
+  def test_get_response_async_runs_response_for_exception_in_thread_on_http404():
+      instance = DummyHandler()
+  
+      def serve_raises(request):
+          raise Http404("not found")
+  
+      # Patch module-level response_for_exception to record whether it's called inside event loop
+      original_rfe = handlers.response_for_exception
+      def response_for_exception_check(request, exc):
+          try:
+              asyncio.get_running_loop()
+              return ("ran_in_loop", True)
+          except RuntimeError:
+              return ("ran_in_thread", False)
+      handlers.response_for_exception = response_for_exception_check
+      try:
+          instance.serve = serve_raises
+          result = asyncio.run(instance.get_response_async(Request))
+          # Correct behavior: response_for_exception should run in thread (no running loop).
+          assert result == ("ran_in_thread", False)
+      finally:
+          handlers.response_for_exception = original_rfe
+  
+  # 3) get_response_async returns the value returned by serve.
+  def test_get_response_async_returns_serve_return_value():
+      instance = DummyHandler()
+      instance.serve = lambda request: "served-ok"
+      result = asyncio.run(instance.get_response_async(Request))
+      assert result == "served-ok"
+  
+  # 4) When serve raises Http404, the exact exception instance is forwarded to response_for_exception.
+  def test_get_response_async_passes_exception_instance_to_response_for_exception():
+      instance = DummyHandler()
+      exc_holder = {}
+      def serve_raises(request):
+          raise Http404("my-message")
+      original_rfe = handlers.response_for_exception
+      def response_for_exception_capture(request, exc):
+          exc_holder['exc'] = exc
+          return "handled"
+      handlers.response_for_exception = response_for_exception_capture
+      try:
+          instance.serve = serve_raises
+          result = asyncio.run(instance.get_response_async(Request))
+          assert result == "handled"
+          assert isinstance(exc_holder.get('exc'), Http404)
+          assert str(exc_holder['exc']) == "my-message"
+      finally:
+          handlers.response_for_exception = original_rfe
+  
+  # 5) get_response_async works when serve is an instance method referencing self.
+  def test_get_response_async_handles_subclass_method_serve():
+      class SubHandler(DummyHandler):
+          def __init__(self):
+              super().__init__()
+              self.value = "from-self"
+          def serve(self, request):
+              return self.value
+      instance = SubHandler()
+      result = asyncio.run(instance.get_response_async(Request))
+      assert result == "from-self"
+  
+  # 6) response_for_exception is not called when serve completes successfully.
+  def test_get_response_async_does_not_call_response_for_exception_when_no_exception():
+      instance = DummyHandler()
+      called = {'rfe': False}
+      original_rfe = handlers.response_for_exception
+      def response_for_exception_mark(*args, **kwargs):
+          called['rfe'] = True
+          return "handled"
+      handlers.response_for_exception = response_for_exception_mark
+      try:
+          instance.serve = lambda request: "ok"
+          result = asyncio.run(instance.get_response_async(Request))
+          assert result == "ok"
+          assert called['rfe'] is False
+      finally:
+          handlers.response_for_exception = original_rfe
+  
+  # 7) Long-running synchronous serve calls should run concurrently when dispatched to threads.
+  def test_get_response_async_concurrent_calls_are_independent():
+      instance = DummyHandler()
+  
+      def serve_sleep(request):
+          # Block the thread for a short period.
+          time.sleep(0.15)
+          return threading.get_ident()
+  
+      instance.serve = serve_sleep
+  
+      async def run_two():
+          t0 = time.time()
+          results = await asyncio.gather(
+              instance.get_response_async(Request),
+              instance.get_response_async(Request),
+          )
+          t1 = time.time()
+          return results, t1 - t0
+  
+      results, elapsed = asyncio.run(run_two())
+      # If served in worker threads (correct behavior), both calls should overlap and finish
+      # in about ~0.15s (allow some margin). If serve executed synchronously in the event loop
+      # the total would be roughly double.
+      assert elapsed < 0.3, "Calls did not run concurrently; likely blocking the event loop"
+      # And the two results should be thread identifiers (ints); they may be same or different threads.
+      assert isinstance(results[0], int) and isinstance(results[1], int)
+  
+  # 8) When serve raises Http404, get_response_async should return whatever response_for_exception returns.
+  def test_get_response_async_awaits_response_for_exception_return_value():
+      instance = DummyHandler()
+      def serve_raises(request):
+          raise Http404("boom")
+      instance.serve = serve_raises
+      original_rfe = handlers.response_for_exception
+      handlers.response_for_exception = lambda request, exc: {"handled": str(exc)}
+      try:
+          result = asyncio.run(instance.get_response_async(Request))
+          assert result == {"handled": "boom"}
+      finally:
+          handlers.response_for_exception = original_rfe
+  
+  # 9) Non-Http404 exceptions should propagate from get_response_async.
+  def test_get_response_async_propagates_non_http404_exceptions():
+      instance = DummyHandler()
+      def serve_raises_value_error(request):
+          raise ValueError("bad")
+      instance.serve = serve_raises_value_error
+      with pytest.raises(ValueError):
+          asyncio.run(instance.get_response_async(Request))
+  
+  # 10) Ensure response_for_exception itself runs without an event loop (is dispatched to thread).
+  def test_get_response_async_uses_sync_to_async_for_response_for_exception():
+      instance = DummyHandler()
+      def serve_raises(request):
+          raise Http404("x")
+      instance.serve = serve_raises
+      called_context = {}
+      original_rfe = handlers.response_for_exception
+      def response_for_exception_context(request, exc):
+          try:
+              asyncio.get_running_loop()
+              called_context['in_loop'] = True
+          except RuntimeError:
+              called_context['in_loop'] = False
+          return "handled"
+      handlers.response_for_exception = response_for_exception_context
+      try:
+          result = asyncio.run(instance.get_response_async(Request))
+          assert result == "handled"
+          # Correct behavior: response_for_exception should run in a thread (no running loop).
+          assert called_context['in_loop'] is False
+      finally:
+          handlers.response_for_exception = original_rfe
+new_imports_code: |
+  import importlib
+  import asyncio
+  import time
+  import threading
+  from types import SimpleNamespace
+  
+  import pytest

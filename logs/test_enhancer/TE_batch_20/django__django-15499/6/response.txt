@@ -1,0 +1,180 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise MigrationOptimizer behavior around CreateModel + AlterModelManagers combinations. They ensure CreateModel and subsequent AlterModelManagers operations are fused into a single CreateModel with the expected managers and fields in a variety of situations (with/without initial managers, with intermediate field operations, with multiple AlterModelManagers, with a RenameModel in-between, and verifying deconstruction includes managers). The tests will fail if CreateModel.reduce does not handle AlterModelManagers correctly (i.e. if the fix in the patch is missing).
+test_code: |
+  from django.db import models, migrations
+  from django.db.migrations.optimizer import MigrationOptimizer
+  from django.test import SimpleTestCase
+  
+  
+  class CustomManager(models.Manager):
+      def get_queryset(self):
+          return super().get_queryset().filter(active=True)
+  
+  
+  class ManagerOptimizationTests(SimpleTestCase):
+      def optimize(self, operations, app_label="migrations"):
+          optimizer = MigrationOptimizer()
+          return optimizer.optimize(operations, app_label)
+  
+      def test_create_and_alter_managers_simple(self):
+          create = migrations.CreateModel(
+              name="TestModel",
+              fields=[],
+              managers=[("objects", models.Manager())],
+          )
+          alter = migrations.AlterModelManagers(
+              name="TestModel",
+              managers=[("objects", models.Manager()), ("things", models.Manager())],
+          )
+          result = self.optimize([create, alter])
+          self.assertEqual(len(result), 1)
+          op = result[0]
+          self.assertIsInstance(op, migrations.CreateModel)
+          self.assertEqual(op.name, "TestModel")
+          self.assertEqual([name for name, _ in op.managers], ["objects", "things"])
+  
+      def test_create_without_managers_then_alter(self):
+          # CreateModel with no managers argument should still absorb AlterModelManagers
+          create = migrations.CreateModel(name="TestModel", fields=[])
+          alter = migrations.AlterModelManagers(
+              name="TestModel",
+              managers=[("objects", models.Manager()), ("custom", CustomManager())],
+          )
+          result = self.optimize([create, alter])
+          self.assertEqual(len(result), 1)
+          op = result[0]
+          self.assertIsInstance(op, migrations.CreateModel)
+          self.assertEqual([name for name, _ in op.managers], ["objects", "custom"])
+  
+      def test_create_with_custom_manager_replaced(self):
+          # CreateModel with an initial custom manager should be replaced by AlterModelManagers
+          create = migrations.CreateModel(
+              name="TestModel",
+              fields=[],
+              managers=[("objects", CustomManager())],
+          )
+          alter = migrations.AlterModelManagers(
+              name="TestModel",
+              managers=[("objects", models.Manager()), ("active_only", CustomManager())],
+          )
+          result = self.optimize([create, alter])
+          self.assertEqual(len(result), 1)
+          op = result[0]
+          self.assertIsInstance(op, migrations.CreateModel)
+          self.assertEqual([name for name, _ in op.managers], ["objects", "active_only"])
+  
+      def test_merge_with_addfield_between(self):
+          # CreateModel + AddField + AlterModelManagers should produce a single CreateModel
+          create = migrations.CreateModel(
+              name="Foo",
+              fields=[("a", models.IntegerField())],
+              managers=[("objects", models.Manager())],
+          )
+          add = migrations.AddField("Foo", "b", models.IntegerField())
+          alter = migrations.AlterModelManagers(
+              name="Foo", managers=[("objects", models.Manager()), ("m", CustomManager())]
+          )
+          result = self.optimize([create, add, alter])
+          self.assertEqual(len(result), 1)
+          op = result[0]
+          self.assertIsInstance(op, migrations.CreateModel)
+          self.assertEqual([n for n, _ in op.fields], ["a", "b"])
+          self.assertEqual([name for name, _ in op.managers], ["objects", "m"])
+  
+      def test_merge_with_alterfield_between(self):
+          # AlterField between should be applied into the single CreateModel
+          create = migrations.CreateModel(
+              name="Foo",
+              fields=[("a", models.IntegerField())],
+          )
+          alter_field = migrations.AlterField("Foo", "a", models.CharField(max_length=20))
+          alter_managers = migrations.AlterModelManagers(
+              name="Foo", managers=[("objects", models.Manager()), ("m", CustomManager())]
+          )
+          result = self.optimize([create, alter_field, alter_managers])
+          self.assertEqual(len(result), 1)
+          op = result[0]
+          self.assertIsInstance(op, migrations.CreateModel)
+          self.assertEqual([n for n, _ in op.fields], ["a"])
+          # ensure field was altered into CharField in the optimized CreateModel
+          self.assertTrue(isinstance(op.fields[0][1], models.CharField))
+          self.assertEqual([name for name, _ in op.managers], ["objects", "m"])
+  
+      def test_merge_with_removefield_between(self):
+          # RemoveField between should remove that field in the resulting CreateModel
+          create = migrations.CreateModel(
+              name="Foo",
+              fields=[("a", models.IntegerField()), ("b", models.IntegerField())],
+              managers=[("objects", models.Manager())],
+          )
+          remove = migrations.RemoveField("Foo", "b")
+          alter = migrations.AlterModelManagers(
+              name="Foo", managers=[("objects", models.Manager()), ("m", CustomManager())]
+          )
+          result = self.optimize([create, remove, alter])
+          self.assertEqual(len(result), 1)
+          op = result[0]
+          self.assertIsInstance(op, migrations.CreateModel)
+          self.assertEqual([n for n, _ in op.fields], ["a"])
+          self.assertEqual([name for name, _ in op.managers], ["objects", "m"])
+  
+      def test_multiple_alter_managers_last_wins(self):
+          create = migrations.CreateModel(name="X", fields=[])
+          alter1 = migrations.AlterModelManagers(
+              name="X", managers=[("a", models.Manager())]
+          )
+          alter2 = migrations.AlterModelManagers(
+              name="X", managers=[("b", CustomManager())]
+          )
+          result = self.optimize([create, alter1, alter2])
+          self.assertEqual(len(result), 1)
+          op = result[0]
+          self.assertIsInstance(op, migrations.CreateModel)
+          # The last AlterModelManagers should be applied
+          self.assertEqual([name for name, _ in op.managers], ["b"])
+  
+      def test_create_rename_and_alter_managers(self):
+          # CreateModel + RenameModel + AlterModelManagers where Alter targets new name
+          create = migrations.CreateModel(name="Old", fields=[])
+          rename = migrations.RenameModel("Old", "New")
+          alter = migrations.AlterModelManagers(
+              name="New", managers=[("objects", models.Manager()), ("m", CustomManager())]
+          )
+          result = self.optimize([create, rename, alter])
+          # Should be optimized to a single CreateModel named "New" with the managers applied
+          self.assertEqual(len(result), 1)
+          op = result[0]
+          self.assertIsInstance(op, migrations.CreateModel)
+          self.assertEqual(op.name, "New")
+          self.assertEqual([name for name, _ in op.managers], ["objects", "m"])
+  
+      def test_optimize_with_custom_app_label(self):
+          # Ensure optimization works when a non-default app_label is passed
+          create = migrations.CreateModel(name="Item", fields=[])
+          alter = migrations.AlterModelManagers(
+              name="Item", managers=[("objects", models.Manager()), ("m", CustomManager())]
+          )
+          optimizer = MigrationOptimizer()
+          result = optimizer.optimize([create, alter], app_label="myapp")
+          self.assertEqual(len(result), 1)
+          op = result[0]
+          self.assertIsInstance(op, migrations.CreateModel)
+          self.assertEqual([n for n, _ in op.managers], ["objects", "m"])
+  
+      def test_deconstruct_includes_managers_after_merge(self):
+          # After merging, deconstruct() should include the managers kwarg when managers are non-default
+          create = migrations.CreateModel(name="Item", fields=[])
+          alter = migrations.AlterModelManagers(
+              name="Item", managers=[("objects", models.Manager()), ("m", CustomManager())]
+          )
+          result = self.optimize([create, alter])
+          self.assertEqual(len(result), 1)
+          op = result[0]
+          _, _, kwargs = op.deconstruct()
+          # managers should be present in deconstruction kwargs because they are non-default
+          self.assertIn("managers", kwargs)
+new_imports_code: |
+  from django.db import models
+  from django.db.migrations.optimizer import MigrationOptimizer
+  from django.db import migrations

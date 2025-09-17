@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_views.test_adminsite_llm.BuildAppDictTests.setUp admin_views.test_adminsite_llm.BuildAppDictTests.setUpTestData admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_admin_and_add_urls_are_none_on_noreversematch admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_app_keys_exist admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_contains_model_key_for_each_model admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_label_filter_returns_only_label admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_label_missing_returns_none admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_method_exists admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_skips_models_with_no_module_perms admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_skips_models_with_no_perms admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_view_only_false_when_change_perm admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_view_only_flag_when_no_change_perm
+coverage json -o coverage.json
+: '>>>>> End Test Output'

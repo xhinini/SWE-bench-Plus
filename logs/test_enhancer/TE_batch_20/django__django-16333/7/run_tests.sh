@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.UserCreationSaveM2MRegressionTests._make_form_class_without_save_m2m auth_tests.test_forms_llm.UserCreationSaveM2MRegressionTests.setUp auth_tests.test_forms_llm.UserCreationSaveM2MRegressionTests.test_multiple_saves_without_save_m2m_do_not_raise auth_tests.test_forms_llm.UserCreationSaveM2MRegressionTests.test_save_with_no_save_m2m_commit_false_returns_unsaved_user auth_tests.test_forms_llm.UserCreationSaveM2MRegressionTests.test_save_with_no_save_m2m_does_not_raise_and_returns_user auth_tests.test_forms_llm.UserCreationSaveM2MRegressionTests.test_save_without_save_m2m_and_password_validated_and_set auth_tests.test_forms_llm.UserCreationSaveM2MRegressionTests.test_save_without_save_m2m_does_not_save_m2m_but_creates_user auth_tests.test_forms_llm.UserCreationSaveM2MRegressionTests.test_save_without_save_m2m_on_default_user_model_does_not_raise
+coverage json -o coverage.json
+: '>>>>> End Test Output'

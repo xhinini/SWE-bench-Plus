@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_views.test_adminsite_llm.BuildAppDictTests.setUpTestData admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_attribute_exists admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_label_filter admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_respects_has_module_permission_false admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_returns_model_key admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_skips_models_without_any_true_perms admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_unknown_label_returns_none admin_views.test_adminsite_llm.BuildAppDictTests.test_app_index_raises_for_invalid_app admin_views.test_adminsite_llm.BuildAppDictTests.test_app_index_renders admin_views.test_adminsite_llm.BuildAppDictTests.test_get_app_list_sorted_apps_and_models admin_views.test_adminsite_llm.BuildAppDictTests.test_view_only_detection_based_on_perms
+coverage json -o coverage.json
+: '>>>>> End Test Output'

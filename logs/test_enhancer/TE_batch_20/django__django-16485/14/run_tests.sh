@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.filter_tests.test_floatformat_llm.RegressionFloatformatZeroTests.test_decimal_string_with_trailing_zeros template_tests.filter_tests.test_floatformat_llm.RegressionFloatformatZeroTests.test_decimal_zero_exponent_negative_20 template_tests.filter_tests.test_floatformat_llm.RegressionFloatformatZeroTests.test_decimal_zero_exponent_negative_3 template_tests.filter_tests.test_floatformat_llm.RegressionFloatformatZeroTests.test_decimal_zero_exponent_positive template_tests.filter_tests.test_floatformat_llm.RegressionFloatformatZeroTests.test_decimal_zero_various_representations template_tests.filter_tests.test_floatformat_llm.RegressionFloatformatZeroTests.test_decimal_zero_with_fewer_fraction_digits_than_p template_tests.filter_tests.test_floatformat_llm.RegressionFloatformatZeroTests.test_decimal_zero_with_localcontext_low_precision template_tests.filter_tests.test_floatformat_llm.RegressionFloatformatZeroTests.test_negative_zero_string_becomes_positive template_tests.filter_tests.test_floatformat_llm.RegressionFloatformatZeroTests.test_zero_float_negative_zero template_tests.filter_tests.test_floatformat_llm.RegressionFloatformatZeroTests.test_zero_large_precision_no_scientific
+coverage json -o coverage.json
+: '>>>>> End Test Output'

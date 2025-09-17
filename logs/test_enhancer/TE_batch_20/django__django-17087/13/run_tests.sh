@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_writer_llm.FunctionTypeSerializerQualnameTests._assert_serializes_to_qualname migrations.test_writer_llm.FunctionTypeSerializerQualnameTests._make_class_with_qualname migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_deep_many_levels migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_nested_one_level migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_nested_three_levels migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_nested_two_levels migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_numeric_and_mixed migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_repeated_names migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_same_inner_name_different_parents_parent1 migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_same_inner_name_different_parents_parent2 migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_with_locals_in_qualname migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_with_unicode_in_qualname
+coverage json -o coverage.json
+: '>>>>> End Test Output'

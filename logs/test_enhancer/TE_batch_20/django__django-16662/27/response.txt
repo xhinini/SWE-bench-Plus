@@ -1,0 +1,350 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests verify the ordering and grouping of import lines produced by
+  MigrationWriter.as_string(). They ensure that "import ..." statements are
+  grouped before "from ... import ..." statements and that commonly-produced
+  imports (datetime, time, custom modules, and the merged
+  "from django.db import migrations, models") appear in the expected order and
+  form in the migration header. The tests construct Migration instances with
+  operations that force particular imports to be present and assert the exact
+  import block emitted by MigrationWriter.as_string().
+test_code: |
+  from django import get_version
+  import datetime
+  import time
+  import os
+  from django.test import SimpleTestCase
+  from django.db import migrations, models
+  from django.db.migrations.writer import MigrationWriter
+  import custom_migration_operations.operations
+  import custom_migration_operations.more_operations
+
+  class ImportOrderingRegressionTests(SimpleTestCase):
+      def _extract_import_block(self, output):
+          """
+          Return the contiguous block of import lines (lines starting with
+          'import ' or 'from ') from the output string. This ignores any
+          file header comments.
+          """
+          lines = output.splitlines()
+          import_lines = []
+          # Skip header comments and blank lines at the top
+          i = 0
+          while i < len(lines) and (lines[i].startswith('#') or lines[i].strip() == ''):
+              i += 1
+          # Collect import/from lines
+          while i < len(lines) and (lines[i].startswith('import ') or lines[i].startswith('from ')):
+              import_lines.append(lines[i])
+              i += 1
+          return "\n".join(import_lines) + ("\n" if import_lines else "")
+
+      def test_import_before_from_simple(self):
+          """
+          Ensure plain 'import ...' lines appear before 'from ... import ...'
+          lines even when the module part of the from-import sorts earlier
+          lexicographically than the import module.
+          Regression for grouping imports vs from-imports.
+          """
+          migration = type(
+              "Migration",
+              (migrations.Migration,),
+              {
+                  "operations": [
+                      # This will create a from-import (models used)
+                      migrations.AlterModelOptions(
+                          name="model",
+                          options={"verbose_name": "model"},
+                      ),
+                      # This will create an import line for a top-level module
+                      migrations.RunPython(lambda apps, schema_editor: None),
+                  ],
+              },
+          )
+          # To force a deterministic import set that includes both 'import'
+          # and 'from' lines, add an operation that references time (import time)
+          migration.operations.append(
+              migrations.AddField("mymodel", "f", models.FloatField(default=time.time))
+          )
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          imports_block = self._extract_import_block(output)
+          # 'import time' should come before the 'from django.db import ...' line
+          self.assertIn("import time\n", imports_block)
+          self.assertRegex(imports_block, r"^import .*\nfrom django.db import migrations", msg=imports_block)
+
+      def test_multiple_imports_grouped_before_froms(self):
+          """
+          Multiple import statements (custom module, datetime, time) should
+          appear before from-import lines (django.db).
+          """
+          migration = type(
+              "Migration",
+              (migrations.Migration,),
+              {
+                  "operations": [
+                      migrations.AddField(
+                          "mymodel",
+                          "ts",
+                          models.DateTimeField(default=datetime.datetime(2012, 1, 1, 1, 1)),
+                      ),
+                      migrations.AddField(
+                          "mymodel",
+                          "f",
+                          models.FloatField(default=time.time),
+                      ),
+                      custom_migration_operations.operations.TestOperation(),
+                      migrations.AlterModelOptions(
+                          name="model",
+                          options={"verbose_name": "model"},
+                      ),
+                  ],
+              },
+          )
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          imports_block = self._extract_import_block(output)
+          # Expect the three imports to exist and be before the from-import.
+          self.assertIn("import datetime\n", imports_block)
+          self.assertIn("import time\n", imports_block)
+          # custom module import should be present
+          self.assertIn("import custom_migration_operations.operations\n", imports_block)
+          # All 'import ' lines should come before the first 'from ' line.
+          first_from_index = imports_block.find("\nfrom ")
+          first_import_index = imports_block.find("import ")
+          self.assertTrue(first_import_index != -1)
+          self.assertTrue(first_from_index != -1)
+          self.assertLess(first_import_index, first_from_index)
+
+      def test_merged_models_with_migrations_present(self):
+          """
+          When models import is needed in addition to migrations, they should be
+          combined into a single 'from django.db import migrations, models' line.
+          """
+          migration = type(
+              "Migration",
+              (migrations.Migration,),
+              {
+                  "operations": [
+                      # This first AddField will cause migrations and models to be needed
+                      migrations.AddField(
+                          "mymodel",
+                          "char",
+                          models.CharField(max_length=10, default="x"),
+                      ),
+                      # Use a model-related operation to ensure models is relevant
+                      migrations.CreateModel("MyModel", (), {}, (models.Model,)),
+                  ],
+              },
+          )
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          imports_block = self._extract_import_block(output)
+          # There should be exactly one combined line for migrations and models
+          self.assertIn("from django.db import migrations, models\n", imports_block)
+          # Ensure there is not a separate 'from django.db import models' line anywhere
+          self.assertNotIn("\nfrom django.db import models\n", imports_block.replace("from django.db import migrations, models\n", ""))
+
+      def test_imports_order_by_module_name(self):
+          """
+          Ensure imports are ordered by their module name (after grouping),
+          e.g., 'import custom_migration_operations.operations' comes before
+          'import datetime' because 'custom...' < 'datetime'.
+          """
+          migration = type(
+              "Migration",
+              (migrations.Migration,),
+              {
+                  "operations": [
+                      custom_migration_operations.operations.TestOperation(),
+                      migrations.AddField(
+                          "mymodel",
+                          "ts",
+                          models.DateTimeField(default=datetime.datetime(2012, 1, 1, 1, 1))
+                      ),
+                      migrations.AddField(
+                          "mymodel",
+                          "f",
+                          models.FloatField(default=time.time),
+                      ),
+                  ],
+              },
+          )
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          imports_block = self._extract_import_block(output)
+          # 'custom...' should appear before 'datetime' in the imports block
+          self.assertLess(
+              imports_block.index("import custom_migration_operations.operations"),
+              imports_block.index("import datetime"),
+          )
+
+      def test_from_only_imports_present_and_sorted(self):
+          """
+          If only 'from' import statements are produced (no plain 'import ...'),
+          they should still be present and appear in sorted order by module.
+          """
+          # Use two operations that both produce from-imports (models usage)
+          migration = type(
+              "Migration",
+              (migrations.Migration,),
+              {
+                  "operations": [
+                      migrations.CreateModel("A", (), {}, (models.Model,)),
+                      migrations.AlterModelOptions("A", options={"verbose_name": "A"}),
+                  ],
+              },
+          )
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          imports_block = self._extract_import_block(output)
+          # Should contain the django.db from import (with migrations at least)
+          self.assertIn("from django.db import migrations\n", imports_block)
+          # There shouldn't be any 'import ' lines at all in this scenario
+          self.assertNotIn("\nimport ", "\n" + imports_block)
+
+      def test_no_duplicate_migrations_models_line(self):
+          """
+          Ensure that only one 'from django.db import migrations, models' line is
+          present even if multiple operations require models.
+          """
+          migration = type(
+              "Migration",
+              (migrations.Migration,),
+              {
+                  "operations": [
+                      migrations.CreateModel("A", (), {}, (models.Model,)),
+                      migrations.CreateModel("B", (), {}, (models.Model,)),
+                      migrations.AddField("A", "f", models.CharField(max_length=10, default="x")),
+                  ],
+              },
+          )
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          imports_block = self._extract_import_block(output)
+          # Count occurrences of the combined line
+          self.assertEqual(imports_block.count("from django.db import migrations, models\n"), 1)
+
+      def test_custom_and_standard_imports_mix(self):
+          """
+          Mixing custom module imports and standard library imports should
+          produce a sane ordering with all 'import' lines first.
+          """
+          migration = type(
+              "Migration",
+              (migrations.Migration,),
+              {
+                  "operations": [
+                      custom_migration_operations.operations.CreateModel(),
+                      migrations.AddField(
+                          "mymodel",
+                          "ts",
+                          models.DateTimeField(default=datetime.datetime(2012, 1, 1, 1, 1)),
+                      ),
+                      migrations.AddField(
+                          "mymodel",
+                          "f",
+                          models.FloatField(default=time.time),
+                      ),
+                  ],
+              },
+          )
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          imports_block = self._extract_import_block(output)
+          # Check that all 'import ' lines appear before any 'from ' line.
+          if "from " in imports_block:
+              first_from_index = imports_block.find("\nfrom ")
+              first_import_index = imports_block.find("import ")
+              self.assertLess(first_import_index, first_from_index)
+
+      def test_imports_stable_for_many_modules(self):
+          """
+          With many imports present, ensure the output contains each expected
+          import and that import-group appears before from-group.
+          """
+          migration = type(
+              "Migration",
+              (migrations.Migration,),
+              {
+                  "operations": [
+                      custom_migration_operations.operations.TestOperation(),
+                      custom_migration_operations.more_operations.TestOperation(),
+                      migrations.AddField("m", "dt", models.DateTimeField(default=datetime.datetime.now)),
+                      migrations.AddField("m", "f", models.FloatField(default=time.time)),
+                      migrations.CreateModel("X", (), {}, (models.Model,)),
+                  ],
+              },
+          )
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          imports_block = self._extract_import_block(output)
+          expected_imports = [
+              "import custom_migration_operations.more_operations",
+              "import custom_migration_operations.operations",
+              "import datetime",
+              "import time",
+              "from django.db import migrations, models",
+          ]
+          for imp in expected_imports:
+              self.assertIn(imp + "\n", imports_block)
+
+      def test_migration_comment_for_migration_functions_present(self):
+          """
+          If an import matching the migration-import regex (import ....<digits>...)
+          was present originally it should be removed from the imports block and
+          instead be mentioned in the migration header comments. We simulate this
+          by injecting such a string into the imports set via a custom serializer
+          registration and verifying the comment text appears.
+          """
+          # Register a simple serializer for a sentinel type that returns an import
+          # string that matches the migration_imports pattern (e.g., import app.migrations.0001)
+          class Sentinel:
+              pass
+
+          from django.db.migrations.writer import MigrationWriter as MW
+          from django.db.migrations.serializer import BaseSerializer, Serializer
+
+          class SentinelSerializer(BaseSerializer):
+              def serialize(self):
+                  # Return a representation and an import that matches the regex
+                  return ("Sentinel()", {"import some.migrations.0001_something"})
+
+          try:
+              MW.register_serializer(Sentinel, SentinelSerializer)
+              migration = type(
+                  "Migration",
+                  (migrations.Migration,),
+                  {
+                      "operations": [
+                          migrations.RunPython(lambda apps, schema_editor: None),
+                      ],
+                  },
+              )
+              # Manually insert a value that will be serialized to the sentinel import
+              # by adding a fake operation that holds the Sentinel instance as an arg.
+              class FakeOp:
+                  def __init__(self, value):
+                      self.value = value
+
+                  def deconstruct(self):
+                      return ("FakeOp", [self.value], {})
+
+                  @property
+                  def __class__(self):
+                      # Make it appear as a custom module operation so an import is attempted
+                      class C:
+                          __module__ = "fake.module"
+                          __name__ = "FakeOp"
+                      return C
+
+              migration.operations.append(FakeOp(Sentinel()))
+              writer = MW(migration)
+              output = writer.as_string()
+              # The migration_imports comment should be present mentioning "some.migrations.0001_something"
+              self.assertIn("Functions from the following migrations need manual copying.", output)
+              self.assertIn("some.migrations.0001_something", output)
+          finally:
+              # Clean up serializer registration
+              MW.unregister_serializer(Sentinel)
+  new_imports_code: ""

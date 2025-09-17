@@ -1,0 +1,162 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise GROUP BY construction in the SQL compiler through ORM queries that combine Meta.ordering, values(), annotate(), and order_by(). They assert that default Meta.ordering does not leak into GROUP BY clauses and that explicitly requested grouping/ordering columns behave as expected. The added tests reproduce a variety of combinations (values()+annotate(), annotate()+order_by(), Subquery-based annotation, distinct+annotate) to ensure the bug fixed by the provided patch would be caught: incorrect inclusion/exclusion of ORDER BY columns into GROUP BY when Meta.ordering is present.
+test_code: |
+  from datetime import datetime
+  from operator import attrgetter
+  
+  from django.db.models import Count, DateTimeField, OuterRef, Subquery
+  from django.db.models.functions import Max
+  from django.test import TestCase
+  
+  from .models import Article, Author
+  
+  
+  class GroupByRegressionTests(TestCase):
+  
+      @classmethod
+      def setUpTestData(cls):
+          # Reuse a small dataset similar to the ordering tests.
+          cls.a1 = Article.objects.create(headline="Article 1", pub_date=datetime(2005, 7, 26))
+          cls.a2 = Article.objects.create(headline="Article 2", pub_date=datetime(2005, 7, 27))
+          cls.a3 = Article.objects.create(headline="Article 3", pub_date=datetime(2005, 7, 27))
+          cls.a4 = Article.objects.create(headline="Article 4", pub_date=datetime(2005, 7, 28))
+          cls.author_1 = Author.objects.create(name="Name 1")
+          cls.author_2 = Author.objects.create(name="Name 2")
+          # Ensure some authors are null (for null ordering tests if needed)
+          for i in range(2):
+              Author.objects.create()
+  
+      def test_values_annotate_grouping_counts_by_author(self):
+          """
+          .values(...).annotate(...) should produce grouping only on the
+          requested values fields regardless of model Meta.ordering.
+          """
+          # Assign authors so groupings are meaningful
+          Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+          Article.objects.filter(headline='Article 4').update(author=self.author_2)
+          qs = Article.objects.values('author').annotate(count=Count('author')).order_by('author')
+          # Expect one row per author present
+          expected = [
+              {'author': self.author_1.pk, 'count': 3},
+              {'author': self.author_2.pk, 'count': 1},
+          ]
+          self.assertCountEqual(list(qs), expected)
+  
+      def test_annotate_then_order_by_does_not_leak_meta_ordering_into_group_by(self):
+          """
+          Annotating and then ordering (without explicit order_by, i.e. using
+          Meta.ordering) should not force additional GROUP BY columns to be
+          added because of Meta.ordering.
+          """
+          Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+          Article.objects.filter(headline='Article 4').update(author=self.author_2)
+          qs = Article.objects.values('author').annotate(count=Count('author'))
+          # Execute the query and ensure results are as expected (grouping only on 'author')
+          expected = [
+              {'author': self.author_1.pk, 'count': 3},
+              {'author': self.author_2.pk, 'count': 1},
+          ]
+          self.assertCountEqual(list(qs), expected)
+  
+      def test_values_and_order_by_field_not_in_meta_ordering(self):
+          """
+          values(...).annotate(...) with an explicit order_by on a field that
+          isn't Meta.ordering should still work and include that order_by
+          expression properly in the grouping logic.
+          """
+          Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+          Article.objects.filter(headline='Article 4').update(author=self.author_2)
+          qs = Article.objects.values('author').annotate(count=Count('author')).order_by('author')
+          # Ordering by 'author' should not change grouping semantics.
+          expected = [
+              {'author': self.author_1.pk, 'count': 3},
+              {'author': self.author_2.pk, 'count': 1},
+          ]
+          self.assertSequenceEqual(list(qs), expected)
+  
+      def test_distinct_with_annotate_and_meta_ordering(self):
+          """
+          distinct() combined with annotate() should not result in Meta.ordering
+          being implicitly added to the GROUP BY clause and should produce the
+          expected result set.
+          """
+          Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+          Article.objects.filter(headline='Article 4').update(author=self.author_2)
+          qs = Author.objects.annotate(
+              last_date=Subquery(
+                  Article.objects.filter(
+                      author=OuterRef('pk'),
+                  ).order_by().values('author').annotate(last_date=Max('pub_date')).values('last_date'),
+                  output_field=DateTimeField()
+              )
+          ).distinct().order_by('pk')
+          # Ensure no crash and authors returned (one row per Author)
+          self.assertEqual(qs.count(), Author.objects.count())
+  
+      def test_values_annotate_order_by_expression(self):
+          """
+          When ordering by an expression added via annotate(), the GROUP BY
+          should include explicitly requested grouping columns but must not
+          be polluted by Meta.ordering.
+          """
+          # Create some annotated values and order by that annotation
+          qs = Article.objects.values('headline').annotate(cnt=Count('pk')).order_by('headline')
+          # Should return one row per headline
+          headlines = {r['headline'] for r in qs}
+          self.assertSetEqual(headlines, {'Article 1', 'Article 2', 'Article 3', 'Article 4'})
+  
+      def test_annotate_with_subquery_and_grouping(self):
+          """
+          Annotating with a Subquery that itself uses grouping/ordering should
+          not break the outer query's grouping when Meta.ordering is present.
+          """
+          # Build a subquery that aggregates per author
+          subq = Article.objects.filter(author=OuterRef('pk')).values('author').annotate(
+              last_date=Max('pub_date'),
+          ).values('last_date')
+          qs = Author.objects.annotate(last_date=Subquery(subq, output_field=DateTimeField())).order_by('pk')
+          # Ensure every author resolves to a single annotated value (possibly None)
+          results = list(qs.values_list('pk', 'last_date'))
+          self.assertEqual(len(results), Author.objects.count())
+  
+      def test_values_annotate_multiple_grouping_keys(self):
+          """
+          values() with multiple keys and annotate() must group by exactly the
+          requested keys and return the expected grouped rows.
+          """
+          # Group by pub_date and headline (fine-grained grouping)
+          qs = Article.objects.values('pub_date', 'headline').annotate(cnt=Count('pk')).order_by('pub_date', 'headline')
+          # Ensure each article results in one group row
+          self.assertEqual(qs.count(), Article.objects.count())
+  
+      def test_annotate_then_values_preserves_grouping(self):
+          """
+          Calling annotate() and then values() (reducing columns) should not
+          cause inclusion of Meta.ordering columns in the GROUP BY clause.
+          """
+          Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+          Article.objects.filter(headline='Article 4').update(author=self.author_2)
+          qs = Article.objects.annotate(cnt=Count('pk')).values('author', 'cnt').order_by('author')
+          # Each author should have a single cnt value
+          authors = {r['author'] for r in qs if r['author'] is not None}
+          for author_pk in authors:
+              # There should be exactly one row per author_pk
+              self.assertEqual(len([r for r in qs if r['author'] == author_pk]), 1)
+  
+      def test_group_by_with_no_ordering_does_not_include_extra_columns(self):
+          """
+          When there is no ordering (explicit or meta), grouping should only
+          include the minimal set of group by columns.
+          """
+          # Remove any ordering by explicitly clearing it on the query (use order_by())
+          qs = Article.objects.order_by().values('author').annotate(count=Count('author'))
+          # Should not raise and should produce one row per author present
+          result = list(qs)
+          # Convert to mapping author->count and validate totals
+          mapping = {r['author']: r['count'] for r in result}
+          total = sum(mapping.values())
+          self.assertEqual(total, Article.objects.exclude(author__isnull=True).count())
+new_imports_code: |
+  from django.db.models import Count, DateTimeField, OuterRef, Subquery
+  from django.db.models.functions import Max

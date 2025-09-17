@@ -1,0 +1,212 @@
+from types import SimpleNamespace
+from types import SimpleNamespace
+from django.test import TestCase
+from django.core.serializers.base import build_instance
+
+
+class BuildInstanceTests(TestCase):
+    def make_model_with_mapping(self, mapping, to_python=int):
+        """
+        Helper that constructs a simple 'Model' class compatible with
+        build_instance(), whose natural_key depends on self._state.db.
+
+        mapping: dict keyed by ((natural_key_tuple), db_manager_db) -> pk_value
+        """
+        class DummyModel:
+            class DoesNotExist(Exception):
+                pass
+
+            # _meta.pk.attname and to_python
+            _meta = SimpleNamespace()
+            _meta.pk = SimpleNamespace(attname="id", to_python=to_python)
+
+            def __init__(self, **data):
+                # Create a _state attribute; _state.db will be set by the
+                # real code before invoking natural_key in the fixed version.
+                self._state = SimpleNamespace(db=None)
+                for k, v in data.items():
+                    setattr(self, k, v)
+
+            # default_manager lives on the _meta object for build_instance
+            class _Manager:
+                def __init__(self, mapping):
+                    self._mapping = mapping
+
+                def db_manager(self, db):
+                    manager_self = self
+                    class DBManager:
+                        def __init__(self, mapping, db):
+                            self.mapping = mapping
+                            self.db = db
+
+                        def get_by_natural_key(self, *natural_key):
+                            key = (tuple(natural_key), self.db)
+                            if key not in self.mapping:
+                                raise DummyModel.DoesNotExist()
+                            # return an object with a pk attribute
+                            return SimpleNamespace(pk=self.mapping[key])
+
+                    return DBManager(manager_self._mapping, db)
+
+            _meta.default_manager = _Manager(mapping)
+
+            def natural_key(self):
+                # natural_key depends on the instance's _state.db value,
+                # which is the subtle point fixed by the patch.
+                # Returns (name, db) tuple.
+                return (getattr(self, "name", None), self._state.db)
+
+        return DummyModel
+
+    def test_sets_pk_from_natural_key_for_other_db(self):
+        mapping = {
+            (("alice", "other"), "other"): "42",
+        }
+        Model = self.make_model_with_mapping(mapping)
+        obj = build_instance(Model, {"name": "alice"}, db="other")
+        # pk set and converted to int
+        self.assertEqual(getattr(obj, "id"), 42)
+
+    def test_sets_pk_from_natural_key_for_default_db(self):
+        mapping = {
+            (("bob", "default"), "default"): "7",
+        }
+        Model = self.make_model_with_mapping(mapping)
+        obj = build_instance(Model, {"name": "bob"}, db="default")
+        self.assertEqual(getattr(obj, "id"), 7)
+
+    def test_does_not_override_existing_pk_in_data(self):
+        # Even if natural_key would map to a different pk, an existing pk in
+        # the data should be preserved.
+        mapping = {
+            (("carol", "other"), "other"): "999",
+        }
+        Model = self.make_model_with_mapping(mapping)
+        obj = build_instance(Model, {"name": "carol", "id": 5}, db="other")
+        # existing pk should be preserved (build_instance shouldn't overwrite it)
+        self.assertEqual(getattr(obj, "id"), 5)
+
+    def test_handles_does_not_exist_leaves_pk_none(self):
+        # If get_by_natural_key raises DoesNotExist, build_instance should
+        # leave the pk absent (i.e. no id attribute on the resulting instance)
+        mapping = {
+            # no entry for ("dave", "other") -> will raise DoesNotExist
+        }
+        Model = self.make_model_with_mapping(mapping)
+        obj = build_instance(Model, {"name": "dave"}, db="other")
+        self.assertFalse(hasattr(obj, "id"))
+
+    def test_calls_to_python_on_pk_conversion(self):
+        # Ensure that to_python on pk is called (e.g., string "007" -> int 7)
+        mapping = {
+            (("eve", "other"), "other"): "007",
+        }
+        # custom to_python that behaves like int conversion
+        Model = self.make_model_with_mapping(mapping, to_python=lambda x: int(x))
+        obj = build_instance(Model, {"name": "eve"}, db="other")
+        self.assertEqual(getattr(obj, "id"), 7)
+
+    def test_ignores_when_no_get_by_natural_key(self):
+        # If the default_manager has no get_by_natural_key attribute, build_instance
+        # should not attempt a natural-key lookup.
+        class ModelNoNK:
+            class DoesNotExist(Exception):
+                pass
+            _meta = SimpleNamespace()
+            _meta.pk = SimpleNamespace(attname="id", to_python=int)
+            # default_manager without get_by_natural_key
+            class _Mgr:
+                def db_manager(self, db):
+                    raise AssertionError("db_manager should not be called")
+            _meta.default_manager = _Mgr()
+
+            def __init__(self, **data):
+                self._state = SimpleNamespace(db=None)
+                for k, v in data.items():
+                    setattr(self, k, v)
+
+        obj = build_instance(ModelNoNK, {"name": "frank"}, db="other")
+        self.assertFalse(hasattr(obj, "id"))
+
+    def test_complex_natural_key_with_db_component(self):
+        # natural_key includes multiple components and the db; mapping expects it
+        mapping = {
+            (("book-title", "author-name", "other"), "other"): "1234",
+        }
+        # Create a Model whose natural_key returns (title, author, db)
+        class BookModel:
+            class DoesNotExist(Exception):
+                pass
+            _meta = SimpleNamespace()
+            _meta.pk = SimpleNamespace(attname="id", to_python=int)
+
+            class _Manager:
+                def __init__(self, mapping):
+                    self._mapping = mapping
+                def db_manager(self, db):
+                    manager_self = self
+                    class DBManager:
+                        def __init__(self, mapping, db):
+                            self.mapping = mapping
+                            self.db = db
+                        def get_by_natural_key(self, *natural_key):
+                            key = (tuple(natural_key), self.db)
+                            if key not in self.mapping:
+                                raise BookModel.DoesNotExist()
+                            return SimpleNamespace(pk=self.mapping[key])
+                    return DBManager(manager_self._mapping, db)
+
+            _meta.default_manager = _Manager(mapping)
+
+            def __init__(self, **data):
+                self._state = SimpleNamespace(db=None)
+                for k, v in data.items():
+                    setattr(self, k, v)
+
+            def natural_key(self):
+                return (self.title, self.author, self._state.db)
+
+        obj = build_instance(BookModel, {"title": "book-title", "author": "author-name"}, db="other")
+        self.assertEqual(getattr(obj, "id"), 1234)
+
+    def test_non_string_db_value_is_used(self):
+        # db can be any hashable value; ensure it's taken into account when
+        # forming the natural key lookup.
+        mapping = {
+            (("gwen", 1), 1): "88",
+        }
+        Model = self.make_model_with_mapping(mapping)
+        obj = build_instance(Model, {"name": "gwen"}, db=1)
+        self.assertEqual(getattr(obj, "id"), 88)
+
+    def test_natural_key_attribute_error_propagates(self):
+        # If natural_key raises AttributeError for reasons unrelated to missing
+        # _state.db, the error should propagate (the candidate patch swallows
+        # AttributeError, which is incorrect).
+        class BadNKModel:
+            class DoesNotExist(Exception):
+                pass
+            _meta = SimpleNamespace()
+            _meta.pk = SimpleNamespace(attname="id", to_python=int)
+
+            class _Manager:
+                def db_manager(self, db):
+                    class DBManager:
+                        def get_by_natural_key(self, *args):
+                            # not used in this test
+                            raise BadNKModel.DoesNotExist()
+                    return DBManager()
+
+            _meta.default_manager = _Manager()
+
+            def __init__(self, **data):
+                self._state = SimpleNamespace(db=None)
+                for k, v in data.items():
+                    setattr(self, k, v)
+
+            def natural_key(self):
+                # This AttributeError should not be swallowed by build_instance.
+                raise AttributeError("boom")
+
+        with self.assertRaises(AttributeError):
+            build_instance(BadNKModel, {"name": "x"}, db="other")

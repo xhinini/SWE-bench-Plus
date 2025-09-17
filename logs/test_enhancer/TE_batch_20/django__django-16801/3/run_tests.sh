@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 model_fields.test_imagefield_llm.ImageFieldNoDimensionCachingTests.test_assign_file_caches_dimensions model_fields.test_imagefield_llm.ImageFieldNoDimensionCachingTests.test_assign_imagefile_caches_dimensions model_fields.test_imagefield_llm.ImageFieldNoDimensionCachingTests.test_assignment_in_constructor_caches_dimensions model_fields.test_imagefield_llm.ImageFieldNoDimensionCachingTests.test_create_assigns_and_caches_dimensions model_fields.test_imagefield_llm.ImageFieldNoDimensionCachingTests.test_delete_clears_dimensions model_fields.test_imagefield_llm.ImageFieldNoDimensionCachingTests.test_file_assignment_then_no_reopen_on_access model_fields.test_imagefield_llm.ImageFieldNoDimensionCachingTests.test_multiple_instances_independent_caches model_fields.test_imagefield_llm.ImageFieldNoDimensionCachingTests.test_reassign_updates_dimensions model_fields.test_imagefield_llm.ImageFieldNoDimensionCachingTests.test_save_method_caches_dimensions model_fields.test_imagefield_llm.ImageFieldNoDimensionCachingTests.test_subsequent_access_does_not_reopen_after_assignment
+coverage json -o coverage.json
+: '>>>>> End Test Output'

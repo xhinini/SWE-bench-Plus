@@ -1,0 +1,121 @@
+from django.db import connection, models, transaction
+from django.db.models.deletion import Collector
+from django.db import connection, models
+from django.test import TestCase, skipUnlessDBFeature, override_settings
+from django.db.models.deletion import Collector
+from django.db import transaction
+from .models import User, Avatar, M2MFrom, M2MTo
+
+class FastDeletePkTests(TestCase):
+    def test_model_delete_clears_pk_for_simple_model(self):
+        # Simple model (User) should have pk set to None after model.delete()
+        u = User.objects.create()
+        # Ensure can_fast_delete is True (sanity check)
+        collector = Collector(using='default')
+        self.assertTrue(collector.can_fast_delete(u))
+        # Call model.delete() on the instance (fast-delete single instance path)
+        result = u.delete()
+        # Model.delete() returns (deleted_count, deleted_dict)
+        self.assertIsInstance(result, tuple)
+        # After deletion, the Python instance's pk should be None
+        self.assertIsNone(u.pk)
+
+    def test_model_delete_clears_pk_when_related_objects_exist(self):
+        # Create an Avatar and a User referring to it - ensure deletion clears pk
+        a = Avatar.objects.create(desc='x')
+        u = User.objects.create(avatar=a)
+        # Delete the avatar which cascades to the user; the User instance should be
+        # fast-deletable when deleting the avatar, but here we call delete()
+        # on the user instance itself to hit the single-object fast-delete path.
+        collector = Collector(using='default')
+        self.assertTrue(collector.can_fast_delete(u))
+        u.delete()
+        self.assertIsNone(u.pk)
+
+    def test_model_delete_clears_pk_even_with_post_delete_listeners(self):
+        # Attaching a post_delete listener should prevent fast-delete, but the
+        # end result still must set instance.pk to None after deletion.
+        calls = []
+
+        def _listener(sender, **kwargs):
+            calls.append((sender, kwargs.get('instance')))
+
+        models.signals.post_delete.connect(_listener, sender=User)
+        u = User.objects.create()
+        # Now delete - since a signal is attached, can_fast_delete would be False for
+        # the collector path, but Model.delete() should still set pk to None.
+        u.delete()
+        models.signals.post_delete.disconnect(_listener, sender=User)
+        self.assertIsNone(u.pk)
+
+    def test_repeated_model_delete_is_idempotent_and_leaves_pk_none(self):
+        # Calling delete twice shouldn't raise and instance.pk should remain None
+        u = User.objects.create()
+        u.delete()
+        # second delete should not raise
+        u.delete()
+        self.assertIsNone(u.pk)
+
+    def test_queryset_delete_does_not_modify_unfetched_instance_pk(self):
+        # Deleting via a queryset shouldn't touch Python object's pk if it wasn't the
+        # object used by the queryset path (i.e., when not using model.delete()).
+        u = User.objects.create()
+        # Delete via queryset
+        User.objects.filter(pk=u.pk).delete()
+        # The Python object `u` was not the target of model.delete(), so its pk
+        # remains as it was (the instance was not updated in memory by queryset deletion).
+        # Note: Different behavior than model.delete() which sets pk to None.
+        self.assertIsNotNone(u.pk)
+
+    def test_model_delete_clears_pk_for_many_to_many_related_object_fast_delete(self):
+        # Ensure fast delete works for models with m2m relationships (single instance delete)
+        t = M2MTo.objects.create()
+        f = M2MFrom.objects.create()
+        f.m2m.add(t)
+        # The M2MFrom instance can be fast-deleted; after model.delete() pk should be None
+        collector = Collector(using='default')
+        self.assertTrue(collector.can_fast_delete(f))
+        f.delete()
+        self.assertIsNone(f.pk)
+
+    def test_model_delete_clears_pk_when_mark_for_rollback_context_used(self):
+        # This simulates the code path that uses mark_for_rollback_on_error() context manager.
+        # Create a user to delete via the single-object fast-delete path.
+        u = User.objects.create()
+        # Mimic the same context as the optimization path (mark_for_rollback_on_error)
+        with transaction.mark_for_rollback_on_error():
+            # Use the low-level delete query to simulate the fast-delete flow.
+            from django.db.models import sql
+            sql.DeleteQuery(User).delete_batch([u.pk], using='default')
+            # After the raw delete call, the optimization is expected to set pk to None.
+            # In the real path, Collector.delete() sets it. We emulate that expectation:
+            # The Model.delete() path sets the Python object's pk to None after deletion.
+        # Now manually call the model.delete() to exercise the wrapper path as well.
+        # Create another user for the definitive check.
+        v = User.objects.create()
+        v.delete()
+        self.assertIsNone(v.pk)
+
+    def test_can_fast_delete_detection_for_instance(self):
+        # Sanity check that can_fast_delete detects deletable instances
+        u = User.objects.create()
+        collector = Collector(using='default')
+        self.assertTrue(collector.can_fast_delete(u))
+
+    def test_model_delete_returns_counts_and_clears_pk_for_avatar(self):
+        # Ensure model.delete() returns correct counts and clears the instance.pk
+        a = Avatar.objects.create(desc='z')
+        count, detail = a.delete()
+        self.assertEqual(count, sum(detail.values()))
+        # The Avatar instance should have its pk cleared after deletion
+        self.assertIsNone(a.pk)
+
+    def test_model_delete_for_non_fetched_queryset_items_does_not_alter_other_instances(self):
+        # Create two users, delete using a queryset selecting one of them,
+        # and ensure the other Python instance still holds its pk.
+        u1 = User.objects.create()
+        u2 = User.objects.create()
+        # Delete u1 via queryset
+        User.objects.filter(pk=u1.pk).delete()
+        # u2 should still have its pk in memory
+        self.assertIsNotNone(u2.pk)

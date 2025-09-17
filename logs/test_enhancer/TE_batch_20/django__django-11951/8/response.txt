@@ -1,0 +1,117 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests patch the database backend's ops.bulk_batch_size to return small or edge-case values and then call bulk_create() with an explicit batch_size larger than that maximum. They assert that the number of executed SQL queries reflects batching capped by the backend maximum (i.e., batch_size is reduced to the backend max), and cover edge cases (bulk_batch_size returning 0, exact division, no batch_size provided, different models). These tests would fail with the old buggy implementation that used the provided batch_size unconditionally when it's truthy, and pass with the corrected logic that caps batch_size to the backend's maximum.
+test_code: |
+  from math import ceil
+  from django.test import TestCase, skipUnlessDBFeature
+  from django.db import connection
+  from .models import TwoFields, Country
+  
+  
+  @skipUnlessDBFeature('has_bulk_insert')
+  class BatchedInsertBatchSizeTests(TestCase):
+      def _patch_bulk_batch_size(self, value):
+          """
+          Patch connection.ops.bulk_batch_size to return a constant `value`.
+          Returns a cleanup function that restores the original.
+          """
+          original = connection.ops.bulk_batch_size
+          connection.ops.bulk_batch_size = lambda fields, objs: value
+          self.addCleanup(lambda: setattr(connection.ops, 'bulk_batch_size', original))
+  
+      def test_batch_size_capped_to_backend_max(self):
+          # backend max is 2, provided batch_size is 5 -> expect ceil(7/2) queries
+          self._patch_bulk_batch_size(2)
+          objs = [TwoFields(f1=i, f2=i) for i in range(7)]
+          max_batch = max(connection.ops.bulk_batch_size(['f1', 'f2'], objs), 1)
+          expected_queries = ceil(len(objs) / max_batch)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(objs, batch_size=5)
+  
+      def test_batch_size_equal_to_backend_max(self):
+          # backend max is 3, provided batch_size is 3 -> expect ceil(8/3) queries
+          self._patch_bulk_batch_size(3)
+          objs = [TwoFields(f1=i, f2=i) for i in range(8)]
+          max_batch = max(connection.ops.bulk_batch_size(['f1', 'f2'], objs), 1)
+          expected_queries = ceil(len(objs) / max_batch)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(objs, batch_size=3)
+  
+      def test_batch_size_greater_than_backend_max_exact_division(self):
+          # backend max is 4, provided batch_size is 10, 12 objects -> 3 queries expected
+          self._patch_bulk_batch_size(4)
+          objs = [TwoFields(f1=i, f2=i) for i in range(12)]
+          max_batch = max(connection.ops.bulk_batch_size(['f1', 'f2'], objs), 1)
+          expected_queries = ceil(len(objs) / max_batch)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(objs, batch_size=10)
+  
+      def test_batch_size_with_backend_zero_becomes_one(self):
+          # backend returns 0 -> should be treated as at least 1
+          self._patch_bulk_batch_size(0)
+          objs = [TwoFields(f1=i, f2=i) for i in range(5)]
+          max_batch = max(connection.ops.bulk_batch_size(['f1', 'f2'], objs), 1)
+          self.assertEqual(max_batch, 1)
+          expected_queries = ceil(len(objs) / max_batch)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(objs, batch_size=None)
+  
+      def test_no_explicit_batch_size_uses_backend_max(self):
+          # backend max is 2, no explicit batch_size -> expect ceil(5/2) queries
+          self._patch_bulk_batch_size(2)
+          objs = [TwoFields(f1=i, f2=i) for i in range(5)]
+          max_batch = max(connection.ops.bulk_batch_size(['f1', 'f2'], objs), 1)
+          expected_queries = ceil(len(objs) / max_batch)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(objs)  # batch_size None
+  
+      def test_large_provided_batch_size_with_small_backend_max(self):
+          # backend max is 1, provided batch_size very large -> expect len(objs) queries
+          self._patch_bulk_batch_size(1)
+          objs = [TwoFields(f1=i, f2=i) for i in range(6)]
+          max_batch = max(connection.ops.bulk_batch_size(['f1', 'f2'], objs), 1)
+          expected_queries = ceil(len(objs) / max_batch)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(objs, batch_size=100)
+  
+      def test_backend_max_of_one_and_no_batch_arg(self):
+          # backend max is 1 and batch_size omitted -> behave as batch_size=1
+          self._patch_bulk_batch_size(1)
+          objs = [TwoFields(f1=i, f2=i) for i in range(3)]
+          max_batch = max(connection.ops.bulk_batch_size(['f1', 'f2'], objs), 1)
+          self.assertEqual(max_batch, 1)
+          expected_queries = ceil(len(objs) / max_batch)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(objs)
+  
+      def test_batch_size_capping_with_different_model_fields(self):
+          # Ensure logic works for a different model (Country)
+          self._patch_bulk_batch_size(2)
+          objs = [Country(name=f"c{i}", iso_two_letter=str(i)[:2]) for i in range(5)]
+          max_batch = max(connection.ops.bulk_batch_size(['name', 'iso_two_letter', 'description'], objs), 1)
+          expected_queries = ceil(len(objs) / max_batch)
+          with self.assertNumQueries(expected_queries):
+              Country.objects.bulk_create(objs, batch_size=10)
+  
+      def test_batch_size_respected_when_smaller_than_backend_max(self):
+          # backend max is 10, provided batch_size is 3 -> should use 3 (no capping up)
+          self._patch_bulk_batch_size(10)
+          objs = [TwoFields(f1=i, f2=i) for i in range(7)]
+          provided = 3
+          expected_queries = ceil(len(objs) / provided)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(objs, batch_size=provided)
+  
+      def test_batch_size_capping_many_objects(self):
+          # backend max is 4, many objects, provided very large -> use backend max
+          self._patch_bulk_batch_size(4)
+          objs = [TwoFields(f1=i, f2=i) for i in range(25)]
+          max_batch = max(connection.ops.bulk_batch_size(['f1', 'f2'], objs), 1)
+          expected_queries = ceil(len(objs) / max_batch)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(objs, batch_size=1000)
+new_imports_code: |
+  from math import ceil
+  from django.test import TestCase, skipUnlessDBFeature
+  from django.db import connection
+  from .models import TwoFields, Country

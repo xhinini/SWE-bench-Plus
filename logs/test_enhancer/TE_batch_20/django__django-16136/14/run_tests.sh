@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 async.tests_llm.AsyncGetOnly.get async.tests_llm.AsyncPostOnly.post async.tests_llm.SyncGetOnly.get async.tests_llm.ViewRegressionsTests.setUp async.tests_llm.ViewRegressionsTests.test_as_view_callback_for_async_view_returns_coroutine_on_unallowed_method async.tests_llm.ViewRegressionsTests.test_dispatch_uses_http_method_not_allowed_and_is_coroutine_for_async_view async.tests_llm.ViewRegressionsTests.test_head_is_set_to_get_on_setup_for_sync_and_async_views async.tests_llm.ViewRegressionsTests.test_http_method_not_allowed_returns_coroutine_for_async_view async.tests_llm.ViewRegressionsTests.test_http_method_not_allowed_returns_response_for_sync_view async.tests_llm.ViewRegressionsTests.test_options_returns_coroutine_for_async_view_and_has_allow_header async.tests_llm.ViewRegressionsTests.test_redirectview_appends_query_string_when_enabled async.tests_llm.ViewRegressionsTests.test_redirectview_returns_gone_when_no_url_or_pattern async.tests_llm.ViewRegressionsTests.test_template_response_mixin_requires_template_name
+coverage json -o coverage.json
+: '>>>>> End Test Output'

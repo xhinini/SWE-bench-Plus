@@ -1,0 +1,162 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise ModelAdmin.get_search_results() behavior for single and multi-term searches, quoted phrases, prefix lookups (^ and =), pk lookups, and many-to-many searches that may spawn duplicates. They assert both which objects are returned and the may_have_duplicates flag where applicable. The tests are written to run within the same tests/admin_changelist package as the existing tests and use the models and admin classes defined there.
+test_code: |
+  from django.test import TestCase, RequestFactory
+  from django.contrib import admin
+  from django.contrib.admin import ModelAdmin
+  from django.contrib.admin.sites import AdminSite
+  from django.contrib.auth.models import AnonymousUser
+
+  from .admin import site
+  from .models import Parent, Child, Band, Genre
+
+  rf = RequestFactory()
+
+  class SearchTests(TestCase):
+      def setUp(self):
+          # Create parents and children for related-field searching.
+          self.parent1 = Parent.objects.create(name='Parent One')
+          self.child1 = Child.objects.create(name='Alice', age=30, parent=self.parent1)
+          self.parent2 = Parent.objects.create(name='Parent Two')
+          self.child2 = Child.objects.create(name='Alice Bob', age=40, parent=self.parent2)
+          self.parent3 = Parent.objects.create(name='Parent Three')
+          self.child3 = Child.objects.create(name='Bob Alice', age=25, parent=self.parent3)
+
+          # Setup bands and genres for m2m search duplication tests.
+          self.genre_rock = Genre.objects.create(name='Rock')
+          self.genre_pop = Genre.objects.create(name='Pop')
+          self.band1 = Band.objects.create(name='Band One', nr_of_members=4)
+          self.band2 = Band.objects.create(name='Band Two', nr_of_members=6)
+          self.band1.genres.add(self.genre_rock)
+          self.band2.genres.add(self.genre_rock, self.genre_pop)
+
+          # Minimal request (anonymous).
+          self.request = rf.get('/')
+          self.request.user = AnonymousUser()
+
+      def _get_results(self, model_admin, queryset, term):
+          """
+          Helper to call get_search_results on a ModelAdmin instance.
+          Returns (list(qs), may_have_duplicates)
+          """
+          qs, may_have_duplicates = model_admin.get_search_results(self.request, queryset, term)
+          return list(qs), may_have_duplicates
+
+      def test_single_word_search_on_related_field_matches(self):
+          # ParentAdmin from tests/admin_changelist/admin.py defines search_fields=['child__name']
+          admin_class = admin.site._registry.get(Parent).__class__ if Parent in admin.site._registry else None
+          if admin_class is None:
+              # Fallback: create a basic admin with related search field.
+              class PA(ModelAdmin):
+                  search_fields = ['child__name']
+              model_admin = PA(Parent, site)
+          else:
+              model_admin = admin_class(Parent, site)
+          results, _ = self._get_results(model_admin, Parent.objects.all(), 'Alice')
+          # Both parent1 (child 'Alice') and parent2 (child 'Alice Bob') and parent3 ('Bob Alice') have 'Alice'
+          self.assertIn(self.parent1, results)
+          self.assertIn(self.parent2, results)
+          self.assertIn(self.parent3, results)
+
+      def test_two_word_search_requires_both_terms(self):
+          # Create an admin that searches the related child's name.
+          class PA(ModelAdmin):
+              search_fields = ['child__name']
+          model_admin = PA(Parent, site)
+          # Searching for "Alice Bob" should match only parent2 which has the exact two words present in the name.
+          results, _ = self._get_results(model_admin, Parent.objects.all(), 'Alice Bob')
+          self.assertIn(self.parent2, results)
+          # parent1 (child name 'Alice') shouldn't match both terms.
+          self.assertNotIn(self.parent1, results)
+          # parent3 'Bob Alice' contains both terms but since lookup is icontains on the whole string,
+          # it still contains "Alice Bob" only for exact phrase; however, get_search_results treats each
+          # term as separate and requires both terms to be present (AND). Confirm parent3 is included
+          # because it includes both words (order-independent).
+          self.assertIn(self.parent3, results)
+
+      def test_quoted_phrase_search_matches_whole_phrase(self):
+          # Admin that searches child__name
+          class PA(ModelAdmin):
+              search_fields = ['child__name']
+          model_admin = PA(Parent, site)
+          # Quoted phrase should search for the whole phrase using icontains.
+          results, _ = self._get_results(model_admin, Parent.objects.all(), '"Alice Bob"')
+          # Only parent2 has the exact phrase "Alice Bob"
+          self.assertIn(self.parent2, results)
+          self.assertNotIn(self.parent1, results)
+          # parent3 has "Bob Alice" and should not match the phrase "Alice Bob"
+          self.assertNotIn(self.parent3, results)
+
+      def test_caret_prefix_search_startswith(self):
+          # Create admin that searches child name with startswith behavior.
+          class CA(ModelAdmin):
+              search_fields = ['^name']
+          model_admin = CA(Child, site)
+          # child1 name 'Alice' should match 'Al' prefix
+          results, _ = self._get_results(model_admin, Child.objects.all(), 'Al')
+          self.assertIn(self.child1, results)
+          # 'lice' should not match startswith
+          results2, _ = self._get_results(model_admin, Child.objects.all(), 'lice')
+          self.assertNotIn(self.child1, results2)
+
+      def test_exact_prefix_search_case_insensitive(self):
+          # Create admin that searches with exact match (case-insensitive)
+          class EA(ModelAdmin):
+              search_fields = ['=name']
+          model_admin = EA(Child, site)
+          # Searching for exact name with different case should match
+          results, _ = self._get_results(model_admin, Child.objects.all(), 'alice')
+          self.assertIn(self.child1, results)
+          # Searching a partial won't match exact
+          results2, _ = self._get_results(model_admin, Child.objects.all(), 'Ali')
+          self.assertNotIn(self.child1, results2)
+
+      def test_pk_search_matches_primary_key(self):
+          class PA(ModelAdmin):
+              search_fields = ['pk']
+          model_admin = PA(Child, site)
+          # Provide the primary key of child2
+          results, _ = self._get_results(model_admin, Child.objects.all(), str(self.child2.pk))
+          self.assertIn(self.child2, results)
+          # Non matching pk does not return child1
+          results2, _ = self._get_results(model_admin, Child.objects.all(), str(self.child1.pk + 999))
+          self.assertNotIn(self.child1, results2)
+
+      def test_nonexistent_field_in_search_is_ignored(self):
+          # If a search field references a non-existent field in the chain, it should not raise,
+          # and searching should simply return no results for that lookup.
+          class NA(ModelAdmin):
+              search_fields = ['child__nonexistentfield']
+          model_admin = NA(Parent, site)
+          # Searching anything must not raise; result may be empty.
+          results, _ = self._get_results(model_admin, Parent.objects.all(), 'Alice')
+          # No matches expected because field doesn't exist
+          self.assertEqual(results, [])
+
+      def test_multiple_terms_across_fields(self):
+          # Test searching where multiple search_fields exist; ensure both terms are applied across the lookups.
+          class MA(ModelAdmin):
+              search_fields = ['child__name', 'child__age']
+          model_admin = MA(Parent, site)
+          # Search for 'Alice 30' (name contains Alice and age equals 30) should match parent1
+          results, _ = self._get_results(model_admin, Parent.objects.all(), 'Alice 30')
+          self.assertIn(self.parent1, results)
+          # parent2 has age 40 so should not match both terms together
+          self.assertNotIn(self.parent2, results)
+
+      def test_many_to_many_search_may_have_duplicates_true(self):
+          # Admin searching on m2m 'genres__name' should signal that duplicates may occur.
+          class BA(ModelAdmin):
+              search_fields = ['genres__name']
+          model_admin = BA(Band, site)
+          # Search for genre 'Rock' should return both bands
+          results, may_have_duplicates = self._get_results(model_admin, Band.objects.all(), 'Rock')
+          self.assertIn(self.band1, results)
+          self.assertIn(self.band2, results)
+          # Because searching over a many-to-many, the may_have_duplicates flag should be True
+          self.assertTrue(may_have_duplicates)
+new_imports_code: |
+  from django.test import RequestFactory
+  from django.contrib.admin import ModelAdmin
+  from django.contrib.auth.models import AnonymousUser

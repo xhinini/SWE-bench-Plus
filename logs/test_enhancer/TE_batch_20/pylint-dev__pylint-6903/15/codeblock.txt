@@ -1,0 +1,156 @@
+from pylint.lint.run import _query_cpu
+# Additional regression tests for pylint.lint.run
+import os
+from unittest.mock import mock_open, MagicMock, patch
+import pytest
+from py._path.local import LocalPath  # type: ignore[import]
+from pylint.lint import Run
+from pylint.testutils import GenericTestReporter as Reporter
+from pylint.lint import run as run_module
+from pylint.lint.run import _query_cpu
+
+def _make_mock_open(mapping):
+    """Return a function that behaves like open and returns different data per path."""
+    builtin_open = open
+    def _mock_open(path, *args, **kwargs):
+        if path in mapping:
+            return mock_open(read_data=mapping[path])()
+        return builtin_open(path, *args, **kwargs)
+    return _mock_open
+
+def _make_mock_path(existing_files):
+    """Return a Path factory that returns objects with is_file() based on existing_files set."""
+    pathlib_path = run_module.Path  # original Path class
+    def _mock_path(path_str, *args, **kwargs):
+        if path_str in existing_files:
+            return MagicMock(is_file=lambda: True)
+        return pathlib_path(path_str, *args, **kwargs)
+    return _mock_path
+
+@pytest.mark.parametrize(
+    "quota,period",
+    [
+        ("100", "100000"),  # small fractional CPU -> int(100/100000) == 0
+        ("0", "100000"),    # zero quota -> int(0/100000) == 0
+    ],
+)
+def test_query_cpu_small_or_zero_quota_returns_at_least_one(quota, period):
+    """Directly test _query_cpu returns at least 1 when quota/period results in 0."""
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": quota,
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": period,
+    }
+    mock_open_fn = _make_mock_open(mapping)
+    mock_path = _make_mock_path(set(mapping.keys()))
+
+    with patch("builtins.open", mock_open_fn):
+        with patch("pylint.lint.run.Path", mock_path):
+            val = _query_cpu()
+    assert val is not None and val >= 1, "Expected at least one CPU to be reported"
+
+def test_query_cpu_quota_with_trailing_whitespace_and_rstrip():
+    """Ensure rstrip() handling still yields at least 1 when fractional."""
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "  123  \n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "  100000  \n",
+    }
+    mock_open_fn = _make_mock_open(mapping)
+    mock_path = _make_mock_path(set(mapping.keys()))
+    with patch("builtins.open", mock_open_fn):
+        with patch("pylint.lint.run.Path", mock_path):
+            val = _query_cpu()
+    assert val is not None and val >= 1
+
+def test_query_cpu_prefers_quota_over_shares_and_returns_at_least_one():
+    """If quota files are present they are preferred and fractional result must be normalized to 1."""
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "50",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000",
+        "/sys/fs/cgroup/cpu/cpu.shares": "2",
+    }
+    mock_open_fn = _make_mock_open(mapping)
+    mock_path = _make_mock_path(set(mapping.keys()))
+    with patch("builtins.open", mock_open_fn):
+        with patch("pylint.lint.run.Path", mock_path):
+            val = _query_cpu()
+    # quota branch yields 0 -> must be normalized to at least 1
+    assert val is not None and val >= 1
+
+def test_query_cpu_large_quota_returns_expected_integer():
+    """Check that large quota/period returns the actual integer number of CPUs."""
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "200000",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000",
+    }
+    mock_open_fn = _make_mock_open(mapping)
+    mock_path = _make_mock_path(set(mapping.keys()))
+    with patch("builtins.open", mock_open_fn):
+        with patch("pylint.lint.run.Path", mock_path):
+            val = _query_cpu()
+    assert val == 2
+
+def test_pylint_run_jobs_equal_zero_with_small_quota_does_not_crash(tmpdir: LocalPath):
+    """Run.Run should not crash when cgroup quota leads to fractional CPU (jobs=0)."""
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "100",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000",
+    }
+    mock_open_fn = _make_mock_open(mapping)
+    mock_path = _make_mock_path(set(mapping.keys()))
+    filepath = os.path.abspath(__file__)
+    testargs = [filepath, "--jobs=0"]
+    with tmpdir.as_cwd():
+        with patch("builtins.open", mock_open_fn):
+            with patch("pylint.lint.run.Path", mock_path):
+                with pytest.raises(SystemExit) as err:
+                    Run(testargs, reporter=Reporter())
+    assert err.value.code == 0
+
+def test_pylint_run_jobs_equal_zero_with_zero_quota_does_not_crash(tmpdir: LocalPath):
+    """Edge-case: zero quota must not lead to 0 CPUs and must not crash."""
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "0",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000",
+    }
+    mock_open_fn = _make_mock_open(mapping)
+    mock_path = _make_mock_path(set(mapping.keys()))
+    filepath = os.path.abspath(__file__)
+    testargs = [filepath, "--jobs=0"]
+    with tmpdir.as_cwd():
+        with patch("builtins.open", mock_open_fn):
+            with patch("pylint.lint.run.Path", mock_path):
+                with pytest.raises(SystemExit) as err:
+                    Run(testargs, reporter=Reporter())
+    assert err.value.code == 0
+
+def test_pylint_run_jobs_zero_with_sched_getaffinity_and_small_quota(tmpdir: LocalPath):
+    """Ensure combining sched_getaffinity presence with small quota still yields non-zero CPUs."""
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "10",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000",
+    }
+    mock_open_fn = _make_mock_open(mapping)
+    mock_path = _make_mock_path(set(mapping.keys()))
+    filepath = os.path.abspath(__file__)
+    testargs = [filepath, "--jobs=0"]
+    with tmpdir.as_cwd():
+        with patch("builtins.open", mock_open_fn):
+            with patch("pylint.lint.run.Path", mock_path):
+                # Make sched_getaffinity present and returning multiple CPUs
+                with patch("os.sched_getaffinity", lambda x: {0, 1, 2}):
+                    with pytest.raises(SystemExit) as err:
+                        Run(testargs, reporter=Reporter())
+    assert err.value.code == 0
+
+def test_query_cpu_negative_quota_uses_shares_and_normalizes_to_one():
+    """If quota is -1 then cpu.shares are used; a small shares must be normalized to at least 1."""
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1",
+        "/sys/fs/cgroup/cpu/cpu.shares": "2",
+    }
+    mock_open_fn = _make_mock_open(mapping)
+    mock_path = _make_mock_path(set(mapping.keys()))
+    with patch("builtins.open", mock_open_fn):
+        with patch("pylint.lint.run.Path", mock_path):
+            val = _query_cpu()
+    assert val is not None and val >= 1

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 cache.tests_llm.AdditionalFileBasedCacheRaceTests.setUp cache.tests_llm.AdditionalFileBasedCacheRaceTests.tearDown cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_handles_enoent_between_exists_and_open cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_handles_enoent_between_exists_and_open_with_version cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_handles_enoent_for_unicode_key cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_handles_enoent_on_prefixed_cache cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_open_called_once_on_race cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_propagates_isadirectory_error cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_propagates_other_os_errors cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_propagates_permission_error cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_has_key_succeeds_when_open_forwarded_to_real_open cache.tests_llm.AdditionalFileBasedCacheRaceTests.test_in_operator_handles_enoent_race
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,140 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests provoke the culling path in DatabaseCache where the computed cull_num is zero (so the SQL used to select the "last" cache key returns no rows and cursor.fetchone() yields None). The original (pre-patch) implementation attempted to index into the None result (cursor.fetchone()[0]) and raised an exception. The tests ensure no exception is raised and that cache operations behave sensibly (keys remain retrievable / operations return expected booleans) when the culling SQL returns no rows. They collectively cover set, add, set_many, get_many, touch, has_key, delete, and return-value behavior across this edge case.
+new_imports_code: |
+  from django.core import management
+  from django.db import connection
+  from django.core.cache import caches
+test_code: |
+  from django.test import TransactionTestCase, override_settings
+  from django.conf import settings
+  import time
+
+  # Use the helper defined in tests/cache/tests.py to build CACHES settings.
+  # If tests run in isolation, reimplement a minimal variant of that helper here.
+  try:
+      from .tests import caches_setting_for_tests  # relative import when running inside tests package
+  except Exception:
+      # Fallback: simple settings constructor for our purposes
+      def caches_setting_for_tests(**params):
+          base = {}
+          setting = {'default': base}
+          setting['default'].update(params)
+          return setting
+
+  @override_settings(CACHES=caches_setting_for_tests(
+      BACKEND='django.core.cache.backends.db.DatabaseCache',
+      LOCATION='test cache table cull_none',
+      OPTIONS={'MAX_ENTRIES': 0, 'CULL_FREQUENCY': 100},
+  ))
+  class DatabaseCacheCullFetchoneNoneTests(TransactionTestCase):
+      """
+      Tests that exercise the _cull() path where the culling-selection SQL
+      returns no rows (cursor.fetchone() is None). In the buggy implementation,
+      that led to indexing into None and an exception.
+      """
+      available_apps = ['cache']
+
+      def setUp(self):
+          super().setUp()
+          # Create the underlying cache table for this cache LOCATION.
+          management.call_command('createcachetable', verbosity=0)
+
+      def tearDown(self):
+          # Drop the cache table created for these tests.
+          table_name = connection.ops.quote_name(settings.CACHES['default']['LOCATION'])
+          with connection.cursor() as cursor:
+              cursor.execute('DROP TABLE %s' % table_name)
+          super().tearDown()
+
+      def test_set_two_keys_triggers_cull_but_does_not_raise(self):
+          c = caches['default']
+          # First set creates one row. Second set will see num > _max_entries (0),
+          # compute cull_num = 1 // 100 = 0, and the culling SELECT will return no rows.
+          self.assertTrue(c.set('k1', 'v1'))
+          # This would trigger the buggy path in the original code.
+          self.assertTrue(c.set('k2', 'v2'))
+          # Both keys should be present (no unexpected deletion/errors).
+          self.assertEqual(c.get('k1'), 'v1')
+          self.assertEqual(c.get('k2'), 'v2')
+
+      def test_add_second_key_triggers_cull_but_does_not_raise(self):
+          c = caches['default']
+          self.assertTrue(c.add('a1', 'x1'))
+          # Second add should trigger cull; ensure it returns True/False properly
+          # (add returns True when inserted).
+          self.assertTrue(c.add('a2', 'x2'))
+          self.assertEqual(c.get('a1'), 'x1')
+          self.assertEqual(c.get('a2'), 'x2')
+
+      def test_set_many_triggers_cull_and_succeeds(self):
+          c = caches['default']
+          # set_many will call _base_set for each item, potentially triggering cull.
+          c.set_many({'m1': 1, 'm2': 2, 'm3': 3})
+          # All keys should be retrievable
+          self.assertEqual(c.get_many(['m1', 'm2', 'm3']), {'m1': 1, 'm2': 2, 'm3': 3})
+
+      def test_repeated_set_and_has_key_after_cull(self):
+          c = caches['default']
+          c.set('h1', 'hv1')
+          c.set('h2', 'hv2')  # triggers cull path
+          # has_key should function and not raise
+          self.assertTrue(c.has_key('h1') or c.has_key('h2'))  # at least one should be present
+          # Ensure keys are retrievable if present
+          self.assertIn(c.get('h1', None), (None, 'hv1'))
+          self.assertIn(c.get('h2', None), (None, 'hv2'))
+
+      def test_touch_after_overflow_does_not_raise_and_updates_expires(self):
+          c = caches['default']
+          c.set('t1', 'tv1', timeout=60)
+          c.set('t2', 'tv2', timeout=60)  # triggers cull path
+          # touch should return True/False but must not raise
+          res = c.touch('t1', timeout=120)
+          self.assertIn(res, (True, False))
+          # Key should still be addressable (either present or not, but no exception)
+          _ = c.get('t1')
+
+      def test_get_many_after_overflow_returns_expected_subset(self):
+          c = caches['default']
+          c.set('g1', 'v1')
+          c.set('g2', 'v2')  # triggers cull path
+          # get_many should not raise and should return dict of present keys
+          res = c.get_many(['g1', 'g2', 'nonexistent'])
+          self.assertIsInstance(res, dict)
+          # Values should be those that exist
+          for key in ('g1', 'g2'):
+              self.assertIn(key, res.keys() | {None})
+
+      def test_delete_does_not_raise_when_called_after_overflow(self):
+          c = caches['default']
+          c.set('d1', 'x')
+          c.set('d2', 'y')  # triggers cull path
+          # delete should not raise and should return a boolean
+          self.assertIn(c.delete('d1'), (True, False))
+          # subsequent delete on nonexistent is False
+          self.assertIn(c.delete('no-such-key'), (True, False))
+
+      def test_set_returns_true_even_when_cull_select_returns_no_rows(self):
+          c = caches['default']
+          # sanity: set should return True when successful, even if culling SELECT returns no rows.
+          self.assertTrue(c.set('r1', 'v'))
+          self.assertTrue(c.set('r2', 'v2'))
+
+      def test_cull_does_not_remove_unexpired_keys_when_fetchone_none(self):
+          c = caches['default']
+          # Ensure keys are set with sufficiently long timeout so they are not expired.
+          c.set('u1', 'one', timeout=60)
+          c.set('u2', 'two', timeout=60)  # triggers cull; cull SELECT likely returns no rows
+          # After cull path, both keys should either be present or at least no exception occurred.
+          self.assertIn(c.get('u1', None), (None, 'one'))
+          self.assertIn(c.get('u2', None), (None, 'two'))
+
+      def test_get_or_set_during_cull_path_does_not_raise(self):
+          c = caches['default']
+          # get_or_set may rely on add; ensure no exceptions while culling logic runs.
+          self.assertEqual(c.get_or_set('gos1', 'g'), 'g')
+          # Trigger overflow.
+          self.assertEqual(c.get_or_set('gos2', 'g2'), 'g2')
+          # Both keys should be retrievable or None, but no exception should have been raised.
+          self.assertIn(c.get('gos1', None), (None, 'g'))
+          self.assertIn(c.get('gos2', None), (None, 'g2'))

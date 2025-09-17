@@ -1,0 +1,127 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify QuerySet._batched_insert() properly caps a provided batch_size to the backend maximum (ops.bulk_batch_size), uses the provided batch_size when smaller, handles zero from ops as a minimum of 1, aggregates returned rows correctly when the backend returns lists and singletons, and correctly raises/forwards ignore_conflicts related errors/flags. They monkeypatch low-level pieces (ops.bulk_batch_size, QuerySet._insert, features) to deterministically exercise batching logic without executing SQL.
+test_code: |
+  from math import ceil
+  from unittest.mock import patch, MagicMock
+
+  from django.test import TestCase, skipUnlessDBFeature, skipIfDBFeature
+  from django.db import connections, NotSupportedError
+
+  from .models import TwoFields
+
+  class BatchedInsertBatchingTests(TestCase):
+      def make_objs(self, n):
+          return [TwoFields(f1=i, f2=i) for i in range(n)]
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batch_size_capped_to_max_when_larger(self):
+          objs = self.make_objs(95)
+          qs = TwoFields.objects._chain()
+          # Simulate backend max_batch_size = 10
+          with patch.object(connections[qs.db].ops, 'bulk_batch_size', return_value=10):
+              with patch.object(type(qs), '_insert', return_value=None) as mock_insert:
+                  qs._batched_insert(objs, TwoFields._meta.concrete_fields, batch_size=50)
+                  # Expect ceil(95/10) calls.
+                  self.assertEqual(mock_insert.call_count, ceil(len(objs) / 10))
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batch_size_used_when_smaller_than_max(self):
+          objs = self.make_objs(95)
+          qs = TwoFields.objects._chain()
+          # Backend max_batch_size = 50, provided batch_size = 5 -> use 5
+          with patch.object(connections[qs.db].ops, 'bulk_batch_size', return_value=50):
+              with patch.object(type(qs), '_insert', return_value=None) as mock_insert:
+                  qs._batched_insert(objs, TwoFields._meta.concrete_fields, batch_size=5)
+                  self.assertEqual(mock_insert.call_count, ceil(len(objs) / 5))
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batch_size_none_uses_max_batch_size(self):
+          objs = self.make_objs(95)
+          qs = TwoFields.objects._chain()
+          # Backend max_batch_size = 10, batch_size is None -> use 10
+          with patch.object(connections[qs.db].ops, 'bulk_batch_size', return_value=10):
+              with patch.object(type(qs), '_insert', return_value=None) as mock_insert:
+                  qs._batched_insert(objs, TwoFields._meta.concrete_fields, batch_size=None)
+                  self.assertEqual(mock_insert.call_count, ceil(len(objs) / 10))
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_ops_return_zero_becomes_one(self):
+          objs = self.make_objs(3)
+          qs = TwoFields.objects._chain()
+          # Backend returns 0 -> max_batch_size should be max(..., 1) => 1
+          with patch.object(connections[qs.db].ops, 'bulk_batch_size', return_value=0):
+              with patch.object(type(qs), '_insert', return_value=None) as mock_insert:
+                  qs._batched_insert(objs, TwoFields._meta.concrete_fields, batch_size=None)
+                  self.assertEqual(mock_insert.call_count, 3)  # one-by-one
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_inserted_rows_handling_list_and_single(self):
+          # Ensure _batched_insert extends when _insert returns a list and appends when it returns a single value.
+          objs = self.make_objs(3)
+          qs = TwoFields.objects._chain()
+          # Make backend return rows from bulk insert
+          with patch.object(connections[qs.db].features, 'can_return_rows_from_bulk_insert', new=True):
+              with patch.object(connections[qs.db].ops, 'bulk_batch_size', return_value=2):
+                  # side_effect: first call returns a list, second returns a single tuple
+                  def fake_insert(self, items, fields, returning_fields=None, raw=False, using=None, ignore_conflicts=False):
+                      if len(items) == 2:
+                          return [(101,), (102,)]
+                      return (103,)
+                  with patch.object(type(qs), '_insert', new=fake_insert):
+                      returned = qs._batched_insert(objs, TwoFields._meta.concrete_fields, batch_size=None)
+                      # We expect three returned "rows" collected.
+                      self.assertEqual(len(returned), 3)
+                      # Flatten to check values
+                      flat = [r[0] for r in returned]
+                      self.assertIn(101, flat)
+                      self.assertIn(102, flat)
+                      self.assertIn(103, flat)
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_exact_division_batches(self):
+          # When objects exactly divide by the max_batch_size, call count should be exact
+          objs = self.make_objs(20)
+          qs = TwoFields.objects._chain()
+          with patch.object(connections[qs.db].ops, 'bulk_batch_size', return_value=5):
+              with patch.object(type(qs), '_insert', return_value=None) as mock_insert:
+                  qs._batched_insert(objs, TwoFields._meta.concrete_fields, batch_size=1000)
+                  self.assertEqual(mock_insert.call_count, 4)  # 20/5 = 4
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batch_size_equal_to_max(self):
+          objs = self.make_objs(37)
+          qs = TwoFields.objects._chain()
+          with patch.object(connections[qs.db].ops, 'bulk_batch_size', return_value=10):
+              with patch.object(type(qs), '_insert', return_value=None) as mock_insert:
+                  # Provide batch_size exactly equal to max_batch_size:
+                  qs._batched_insert(objs, TwoFields._meta.concrete_fields, batch_size=10)
+                  self.assertEqual(mock_insert.call_count, ceil(len(objs) / 10))
+
+      @skipIfDBFeature('supports_ignore_conflicts')
+      def test_batched_insert_raises_on_unsupported_ignore_conflicts(self):
+          # If ignore_conflicts is True but backend doesn't support it, raise NotSupportedError
+          objs = self.make_objs(5)
+          qs = TwoFields.objects._chain()
+          # Ensure supports_ignore_conflicts is False for this backend simulation
+          with patch.object(connections[qs.db].features, 'supports_ignore_conflicts', new=False):
+              with patch.object(connections[qs.db].ops, 'bulk_batch_size', return_value=2):
+                  with self.assertRaises(NotSupportedError):
+                      qs._batched_insert(objs, TwoFields._meta.concrete_fields, batch_size=None, ignore_conflicts=True)
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_bulk_create_forwards_ignore_conflicts_flag_to_batched_insert(self):
+          # Verify bulk_create forwards ignore_conflicts to _batched_insert by patching _batched_insert.
+          objs = self.make_objs(7)
+          called = {}
+          def fake_batched_insert(self, objs_arg, fields_arg, batch_size, ignore_conflicts=False):
+              called['ignore_conflicts'] = ignore_conflicts
+              return []
+          with patch.object(type(TwoFields.objects), '_batched_insert', new=fake_batched_insert):
+              TwoFields.objects.bulk_create(objs, batch_size=3, ignore_conflicts=True)
+              self.assertTrue(called.get('ignore_conflicts', False))
+
+  # End of tests
+new_imports_code: |
+  from unittest.mock import patch, MagicMock
+  from math import ceil

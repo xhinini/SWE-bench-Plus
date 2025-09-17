@@ -1,0 +1,228 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise various list_display edge-cases: properties, methods, class attributes, descriptors that raise AttributeError on class access, ManyToManyFields and missing attributes. They assert that ManyToManyFields produce admin.E109 and missing/invalid attributes produce admin.E108, and that non-field attributes accessible via the model class or via get_field are accepted. These tests would fail against the candidate patch (which mishandles getattr/get_field ordering and/or error ids/messages) and should pass with the provided gold patch.
+test_code: |
+  from django.contrib.admin.sites import AdminSite
+  from django.contrib.admin.options import ModelAdmin
+  from django.core.checks import Error
+  from django.db.models import Field, Model, ManyToManyField, IntegerField, CharField
+  from django.test import SimpleTestCase
+  
+  
+  class AdditionalListDisplayChecks(SimpleTestCase):
+      def test_mixed_list_display_errors(self):
+          """
+          Mixed list_display with a callable, a custom Field (descriptor),
+          a ManyToManyField, a missing field and a property. Expect errors only
+          for the ManyToManyField (admin.E109) and the missing field (admin.E108).
+          """
+          class PositionField(Field):
+              def contribute_to_class(self, cls, name):
+                  super().contribute_to_class(cls, name)
+                  # Ensure attribute exists on the class (descriptor installed)
+                  setattr(cls, self.name, self)
+  
+              def __get__(self, instance, owner):
+                  # Accessing via class raises AttributeError to emulate
+                  # descriptor that only works on instances.
+                  if instance is None:
+                      raise AttributeError()
+                  return 0
+  
+          class OtherThing(Model):
+              name = CharField(max_length=50)
+  
+              class Meta:
+                  app_label = 'testapp'
+  
+          class Thing(Model):
+              number = IntegerField(default=0)
+              order = PositionField()
+              others = ManyToManyField(OtherThing)
+  
+              @property
+              def double_number(self):
+                  return self.number * 2
+  
+              class Meta:
+                  app_label = 'testapp'
+  
+          class ThingAdmin(ModelAdmin):
+              def get_number(self, obj):
+                  return obj.number
+              list_display = [get_number, 'order', 'others', 'nonexistent', 'double_number']
+  
+          admin_obj = ThingAdmin(Thing, AdminSite())
+          errors = admin_obj.check()
+          # Expect two errors: one for ManyToManyField (E109) and one for missing field (E108)
+          ids = {e.id for e in errors}
+          self.assertIn('admin.E109', ids, 'Expected a ManyToManyField error (admin.E109)')
+          self.assertIn('admin.E108', ids, 'Expected a missing/non-callable attribute error (admin.E108)')
+          # Check message contents for the specific errors
+          msg_for_e109 = next(e.msg for e in errors if e.id == 'admin.E109')
+          self.assertIn("must not be a ManyToManyField", msg_for_e109)
+          msg_for_e108 = next(e.msg for e in errors if e.id == 'admin.E108')
+          self.assertIn("which is not a callable", msg_for_e108)
+  
+      def test_property_on_model_valid(self):
+          class M(Model):
+              @property
+              def fancy(self):
+                  return "ok"
+  
+              class Meta:
+                  app_label = 'testapp'
+  
+          class MAdmin(ModelAdmin):
+              list_display = ('fancy',)
+  
+          self.assertEqual(MAdmin(M, AdminSite()).check(), [])
+  
+      def test_model_method_valid(self):
+          class M(Model):
+              def compute(self):
+                  return 42
+              class Meta:
+                  app_label = 'testapp'
+  
+          class MAdmin(ModelAdmin):
+              list_display = ('compute',)
+  
+          self.assertEqual(MAdmin(M, AdminSite()).check(), [])
+  
+      def test_class_attribute_nonfield_valid(self):
+          class M(Model):
+              SOME_CONST = 123
+              class Meta:
+                  app_label = 'testapp'
+  
+          class MAdmin(ModelAdmin):
+              list_display = ('SOME_CONST',)
+  
+          # class attribute should be accepted (not treated as missing)
+          self.assertEqual(MAdmin(M, AdminSite()).check(), [])
+  
+      def test_descriptor_accessible_via_instance_valid(self):
+          """
+          Descriptor that is actually a registered Field must be accepted even
+          if its __get__ raises AttributeError when accessed on the class.
+          """
+          class PositionField(Field):
+              def contribute_to_class(self, cls, name):
+                  super().contribute_to_class(cls, name)
+                  setattr(cls, self.name, self)
+  
+              def __get__(self, instance, owner):
+                  if instance is None:
+                      raise AttributeError()
+                  return 0
+  
+          class T(Model):
+              position = PositionField()
+              class Meta:
+                  app_label = 'testapp'
+  
+          class TAdmin(ModelAdmin):
+              list_display = ('position',)
+  
+          # Registered Field should be valid since get_field() finds it.
+          self.assertEqual(TAdmin(T, AdminSite()).check(), [])
+  
+      def test_manytomany_error_details(self):
+          class Other(Model):
+              name = CharField(max_length=10)
+              class Meta:
+                  app_label = 'testapp'
+  
+          class T(Model):
+              others = ManyToManyField(Other)
+              class Meta:
+                  app_label = 'testapp'
+  
+          class TAdmin(ModelAdmin):
+              list_display = ('others',)
+  
+          errors = TAdmin(T, AdminSite()).check()
+          self.assertEqual(len(errors), 1)
+          err = errors[0]
+          self.assertEqual(err.id, 'admin.E109')
+          self.assertIn("must not be a ManyToManyField", err.msg)
+  
+      def test_missing_field_error_details(self):
+          class T(Model):
+              name = CharField(max_length=10)
+              class Meta:
+                  app_label = 'testapp'
+  
+          class TAdmin(ModelAdmin):
+              list_display = ('does_not_exist',)
+  
+          errors = TAdmin(T, AdminSite()).check()
+          self.assertEqual(len(errors), 1)
+          err = errors[0]
+          self.assertEqual(err.id, 'admin.E108')
+          self.assertIn("which is not a callable", err.msg)
+  
+      def test_nonregistered_descriptor_raises_error(self):
+          """
+          A descriptor installed on the model class that is not a registered Field
+          and raises AttributeError on class access should be reported as missing
+          (admin.E108).
+          """
+          class BadDescriptor:
+              def __get__(self, instance, owner):
+                  if instance is None:
+                      raise AttributeError("only on instances")
+                  return 1
+  
+          class T(Model):
+              name = CharField(max_length=10)
+              class Meta:
+                  app_label = 'testapp'
+  
+          # Install descriptor on the class but do NOT register it as a Field.
+          setattr(T, 'bad', BadDescriptor())
+  
+          class TAdmin(ModelAdmin):
+              list_display = ('bad',)
+  
+          errors = TAdmin(T, AdminSite()).check()
+          self.assertEqual(len(errors), 1)
+          err = errors[0]
+          self.assertEqual(err.id, 'admin.E108')
+          self.assertIn("which is not a callable", err.msg)
+  
+      def test_property_and_method_combination(self):
+          """
+          Combination of property and method in list_display should be allowed.
+          """
+          class T(Model):
+              @property
+              def p(self):
+                  return 1
+              def m(self):
+                  return 2
+              class Meta:
+                  app_label = 'testapp'
+  
+          class TAdmin(ModelAdmin):
+              list_display = ('p', 'm')
+  
+          self.assertEqual(TAdmin(T, AdminSite()).check(), [])
+  
+      def test_class_level_noncallable_object_valid(self):
+          """
+          Ensure non-callable class-level objects that are present as attributes
+          on the model class are accepted.
+          """
+          class T(Model):
+              SOME = ("a", "b")
+              class Meta:
+                  app_label = 'testapp'
+  
+          class TAdmin(ModelAdmin):
+              list_display = ('SOME',)
+  
+          self.assertEqual(TAdmin(T, AdminSite()).check(), [])
+new_imports_code: |
+  # No additional imports required; the test code uses imports already available in the test module context.

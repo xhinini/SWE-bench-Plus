@@ -1,0 +1,186 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise deserialize_db_from_string around circular references, constraint-checking, and error/rollback behavior. Several tests assert that constraint checks are disabled during deserialization and that check_constraints() is called afterward. The candidate (model) patch omitted disabling constraint checks and the final call to check_constraints, so tests that expect successful deserialization of circular references or expect check_constraints to be called will fail under that patch and pass with the gold patch.
+test_code: |
+  # Additional regression tests for deserialize_db_from_string
+  from contextlib import contextmanager
+  from django.db import IntegrityError
+  
+  from django.test import SimpleTestCase
+  from django.db import connection
+  from unittest import mock
+  
+  from ..models import Object, ObjectReference
+  
+  
+  class TestDeserializeDbFromStringAdditional(SimpleTestCase):
+      databases = {'default'}
+  
+      def test_circular_reference_forward_order(self):
+          # Object before ObjectReference in the JSON.
+          data = """
+          [
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              },
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              }
+          ]
+          """
+          # Should not raise and objects should be linked.
+          connection.creation.deserialize_db_from_string(data)
+          obj = Object.objects.get(pk=1)
+          obj_ref = ObjectReference.objects.get(pk=1)
+          self.assertEqual(obj.obj_ref, obj_ref)
+          self.assertEqual(obj_ref.obj, obj)
+  
+      def test_circular_reference_reversed_order(self):
+          # ObjectReference before Object in the JSON.
+          data = """
+          [
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              },
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              }
+          ]
+          """
+          connection.creation.deserialize_db_from_string(data)
+          obj = Object.objects.get(pk=1)
+          obj_ref = ObjectReference.objects.get(pk=1)
+          self.assertEqual(obj.obj_ref, obj_ref)
+          self.assertEqual(obj_ref.obj, obj)
+  
+      def test_circular_reference_multiple_pairs(self):
+          # Two independent pairs to ensure handling of multiple cycles.
+          data = """
+          [
+              {"model": "backends.object", "pk": 1, "fields": {"obj_ref": 2, "related_objects": []}},
+              {"model": "backends.objectreference", "pk": 2, "fields": {"obj": 1}},
+              {"model": "backends.object", "pk": 3, "fields": {"obj_ref": 4, "related_objects": []}},
+              {"model": "backends.objectreference", "pk": 4, "fields": {"obj": 3}}
+          ]
+          """
+          connection.creation.deserialize_db_from_string(data)
+          self.assertEqual(Object.objects.get(pk=1).obj_ref, ObjectReference.objects.get(pk=2))
+          self.assertEqual(Object.objects.get(pk=3).obj_ref, ObjectReference.objects.get(pk=4))
+  
+      def test_deserialize_calls_check_constraints(self):
+          # Ensure check_constraints() is called after deserialization.
+          data = """
+          [
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              },
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              }
+          ]
+          """
+          with mock.patch.object(connection, 'check_constraints') as mocked_check:
+              connection.creation.deserialize_db_from_string(data)
+              mocked_check.assert_called_once()
+  
+      def test_constraint_checks_disabled_used(self):
+          # Ensure constraint_checks_disabled() context is used during deserialization.
+          data = """
+          [
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              },
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              }
+          ]
+          """
+          entered = {'count': 0}
+  
+          @contextmanager
+          def fake_disabled():
+              entered['count'] += 1
+              try:
+                  yield
+              finally:
+                  pass
+  
+          with mock.patch.object(connection, 'constraint_checks_disabled', fake_disabled):
+              connection.creation.deserialize_db_from_string(data)
+  
+          # The context manager should have been entered at least once.
+          self.assertGreaterEqual(entered['count'], 1)
+  
+      def test_invalid_foreign_key_raises(self):
+          # Data contains an invalid foreign key; check_constraints should detect it.
+          data = """
+          [
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 999, "related_objects": []}
+              }
+          ]
+          """
+          # With the gold patch, check_constraints will be called and should raise an error
+          # because the obj_ref points to a non-existent PK. The candidate patch omits
+          # check_constraints, so this test would fail there.
+          with self.assertRaises(IntegrityError):
+              connection.creation.deserialize_db_from_string(data)
+  
+      def test_deserialize_with_whitespace(self):
+          # Ensure extra whitespace/newlines don't break deserialization.
+          data = "[  \n  {  \"model\": \"backends.object\",  \"pk\": 1, \"fields\": {\"obj_ref\": 1, \"related_objects\": []} } ,\n { \"model\": \"backends.objectreference\", \"pk\": 1, \"fields\": {\"obj\": 1} } ]"
+          connection.creation.deserialize_db_from_string(data)
+          self.assertEqual(Object.objects.count(), 1)
+          self.assertEqual(ObjectReference.objects.count(), 1)
+  
+      def test_deserialize_empty_list(self):
+          # Empty data should be a no-op.
+          data = "[]"
+          connection.creation.deserialize_db_from_string(data)
+          self.assertEqual(Object.objects.count(), 0)
+          self.assertEqual(ObjectReference.objects.count(), 0)
+  
+      def test_deserialize_rolls_back_on_save_error(self):
+          # If a save() raises, the transaction should roll back and leave no partial data.
+          data = """
+          [
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              },
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              }
+          ]
+          """
+          # Make ObjectReference.save raise to simulate an error during deserialization.
+          with mock.patch.object(ObjectReference, 'save', side_effect=Exception("boom")):
+              with self.assertRaises(Exception):
+                  connection.creation.deserialize_db_from_string(data)
+          # Nothing should have been committed.
+          self.assertEqual(Object.objects.count(), 0)
+          self.assertEqual(ObjectReference.objects.count(), 0)
+new_imports_code: |
+  from contextlib import contextmanager
+  from django.db import IntegrityError

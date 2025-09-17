@@ -1,0 +1,248 @@
+import types
+import unittest
+import types
+import unittest
+
+from django.core.serializers.base import build_instance
+
+class DummyPK:
+    def __init__(self, attname="id", to_python=lambda x: x):
+        self.attname = attname
+        self._to_python = to_python
+
+    def to_python(self, value):
+        return self._to_python(value)
+
+class DummyManager:
+    def __init__(self, result_obj=None, record_calls=None, raise_exc=None):
+        self._result_obj = result_obj
+        self._record_calls = record_calls
+        self._raise_exc = raise_exc
+
+    def db_manager(self, db):
+        # Return a manager-like object that remembers the db argument
+        self._last_db = db
+        return self
+
+    def get_by_natural_key(self, *args):
+        if self._raise_exc:
+            raise self._raise_exc
+        if self._record_calls is not None:
+            self._record_calls.append(tuple(args))
+        return self._result_obj
+
+def make_model(natural_key_fn, default_manager=None, pk_to_python=lambda x: x, pk_attname="id",
+               remote_fields=None):
+    """
+    Construct a simple dummy Model-like class suitable for build_instance tests.
+    - natural_key_fn(self) -> tuple returned by Model.natural_key
+    - default_manager is used for Model._meta.default_manager
+    - remote_fields: set of field names considered relational (their Field.remote_field is truthy)
+    """
+    remote_fields = set(remote_fields or ())
+
+    class DummyModel:
+        DoesNotExist = Exception
+
+        def __init__(self, **data):
+            # set attributes from data to simulate Model(**data)
+            for k, v in data.items():
+                setattr(self, k, v)
+            # simple _state object
+            self._state = types.SimpleNamespace(db=None)
+
+        def natural_key(self):
+            return natural_key_fn(self)
+
+    DummyModel._meta = types.SimpleNamespace()
+    DummyModel._meta.default_manager = default_manager
+    DummyModel._meta.pk = DummyPK(attname=pk_attname, to_python=pk_to_python)
+
+    def get_field(name):
+        # mimic Field object with remote_field attribute
+        remote_field = object() if name in remote_fields else None
+        return types.SimpleNamespace(remote_field=remote_field)
+
+    DummyModel._meta.get_field = get_field
+
+    return DummyModel
+
+class BuildInstanceTests(unittest.TestCase):
+    def test_pk_set_when_fk_field_is_remote_and_data_contains_attname(self):
+        """
+        If the data contains the FK attname (e.g. author_id), build_instance should
+        call natural_key() on an instance that has that attname set and then set
+        the Model PK from the manager.get_by_natural_key result.
+        """
+        calls = []
+        # manager returns an object with pk attribute '42'
+        result_obj = types.SimpleNamespace(pk="42")
+        manager = DummyManager(result_obj=result_obj, record_calls=calls)
+        def natural_key_fn(self):
+            # natural key uses both title and the fk attname 'author_id'
+            return (getattr(self, "title"), getattr(self, "author_id"))
+        Model = make_model(natural_key_fn, default_manager=manager, remote_fields=set())  # remote_fields is empty so constructor sets author_id
+        data = {"title": "The Book", "author_id": "tolkien"}
+        inst = build_instance(Model, data, db="otherdb")
+        self.assertTrue(hasattr(inst, "id"))
+        # to_python not specified so id should be "42"
+        self.assertEqual(inst.id, "42")
+        # ensure get_by_natural_key called with the tuple provided by natural_key
+        self.assertEqual(calls, [("The Book", "tolkien")])
+        # ensure the manager was asked for the correct db
+        self.assertEqual(manager._last_db, "otherdb")
+
+    def test_pk_set_when_fk_field_is_non_remote(self):
+        """
+        When the field is considered non-relational (remote_field is None),
+        the initial Model(**data) will set the attribute and natural_key() should work.
+        This is similar to the previous test but exercises the non-remote branch.
+        """
+        calls = []
+        result_obj = types.SimpleNamespace(pk=100)
+        manager = DummyManager(result_obj=result_obj, record_calls=calls)
+        def natural_key_fn(self):
+            return (self.title, self.author_id)
+        # remote_fields empty: constructor sets author_id
+        Model = make_model(natural_key_fn, default_manager=manager, remote_fields=set(), pk_to_python=int)
+        data = {"title": "Another Book", "author_id": "rowling"}
+        inst = build_instance(Model, data, db="default")
+        self.assertEqual(inst.id, 100)  # to_python converted via pk_to_python
+        self.assertEqual(calls, [("Another Book", "rowling")])
+        self.assertEqual(manager._last_db, "default")
+
+    def test_existing_pk_preserved(self):
+        """
+        If the data already contains the primary key, build_instance should not
+        attempt to use the natural key to overwrite it.
+        """
+        # manager would raise if called
+        manager = DummyManager(result_obj=None, raise_exc=AssertionError("should not be called"))
+        def natural_key_fn(self):
+            return ("unused",)
+        Model = make_model(natural_key_fn, default_manager=manager)
+        data = {"id": 5, "name": "Existing"}
+        inst = build_instance(Model, data, db="ignored")
+        # the provided id remains
+        self.assertEqual(inst.id, 5)
+
+    def test_no_get_by_natural_key_on_manager(self):
+        """
+        If the default manager does not implement get_by_natural_key, build_instance should
+        simply return an instance built from the provided data without raising.
+        """
+        manager = types.SimpleNamespace()  # no get_by_natural_key attr
+        def natural_key_fn(self):
+            raise AssertionError("natural_key should not be invoked when manager lacks get_by_natural_key")
+        Model = make_model(natural_key_fn, default_manager=manager)
+        data = {"title": "No Manager"}
+        inst = build_instance(Model, data, db="x")
+        # id not added
+        self.assertFalse(hasattr(inst, "id"))
+
+    def test_handles_manager_raises_doesnotexist(self):
+        """
+        If get_by_natural_key raises Model.DoesNotExist, build_instance should
+        ignore it and return the instance without adding a pk.
+        """
+        class DoesNotExist(Exception):
+            pass
+        # manager will raise the DoesNotExist
+        manager = DummyManager(raise_exc=DoesNotExist())
+        def natural_key_fn(self):
+            return ("missing",)
+        Model = make_model(natural_key_fn, default_manager=manager)
+        # ensure Model.DoesNotExist is the same type used by manager
+        Model.DoesNotExist = DoesNotExist
+        data = {"title": "Missing"}
+        inst = build_instance(Model, data, db="y")
+        self.assertFalse(hasattr(inst, "id"))
+
+    def test_db_passed_to_db_manager(self):
+        """
+        Ensure the db argument is forwarded to default_manager.db_manager(db)
+        """
+        calls = []
+        result_obj = types.SimpleNamespace(pk="900")
+        manager = DummyManager(result_obj=result_obj, record_calls=calls)
+        def natural_key_fn(self):
+            return ("k",)
+        Model = make_model(natural_key_fn, default_manager=manager)
+        data = {"title": "X"}
+        inst = build_instance(Model, data, db="my_db_alias")
+        self.assertEqual(manager._last_db, "my_db_alias")
+        self.assertEqual(inst.id, "900")
+
+    def test_to_python_called_on_pk(self):
+        """
+        Ensure Model._meta.pk.to_python is used when converting the returned pk.
+        """
+        calls = []
+        def to_python(v):
+            calls.append(v)
+            return int(v)
+        result_obj = types.SimpleNamespace(pk="777")
+        manager = DummyManager(result_obj=result_obj)
+        def natural_key_fn(self):
+            return ("zz",)
+        Model = make_model(natural_key_fn, default_manager=manager, pk_to_python=to_python)
+        data = {"bar": "baz"}
+        inst = build_instance(Model, data, db=None)
+        self.assertEqual(calls, ["777"])
+        self.assertEqual(inst.id, 777)
+
+    def test_natural_key_with_multiple_elements_including_fk(self):
+        """
+        natural_key returning multiple elements including an fk attname should be honored.
+        """
+        calls = []
+        result_obj = types.SimpleNamespace(pk="55")
+        manager = DummyManager(result_obj=result_obj, record_calls=calls)
+        def natural_key_fn(self):
+            return (self.part1, self.part2, getattr(self, "author_id"))
+        Model = make_model(natural_key_fn, default_manager=manager, remote_fields=set())
+        data = {"part1": "a", "part2": "b", "author_id": "auth"}
+        inst = build_instance(Model, data, db="db")
+        self.assertEqual(inst.id, "55")
+        self.assertEqual(calls, [("a", "b", "auth")])
+
+    def test_non_string_pk_conversion(self):
+        """
+        Ensure that numeric pk strings returned by get_by_natural_key are converted
+        to numeric Python types via to_python.
+        """
+        result_obj = types.SimpleNamespace(pk="123")
+        manager = DummyManager(result_obj=result_obj)
+        def natural_key_fn(self):
+            return ("n",)
+        Model = make_model(natural_key_fn, default_manager=manager, pk_to_python=int)
+        data = {"x": "y"}
+        inst = build_instance(Model, data, db="d")
+        self.assertEqual(inst.id, 123)
+
+    def test_missing_fk_attname_causes_no_pk_if_not_set(self):
+        """
+        If a natural_key relies on an attname that is not set on the instance
+        (because the constructor wasn't used to set it), build_instance should still
+        attempt to create the instance properly. The correct implementation sets
+        attributes from the provided data (Model(**data)) so natural_key() works.
+        The candidate implementation (which doesn't set relational attnames) will
+        fail to set the PK. This test asserts that the PK is set (gold) and thus would
+        fail under the candidate patch.
+        """
+        calls = []
+        result_obj = types.SimpleNamespace(pk="321")
+        manager = DummyManager(result_obj=result_obj, record_calls=calls)
+        def natural_key_fn(self):
+            # accesses author_id which must be present on the instance
+            return (self.name, self.author_id)
+        # Mark 'author_id' as remote to simulate the candidate skipping setting it.
+        Model = make_model(natural_key_fn, default_manager=manager, remote_fields={"author_id"})
+        data = {"name": "ReliedUpon", "author_id": "xkcd"}
+        inst = build_instance(Model, data, db="db")
+        # Gold: id set; Candidate: likely missing id
+        self.assertEqual(inst.id, "321")
+        self.assertEqual(calls, [("ReliedUpon", "xkcd")])
+
+if __name__ == "__main__":
+    unittest.main()

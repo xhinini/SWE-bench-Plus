@@ -1,0 +1,246 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise MigrationLoader.load_disk() behavior for various kinds of "migrations" modules: regular packages with no __file__ (frozen env), namespace packages (no __file__ and non-list __path__), single-file modules (no __path__), packages with non-list __path__ types, filtering of private/hidden filenames, reload behavior when module already loaded, and error handling when a migration module lacks a Migration class. The tests mock pkgutil.iter_modules and sys.modules to avoid filesystem dependencies and patch django.apps.apps.get_app_configs to control the scanned apps. They are designed to fail on the faulty "model patch" and pass with the corrected loader implementation.
+test_code: |
+  import sys
+  import types
+  from unittest import mock
+
+  import pkgutil
+  from django.test import TestCase, override_settings
+
+  from django.db.migrations.loader import MigrationLoader
+  from django.db.migrations.exceptions import BadMigrationError
+  from django.apps import apps as django_apps
+
+  class MockAppConfig:
+      def __init__(self, label, name=None):
+          self.label = label
+          # name is the full package name used only if migrations_module() falls back to app config
+          self.name = name or label
+
+  def _make_module_with_migrations(module_name, migration_names=None, has_migration_class=True, file_attr=True, path_attr=None):
+      """
+      Helper: create module in sys.modules for package module_name and its
+      migration submodules. `file_attr` if True will set __file__; otherwise
+      __file__ will be omitted. `path_attr` sets __path__ to the given value.
+      """
+      # Main package/module
+      mod = types.ModuleType(module_name)
+      if file_attr:
+          # set a dummy __file__ to simulate normal packages
+          mod.__file__ = "/non/existent/%s/__init__.py" % (module_name,)
+      else:
+          # ensure no __file__ attribute
+          if hasattr(mod, "__file__"):
+              delattr(mod, "__file__")
+      if path_attr is not None:
+          mod.__path__ = path_attr
+      sys.modules[module_name] = mod
+
+      # Create migration submodules
+      for name in (migration_names or []):
+          sub_name = "%s.%s" % (module_name, name)
+          sub = types.ModuleType(sub_name)
+          if has_migration_class:
+              class Migration:
+                  def __init__(self, name, app_label):
+                      self.name = name
+                      self.app_label = app_label
+                      self.dependencies = []
+                      self.run_before = []
+                      self.replaces = []
+                      self.atomic = False
+                  def apply(self, state, schema_editor, collect_sql=False):
+                      return state
+                  def unapply(self, state, schema_editor, collect_sql=False):
+                      return state
+              sub.Migration = Migration
+          sys.modules[sub_name] = sub
+      return mod
+
+  class LoaderExtraTests(TestCase):
+      """
+      Extra tests for MigrationLoader.load_disk() covering various package types
+      and edge cases not relying on the filesystem.
+      """
+
+      def setUp(self):
+          # Ensure no leftover modules affect tests
+          self._saved_modules = dict(sys.modules)
+
+      def tearDown(self):
+          # Restore sys.modules
+          sys.modules.clear()
+          sys.modules.update(self._saved_modules)
+
+      @mock.patch.object(django_apps, "get_app_configs")
+      @mock.patch("pkgutil.iter_modules")
+      @override_settings(MIGRATION_MODULES={"myapp": "fake_pkg"}, INSTALLED_APPS=['myapp'])
+      def test_regular_package_without___file___loads(self, mock_iter_modules, mock_get_app_configs):
+          """
+          Regular packages (with __path__ as list) that have no __file__ attribute
+          (frozen environments) should be treated as normal packages and their
+          migrations loaded.
+          """
+          mock_get_app_configs.return_value = [MockAppConfig(label="myapp", name="myapp")]
+          # fake package: no __file__, __path__ is list => treated as package
+          _make_module_with_migrations("fake_pkg", migration_names=["0001_initial"], has_migration_class=True, file_attr=False, path_attr=["/fake"])
+          mock_iter_modules.return_value = iter([(None, "0001_initial", False)])
+          loader = MigrationLoader(connection=None, load=False)
+          loader.load_disk()
+          self.assertIn(("myapp", "0001_initial"), loader.disk_migrations)
+          self.assertNotIn("myapp", loader.unmigrated_apps, "Regular package without __file__ should be considered migrated")
+
+      @mock.patch.object(django_apps, "get_app_configs")
+      @mock.patch("pkgutil.iter_modules")
+      @override_settings(MIGRATION_MODULES={"myapp": "namespace_pkg"}, INSTALLED_APPS=['myapp'])
+      def test_namespace_package_ignored_when_no___file___and_non_list___path__(self, mock_iter_modules, mock_get_app_configs):
+          """
+          Namespace packages (no __file__ and __path__ is not a list) should be ignored.
+          """
+          mock_get_app_configs.return_value = [MockAppConfig(label="myapp", name="myapp")]
+          class CustomPath:
+              # custom iterable type, not a list
+              def __iter__(self): yield "/fake"
+          _make_module_with_migrations("namespace_pkg", migration_names=["0001_initial"], has_migration_class=True, file_attr=False, path_attr=CustomPath())
+          # Even if pkgutil would find names, namespace packages should be ignored by loader
+          mock_iter_modules.return_value = iter([(None, "0001_initial", False)])
+          loader = MigrationLoader(connection=None, load=False)
+          loader.load_disk()
+          self.assertIn("myapp", loader.unmigrated_apps)
+          self.assertNotIn(("myapp", "0001_initial"), loader.disk_migrations)
+
+      @mock.patch.object(django_apps, "get_app_configs")
+      @mock.patch("pkgutil.iter_modules")
+      @override_settings(MIGRATION_MODULES={"myapp": "module_file"}, INSTALLED_APPS=['myapp'])
+      def test_single_file_module_is_ignored(self, mock_iter_modules, mock_get_app_configs):
+          """
+          If the migrations module is a single file (no __path__), it should be
+          treated as unmigrated.
+          """
+          mock_get_app_configs.return_value = [MockAppConfig(label="myapp", name="myapp")]
+          # Make a module with no __path__ (single-file style). Ensure __file__ exists.
+          _make_module_with_migrations("module_file", migration_names=[], has_migration_class=True, file_attr=True, path_attr=None)
+          mock_iter_modules.return_value = iter([])
+          loader = MigrationLoader(connection=None, load=False)
+          loader.load_disk()
+          self.assertIn("myapp", loader.unmigrated_apps)
+          self.assertEqual(loader.disk_migrations, {})
+
+      @mock.patch.object(django_apps, "get_app_configs")
+      @mock.patch("pkgutil.iter_modules")
+      @override_settings(MIGRATION_MODULES={"myapp": "tuple_path_pkg"}, INSTALLED_APPS=['myapp'])
+      def test_path_tuple_treated_as_namespace_package(self, mock_iter_modules, mock_get_app_configs):
+          """
+          If __path__ is a tuple (not a list) and __file__ is missing, treat
+          it as a namespace package (ignore).
+          """
+          mock_get_app_configs.return_value = [MockAppConfig(label="myapp", name="myapp")]
+          _make_module_with_migrations("tuple_path_pkg", migration_names=["0001_initial"], has_migration_class=True, file_attr=False, path_attr=("/fake",))
+          mock_iter_modules.return_value = iter([(None, "0001_initial", False)])
+          loader = MigrationLoader(connection=None, load=False)
+          loader.load_disk()
+          self.assertIn("myapp", loader.unmigrated_apps)
+          self.assertNotIn(("myapp", "0001_initial"), loader.disk_migrations)
+
+      @mock.patch.object(django_apps, "get_app_configs")
+      @mock.patch("pkgutil.iter_modules")
+      @override_settings(MIGRATION_MODULES={"myapp": "fake_pkg_priv"}, INSTALLED_APPS=['myapp'])
+      def test_ignore_private_and_tilde_prefixed_filenames(self, mock_iter_modules, mock_get_app_configs):
+          """
+          Filenames starting with '_' or '~' should be ignored by the loader.
+          """
+          mock_get_app_configs.return_value = [MockAppConfig(label="myapp", name="myapp")]
+          _make_module_with_migrations("fake_pkg_priv", migration_names=["_private", "~temp", "0001_initial"], has_migration_class=True, file_attr=True, path_attr=["/fake"])
+          # pkgutil would report the three names; loader should filter to only the valid one.
+          mock_iter_modules.return_value = iter([
+              (None, "_private", False),
+              (None, "~temp", False),
+              (None, "0001_initial", False),
+          ])
+          loader = MigrationLoader(connection=None, load=False)
+          loader.load_disk()
+          migrations = [name for app, name in loader.disk_migrations if app == "myapp"]
+          self.assertEqual(migrations, ["0001_initial"])
+
+      @mock.patch.object(django_apps, "get_app_configs")
+      @mock.patch("pkgutil.iter_modules")
+      @override_settings(MIGRATION_MODULES={"myapp": "preloaded_pkg"}, INSTALLED_APPS=['myapp'])
+      def test_reload_called_when_module_was_loaded(self, mock_iter_modules, mock_get_app_configs):
+          """
+          If the migrations module was already present in sys.modules, the loader
+          should call importlib.reload() on it so tests can pick up changes.
+          """
+          mock_get_app_configs.return_value = [MockAppConfig(label="myapp", name="myapp")]
+          mod = _make_module_with_migrations("preloaded_pkg", migration_names=["0001_initial"], has_migration_class=True, file_attr=True, path_attr=["/fake"])
+          mock_iter_modules.return_value = iter([(None, "0001_initial", False)])
+          # Simulate it being already loaded
+          assert "preloaded_pkg" in sys.modules
+          with mock.patch("importlib.reload") as mock_reload:
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              # reload should be called with our module
+              mock_reload.assert_called()
+              # ensure migrations were loaded
+              self.assertIn(("myapp", "0001_initial"), loader.disk_migrations)
+
+      @mock.patch.object(django_apps, "get_app_configs")
+      @mock.patch("pkgutil.iter_modules")
+      @override_settings(MIGRATION_MODULES={"myapp": "bad_migration_pkg"}, INSTALLED_APPS=['myapp'])
+      def test_missing_Migration_class_raises_BadMigrationError(self, mock_iter_modules, mock_get_app_configs):
+          """
+          If a migration module doesn't define a Migration class, a BadMigrationError
+          should be raised.
+          """
+          mock_get_app_configs.return_value = [MockAppConfig(label="myapp", name="myapp")]
+          # Create submodule without a Migration attribute
+          _make_module_with_migrations("bad_migration_pkg", migration_names=["0001_initial"], has_migration_class=False, file_attr=True, path_attr=["/fake"])
+          mock_iter_modules.return_value = iter([(None, "0001_initial", False)])
+          loader = MigrationLoader(connection=None, load=False)
+          with self.assertRaises(BadMigrationError):
+              loader.load_disk()
+
+      @mock.patch.object(django_apps, "get_app_configs")
+      @mock.patch("pkgutil.iter_modules")
+      @override_settings(MIGRATION_MODULES={"myapp": "nonlist_path_with_file"}, INSTALLED_APPS=['myapp'])
+      def test_non_list___path___but_with___file___is_treated_as_package(self, mock_iter_modules, mock_get_app_configs):
+          """
+          If __path__ is a non-list custom object but __file__ is present (not None),
+          the package should be treated as a package (not a namespace) and migrations loaded.
+          This verifies the loader only treats no-__file__ + non-list-__path__ as namespace.
+          """
+          mock_get_app_configs.return_value = [MockAppConfig(label="myapp", name="myapp")]
+          class CustomPath:
+              def __iter__(self): yield "/fake"
+          # file_attr=True but __path__ is custom (not a list). Should still be treated as package.
+          _make_module_with_migrations("nonlist_path_with_file", migration_names=["0001_initial"], has_migration_class=True, file_attr=True, path_attr=CustomPath())
+          mock_iter_modules.return_value = iter([(None, "0001_initial", False)])
+          loader = MigrationLoader(connection=None, load=False)
+          loader.load_disk()
+          self.assertIn(("myapp", "0001_initial"), loader.disk_migrations)
+          self.assertNotIn("myapp", loader.unmigrated_apps)
+
+      @mock.patch.object(django_apps, "get_app_configs")
+      @mock.patch("pkgutil.iter_modules")
+      @override_settings(MIGRATION_MODULES={"myapp": "filtering_pkg"}, INSTALLED_APPS=['myapp'])
+      def test_pkgutil_listing_filtered_before_import(self, mock_iter_modules, mock_get_app_configs):
+          """
+          Ensure the loader filters package listing returned by pkgutil.iter_modules
+          (hidden files excluded) before attempting to import migration submodules.
+          This protects against importing unintended names.
+          """
+          mock_get_app_configs.return_value = [MockAppConfig(label="myapp", name="myapp")]
+          _make_module_with_migrations("filtering_pkg", migration_names=["0001_initial", "_ignore"], has_migration_class=True, file_attr=True, path_attr=["/fake"])
+          mock_iter_modules.return_value = iter([(None, "_ignore", False), (None, "0001_initial", False)])
+          loader = MigrationLoader(connection=None, load=False)
+          loader.load_disk()
+          # Only the allowed migration should be present
+          migrations = [name for app, name in loader.disk_migrations if app == "myapp"]
+          self.assertEqual(migrations, ["0001_initial"])
+new_imports_code: |
+  import sys
+  import types
+  from unittest import mock
+  import pkgutil
+  from django.apps import apps as django_apps

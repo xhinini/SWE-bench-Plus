@@ -1,0 +1,143 @@
+from contextlib import ExitStack as _ExitStack  # helper used internally by tests (not required to be exported)
+from pathlib import Path
+from unittest import mock
+
+from django.test import SimpleTestCase
+
+import django.template.autoreload as autoreload
+
+
+class FakeEngine:
+    def __init__(self, dirs=None, loaders=None):
+        self.dirs = dirs or []
+        # template_loaders is iterated by autoreload; use provided loader objects
+        self.template_loaders = loaders or []
+
+
+class FakeLoader:
+    def __init__(self, dirs=None, has_get_dirs=True):
+        self._dirs = dirs or []
+        if has_get_dirs:
+            self.get_dirs = lambda: list(self._dirs)
+
+
+class FakeBackend:
+    def __init__(self, engine):
+        self.engine = engine
+
+
+class AutoreloadEmptyDirTests(SimpleTestCase):
+    def _make_backend_and_patch(self, engine_dirs=None, loader_dirs_list=None, django_templates_class=None, is_django_path_func=None):
+        """
+        Helper to create a fake backend and patch autoreload.engines.all and autoreload.DjangoTemplates
+        so isinstance checks pass and engines.all() returns our single backend.
+        """
+        loaders = []
+        if loader_dirs_list is not None:
+            for dirs in loader_dirs_list:
+                loaders.append(FakeLoader(dirs=dirs))
+
+        engine = FakeEngine(dirs=list(engine_dirs or []), loaders=loaders)
+        backend = FakeBackend(engine)
+
+        # Patch the DjangoTemplates name used in the module so isinstance(backend, DjangoTemplates) passes.
+        FakeDT = django_templates_class or type("FakeDT", (), {})
+        # Make our backend an instance of FakeDT by setting its class.
+        backend.__class__ = FakeDT
+
+        # Patch engines.all to return our backend and optionally patch is_django_path.
+        patchers = [
+            mock.patch("django.template.autoreload.engines.all", return_value=[backend]),
+            mock.patch("django.template.autoreload.DjangoTemplates", FakeDT),
+        ]
+        if is_django_path_func is not None:
+            patchers.append(mock.patch("django.template.autoreload.is_django_path", is_django_path_func))
+
+        cm = mock.ExitStack()
+        for p in patchers:
+            cm.enter_context(p)
+
+        return backend, cm
+
+    def test_engine_dirs_with_empty_string_filtered(self):
+        backend, cm = self._make_backend_and_patch(engine_dirs=["", "templates"])
+        with cm:
+            dirs = autoreload.get_template_directories()
+        self.assertSetEqual(dirs, {Path.cwd() / "templates"})
+
+    def test_loader_get_dirs_with_empty_string_filtered(self):
+        backend, cm = self._make_backend_and_patch(loader_dirs_list=[[""]])
+        with cm:
+            dirs = autoreload.get_template_directories()
+        self.assertSetEqual(dirs, set())
+
+    def test_loader_get_dirs_with_empty_and_valid(self):
+        backend, cm = self._make_backend_and_patch(loader_dirs_list=[["templates", ""]])
+        with cm:
+            dirs = autoreload.get_template_directories()
+        self.assertSetEqual(dirs, {Path.cwd() / "templates"})
+
+    def test_loader_get_dirs_filters_django_paths(self):
+        # Provide a predicate that treats 'DJANGO_PATH' as a django path to be filtered out.
+        def fake_is_django_path(p):
+            return p == "DJANGO_PATH"
+
+        backend, cm = self._make_backend_and_patch(
+            loader_dirs_list=[["DJANGO_PATH", "templates"]], is_django_path_func=fake_is_django_path
+        )
+        with cm:
+            dirs = autoreload.get_template_directories()
+        self.assertSetEqual(dirs, {Path.cwd() / "templates"})
+
+    def test_combined_engine_and_loader_empty(self):
+        backend, cm = self._make_backend_and_patch(engine_dirs=["templates_extra", ""], loader_dirs_list=[[""]])
+        with cm:
+            dirs = autoreload.get_template_directories()
+        self.assertSetEqual(dirs, {Path.cwd() / "templates_extra"})
+
+    def test_no_dirs_results_in_empty_set(self):
+        backend, cm = self._make_backend_and_patch(engine_dirs=[], loader_dirs_list=[[]])
+        with cm:
+            dirs = autoreload.get_template_directories()
+        self.assertSetEqual(dirs, set())
+
+    def test_relative_and_empty_dirs(self):
+        backend, cm = self._make_backend_and_patch(engine_dirs=["", "relative/path"])
+        with cm:
+            dirs = autoreload.get_template_directories()
+        self.assertSetEqual(dirs, {Path.cwd() / "relative/path"})
+
+    def test_template_changed_does_not_reset_for_empty_loader_dirs(self):
+        # If loader.get_dirs returns only an empty string, get_template_directories should be empty,
+        # and template_changed should not trigger reset_loaders for a file in cwd.
+        backend, cm = self._make_backend_and_patch(loader_dirs_list=[[""]])
+        with cm:
+            with mock.patch("django.template.autoreload.reset_loaders") as mock_reset:
+                # Use a file that would be inside Path.cwd() to ensure that if empty string were
+                # incorrectly converted to cwd, it would trigger reset.
+                test_file = Path.cwd() / "somefile.txt"
+                result = autoreload.template_changed(None, test_file)
+                self.assertIsNone(result)
+                mock_reset.assert_not_called()
+
+    def test_watch_for_template_changes_does_not_watch_empty_dirs(self):
+        # When engine.dirs contains an empty string and a real dir, watch_dir should be called only for the real dir.
+        backend, cm = self._make_backend_and_patch(engine_dirs=["", "watched_templates"])
+        with cm:
+            reloader = mock.MagicMock()
+            autoreload.watch_for_template_changes(reloader)
+            self.assertIn(mock.call(Path.cwd() / "watched_templates", "**/*"), reloader.watch_dir.call_args_list)
+            # Ensure cwd (from empty string) is not watched.
+            self.assertNotIn(mock.call(Path.cwd(), "**/*"), reloader.watch_dir.call_args_list)
+
+    def test_get_template_directories_filters_empty_and_django_paths_combined(self):
+        # Combined case: engine has an empty entry and loader returns a django path plus a valid path.
+        def fake_is_django_path(p):
+            return p == "DJANGO"
+
+        backend, cm = self._make_backend_and_patch(
+            engine_dirs=[""], loader_dirs_list=[["DJANGO", "valid_dir"]], is_django_path_func=fake_is_django_path
+        )
+        with cm:
+            dirs = autoreload.get_template_directories()
+        self.assertSetEqual(dirs, {Path.cwd() / "valid_dir"})

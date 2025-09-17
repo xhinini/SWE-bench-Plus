@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 decorators.tests_llm.RegressionMethodDecoratorTests.test_chain_of_method_and_class_decorators_preserves_name decorators.tests_llm.RegressionMethodDecoratorTests.test_decorating_dunder_call_via_class_name_argument decorators.tests_llm.RegressionMethodDecoratorTests.test_descriptor_wrapper_with_wraps_sees_original_name decorators.tests_llm.RegressionMethodDecoratorTests.test_multiple_wraps_decorators_preserve_name decorators.tests_llm.RegressionMethodDecoratorTests.test_tuple_of_decorators_on_method_preserves_name_and_module decorators.tests_llm.RegressionMethodDecoratorTests.test_wraps_preserves_dunder_call_name decorators.tests_llm.RegressionMethodDecoratorTests.test_wraps_preserves_module_and_name decorators.tests_llm.RegressionMethodDecoratorTests.test_wraps_preserves_name_on_instance_method decorators.tests_llm.RegressionMethodDecoratorTests.test_wraps_preserves_name_when_decorating_class
+coverage json -o coverage.json
+: '>>>>> End Test Output'

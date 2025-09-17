@@ -1,0 +1,710 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `sphinx/ext/viewcode.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 """
+2     sphinx.ext.viewcode
+3     ~~~~~~~~~~~~~~~~~~~
+4 
+5     Add links to module code in Python object descriptions.
+6 
+7     :copyright: Copyright 2007-2021 by the Sphinx team, see AUTHORS.
+8     :license: BSD, see LICENSE for details.
+9 """
+10 
+11 import posixpath
+12 import traceback
+13 from os import path
+14 from typing import Any, Dict, Generator, Iterable, Optional, Set, Tuple, cast
+15 
+16 from docutils import nodes
+17 from docutils.nodes import Element, Node
+18 
+19 import sphinx
+20 from sphinx import addnodes
+21 from sphinx.application import Sphinx
+22 from sphinx.builders.html import StandaloneHTMLBuilder
+23 from sphinx.environment import BuildEnvironment
+24 from sphinx.locale import _, __
+25 from sphinx.pycode import ModuleAnalyzer
+26 from sphinx.util import get_full_modname, logging, status_iterator
+27 from sphinx.util.nodes import make_refnode
+28 
+29 logger = logging.getLogger(__name__)
+30 
+31 
+32 OUTPUT_DIRNAME = '_modules'
+33 
+34 
+35 def _get_full_modname(app: Sphinx, modname: str, attribute: str) -> Optional[str]:
+36     try:
+37         return get_full_modname(modname, attribute)
+38     except AttributeError:
+39         # sphinx.ext.viewcode can't follow class instance attribute
+40         # then AttributeError logging output only verbose mode.
+41         logger.verbose('Didn\'t find %s in %s', attribute, modname)
+42         return None
+43     except Exception as e:
+44         # sphinx.ext.viewcode follow python domain directives.
+45         # because of that, if there are no real modules exists that specified
+46         # by py:function or other directives, viewcode emits a lot of warnings.
+47         # It should be displayed only verbose mode.
+48         logger.verbose(traceback.format_exc().rstrip())
+49         logger.verbose('viewcode can\'t import %s, failed with error "%s"', modname, e)
+50         return None
+51 
+52 
+53 def doctree_read(app: Sphinx, doctree: Node) -> None:
+54     env = app.builder.env
+55     if not hasattr(env, '_viewcode_modules'):
+56         env._viewcode_modules = {}  # type: ignore
+57     if app.builder.name == "singlehtml":
+58         return
+59     if app.builder.name.startswith("epub") and not env.config.viewcode_enable_epub:
+60         return
+61 
+62     def has_tag(modname: str, fullname: str, docname: str, refname: str) -> bool:
+63         entry = env._viewcode_modules.get(modname, None)  # type: ignore
+64         if entry is False:
+65             return False
+66 
+67         code_tags = app.emit_firstresult('viewcode-find-source', modname)
+68         if code_tags is None:
+69             try:
+70                 analyzer = ModuleAnalyzer.for_module(modname)
+71                 analyzer.find_tags()
+72             except Exception:
+73                 env._viewcode_modules[modname] = False  # type: ignore
+74                 return False
+75 
+76             code = analyzer.code
+77             tags = analyzer.tags
+78         else:
+79             code, tags = code_tags
+80 
+81         if entry is None or entry[0] != code:
+82             entry = code, tags, {}, refname
+83             env._viewcode_modules[modname] = entry  # type: ignore
+84         _, tags, used, _ = entry
+85         if fullname in tags:
+86             used[fullname] = docname
+87             return True
+88 
+89         return False
+90 
+91     for objnode in doctree.traverse(addnodes.desc):
+92         if objnode.get('domain') != 'py':
+93             continue
+94         names = set()  # type: Set[str]
+95         for signode in objnode:
+96             if not isinstance(signode, addnodes.desc_signature):
+97                 continue
+98             modname = signode.get('module')
+99             fullname = signode.get('fullname')
+100             refname = modname
+101             if env.config.viewcode_follow_imported_members:
+102                 new_modname = app.emit_firstresult(
+103                     'viewcode-follow-imported', modname, fullname,
+104                 )
+105                 if not new_modname:
+106                     new_modname = _get_full_modname(app, modname, fullname)
+107                 modname = new_modname
+108             if not modname:
+109                 continue
+110             fullname = signode.get('fullname')
+111             if not has_tag(modname, fullname, env.docname, refname):
+112                 continue
+113             if fullname in names:
+114                 # only one link per name, please
+115                 continue
+116             names.add(fullname)
+117             pagename = posixpath.join(OUTPUT_DIRNAME, modname.replace('.', '/'))
+118             inline = nodes.inline('', _('[source]'), classes=['viewcode-link'])
+119             onlynode = addnodes.only(expr='html')
+120             onlynode += addnodes.pending_xref('', inline, reftype='viewcode', refdomain='std',
+121                                               refexplicit=False, reftarget=pagename,
+122                                               refid=fullname, refdoc=env.docname)
+123             signode += onlynode
+124 
+125 
+126 def env_merge_info(app: Sphinx, env: BuildEnvironment, docnames: Iterable[str],
+127                    other: BuildEnvironment) -> None:
+128     if not hasattr(other, '_viewcode_modules'):
+129         return
+130     # create a _viewcode_modules dict on the main environment
+131     if not hasattr(env, '_viewcode_modules'):
+132         env._viewcode_modules = {}  # type: ignore
+133     # now merge in the information from the subprocess
+134     env._viewcode_modules.update(other._viewcode_modules)  # type: ignore
+135 
+136 
+137 def missing_reference(app: Sphinx, env: BuildEnvironment, node: Element, contnode: Node
+138                       ) -> Optional[Node]:
+139     # resolve our "viewcode" reference nodes -- they need special treatment
+140     if node['reftype'] == 'viewcode':
+141         return make_refnode(app.builder, node['refdoc'], node['reftarget'],
+142                             node['refid'], contnode)
+143 
+144     return None
+145 
+146 
+147 def get_module_filename(app: Sphinx, modname: str) -> Optional[str]:
+148     """Get module filename for *modname*."""
+149     source_info = app.emit_firstresult('viewcode-find-source', modname)
+150     if source_info:
+151         return None
+152     else:
+153         try:
+154             filename, source = ModuleAnalyzer.get_module_source(modname)
+155             return filename
+156         except Exception:
+157             return None
+158 
+159 
+160 def should_generate_module_page(app: Sphinx, modname: str) -> bool:
+161     """Check generation of module page is needed."""
+162     module_filename = get_module_filename(app, modname)
+163     if module_filename is None:
+164         # Always (re-)generate module page when module filename is not found.
+165         return True
+166 
+167     builder = cast(StandaloneHTMLBuilder, app.builder)
+168     basename = modname.replace('.', '/') + builder.out_suffix
+169     page_filename = path.join(app.outdir, '_modules/', basename)
+170 
+171     try:
+172         if path.getmtime(module_filename) <= path.getmtime(page_filename):
+173             # generation is not needed if the HTML page is newer than module file.
+174             return False
+175     except IOError:
+176         pass
+177 
+178     return True
+179 
+180 
+181 def collect_pages(app: Sphinx) -> Generator[Tuple[str, Dict[str, Any], str], None, None]:
+182     env = app.builder.env
+183     if not hasattr(env, '_viewcode_modules'):
+184         return
+185     if app.builder.name == "singlehtml":
+186         return
+187     if app.builder.name.startswith("epub") and not env.config.viewcode_enable_epub:
+188         return
+189     highlighter = app.builder.highlighter  # type: ignore
+190     urito = app.builder.get_relative_uri
+191 
+192     modnames = set(env._viewcode_modules)  # type: ignore
+193 
+194     for modname, entry in status_iterator(
+195             sorted(env._viewcode_modules.items()),  # type: ignore
+196             __('highlighting module code... '), "blue",
+197             len(env._viewcode_modules),  # type: ignore
+198             app.verbosity, lambda x: x[0]):
+199         if not entry:
+200             continue
+201         if not should_generate_module_page(app, modname):
+202             continue
+203 
+204         code, tags, used, refname = entry
+205         # construct a page name for the highlighted source
+206         pagename = posixpath.join(OUTPUT_DIRNAME, modname.replace('.', '/'))
+207         # highlight the source using the builder's highlighter
+208         if env.config.highlight_language in ('python3', 'default', 'none'):
+209             lexer = env.config.highlight_language
+210         else:
+211             lexer = 'python'
+212         highlighted = highlighter.highlight_block(code, lexer, linenos=False)
+213         # split the code into lines
+214         lines = highlighted.splitlines()
+215         # split off wrap markup from the first line of the actual code
+216         before, after = lines[0].split('<pre>')
+217         lines[0:1] = [before + '<pre>', after]
+218         # nothing to do for the last line; it always starts with </pre> anyway
+219         # now that we have code lines (starting at index 1), insert anchors for
+220         # the collected tags (HACK: this only works if the tag boundaries are
+221         # properly nested!)
+222         maxindex = len(lines) - 1
+223         for name, docname in used.items():
+224             type, start, end = tags[name]
+225             backlink = urito(pagename, docname) + '#' + refname + '.' + name
+226             lines[start] = (
+227                 '<div class="viewcode-block" id="%s"><a class="viewcode-back" '
+228                 'href="%s">%s</a>' % (name, backlink, _('[docs]')) +
+229                 lines[start])
+230             lines[min(end, maxindex)] += '</div>'
+231         # try to find parents (for submodules)
+232         parents = []
+233         parent = modname
+234         while '.' in parent:
+235             parent = parent.rsplit('.', 1)[0]
+236             if parent in modnames:
+237                 parents.append({
+238                     'link': urito(pagename,
+239                                   posixpath.join(OUTPUT_DIRNAME, parent.replace('.', '/'))),
+240                     'title': parent})
+241         parents.append({'link': urito(pagename, posixpath.join(OUTPUT_DIRNAME, 'index')),
+242                         'title': _('Module code')})
+243         parents.reverse()
+244         # putting it all together
+245         context = {
+246             'parents': parents,
+247             'title': modname,
+248             'body': (_('<h1>Source code for %s</h1>') % modname +
+249                      '\n'.join(lines)),
+250         }
+251         yield (pagename, context, 'page.html')
+252 
+253     if not modnames:
+254         return
+255 
+256     html = ['\n']
+257     # the stack logic is needed for using nested lists for submodules
+258     stack = ['']
+259     for modname in sorted(modnames):
+260         if modname.startswith(stack[-1]):
+261             stack.append(modname + '.')
+262             html.append('<ul>')
+263         else:
+264             stack.pop()
+265             while not modname.startswith(stack[-1]):
+266                 stack.pop()
+267                 html.append('</ul>')
+268             stack.append(modname + '.')
+269         html.append('<li><a href="%s">%s</a></li>\n' % (
+270             urito(posixpath.join(OUTPUT_DIRNAME, 'index'),
+271                   posixpath.join(OUTPUT_DIRNAME, modname.replace('.', '/'))),
+272             modname))
+273     html.append('</ul>' * (len(stack) - 1))
+274     context = {
+275         'title': _('Overview: module code'),
+276         'body': (_('<h1>All modules for which code is available</h1>') +
+277                  ''.join(html)),
+278     }
+279 
+280     yield (posixpath.join(OUTPUT_DIRNAME, 'index'), context, 'page.html')
+281 
+282 
+283 def setup(app: Sphinx) -> Dict[str, Any]:
+284     app.add_config_value('viewcode_import', None, False)
+285     app.add_config_value('viewcode_enable_epub', False, False)
+286     app.add_config_value('viewcode_follow_imported_members', True, False)
+287     app.connect('doctree-read', doctree_read)
+288     app.connect('env-merge-info', env_merge_info)
+289     app.connect('html-collect-pages', collect_pages)
+290     app.connect('missing-reference', missing_reference)
+291     # app.add_config_value('viewcode_include_modules', [], 'env')
+292     # app.add_config_value('viewcode_exclude_modules', [], 'env')
+293     app.add_event('viewcode-find-source')
+294     app.add_event('viewcode-follow-imported')
+295     return {
+296         'version': sphinx.__display_version__,
+297         'env_version': 1,
+298         'parallel_read_safe': True
+299     }
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `sphinx/ext/viewcode.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/sphinx/ext/viewcode.py b/sphinx/ext/viewcode.py
+--- a/sphinx/ext/viewcode.py
++++ b/sphinx/ext/viewcode.py
+@@ -182,6 +182,10 @@ def collect_pages(app: Sphinx) -> Generator[Tuple[str, Dict[str, Any], str], Non
+     env = app.builder.env
+     if not hasattr(env, '_viewcode_modules'):
+         return
++    if app.builder.name == "singlehtml":
++        return
++    if app.builder.name.startswith("epub") and not env.config.viewcode_enable_epub:
++        return
+     highlighter = app.builder.highlighter  # type: ignore
+     urito = app.builder.get_relative_uri
+ 
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/sphinx/ext/viewcode.py b/sphinx/ext/viewcode.py
+index a7d52a91c..060604e25 100644
+--- a/sphinx/ext/viewcode.py
++++ b/sphinx/ext/viewcode.py
+@@ -182,6 +182,8 @@ def collect_pages(app: Sphinx) -> Generator[Tuple[str, Dict[str, Any], str], Non
+     env = app.builder.env
+     if not hasattr(env, '_viewcode_modules'):
+         return
++    if app.builder.name.startswith("epub") and not env.config.viewcode_enable_epub:
++        return
+     highlighter = app.builder.highlighter  # type: ignore
+     urito = app.builder.get_relative_uri
+ 
+diff --git a/test_viewcode_epub.py b/test_viewcode_epub.py
+new file mode 100644
+index 000000000..2c8d272c8
+--- /dev/null
++++ b/test_viewcode_epub.py
+@@ -0,0 +1,75 @@
++import os
++import shutil
++import tempfile
++from pathlib import Path
++
++from sphinx.application import Sphinx
++
++def main():
++    # Create a temporary directory for the test
++    with tempfile.TemporaryDirectory() as tmpdir:
++        # Create source directory
++        srcdir = Path(tmpdir) / 'src'
++        srcdir.mkdir()
++        
++        # Create a Python module to view
++        with open(srcdir / 'test_module.py', 'w') as f:
++            f.write('''
++def test_function():
++    """A test function."""
++    return 42
++''')
++
++        # Create a simple conf.py
++        with open(srcdir / 'conf.py', 'w') as f:
++            f.write('''
++import os
++import sys
++sys.path.insert(0, os.path.abspath('.'))
++
++extensions = ['sphinx.ext.viewcode', 'sphinx.ext.autodoc']
++viewcode_enable_epub = True
++''')
++        
++        # Create a simple index.rst
++        with open(srcdir / 'index.rst', 'w') as f:
++            f.write('''
++Test
++====
++
++.. automodule:: test_module
++   :members:
++''')
++        
++        # Create output directories
++        html_outdir = Path(tmpdir) / 'html'
++        epub_outdir = Path(tmpdir) / 'epub'
++        
++        # Build HTML and EPUB
++        app = Sphinx(
++            srcdir=str(srcdir),
++            confdir=str(srcdir),
++            outdir=str(html_outdir),
++            doctreedir=str(html_outdir / '.doctrees'),
++            buildername='html'
++        )
++        app.build()
++
++        app = Sphinx(
++            srcdir=str(srcdir),
++            confdir=str(srcdir),
++            outdir=str(epub_outdir),
++            doctreedir=str(epub_outdir / '.doctrees'),
++            buildername='epub'
++        )
++        app.build()
++        
++        # Check if _modules directory exists in epub output
++        modules_dir = epub_outdir / '_modules'
++        if modules_dir.exists():
++            print("BUG: _modules directory exists in epub output even though viewcode_enable_epub=False")
++        else:
++            print("OK: No _modules directory in epub output")
++
++if __name__ == '__main__':
++    main()
+\ No newline at end of file
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `tests/test_ext_viewcode.py` that contains the existing tests.
+-----------------------------------------------------------
+"""
+    test_ext_viewcode
+    ~~~~~~~~~~~~~~~~~
+
+    Test sphinx.ext.viewcode extension.
+
+    :copyright: Copyright 2007-2021 by the Sphinx team, see AUTHORS.
+    :license: BSD, see LICENSE for details.
+"""
+
+import re
+
+import pytest
+
+
+@pytest.mark.sphinx(testroot='ext-viewcode')
+def test_viewcode(app, status, warning):
+    app.builder.build_all()
+
+    warnings = re.sub(r'\\+', '/', warning.getvalue())
+    assert re.findall(
+        r"index.rst:\d+: WARNING: Object named 'func1' not found in include " +
+        r"file .*/spam/__init__.py'",
+        warnings
+    )
+
+    result = (app.outdir / 'index.html').read_text()
+    assert result.count('href="_modules/spam/mod1.html#func1"') == 2
+    assert result.count('href="_modules/spam/mod2.html#func2"') == 2
+    assert result.count('href="_modules/spam/mod1.html#Class1"') == 2
+    assert result.count('href="_modules/spam/mod2.html#Class2"') == 2
+    assert result.count('@decorator') == 1
+
+    # test that the class attribute is correctly documented
+    assert result.count('this is Class3') == 2
+    assert 'this is the class attribute class_attr' in result
+    # the next assert fails, until the autodoc bug gets fixed
+    assert result.count('this is the class attribute class_attr') == 2
+
+    result = (app.outdir / '_modules/spam/mod1.html').read_text()
+    result = re.sub('<span class=".*?">', '<span>', result)  # filter pygments classes
+    assert ('<div class="viewcode-block" id="Class1"><a class="viewcode-back" '
+            'href="../../index.html#spam.Class1">[docs]</a>'
+            '<span>@decorator</span>\n'
+            '<span>class</span> <span>Class1</span>'
+            '<span>(</span><span>object</span><span>):</span>\n'
+            '    <span>&quot;&quot;&quot;</span>\n'
+            '<span>    this is Class1</span>\n'
+            '<span>    &quot;&quot;&quot;</span></div>\n') in result
+
+
+@pytest.mark.sphinx('epub', testroot='ext-viewcode')
+def test_viewcode_epub_default(app, status, warning):
+    app.builder.build_all()
+
+    assert not (app.outdir / '_modules/spam/mod1.xhtml').exists()
+
+
+@pytest.mark.sphinx('epub', testroot='ext-viewcode',
+                    confoverrides={'viewcode_enable_epub': True})
+def test_viewcode_epub_enabled(app, status, warning):
+    app.builder.build_all()
+
+    assert (app.outdir / '_modules/spam/mod1.xhtml').exists()
+
+
+@pytest.mark.sphinx(testroot='ext-viewcode', tags=['test_linkcode'])
+def test_linkcode(app, status, warning):
+    app.builder.build(['objects'])
+
+    stuff = (app.outdir / 'objects.html').read_text()
+
+    assert 'http://foobar/source/foolib.py' in stuff
+    assert 'http://foobar/js/' in stuff
+    assert 'http://foobar/c/' in stuff
+    assert 'http://foobar/cpp/' in stuff
+
+
+@pytest.mark.sphinx(testroot='ext-viewcode-find')
+def test_local_source_files(app, status, warning):
+    def find_source(app, modname):
+        if modname == 'not_a_package':
+            source = (app.srcdir / 'not_a_package/__init__.py').read_text()
+            tags = {
+                'func1': ('def', 1, 1),
+                'Class1': ('class', 1, 1),
+                'not_a_package.submodule.func1': ('def', 1, 1),
+                'not_a_package.submodule.Class1': ('class', 1, 1),
+            }
+        else:
+            source = (app.srcdir / 'not_a_package/submodule.py').read_text()
+            tags = {
+                'not_a_package.submodule.func1': ('def', 11, 15),
+                'Class1': ('class', 19, 22),
+                'not_a_package.submodule.Class1': ('class', 19, 22),
+                'Class3': ('class', 25, 30),
+                'not_a_package.submodule.Class3.class_attr': ('other', 29, 29),
+            }
+        return (source, tags)
+
+    app.connect('viewcode-find-source', find_source)
+    app.builder.build_all()
+
+    warnings = re.sub(r'\\+', '/', warning.getvalue())
+    assert re.findall(
+        r"index.rst:\d+: WARNING: Object named 'func1' not found in include " +
+        r"file .*/not_a_package/__init__.py'",
+        warnings
+    )
+
+    result = (app.outdir / 'index.html').read_text()
+    assert result.count('href="_modules/not_a_package.html#func1"') == 1
+    assert result.count('href="_modules/not_a_package.html#not_a_package.submodule.func1"') == 1
+    assert result.count('href="_modules/not_a_package/submodule.html#Class1"') == 1
+    assert result.count('href="_modules/not_a_package/submodule.html#Class3"') == 1
+    assert result.count('href="_modules/not_a_package/submodule.html#not_a_package.submodule.Class1"') == 1
+
+    assert result.count('href="_modules/not_a_package/submodule.html#not_a_package.submodule.Class3.class_attr"') == 1
+    assert result.count('This is the class attribute class_attr') == 1
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""
+
+
+## Methods Under Test
+        
+Please generate test for `doctree_read` to cover the path
+54     env = app.builder.env
+55     if not hasattr(env, '_viewcode_modules'):
+57     if app.builder.name == "singlehtml":
+59     if app.builder.name.startswith("epub") and not env.config.viewcode_enable_epub:
+60         return
+-----------------------------------------------------------
+    
+
+Please generate test for `doctree_read` to cover the path
+54     env = app.builder.env
+55     if not hasattr(env, '_viewcode_modules'):
+57     if app.builder.name == "singlehtml":
+58         return
+-----------------------------------------------------------
+    
+
+Please generate test for `env_merge_info` to cover the path
+128     if not hasattr(other, '_viewcode_modules'):
+131     if not hasattr(env, '_viewcode_modules'):
+132         env._viewcode_modules = {}  # type: ignore
+134     env._viewcode_modules.update(other._viewcode_modules)  # type: ignore
+-----------------------------------------------------------
+    
+
+Please generate test for `env_merge_info` to cover the path
+128     if not hasattr(other, '_viewcode_modules'):
+129         return
+-----------------------------------------------------------
+    
+
+Please generate test for `missing_reference` to cover the path
+140     if node['reftype'] == 'viewcode':
+141         return make_refnode(app.builder, node['refdoc'], node['reftarget'],
+-----------------------------------------------------------
+    
+
+Please generate test for `get_module_filename` to cover the path
+148     """Get module filename for *modname*."""
+149     source_info = app.emit_firstresult('viewcode-find-source', modname)
+150     if source_info:
+153         try:
+154             filename, source = ModuleAnalyzer.get_module_source(modname)
+155             return filename
+-----------------------------------------------------------
+    
+
+Please generate test for `get_module_filename` to cover the path
+148     """Get module filename for *modname*."""
+149     source_info = app.emit_firstresult('viewcode-find-source', modname)
+150     if source_info:
+151         return None
+-----------------------------------------------------------
+    
+
+Please generate test for `should_generate_module_page` to cover the path
+161     """Check generation of module page is needed."""
+162     module_filename = get_module_filename(app, modname)
+163     if module_filename is None:
+167     builder = cast(StandaloneHTMLBuilder, app.builder)
+168     basename = modname.replace('.', '/') + builder.out_suffix
+169     page_filename = path.join(app.outdir, '_modules/', basename)
+171     try:
+172         if path.getmtime(module_filename) <= path.getmtime(page_filename):
+174             return False
+-----------------------------------------------------------
+    
+
+Please generate test for `should_generate_module_page` to cover the path
+161     """Check generation of module page is needed."""
+162     module_filename = get_module_filename(app, modname)
+163     if module_filename is None:
+165         return True
+-----------------------------------------------------------
+    
+
+Please generate test for `collect_pages` to cover the path
+182     env = app.builder.env
+183     if not hasattr(env, '_viewcode_modules'):
+185     if app.builder.name == "singlehtml":
+187     if app.builder.name.startswith("epub") and not env.config.viewcode_enable_epub:
+189     highlighter = app.builder.highlighter  # type: ignore
+190     urito = app.builder.get_relative_uri
+191 
+192     modnames = set(env._viewcode_modules)  # type: ignore
+194     for modname, entry in status_iterator(
+253     if not modnames:
+256     html = ['\n']
+257     # the stack logic is needed for using nested lists for submodules
+258     stack = ['']
+259     for modname in sorted(modnames):
+273     html.append('</ul>' * (len(stack) - 1))
+274     context = {
+275         'title': _('Overview: module code'),
+276         'body': (_('<h1>All modules for which code is available</h1>') +
+277                  ''.join(html)),
+278     }
+279 
+280     yield (posixpath.join(OUTPUT_DIRNAME, 'index'), context, 'page.html')
+-----------------------------------------------------------
+    
+
+Please generate test for `collect_pages` to cover the path
+182     env = app.builder.env
+183     if not hasattr(env, '_viewcode_modules'):
+184         return
+-----------------------------------------------------------
+    

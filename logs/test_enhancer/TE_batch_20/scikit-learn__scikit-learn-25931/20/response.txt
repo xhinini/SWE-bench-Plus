@@ -1,0 +1,165 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  A set of regression tests for IsolationForest focusing on:
+  - Preservation of feature names when fitting with a pandas DataFrame and a
+    non-"auto" contamination (this exercised the bug fixed by the gold patch).
+  - Correct relationship between score_samples, decision_function and offset_
+    when contamination is not "auto".
+  - Consistency between sparse (csr/csc) and dense workflows for training and
+    prediction, including when forcing chunked computation via mocking
+    get_chunk_n_rows.
+  - Ensuring chunked scoring yields identical results to unchunked scoring.
+  These tests are written to be non-flaky and consistent with the existing
+  test suite conventions.
+test_code: |
+  import numpy as np
+  import pytest
+  import warnings
+
+  from scipy.sparse import csr_matrix, csc_matrix
+  from sklearn.ensemble import IsolationForest
+  from sklearn.utils import check_random_state
+  from sklearn.utils._testing import assert_array_equal, assert_allclose
+  from unittest.mock import patch, Mock
+
+  # 1) Ensure feature names are preserved when fitting with pandas DataFrame
+  def test_feature_names_preserved_with_dataframe_and_contamination_float():
+      pd = pytest.importorskip("pandas")
+      rng = check_random_state(0)
+      # single feature DataFrame
+      X = pd.DataFrame(rng.randn(10, 1), columns=["feature_1"])
+      clf = IsolationForest(random_state=0, contamination=0.1)
+      # Should not raise and should preserve feature names
+      with warnings.catch_warnings():
+          warnings.simplefilter("error", UserWarning)
+          clf.fit(X)
+      assert hasattr(clf, "feature_names_in_")
+      assert_array_equal(clf.feature_names_in_, np.array(["feature_1"], dtype=object))
+
+  # 2) Fit on DataFrame, score_samples/decision_function relationship
+  def test_score_and_decision_relationship_with_dataframe():
+      pd = pytest.importorskip("pandas")
+      rng = check_random_state(1)
+      X = pd.DataFrame(rng.randn(20, 2), columns=["a", "b"])
+      clf = IsolationForest(random_state=42, contamination=0.2)
+      with warnings.catch_warnings():
+          warnings.simplefilter("error", UserWarning)
+          clf.fit(X)
+      X_test = pd.DataFrame([[0.0, 0.0], [1.0, 1.0]], columns=["a", "b"])
+      scores = clf.score_samples(X_test)
+      decisions = clf.decision_function(X_test)
+      # score_samples == decision_function + offset_
+      assert_array_equal(scores, decisions + clf.offset_)
+
+  # 3) Training on csc, predicting on csr matches dense behavior
+  def test_sparse_csc_train_predict_csr_matches_dense():
+      rng = check_random_state(2)
+      X = rng.randn(50, 4)
+      # split
+      X_train = X[:30]
+      X_test = X[30:]
+      X_train_csc = csc_matrix(X_train)
+      X_test_csr = csr_matrix(X_test)
+      clf_sparse = IsolationForest(n_estimators=20, random_state=0).fit(X_train_csc)
+      pred_sparse = clf_sparse.predict(X_test_csr)
+      clf_dense = IsolationForest(n_estimators=20, random_state=0).fit(X_train)
+      pred_dense = clf_dense.predict(X_test)
+      assert_array_equal(pred_sparse, pred_dense)
+
+  # 4) Training on csr, predicting on csc matches dense behavior
+  def test_sparse_csr_train_predict_csc_matches_dense():
+      rng = check_random_state(3)
+      X = rng.randn(60, 3)
+      X_train = X[:40]
+      X_test = X[40:]
+      X_train_csr = csr_matrix(X_train)
+      X_test_csc = csc_matrix(X_test)
+      clf_sparse = IsolationForest(n_estimators=15, random_state=0).fit(X_train_csr)
+      pred_sparse = clf_sparse.predict(X_test_csc)
+      clf_dense = IsolationForest(n_estimators=15, random_state=0).fit(X_train)
+      pred_dense = clf_dense.predict(X_test)
+      assert_array_equal(pred_sparse, pred_dense)
+
+  # 5) offset_ equals empirical percentile of internal scores computed at fit
+  def test_offset_matches_percentile_of_internal_scores():
+      rng = check_random_state(4)
+      X = rng.randn(30, 2)
+      contamination = 0.25
+      clf = IsolationForest(n_estimators=10, random_state=0, contamination=contamination)
+      clf.fit(X)
+      # compute scores in the same manner as score_samples (no input re-validation)
+      # Use score_samples to get the public API result and compare percentile.
+      scores = clf._score_samples(clf._validate_data(X, accept_sparse="csr", dtype=np.float32, reset=False))
+      expected_offset = np.percentile(scores, 100.0 * contamination)
+      assert_allclose(clf.offset_, expected_offset)
+
+  # 6) Single-row fits and predictions on small arrays
+  def test_single_row_fit_and_predict():
+      rng = check_random_state(5)
+      X = rng.randn(1, 5)
+      clf = IsolationForest(random_state=0).fit(X)
+      # Single sample prediction shouldn't error and should be an array of 1
+      pred = clf.predict(X)
+      assert pred.shape == (1,)
+      assert pred[0] in (-1, 1)
+
+  # 7) score_samples works on dense and sparse identically (forcing chunking)
+  @patch("sklearn.ensemble._iforest.get_chunk_n_rows", side_effect=Mock(**{"return_value": 1}))
+  def test_chunked_vs_unchunked_scores_sparse(mocked_get_chunk):
+      rng = check_random_state(6)
+      X = rng.randn(12, 3)
+      X_train = X[:8]
+      X_test = X[8:]
+      X_train_csr = csr_matrix(X_train)
+      clf = IsolationForest(n_estimators=12, random_state=0).fit(X_train_csr)
+      # Force chunking for scoring via the patched get_chunk_n_rows
+      s_chunked = clf.score_samples(X_test)
+      # Unpatch and compute also (call private compute directly to compare)
+      mocked_get_chunk.return_value = 1000  # big chunk -> no chunking
+      s_no_chunk = clf.score_samples(X_test)
+      assert_allclose(s_chunked, s_no_chunk)
+
+  # 8) score_samples for pandas input after fit (preserve columns order)
+  def test_score_samples_preserves_dataframe_column_order():
+      pd = pytest.importorskip("pandas")
+      rng = check_random_state(7)
+      X = pd.DataFrame(rng.randn(25, 3), columns=["c1", "c2", "c3"])
+      clf = IsolationForest(random_state=0, contamination=0.15)
+      with warnings.catch_warnings():
+          warnings.simplefilter("error", UserWarning)
+          clf.fit(X)
+      X_test = pd.DataFrame([[0.1, -0.1, 0.0]], columns=["c1", "c2", "c3"])
+      # This should not raise and should return a single-element array
+      s = clf.score_samples(X_test)
+      assert s.shape == (1,)
+
+  # 9) predict after fit returns array of expected shape for sparse rows
+  def test_predict_shape_on_sparse_rows():
+      rng = check_random_state(8)
+      X = rng.randn(20, 4)
+      X_train = X[:15]
+      X_test = X[15:]
+      X_train_csr = csr_matrix(X_train)
+      X_test_csr = csr_matrix(X_test)
+      clf = IsolationForest(n_estimators=10, random_state=0).fit(X_train_csr)
+      pred = clf.predict(X_test_csr)
+      assert pred.shape == (X_test.shape[0],)
+
+  # 10) chunking does not alter sign-based outlier decision (predict) vs dense
+  @patch("sklearn.ensemble._iforest.get_chunk_n_rows", side_effect=Mock(**{"return_value": 2}))
+  def test_chunking_does_not_change_predict(mocked_get_chunk):
+      rng = check_random_state(9)
+      X = rng.randn(40, 4)
+      X_train = X[:30]
+      X_test = X[30:]
+      clf_dense = IsolationForest(n_estimators=25, random_state=0).fit(X_train)
+      pred_dense = clf_dense.predict(X_test)
+      # Train a sparse classifier and ensure predict agrees
+      X_train_csr = csr_matrix(X_train)
+      X_test_csr = csr_matrix(X_test)
+      clf_sparse = IsolationForest(n_estimators=25, random_state=0).fit(X_train_csr)
+      pred_sparse = clf_sparse.predict(X_test_csr)
+      assert_array_equal(pred_dense, pred_sparse)
+new_imports_code: |
+  # No extra top-level imports required beyond those used in test_code.

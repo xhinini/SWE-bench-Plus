@@ -1,0 +1,132 @@
+from django.db.models import Value, F
+from django.db.models.functions import Lower
+from django.test import TestCase, skipUnlessDBFeature
+from django.db.models import F, Value
+from django.db.models.functions import Lower
+import datetime
+
+from .models import (
+    Note, Number, Individual, CustomDbColumn, Article, JSONFieldNullable,
+)
+
+class CustomExpr:
+    """
+    A wrapper that *isn't* a Django Expression subclass but implements
+    resolve_expression so that it can be used as an expression-like object.
+    """
+    def __init__(self, expr):
+        self.expr = expr
+
+    def resolve_expression(self, *args, **kwargs):
+        # Delegate to the wrapped expression
+        return self.expr
+
+class WithoutResolve:
+    """
+    An object that does not implement resolve_expression and therefore should
+    be treated as a literal and wrapped with Value(...) by bulk_update.
+    """
+    def __init__(self, value):
+        self.value = value
+
+    def __str__(self):
+        return str(self.value)
+
+class BulkUpdateExpressionLikeTests(TestCase):
+    def test_custom_expr_increments_number_field(self):
+        # Prepare objects
+        nums = [Number.objects.create(num=0) for _ in range(5)]
+        # Assign expression-like object that resolves to F('num') + 1
+        for n in nums:
+            n.num = CustomExpr(F('num') + 1)
+        Number.objects.bulk_update(nums, ['num'])
+        self.assertCountEqual(Number.objects.filter(num=1), nums)
+
+    def test_custom_expr_assigns_charfield_from_another_field(self):
+        notes = [
+            Note.objects.create(note='note%s' % i, misc='x')
+            for i in range(5)
+        ]
+        for obj in notes:
+            obj.misc = CustomExpr(F('note'))
+        Note.objects.bulk_update(notes, ['misc'])
+        self.assertCountEqual(Note.objects.filter(misc__startswith='note'), notes)
+
+    def test_custom_expr_with_function_expression(self):
+        # Use Lower() function as the underlying expression returned by resolve_expression
+        notes = [Note.objects.create(note='UPPER', misc='x') for _ in range(3)]
+        for obj in notes:
+            obj.note = CustomExpr(Lower('note'))
+        Note.objects.bulk_update(notes, ['note'])
+        self.assertCountEqual(Note.objects.filter(note='upper'), notes)
+
+    def test_custom_expr_multiple_fields_together(self):
+        notes = [
+            Note.objects.create(note='N%s' % i, misc='M%s' % i)
+            for i in range(5)
+        ]
+        for obj in notes:
+            obj.note = CustomExpr(Lower('note'))
+            obj.misc = CustomExpr(F('note'))
+        Note.objects.bulk_update(notes, ['note', 'misc'])
+        self.assertCountEqual(Note.objects.filter(note__startswith='n'), notes)
+        self.assertCountEqual(Note.objects.filter(misc__startswith='N'), notes)
+
+    def test_custom_expr_boolean_field(self):
+        individuals = [Individual.objects.create(alive=False) for _ in range(4)]
+        for inst in individuals:
+            inst.alive = CustomExpr(Value(True))
+        Individual.objects.bulk_update(individuals, ['alive'])
+        self.assertCountEqual(Individual.objects.filter(alive=True), individuals)
+
+    def test_custom_expr_ipaddress_field(self):
+        # CustomDbColumn.ip_address is a Char/IP field in the test models.
+        objs = [CustomDbColumn.objects.create(ip_address='0.0.0.0') for _ in range(3)]
+        for i, obj in enumerate(objs):
+            obj.ip_address = CustomExpr(Value('1.2.3.%d' % (i + 1)))
+        CustomDbColumn.objects.bulk_update(objs, ['ip_address'])
+        self.assertCountEqual(
+            CustomDbColumn.objects.filter(ip_address__startswith='1.2.3.'), objs
+        )
+
+    def test_custom_expr_datetime_field(self):
+        articles = [
+            Article.objects.create(name=str(i), created=datetime.datetime(2000, 1, 1))
+            for i in range(3)
+        ]
+        new_dt = datetime.datetime(1999, 12, 31, 23, 59, 59)
+        for a in articles:
+            a.created = CustomExpr(Value(new_dt))
+        Article.objects.bulk_update(articles, ['created'])
+        self.assertCountEqual(Article.objects.filter(created=new_dt), articles)
+
+    @skipUnlessDBFeature('supports_json_field')
+    def test_custom_expr_json_field(self):
+        JSONFieldNullable.objects.bulk_create([
+            JSONFieldNullable(json_field={'a': i}) for i in range(3)
+        ])
+        objs = list(JSONFieldNullable.objects.all())
+        for o in objs:
+            # Change JSON to include a 'b' key based on existing value via custom expr
+            o.json_field = CustomExpr(Value({'b': o.json_field['a'] + 1}))
+        JSONFieldNullable.objects.bulk_update(objs, ['json_field'])
+        self.assertCountEqual(JSONFieldNullable.objects.filter(json_field__has_key='b'), objs)
+
+    def test_without_resolve_is_treated_as_literal(self):
+        # Objects with attributes that don't implement resolve_expression
+        # should be wrapped in Value(...) and persisted literally.
+        nums = [Number.objects.create(num=0) for _ in range(2)]
+        for i, n in enumerate(nums):
+            n.num = WithoutResolve(i + 5)
+        Number.objects.bulk_update(nums, ['num'])
+        self.assertCountEqual(Number.objects.filter(num__in=[5, 6]), nums)
+
+    def test_duplicate_objects_in_batches_with_custom_expr(self):
+        # Ensure duplicates across batches still result in the expression being applied.
+        note = Note.objects.create(note='dup', misc='x')
+        # Reuse the same instance twice; assign expression-like misc -> note
+        note.misc = CustomExpr(F('note'))
+        rows = Note.objects.bulk_update([note, note], ['misc'], batch_size=1)
+        # We updated the same row twice (two batches), rows updated should be 2.
+        self.assertEqual(rows, 2)
+        self.assertCountEqual(Note.objects.filter(misc='dup'), [note])

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 queries.test_bulk_update_llm.BulkUpdateExpressionLikeObjectTests.setUpTestData queries.test_bulk_update_llm.BulkUpdateExpressionLikeObjectTests.test_custom_expr_boolean_field queries.test_bulk_update_llm.BulkUpdateExpressionLikeObjectTests.test_custom_expr_custom_db_column_increment queries.test_bulk_update_llm.BulkUpdateExpressionLikeObjectTests.test_custom_expr_fk_field_via_tag_id queries.test_bulk_update_llm.BulkUpdateExpressionLikeObjectTests.test_custom_expr_function_lower queries.test_bulk_update_llm.BulkUpdateExpressionLikeObjectTests.test_custom_expr_integer_duplicates_and_batches queries.test_bulk_update_llm.BulkUpdateExpressionLikeObjectTests.test_custom_expr_integer_increment queries.test_bulk_update_llm.BulkUpdateExpressionLikeObjectTests.test_custom_expr_json_field queries.test_bulk_update_llm.BulkUpdateExpressionLikeObjectTests.test_custom_expr_nullable_set_null_for_fk queries.test_bulk_update_llm.BulkUpdateExpressionLikeObjectTests.test_custom_expr_text_field queries.test_bulk_update_llm.BulkUpdateExpressionLikeObjectTests.test_custom_expr_text_field_batch_size_one queries.test_bulk_update_llm.FakeExpr.__init__ queries.test_bulk_update_llm.FakeExpr.resolve_expression
+coverage json -o coverage.json
+: '>>>>> End Test Output'

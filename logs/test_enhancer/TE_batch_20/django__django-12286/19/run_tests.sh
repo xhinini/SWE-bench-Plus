@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 check_framework.test_translation_llm.TranslationImportRegressionTests._reload_checks_with_stubbed_translation check_framework.test_translation_llm.TranslationImportRegressionTests.test_invalid_language_non_string_with_stubbed_trans_real check_framework.test_translation_llm.TranslationImportRegressionTests.test_invalid_language_similar_but_not_supported_with_stubbed_trans_real check_framework.test_translation_llm.TranslationImportRegressionTests.test_invalid_language_unrecognized_region_with_stubbed_trans_real check_framework.test_translation_llm.TranslationImportRegressionTests.test_invalid_language_xx_with_stubbed_trans_real check_framework.test_translation_llm.TranslationImportRegressionTests.test_multiple_reloads_do_not_leak_state check_framework.test_translation_llm.TranslationImportRegressionTests.test_valid_language_case_insensitive_en_us_with_stubbed_trans_real check_framework.test_translation_llm.TranslationImportRegressionTests.test_valid_language_en_us_with_stubbed_trans_real check_framework.test_translation_llm.TranslationImportRegressionTests.test_valid_language_en_with_stubbed_trans_real check_framework.test_translation_llm.TranslationImportRegressionTests.test_valid_language_fr_ca_with_stubbed_trans_real check_framework.test_translation_llm.TranslationImportRegressionTests.test_valid_language_script_variant_with_stubbed_trans_real
+coverage json -o coverage.json
+: '>>>>> End Test Output'

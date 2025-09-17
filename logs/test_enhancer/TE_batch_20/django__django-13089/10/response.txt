@@ -1,0 +1,193 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify DatabaseCache._cull's robustness when the intermediate SELECT that determines the last cache key returns falsy values (None, empty sequences, tuples with None). They assert that no TypeError is raised (which would occur if the code attempted to index None) and that deletions only occur when a valid last_cache_key is returned. The tests also check that the computed cull_num passed to the culling SQL is correct and that the zero-cull-frequency behavior calls clear().
+test_code: |
+  from unittest import mock
+
+  from django.core.cache import caches
+  from django.db import router, connections
+  from django.utils import timezone
+
+  class DatabaseCacheCullTests:
+      """
+      A mixin providing helper assertions for _cull tests. These methods are
+      used inside the DBCacheTests TransactionTestCase, which already sets up
+      a DatabaseCache-based cache configuration (`cull` and `zero_cull`).
+      """
+
+      def _get_cull_cache_and_db(self):
+          cull_cache = caches['cull']
+          db = router.db_for_write(cull_cache.cache_model_class)
+          return cull_cache, db
+
+      def _calls_sql_containing(self, mock_cursor, substring):
+          return any(substring in (call_args[0][0] if call_args[0] else '') for call_args in mock_cursor.execute.call_args_list)
+
+  # Inject tests into the existing DBCacheTests test case class.
+  def _attach_tests(DBCacheTests):
+      # 1) No last_cache_key (None): should not raise and should not execute delete-by-key.
+      def test_cull_handles_missing_last_cache_key_no_exception(self):
+          cull_cache, db = self._get_cull_cache_and_db()
+          mock_cursor = mock.Mock()
+          # First fetchone() -> COUNT(*) result (num,) > _max_entries, second -> None (no last key)
+          mock_cursor.fetchone = mock.Mock(side_effect=[(100,), None])
+          mock_cursor.execute = mock.Mock()
+          now = timezone.now().replace(microsecond=0)
+          # Should not raise
+          cull_cache._cull(db, mock_cursor, now)
+          # Ensure the specialized delete using cache_key < ... was not executed.
+          self.assertFalse(self._calls_sql_containing(mock_cursor, 'cache_key <'))
+
+      # 2) Valid last_cache_key present: should execute the delete-by-key SQL with that key.
+      def test_cull_deletes_when_last_cache_key_present(self):
+          cull_cache, db = self._get_cull_cache_and_db()
+          mock_cursor = mock.Mock()
+          mock_cursor.fetchone = mock.Mock(side_effect=[(100,), ('last-key',)])
+          mock_cursor.execute = mock.Mock()
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          # There should be a delete using "cache_key <"
+          self.assertTrue(self._calls_sql_containing(mock_cursor, 'cache_key <'))
+          # And the params for the delete should include our last-key value
+          found = False
+          for call in mock_cursor.execute.call_args_list:
+              args, kwargs = call
+              if args and 'cache_key <' in args[0]:
+                  # params are passed as second positional argument to execute()
+                  params = args[1] if len(args) > 1 else []
+                  if params and params[0] == 'last-key':
+                      found = True
+          self.assertTrue(found, "Expected delete-by-key call with 'last-key' parameter")
+
+      # 3) last_cache_key is a tuple with None element: should not blow up or delete
+      def test_cull_ignores_none_tuple_element(self):
+          cull_cache, db = self._get_cull_cache_and_db()
+          mock_cursor = mock.Mock()
+          mock_cursor.fetchone = mock.Mock(side_effect=[(100,), (None,)])
+          mock_cursor.execute = mock.Mock()
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          self.assertFalse(self._calls_sql_containing(mock_cursor, 'cache_key <'))
+
+      # 4) last_cache_key is an empty list: should be treated as falsy and not delete
+      def test_cull_ignores_empty_sequence(self):
+          cull_cache, db = self._get_cull_cache_and_db()
+          mock_cursor = mock.Mock()
+          mock_cursor.fetchone = mock.Mock(side_effect=[(100,), []])
+          mock_cursor.execute = mock.Mock()
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          self.assertFalse(self._calls_sql_containing(mock_cursor, 'cache_key <'))
+
+      # 5) cull_num passed to culling SQL is calculated as num // _cull_frequency
+      def test_cull_calls_culling_sql_with_correct_cull_num(self):
+          cull_cache, db = self._get_cull_cache_and_db()
+          # Force a known cull_frequency
+          old_freq = cull_cache._cull_frequency
+          cull_cache._cull_frequency = 4
+          try:
+              mock_cursor = mock.Mock()
+              # num = 101 -> cull_num = 101 // 4 = 25
+              mock_cursor.fetchone = mock.Mock(side_effect=[(101,), ('last',)])
+              mock_cursor.execute = mock.Mock()
+              now = timezone.now().replace(microsecond=0)
+              cull_cache._cull(db, mock_cursor, now)
+              # Find execute call that passed the cull_num parameter
+              found = False
+              for call in mock_cursor.execute.call_args_list:
+                  args, kwargs = call
+                  if len(args) > 1 and args[1] == [101 // 4]:
+                      found = True
+              self.assertTrue(found, "Expected culling SQL to be executed with cull_num == 101 // 4")
+          finally:
+              cull_cache._cull_frequency = old_freq
+
+      # 6) If num <= _max_entries, the culling SQL should not be executed
+      def test_cull_skips_when_under_max_entries(self):
+          cull_cache, db = self._get_cull_cache_and_db()
+          mock_cursor = mock.Mock()
+          # num is lower than default MAX_ENTRIES for 'cull' config (which is 30)
+          mock_cursor.fetchone = mock.Mock(side_effect=[(10,)])
+          mock_cursor.execute = mock.Mock()
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          self.assertFalse(self._calls_sql_containing(mock_cursor, 'cache_key_culling_sql') or
+                           self._calls_sql_containing(mock_cursor, 'cache_key <'))
+
+      # 7) Empty tuple returned by fetchone() as last_cache_key should be treated as falsy
+      def test_cull_handles_empty_tuple(self):
+          cull_cache, db = self._get_cull_cache_and_db()
+          mock_cursor = mock.Mock()
+          mock_cursor.fetchone = mock.Mock(side_effect=[(31,), tuple()])
+          mock_cursor.execute = mock.Mock()
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          self.assertFalse(self._calls_sql_containing(mock_cursor, 'cache_key <'))
+
+      # 8) If last_cache_key is bytes, it should still issue the delete
+      def test_cull_handles_bytes_last_cache_key(self):
+          cull_cache, db = self._get_cull_cache_and_db()
+          mock_cursor = mock.Mock()
+          mock_cursor.fetchone = mock.Mock(side_effect=[(100,), (b'keybytes',)])
+          mock_cursor.execute = mock.Mock()
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          # Ensure delete-by-key run and parameter is the bytes value
+          found = False
+          for call in mock_cursor.execute.call_args_list:
+              args, kwargs = call
+              if args and 'cache_key <' in args[0]:
+                  params = args[1] if len(args) > 1 else []
+                  if params and params[0] == b'keybytes':
+                      found = True
+          self.assertTrue(found)
+
+      # 9) For the zero-cull cache, when _cull_frequency == 0 clear() should be invoked
+      def test_zero_cull_calls_clear(self):
+          zero_cull_cache = caches['zero_cull']
+          db = router.db_for_write(zero_cull_cache.cache_model_class)
+          mock_cursor = mock.Mock()
+          mock_cursor.fetchone = mock.Mock(side_effect=[(100,), None])
+          mock_cursor.execute = mock.Mock()
+          # Patch clear() to observe calls
+          with mock.patch.object(zero_cull_cache, 'clear', autospec=True) as mock_clear:
+              now = timezone.now().replace(microsecond=0)
+              zero_cull_cache._cull(db, mock_cursor, now)
+              mock_clear.assert_called_once()
+
+      # 10) If the COUNT fetch returns a value and a valid last key tuple with an empty-string element, treat as valid only if truthy
+      def test_cull_ignores_last_cache_key_with_empty_string(self):
+          cull_cache, db = self._get_cull_cache_and_db()
+          mock_cursor = mock.Mock()
+          # Simulate a last key that is ('',) - empty string is falsy -> should not delete
+          mock_cursor.fetchone = mock.Mock(side_effect=[(100,), ('',)])
+          mock_cursor.execute = mock.Mock()
+          now = timezone.now().replace(microsecond=0)
+          cull_cache._cull(db, mock_cursor, now)
+          self.assertFalse(self._calls_sql_containing(mock_cursor, 'cache_key <'))
+
+      # Attach methods to the test class
+      test_methods = [
+          test_cull_handles_missing_last_cache_key_no_exception,
+          test_cull_deletes_when_last_cache_key_present,
+          test_cull_ignores_none_tuple_element,
+          test_cull_ignores_empty_sequence,
+          test_cull_calls_culling_sql_with_correct_cull_num,
+          test_cull_skips_when_under_max_entries,
+          test_cull_handles_empty_tuple,
+          test_cull_handles_bytes_last_cache_key,
+          test_zero_cull_calls_clear,
+          test_cull_ignores_last_cache_key_with_empty_string,
+      ]
+      for func in test_methods:
+          setattr(DBCacheTests, func.__name__, func)
+
+  # Find the DBCacheTests class defined in the module where tests live and attach tests.
+  try:
+      from django.core.cache.tests import DBCacheTests as _DBCacheTests_module
+  except Exception:
+      # Fallback import path: tests.cache.tests defines DBCacheTests in the provided file.
+      from tests.cache.tests import DBCacheTests as _DBCacheTests_module
+
+  _attach_tests(_DBCacheTests_module)
+new_imports_code: ""

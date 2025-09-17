@@ -1,0 +1,146 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests ensure that ValueError raised while resolving filesystem paths (e.g. from network filesystems) are safely ignored by iter_modules_and_files and sys_path_directories. They simulate Path.resolve raising ValueError with arbitrary messages and confirm the functions continue (do not raise) and still return valid resolved paths when present. This detects the candidate patch that conditionally re-raises ValueErrors with messages other than 'embedded null byte'.
+test_code: |
+  from unittest import mock
+  import sys
+  import tempfile
+  import types
+  from pathlib import Path
+  from django.test import SimpleTestCase
+  from django.test.utils import extend_sys_path
+  from django.utils import autoreload
+
+  class TestValueErrorHandling(SimpleTestCase):
+      def setUp(self):
+          # Keep original resolve to call through for non-matching paths.
+          self.orig_resolve = Path.resolve
+
+      def tearDown(self):
+          # Clear lru cache to avoid cross-test pollution.
+          try:
+              autoreload.iter_modules_and_files.cache_clear()
+          except Exception:
+              pass
+
+      def _make_resolve_side(self, bad_paths, message):
+          orig = self.orig_resolve
+          def _resolve(self, strict=True):
+              if str(self) in bad_paths:
+                  raise ValueError(message)
+              return orig(self, strict=strict)
+          return _resolve
+
+      def test_iter_modules_and_files_ignores_valueerror_for_extra_files_str(self):
+          bad = "/this/is/a/bad/path"
+          with mock.patch.object(Path, "resolve", side_effect=self._make_resolve_side({bad}, "network error")):
+              autoreload.iter_modules_and_files.cache_clear()
+              # Should not raise, and should return empty set (bad path ignored)
+              result = autoreload.iter_modules_and_files((), frozenset([bad]))
+              self.assertEqual(result, frozenset())
+
+      def test_iter_modules_and_files_ignores_valueerror_for_extra_files_path(self):
+          bad_path = Path("/another/bad/path")
+          with mock.patch.object(Path, "resolve", side_effect=self._make_resolve_side({str(bad_path)}, "network fs issue")):
+              autoreload.iter_modules_and_files.cache_clear()
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+              self.assertEqual(result, frozenset())
+
+      def test_iter_modules_and_files_with_valid_and_faulty_extra_files(self):
+          # Create a valid file and a faulty path; only the valid one should be returned.
+          td = tempfile.TemporaryDirectory()
+          self.addCleanup(td.cleanup)
+          valid = Path(td.name) / "good.py"
+          valid.parent.mkdir(parents=True, exist_ok=True)
+          valid.touch()
+          bad = "/bad/path/for/test"
+          bad_set = {bad}
+          with mock.patch.object(Path, "resolve", side_effect=self._make_resolve_side(bad_set, "network error")):
+              autoreload.iter_modules_and_files.cache_clear()
+              result = autoreload.iter_modules_and_files((), frozenset([str(valid), bad]))
+              # valid should be resolved and present
+              self.assertIn(valid.resolve(), result)
+
+      def test_iter_modules_and_files_ignores_valueerror_from_module_spec_origin(self):
+          bad_origin = "/module/origin/bad"
+          module = types.ModuleType("test_mod")
+          # Create a fake spec with has_location True and an origin that triggers ValueError.
+          module.__spec__ = types.SimpleNamespace(has_location=True, loader=object(), origin=bad_origin)
+          with mock.patch.object(Path, "resolve", side_effect=self._make_resolve_side({bad_origin}, "network failure")):
+              autoreload.iter_modules_and_files.cache_clear()
+              result = autoreload.iter_modules_and_files((module,), frozenset())
+              # The bad origin should be ignored resulting in empty set.
+              self.assertEqual(result, frozenset())
+
+      def test_sys_path_directories_ignores_valueerror_for_sys_path_entry(self):
+          bad = "/sys/path/bad"
+          # Temporarily add bad entry to sys.path
+          sys.path.append(bad)
+          self.addCleanup(lambda: sys.path.remove(bad) if bad in sys.path else None)
+          with mock.patch.object(Path, "resolve", side_effect=self._make_resolve_side({bad}, "some network error")):
+              # Should not raise; bad entry simply ignored
+              result = list(autoreload.sys_path_directories())
+              # Ensure bad path is not yielded
+              self.assertNotIn(Path(bad), result)
+              # No exception thrown is the main assertion
+
+      def test_sys_path_directories_with_mixed_sys_path_entries(self):
+          # One good and one bad sys.path entry
+          td = tempfile.TemporaryDirectory()
+          self.addCleanup(td.cleanup)
+          good = Path(td.name).resolve()
+          bad = "/another/sys/path/bad"
+          sys.path.append(str(good))
+          sys.path.append(bad)
+          self.addCleanup(lambda: sys.path.remove(str(good)) if str(good) in sys.path else None)
+          self.addCleanup(lambda: sys.path.remove(bad) if bad in sys.path else None)
+          with mock.patch.object(Path, "resolve", side_effect=self._make_resolve_side({bad}, "network hiccup")):
+              result = list(autoreload.sys_path_directories())
+              # good directory must be present
+              self.assertIn(good, result)
+
+      def test_iter_all_python_module_files_ignores_valueerror_from_sys_modules(self):
+          # Create a module in sys.modules with a spec origin that triggers ValueError
+          bad_origin = "/sys/module/bad/origin"
+          module = types.ModuleType("test_mod_sys")
+          module.__spec__ = types.SimpleNamespace(has_location=True, loader=object(), origin=bad_origin)
+          sys.modules[module.__name__] = module
+          self.addCleanup(lambda: sys.modules.pop(module.__name__, None))
+          with mock.patch.object(Path, "resolve", side_effect=self._make_resolve_side({bad_origin}, "network fs")):
+              autoreload.iter_modules_and_files.cache_clear()
+              # iter_all_python_module_files should not raise and should simply ignore the bad origin
+              files = list(autoreload.iter_all_python_module_files())
+              # The set may include many system modules; ensure no exception and that bad path not in results
+              self.assertNotIn(Path(bad_origin), files)
+
+      def test_iter_modules_and_files_ignores_arbitrary_valueerror_messages(self):
+          # Ensure that ValueError with arbitrary message is ignored (not only 'embedded null byte').
+          bad = "/arbitrary/error/path"
+          with mock.patch.object(Path, "resolve", side_effect=self._make_resolve_side({bad}, "this is an arbitrary message")):
+              autoreload.iter_modules_and_files.cache_clear()
+              result = autoreload.iter_modules_and_files((), frozenset([bad]))
+              self.assertEqual(result, frozenset())
+
+      def test_sys_path_directories_ignores_arbitrary_valueerror_messages(self):
+          bad = "/sys/arbitrary/bad"
+          sys.path.append(bad)
+          self.addCleanup(lambda: sys.path.remove(bad) if bad in sys.path else None)
+          with mock.patch.object(Path, "resolve", side_effect=self._make_resolve_side({bad}, "arbitrary msg")):
+              result = list(autoreload.sys_path_directories())
+              self.assertNotIn(Path(bad), result)
+
+      def test_iter_modules_and_files_embedded_null_byte_still_ignored(self):
+          # Confirm embedded null byte behaviour unchanged (ignored).
+          path_with_null = "embedded_null_byte\x00.py"
+          autoreload.iter_modules_and_files.cache_clear()
+          result = autoreload.iter_modules_and_files((), frozenset([path_with_null]))
+          self.assertEqual(result, frozenset())
+new_imports_code: |
+  from unittest import mock
+  import sys
+  import tempfile
+  import types
+  from pathlib import Path
+  from django.test import SimpleTestCase
+  from django.test.utils import extend_sys_path
+  from django.utils import autoreload

@@ -1,0 +1,146 @@
+from unittest.mock import patch
+import types
+from django.urls import NoReverseMatch
+from unittest.mock import patch
+import types
+
+from django.urls import NoReverseMatch, reverse
+from django.test import TestCase, override_settings
+from django.test.client import RequestFactory
+from django.contrib.auth.models import User
+
+from .models import Article
+from django.contrib import admin
+
+# reuse the site instance defined in the module under test
+from .test_adminsite import site  # noqa: F401 (site is created at module import)
+
+@override_settings(ROOT_URLCONF='admin_views.test_adminsite')
+class BuildAppDictTests(TestCase):
+    """
+    Tests that exercise the AdminSite._build_app_dict internal API and related behavior.
+    These tests will detect regressions where _build_app_dict is renamed or removed,
+    and ensure the 'model' key is present for each model dict.
+    """
+    @classmethod
+    def setUpTestData(cls):
+        cls.u1 = User.objects.create_superuser(username='super2', password='secret', email='super2@example.com')
+
+    def setUp(self):
+        self.rf = RequestFactory()
+        self.request = self.rf.get(reverse('test_adminsite:index'))
+        self.request.user = self.u1
+
+    def test__build_app_dict_exists(self):
+        # Ensure there is a private _build_app_dict method on the site object.
+        self.assertTrue(hasattr(site, '_build_app_dict'), "AdminSite must have a _build_app_dict method")
+
+    def test__build_app_dict_returns_dict_for_label(self):
+        app_dict = site._build_app_dict(self.request, label='admin_views')
+        self.assertIsInstance(app_dict, dict)
+        self.assertIn('models', app_dict)
+        models = app_dict['models']
+        self.assertGreaterEqual(len(models), 1)
+        model_info = models[0]
+        # The 'model' key must be present and reference the model class
+        self.assertIn('model', model_info)
+        self.assertIs(model_info['model'], Article)
+
+    def test__build_app_dict_no_label_returns_all_apps(self):
+        app_dict = site._build_app_dict(self.request)
+        # Should include both registered apps: admin_views and auth
+        self.assertIn('admin_views', app_dict)
+        self.assertIn('auth', app_dict)
+
+    def test__build_app_dict_model_key_in_each_model(self):
+        app_dict = site._build_app_dict(self.request)
+        for app_label, app in app_dict.items():
+            for model_info in app.get('models', []):
+                self.assertIn('model', model_info, "Each model dict must include a 'model' key")
+
+    def test_get_app_list_calls__build_app_dict(self):
+        # Spy on the instance method to ensure get_app_list uses _build_app_dict.
+        original = getattr(site, '_build_app_dict')
+        called = {'v': False}
+
+        def spy(original_func, request, label=None):
+            called['v'] = True
+            return original_func(request, label)
+
+        # Bind the spy wrapper to the instance, preserving behavior
+        site._build_app_dict = types.MethodType(lambda self, request, label=None: spy(original, request, label), site)
+        try:
+            _ = site.get_app_list(self.request)
+            self.assertTrue(called['v'], "get_app_list must call _build_app_dict")
+        finally:
+            # restore
+            site._build_app_dict = original
+
+    def test_app_index_calls__build_app_dict(self):
+        # Spy on the instance method to ensure app_index uses _build_app_dict.
+        original = getattr(site, '_build_app_dict')
+        called = {'v': False}
+
+        def spy(original_func, request, label=None):
+            called['v'] = True
+            return original_func(request, label)
+
+        site._build_app_dict = types.MethodType(lambda self, request, label=None: spy(original, request, label), site)
+        try:
+            response = site.app_index(self.request, 'admin_views')
+            self.assertTrue(called['v'], "app_index must call _build_app_dict")
+            # Ensure a TemplateResponse is returned (minimal sanity)
+            self.assertTrue(hasattr(response, 'render'))
+        finally:
+            site._build_app_dict = original
+
+    def test__build_app_dict_label_filter_returns_only_label(self):
+        auth_dict = site._build_app_dict(self.request, label='auth')
+        self.assertIsNotNone(auth_dict)
+        # Should return dict for the 'auth' app only
+        self.assertEqual(auth_dict['app_label'], 'auth')
+
+    def test__build_app_dict_skips_models_without_module_perms(self):
+        # Temporarily replace the registered admin for Article to deny module perms.
+        ArticleAdminOriginal = site._registry[Article]
+        class NoModulePermsAdmin(ArticleAdminOriginal.__class__):
+            def has_module_permission(self, request):
+                return False
+        site._registry[Article] = NoModulePermsAdmin(Article, site)
+        try:
+            app_dict = site._build_app_dict(self.request)
+            # admin_views app should either be absent or have no models because Article has no module perms
+            admin_entry = app_dict.get('admin_views', {})
+            models = admin_entry.get('models', [])
+            # Article should be excluded
+            for m in models:
+                self.assertNotEqual(m.get('model'), Article)
+        finally:
+            site._registry[Article] = ArticleAdminOriginal
+
+    def test__build_app_dict_handles_noreversematch_for_model_urls(self):
+        # Only make reverse() raise for changelist or add URLs; other reverses must continue to work.
+        real_reverse = reverse
+
+        def fake_reverse(name, *args, **kwargs):
+            # name might be like 'admin:app_model_changelist' or 'admin:app_model_add'
+            if isinstance(name, str) and (name.endswith('_changelist') or name.endswith('_add')):
+                raise NoReverseMatch()
+            return real_reverse(name, *args, **kwargs)
+
+        with patch('django.contrib.admin.sites.reverse', side_effect=fake_reverse):
+            app_dict = site._build_app_dict(self.request)
+            # Ensure models are present and admin_url/add_url are None (when perms exist but reverse failed)
+            for app_label, app in app_dict.items():
+                for m in app.get('models', []):
+                    # admin_url and add_url should either be a string or None; when our fake_reverse raised,
+                    # they must be None and the code must not crash.
+                    self.assertIn('admin_url', m)
+                    self.assertIn('add_url', m)
+
+    def test_each_context_available_apps_models_include_model_key(self):
+        ctx = site.each_context(self.request)
+        apps = ctx['available_apps']
+        for app in apps:
+            for m in app.get('models', []):
+                self.assertIn('model', m)

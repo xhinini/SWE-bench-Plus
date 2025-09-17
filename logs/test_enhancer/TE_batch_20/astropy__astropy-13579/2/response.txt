@@ -1,0 +1,155 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These 10 parametrized regression tests verify that SlicedLowLevelWCS.world_to_pixel_values
+  correctly inserts the fixed ("sliced-out") world coordinates when converting world
+  coordinates back to pixel coordinates. For each case we choose a full pixel triple
+  for the underlying 3-D WCS, compute the full world coordinates with the original WCS,
+  then feed only the kept world-coordinates into the sliced WCS.world_to_pixel_values.
+  The returned pixels should match the corresponding kept pixel coordinates from the
+  original full pixel triple. This detects incorrect indexing/selection of dropped
+  world coordinates (the bug that the gold patch fixes) and also checks broadcasting
+  behavior by ensuring scalar inputs yield scalar outputs consistent with the full WCS.
+test_code: |
+  import warnings
+  import numpy as np
+  from numpy.testing import assert_allclose
+  import pytest
+  from astropy.io.fits import Header
+  from astropy.io.fits.verify import VerifyWarning
+  from astropy.wcs import WCS
+  from astropy.wcs.wcsapi.wrappers.sliced_wcs import SlicedLowLevelWCS
+
+  # Header copied from the existing tests to reproduce the same WCS behavior.
+  HEADER_SPECTRAL_CUBE = """
+  NAXIS   = 3
+  NAXIS1  = 10
+  NAXIS2  = 20
+  NAXIS3  = 30
+  CTYPE1  = GLAT-CAR
+  CTYPE2  = FREQ
+  CTYPE3  = GLON-CAR
+  CNAME1  = Latitude
+  CNAME2  = Frequency
+  CNAME3  = Longitude
+  CRVAL1  = 10
+  CRVAL2  = 20
+  CRVAL3  = 25
+  CRPIX1  = 30
+  CRPIX2  = 40
+  CRPIX3  = 45
+  CDELT1  = -0.1
+  CDELT2  =  0.5
+  CDELT3  =  0.1
+  CUNIT1  = deg
+  CUNIT2  = Hz
+  CUNIT3  = deg
+  """
+
+  @pytest.fixture
+  def fits_wcs():
+      # Build the WCS under warnings suppression to match other tests
+      with warnings.catch_warnings():
+          warnings.simplefilter('ignore', VerifyWarning)
+          w = WCS(Header.fromstring(HEADER_SPECTRAL_CUBE, sep='\n'))
+      # pixel_bounds are not required for these tests; they exist in main test module,
+      # but behavior here does not depend on pixel_bounds.
+      return w
+
+  CASES = [
+      # Each tuple is (slices, full_pixel_triplet)
+      ([slice(None), 10, slice(None)], (29, 10, 44)),
+      ([slice(None), 0, slice(None)], (29, 0, 44)),
+      ([slice(None), 5, slice(None)], (29, 5, 44)),
+      ([0, slice(None), slice(None)], (0, 39, 44)),
+      ([slice(None), slice(None), 0], (29, 39, 0)),
+      ([10, 0, slice(None)], (10, 0, 44)),
+      ([slice(None), 2, 3], (29, 2, 3)),
+      ([3, slice(None), 5], (3, 39, 5)),
+      ([slice(None), slice(None), slice(None)], (29, 39, 44)),  # identity slice
+      ([5, 6, slice(None)], (5, 6, 44)),
+  ]
+
+  @pytest.mark.parametrize("slices, full_pixel", CASES)
+  def test_world_to_pixel_roundtrip_with_sliced_out_dimensions(fits_wcs, slices, full_pixel):
+      """
+      For the given slice specification and a full pixel triplet for the underlying WCS,
+      compute the full world coordinates using the original WCS, then call the sliced
+      WCS.world_to_pixel_values with only the kept world coordinates. The resulting
+      pixel coordinates should match the kept pixel coordinates from the original
+      full_pixel triplet.
+      """
+      sl = SlicedLowLevelWCS(fits_wcs, slices)
+
+      # Get the world coordinates for the full pixel indices on the original WCS
+      full_world = fits_wcs.pixel_to_world_values(*full_pixel)
+
+      # Build the world inputs expected by the sliced WCS: only the kept world dims
+      world_inputs = tuple(full_world[iw] for iw in sl._world_keep)
+
+      # Call world_to_pixel_values on the sliced WCS
+      out = sl.world_to_pixel_values(*world_inputs)
+
+      # Normalize output to a tuple of scalars for comparison
+      if isinstance(out, np.ndarray):
+          if out.shape == ():  # zero-d array -> scalar value
+              out_tuple = (out.item(),)
+          else:
+              out_tuple = tuple(np.asarray(out))
+      elif isinstance(out, (list, tuple)):
+          out_tuple = tuple(out)
+      else:
+          # scalar value (single pixel)
+          out_tuple = (out,)
+
+      # Expected pixel coordinates are the kept pixel indices from the original full_pixel
+      expected_pixels = tuple(full_pixel[ip] for ip in sl._pixel_keep)
+
+      # Ensure lengths match and values are close numerically
+      assert len(out_tuple) == len(expected_pixels)
+      assert_allclose(out_tuple, expected_pixels, atol=1e-8, rtol=1e-8)
+
+  def test_world_to_pixel_broadcasting_consistency(fits_wcs):
+      """
+      Ensure that broadcasting works for the sliced case: supplying arrays of world
+      coordinates (kept dims only) results in arrays of pixel coordinates corresponding
+      to the kept pixel indices.
+      """
+      slices = [slice(None), 10, slice(None)]
+      sl = SlicedLowLevelWCS(fits_wcs, slices)
+
+      full_pixel = (29, 10, 44)
+      full_world = fits_wcs.pixel_to_world_values(*full_pixel)
+
+      # Prepare two different world coordinate pairs (kept dims) by perturbing the base
+      kept_idxs = sl._world_keep
+      # Construct arrays for each kept world dimension
+      world_vals = [full_world[i] for i in kept_idxs]
+      # Make small perturbations - note: choose values that keep the mapping linear for the WCS
+      world_arrays = [np.array([val, val + 0.01]) for val in world_vals]
+
+      out = sl.world_to_pixel_values(*world_arrays)
+
+      # Convert output to arrays for comparison
+      if isinstance(out, np.ndarray):
+          # If the sliced WCS returned a single ndarray for one pixel dim, ensure shape matches
+          out_arrs = (np.asarray(out),)
+      else:
+          out_arrs = tuple(np.asarray(o) for o in out)
+
+      # Expected pixel arrays: each should be the kept pixel index repeated/shifted similarly.
+      expected_pixels = tuple(np.full_like(out_arrs[0], full_pixel[ip], dtype=float) for ip in sl._pixel_keep)
+
+      # Compare shapes and values
+      assert len(out_arrs) == len(expected_pixels)
+      for got, exp in zip(out_arrs, expected_pixels):
+          assert got.shape == exp.shape
+          assert_allclose(got, exp, atol=1e-8, rtol=1e-8)
+new_imports_code: |
+  import warnings
+  import numpy as np
+  from numpy.testing import assert_allclose
+  from astropy.io.fits import Header
+  from astropy.io.fits.verify import VerifyWarning
+  from astropy.wcs import WCS
+  from astropy.wcs.wcsapi.wrappers.sliced_wcs import SlicedLowLevelWCS

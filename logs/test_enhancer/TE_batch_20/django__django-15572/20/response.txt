@@ -1,0 +1,181 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  Ten regression tests for django.template.autoreload.get_template_directories,
+  watch_for_template_changes, and template_changed. The tests validate that
+  empty strings in backend.engine.dirs and loader.get_dirs are ignored (so the
+  current working directory is not accidentally included), that loader-provided
+  directories are filtered for empty and Django internal paths, that returned
+  directories are deduplicated and normalized to Path objects, and that
+  template_changed only triggers loader reset for non-.py files that reside in
+  one of the template directories. Tests use monkeypatching of autoreload.DjangoTemplates
+  and engines.all to supply controlled fake backends and loaders.
+test_code: |
+  from pathlib import Path
+  from types import SimpleNamespace
+  from unittest import mock
+  from django.test import SimpleTestCase
+  
+  from django.template import autoreload
+  
+  
+  class AdditionalTemplateReloadTests(SimpleTestCase):
+      def make_backend(self, dirs, loader_dirs_list=None):
+          """
+          Create a fake backend instance that is considered an instance of the
+          patched DjangoTemplates class for isinstance checks in autoreload.
+  
+          - dirs: list of DIRS for engine.dirs (may include empty strings)
+          - loader_dirs_list: list of lists returned by loader.get_dirs()
+          """
+          backend = SimpleNamespace()
+          loader_dirs_list = loader_dirs_list or []
+          # Create loader objects exposing get_dirs()
+          backend.engine = SimpleNamespace(
+              dirs=dirs,
+              template_loaders=[
+                  SimpleNamespace(get_dirs=(lambda ld=ld: ld)) for ld in loader_dirs_list
+              ],
+          )
+          return backend
+  
+      def test_ignores_empty_string_among_dir_entries(self):
+          # DIRS contains an empty string and a valid directory. The empty string
+          # should not cause Path.cwd() to be included.
+          cwd = Path.cwd()
+          valid = Path("some_templates")
+          backend = self.make_backend([str(valid), ""])
+  
+          Fake = type("FakeDjangoTemplates", (), {})  # placeholder class
+          with mock.patch("django.template.autoreload.DjangoTemplates", Fake), mock.patch(
+              "django.template.autoreload.engines.all", return_value=[backend]
+          ):
+              dirs = autoreload.get_template_directories()
+  
+          self.assertNotIn(cwd, dirs)
+          # The valid dir should be normalized relative to cwd
+          self.assertIn(cwd / valid, dirs)
+  
+      def test_watch_for_template_changes_ignores_empty_dir(self):
+          # Ensure watch_for_template_changes does not watch Path.cwd() when DIRS
+          # contains an empty string.
+          ROOT = Path("root_dir_for_test")
+          backend = self.make_backend([str(ROOT), ""])
+          Fake = type("FakeDjangoTemplates", (), {})
+          mock_reloader = mock.MagicMock()
+          with mock.patch("django.template.autoreload.DjangoTemplates", Fake), mock.patch(
+              "django.template.autoreload.engines.all", return_value=[backend]
+          ):
+              autoreload.watch_for_template_changes(mock_reloader)
+  
+          # Will watch only the explicit ROOT directory, not Path.cwd()
+          expected = [mock.call(Path.cwd() / ROOT, "**/*")]
+          self.assertEqual(sorted(mock_reloader.watch_dir.call_args_list), sorted(expected))
+  
+      def test_loader_get_dirs_filters_empty_and_django_paths(self):
+          # Loader.get_dirs returns: empty string, a django internal path (is_django_path),
+          # and a valid path. Only the valid path should be included.
+          valid = "valid_loader_dir"
+          loader_dirs = ["", "django.template.loaders.something", valid]
+          backend = self.make_backend([], loader_dirs_list=[loader_dirs])
+          Fake = type("FakeDjangoTemplates", (), {})
+          with mock.patch("django.template.autoreload.DjangoTemplates", Fake), mock.patch(
+              "django.template.autoreload.engines.all", return_value=[backend]
+          ):
+              dirs = autoreload.get_template_directories()
+  
+          self.assertEqual(dirs, {Path.cwd() / valid})
+  
+      def test_deduplicates_duplicate_directories(self):
+          # Duplicate entries in engine.dirs and loader.get_dirs should result
+          # in a single Path in the returned set.
+          duplicate = "dup_dir"
+          backend = self.make_backend([duplicate, duplicate], loader_dirs_list=[[duplicate, ""]])
+          Fake = type("FakeDjangoTemplates", (), {})
+          with mock.patch("django.template.autoreload.DjangoTemplates", Fake), mock.patch(
+              "django.template.autoreload.engines.all", return_value=[backend]
+          ):
+              dirs = autoreload.get_template_directories()
+  
+          self.assertEqual(len(dirs), 1)
+          self.assertIn(Path.cwd() / duplicate, dirs)
+  
+      def test_normalizes_path_objects_and_strings(self):
+          # Mixing Path objects and str entries should result in normalized Path objects.
+          p = Path("p_dir")
+          s = "s_dir"
+          backend = self.make_backend([p, s, ""])
+          Fake = type("FakeDjangoTemplates", (), {})
+          with mock.patch("django.template.autoreload.DjangoTemplates", Fake), mock.patch(
+              "django.template.autoreload.engines.all", return_value=[backend]
+          ):
+              dirs = autoreload.get_template_directories()
+  
+          expected = {Path.cwd() / p, Path.cwd() / s}
+          self.assertEqual(dirs, expected)
+  
+      def test_template_changed_resets_loaders_when_file_in_template_dir(self):
+          # If the changed file is inside a template directory, reset_loaders is called.
+          template_dir = Path("/a/project/templates")
+          file_path = template_dir / "sub" / "file.html"
+          with mock.patch(
+              "django.template.autoreload.get_template_directories", return_value={template_dir}
+          ), mock.patch("django.template.autoreload.reset_loaders") as mock_reset:
+              result = autoreload.template_changed(None, file_path)
+  
+          self.assertTrue(result)
+          mock_reset.assert_called_once()
+  
+      def test_template_changed_does_not_reset_for_python_files(self):
+          # .py changes should be ignored.
+          template_dir = Path("/a/project/templates")
+          file_path = template_dir / "module.py"
+          with mock.patch(
+              "django.template.autoreload.get_template_directories", return_value={template_dir}
+          ), mock.patch("django.template.autoreload.reset_loaders") as mock_reset:
+              result = autoreload.template_changed(None, file_path)
+  
+          # For .py, function returns None (not True) and reset_loaders is not called.
+          self.assertIsNone(result)
+          mock_reset.assert_not_called()
+  
+      def test_multiple_backends_and_loaders_combined(self):
+          # Multiple backends and multiple loaders should combine their dirs
+          # and ignore empties appropriately.
+          b1 = self.make_backend(["b1_dir", ""], loader_dirs_list=[["l1_dir", ""]])
+          b2 = self.make_backend(["", "b2_dir"], loader_dirs_list=[["", "l2_dir"]])
+          Fake = type("FakeDjangoTemplates", (), {})
+          with mock.patch("django.template.autoreload.DjangoTemplates", Fake), mock.patch(
+              "django.template.autoreload.engines.all", return_value=[b1, b2]
+          ):
+              dirs = autoreload.get_template_directories()
+  
+          expected = {Path.cwd() / "b1_dir", Path.cwd() / "b2_dir", Path.cwd() / "l1_dir", Path.cwd() / "l2_dir"}
+          self.assertEqual(dirs, expected)
+  
+      def test_watch_for_template_changes_watches_all_directories(self):
+          # Confirm watch_for_template_changes watches every returned template directory.
+          b1 = self.make_backend(["w1"])
+          b2 = self.make_backend(["w2", ""])
+          Fake = type("FakeDjangoTemplates", (), {})
+          mock_reloader = mock.MagicMock()
+          with mock.patch("django.template.autoreload.DjangoTemplates", Fake), mock.patch(
+              "django.template.autoreload.engines.all", return_value=[b1, b2]
+          ):
+              autoreload.watch_for_template_changes(mock_reloader)
+  
+          expected_calls = {mock.call(Path.cwd() / "w1", "**/*"), mock.call(Path.cwd() / "w2", "**/*")}
+          self.assertEqual(set(mock_reloader.watch_dir.call_args_list), expected_calls)
+  
+      def test_loader_dirs_with_only_empty_entries_produce_no_dirs(self):
+          # If both engine.dirs and loader.get_dirs contain only empty strings, result is empty set.
+          backend = self.make_backend([""], loader_dirs_list=[["", ""]])
+          Fake = type("FakeDjangoTemplates", (), {})
+          with mock.patch("django.template.autoreload.DjangoTemplates", Fake), mock.patch(
+              "django.template.autoreload.engines.all", return_value=[backend]
+          ):
+              dirs = autoreload.get_template_directories()
+  
+          self.assertEqual(dirs, set())
+new_imports_code: |
+  from types import SimpleNamespace

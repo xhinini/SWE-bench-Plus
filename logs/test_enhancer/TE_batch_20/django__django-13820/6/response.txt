@@ -1,0 +1,292 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests create fake migration modules with different combinations of __file__ and __path__ attributes (regular packages, namespace packages, module files, and unusual __path__ types). They patch django.apps.get_app_configs to return a single app config and set MIGRATION_MODULES so MigrationLoader will attempt to import the fake module. Each test asserts whether the app is classified as migrated or unmigrated (and that disk_migrations remains empty when there are no migration files). The tests are intended to detect incorrect handling of the distinction between regular packages and namespace packages that was fixed by the gold patch but broken by the candidate model patch.
+test_code: |
+  import sys
+  import types
+  import tempfile
+  import shutil
+  import pkgutil
+  from importlib import reload
+  from django.test import TestCase, override_settings
+  from django.conf import settings
+  from django.apps import apps
+  from django.db.migrations.loader import MigrationLoader
+  
+  class MockAppConfig:
+      def __init__(self, label, name='fakepkg'):
+          self.label = label
+          self.name = name
+  
+  def _install_fake_app_config(monkeyed_list):
+      """
+      Replace apps.get_app_configs to return a list of MockAppConfig instances.
+      Returns a function to restore the original.
+      """
+      original = apps.get_app_configs
+      apps.get_app_configs = lambda: monkeyed_list
+      return original
+  
+  def _restore_app_configs(original):
+      apps.get_app_configs = original
+  
+  def _cleanup_module(module_name, tempdir=None):
+      sys.modules.pop(module_name, None)
+      # Also remove submodules possibly imported
+      sys.modules.pop(f"{module_name}.migrations", None)
+      if tempdir:
+          try:
+              shutil.rmtree(tempdir)
+          except Exception:
+              pass
+  
+  class LoaderEdgeCaseTests(TestCase):
+      """
+      Tests for edge cases around module.__file__ and module.__path__ handling.
+      """
+  
+      def setUp(self):
+          # Ensure tests don't pick up real app configs.
+          self._original_get_app_configs = apps.get_app_configs
+          self.addCleanup(_restore_app_configs, self._original_get_app_configs)
+  
+      def _make_module(self, module_name, file_attr=None, path_attr=None):
+          """
+          Create a ModuleType with optional __file__ and __path__.
+          If path_attr is a list, it is used as __path__.
+          If path_attr is a custom object, it is set directly.
+          """
+          module = types.ModuleType(module_name)
+          # Set __spec__ minimally to avoid issues in some import machinery paths.
+          module.__spec__ = types.SimpleNamespace(origin=(file_attr if file_attr is not None else None), has_location=(file_attr is not None))
+          if file_attr is not None:
+              module.__file__ = file_attr
+          else:
+              # Ensure __file__ attribute is absent if None was requested (simulate missing)
+              if hasattr(module, "__file__"):
+                  delattr(module, "__file__")
+          if path_attr is not None:
+              module.__path__ = path_attr
+          else:
+              # Do not set __path__ to simulate a module file
+              if hasattr(module, "__path__"):
+                  delattr(module, "__path__")
+          sys.modules[module_name] = module
+          return module
+  
+      @override_settings(MIGRATION_MODULES={'testapp': 'fakepkg.migrations'})
+      def test_regular_package_with_no_file_and_path_list_is_migrated(self):
+          """
+          Regular package with no __file__ but __path__ is a list should be treated as migrated.
+          (Supports frozen environments.)
+          """
+          module_name = 'fakepkg.migrations'
+          tempdir = tempfile.mkdtemp()
+          try:
+              # Create a package path list (regular package)
+              module = self._make_module(module_name, file_attr=None, path_attr=[tempdir])
+              original = _install_fake_app_config([MockAppConfig('testapp')])
+              try:
+                  loader = MigrationLoader(connection=None, load=False)
+                  # Run load_disk directly
+                  loader.load_disk()
+                  # Should be considered migrated (regular package with list path)
+                  self.assertIn('testapp', loader.migrated_apps)
+                  self.assertNotIn('testapp', loader.unmigrated_apps)
+              finally:
+                  _restore_app_configs(original)
+          finally:
+              _cleanup_module(module_name, tempdir)
+  
+      @override_settings(MIGRATION_MODULES={'testapp': 'fakepkg.migrations'})
+      def test_namespace_package_with_no_file_and_custom_path_is_unmigrated(self):
+          """
+          Namespace package (no __file__ and __path__ is not a list) should be ignored.
+          """
+          module_name = 'fakepkg.migrations'
+          # Custom path object that is not a list
+          class CustomPath:
+              def __iter__(self):
+                  yield '/does/not/exist'
+          path_obj = CustomPath()
+          module = self._make_module(module_name, file_attr=None, path_attr=path_obj)
+          original = _install_fake_app_config([MockAppConfig('testapp')])
+          try:
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              self.assertIn('testapp', loader.unmigrated_apps)
+              self.assertNotIn('testapp', loader.migrated_apps)
+          finally:
+              _restore_app_configs(original)
+              _cleanup_module(module_name)
+  
+      @override_settings(MIGRATION_MODULES={'testapp': 'fakepkg.migrations'})
+      def test_module_file_without_path_is_unmigrated(self):
+          """
+          migrations module implemented as a file (no __path__) should be ignored.
+          """
+          module_name = 'fakepkg.migrations'
+          module = self._make_module(module_name, file_attr='/some/file.py', path_attr=None)
+          original = _install_fake_app_config([MockAppConfig('testapp')])
+          try:
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              self.assertIn('testapp', loader.unmigrated_apps)
+              self.assertNotIn('testapp', loader.migrated_apps)
+          finally:
+              _restore_app_configs(original)
+              _cleanup_module(module_name)
+  
+      @override_settings(MIGRATION_MODULES={'testapp': 'fakepkg.migrations'})
+      def test_no_path_and_no_file_is_unmigrated(self):
+          """
+          A module with neither __file__ nor __path__ should be treated as unmigrated.
+          """
+          module_name = 'fakepkg.migrations'
+          # Create module with neither attribute
+          module = types.ModuleType(module_name)
+          module.__spec__ = types.SimpleNamespace(origin=None, has_location=False)
+          sys.modules[module_name] = module
+          original = _install_fake_app_config([MockAppConfig('testapp')])
+          try:
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              self.assertIn('testapp', loader.unmigrated_apps)
+              self.assertNotIn('testapp', loader.migrated_apps)
+          finally:
+              _restore_app_configs(original)
+              _cleanup_module(module_name)
+  
+      @override_settings(MIGRATION_MODULES={'testapp': 'fakepkg.migrations'})
+      def test_path_tuple_and_no_file_is_unmigrated(self):
+          """
+          __path__ as a tuple and __file__ missing should be considered a namespace (unmigrated).
+          """
+          module_name = 'fakepkg.migrations'
+          tempdir = tempfile.mkdtemp()
+          try:
+              # Use a tuple for __path__ (not a list)
+              module = self._make_module(module_name, file_attr=None, path_attr=(tempdir,))
+              original = _install_fake_app_config([MockAppConfig('testapp')])
+              try:
+                  loader = MigrationLoader(connection=None, load=False)
+                  loader.load_disk()
+                  self.assertIn('testapp', loader.unmigrated_apps)
+                  self.assertNotIn('testapp', loader.migrated_apps)
+              finally:
+                  _restore_app_configs(original)
+          finally:
+              _cleanup_module(module_name, tempdir)
+  
+      @override_settings(MIGRATION_MODULES={'testapp': 'fakepkg.migrations'})
+      def test_path_tuple_but_file_present_is_migrated(self):
+          """
+          If __file__ is present, the module should be treated as a package even if __path__ is not a list.
+          """
+          module_name = 'fakepkg.migrations'
+          tempdir = tempfile.mkdtemp()
+          try:
+              module = self._make_module(module_name, file_attr='/some/file.py', path_attr=(tempdir,))
+              original = _install_fake_app_config([MockAppConfig('testapp')])
+              try:
+                  loader = MigrationLoader(connection=None, load=False)
+                  loader.load_disk()
+                  # __file__ present -> treated as migrated package
+                  self.assertIn('testapp', loader.migrated_apps)
+                  self.assertNotIn('testapp', loader.unmigrated_apps)
+              finally:
+                  _restore_app_configs(original)
+          finally:
+              _cleanup_module(module_name, tempdir)
+  
+      @override_settings(MIGRATION_MODULES={'testapp': 'fakepkg.migrations'})
+      def test_custom_path_object_but_file_present_is_migrated(self):
+          """
+          Custom __path__ object (not a list) but with __file__ present should be treated as migrated.
+          """
+          module_name = 'fakepkg.migrations'
+          class CustomPath(list):
+              pass
+          tempdir = tempfile.mkdtemp()
+          try:
+              # Use a subclass of list to simulate non-plain-list but isinstance(..., list) should be True.
+              path_obj = CustomPath([tempdir])
+              module = self._make_module(module_name, file_attr='/some/file.py', path_attr=path_obj)
+              original = _install_fake_app_config([MockAppConfig('testapp')])
+              try:
+                  loader = MigrationLoader(connection=None, load=False)
+                  loader.load_disk()
+                  self.assertIn('testapp', loader.migrated_apps)
+                  self.assertNotIn('testapp', loader.unmigrated_apps)
+              finally:
+                  _restore_app_configs(original)
+          finally:
+              _cleanup_module(module_name, tempdir)
+  
+      @override_settings(MIGRATION_MODULES={'testapp': 'fakepkg.migrations'})
+      def test_was_loaded_triggers_reload_and_marks_migrated_for_list_path(self):
+          """
+          If the module was already in sys.modules, MigrationLoader should reload it
+          and still treat a list __path__ with missing __file__ as migrated.
+          """
+          module_name = 'fakepkg.migrations'
+          tempdir = tempfile.mkdtemp()
+          try:
+              module = self._make_module(module_name, file_attr=None, path_attr=[tempdir])
+              # Ensure module is considered 'was_loaded' by having it in sys.modules (already is),
+              # and patch importlib.reload to record invocation.
+              import importlib
+              original_reload = importlib.reload
+              called = {}
+              def fake_reload(m):
+                  called['reloaded'] = True
+                  return original_reload(m)
+              importlib.reload = fake_reload
+              original = _install_fake_app_config([MockAppConfig('testapp')])
+              try:
+                  loader = MigrationLoader(connection=None, load=True)
+                  # If suite reached here, it did not raise and migration app was marked migrated.
+                  self.assertIn('testapp', loader.migrated_apps)
+                  self.assertTrue(called.get('reloaded', False))
+              finally:
+                  importlib.reload = original_reload
+                  _restore_app_configs(original)
+          finally:
+              _cleanup_module(module_name, tempdir)
+  
+      @override_settings(MIGRATION_MODULES={'testapp': 'fakepkg.migrations'})
+      def test_pkgutil_iter_modules_not_called_for_unmigrated_namespace(self):
+          """
+          For a namespace package (no __file__ and non-list __path__), pkgutil.iter_modules
+          should not be called (loader should early-ignore the app).
+          """
+          module_name = 'fakepkg.migrations'
+          class CustomPath:
+              def __iter__(self):
+                  yield '/no/files'
+          module = self._make_module(module_name, file_attr=None, path_attr=CustomPath())
+          original = _install_fake_app_config([MockAppConfig('testapp')])
+          try:
+              # Patch pkgutil.iter_modules to raise if it is called for this object's path type.
+              original_iter = pkgutil.iter_modules
+              def fake_iter_modules(path):
+                  # If called with our custom object, fail the test.
+                  if isinstance(path, CustomPath):
+                      raise AssertionError("pkgutil.iter_modules was called for a namespace package")
+                  return original_iter(path)
+              pkgutil.iter_modules = fake_iter_modules
+              try:
+                  loader = MigrationLoader(connection=None, load=False)
+                  loader.load_disk()  # Should not trigger fake_iter_modules for CustomPath
+                  self.assertIn('testapp', loader.unmigrated_apps)
+              finally:
+                  pkgutil.iter_modules = original_iter
+          finally:
+              _restore_app_configs(original)
+              _cleanup_module(module_name)
+new_imports_code: |
+  import types
+  import tempfile
+  import shutil
+  import pkgutil
+  from importlib import reload

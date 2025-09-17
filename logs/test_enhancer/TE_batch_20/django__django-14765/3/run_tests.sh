@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_state_llm.ProjectStateRealAppsTests.test_real_apps_accepts_set_and_resolves migrations.test_state_llm.ProjectStateRealAppsTests.test_real_apps_dict_raises_no_message migrations.test_state_llm.ProjectStateRealAppsTests.test_real_apps_empty_set_is_accepted migrations.test_state_llm.ProjectStateRealAppsTests.test_real_apps_frozenset_raises_no_message migrations.test_state_llm.ProjectStateRealAppsTests.test_real_apps_generator_raises_no_message migrations.test_state_llm.ProjectStateRealAppsTests.test_real_apps_mutation_reflected migrations.test_state_llm.ProjectStateRealAppsTests.test_real_apps_non_set_list_raises_no_message migrations.test_state_llm.ProjectStateRealAppsTests.test_real_apps_non_set_tuple_raises_no_message migrations.test_state_llm.ProjectStateRealAppsTests.test_real_apps_none_defaults_to_empty_set migrations.test_state_llm.ProjectStateRealAppsTests.test_real_apps_subclass_of_set_is_accepted
+coverage json -o coverage.json
+: '>>>>> End Test Output'

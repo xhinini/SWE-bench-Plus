@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.tests_llm.TransactionAtomicDBAliasTests._base_post_data admin_changelist.tests_llm.TransactionAtomicDBAliasTests._post_swallow_changelist admin_changelist.tests_llm.TransactionAtomicDBAliasTests.setUp admin_changelist.tests_llm.TransactionAtomicDBAliasTests.test_atomic_called_even_when_no_forms_changed admin_changelist.tests_llm.TransactionAtomicDBAliasTests.test_atomic_called_multiple_changed_forms admin_changelist.tests_llm.TransactionAtomicDBAliasTests.test_atomic_called_when_log_change_raises_first admin_changelist.tests_llm.TransactionAtomicDBAliasTests.test_atomic_called_when_log_change_raises_second admin_changelist.tests_llm.TransactionAtomicDBAliasTests.test_atomic_called_when_router_returns_none admin_changelist.tests_llm.TransactionAtomicDBAliasTests.test_atomic_called_with_db_for_write_after_multiple_posts admin_changelist.tests_llm.TransactionAtomicDBAliasTests.test_atomic_called_with_ordering_param_present admin_changelist.tests_llm.TransactionAtomicDBAliasTests.test_atomic_called_with_router_db_for_write_default admin_changelist.tests_llm.TransactionAtomicDBAliasTests.test_atomic_called_with_router_db_for_write_non_default
+coverage json -o coverage.json
+: '>>>>> End Test Output'

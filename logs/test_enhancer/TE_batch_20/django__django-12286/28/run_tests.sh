@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 check_framework.test_translation_llm.TranslationConsistentChecksRegressionTests._assert_consistent_returns_empty check_framework.test_translation_llm.TranslationConsistentChecksRegressionTests._assert_consistent_returns_error check_framework.test_translation_llm.TranslationConsistentChecksRegressionTests._patch_trans_real_without_variant check_framework.test_translation_llm.TranslationConsistentChecksRegressionTests.test_en_supported_base check_framework.test_translation_llm.TranslationConsistentChecksRegressionTests.test_en_us_supported_case_insensitive check_framework.test_translation_llm.TranslationConsistentChecksRegressionTests.test_en_us_supported_with_base_en check_framework.test_translation_llm.TranslationConsistentChecksRegressionTests.test_es_419_supported_with_base_es check_framework.test_translation_llm.TranslationConsistentChecksRegressionTests.test_exact_variant_in_languages check_framework.test_translation_llm.TranslationConsistentChecksRegressionTests.test_fr_ca_supported_with_base_fr check_framework.test_translation_llm.TranslationConsistentChecksRegressionTests.test_fr_not_supported_returns_error check_framework.test_translation_llm.TranslationConsistentChecksRegressionTests.test_pt_br_not_supported_when_only_pt_pt_present check_framework.test_translation_llm.TranslationConsistentChecksRegressionTests.test_region_case_variation check_framework.test_translation_llm.TranslationConsistentChecksRegressionTests.test_zh_hans_supported_script_with_base_zh
+coverage json -o coverage.json
+: '>>>>> End Test Output'

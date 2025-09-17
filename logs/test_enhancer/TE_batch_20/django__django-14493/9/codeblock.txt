@@ -1,0 +1,194 @@
+from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
+import os
+import shutil
+import tempfile
+import unittest
+from io import BytesIO
+
+from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
+from django.core.files.base import ContentFile
+
+
+class PostProcessMaxPassesZeroTests(unittest.TestCase):
+    def setUp(self):
+        # Create a temporary directory for each test to act as STATIC_ROOT
+        self.temp_dir = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.temp_dir)
+
+    def _make_storage_and_paths(self, files):
+        """
+        Helper to create files in the temp dir, instantiate a ManifestStaticFilesStorage
+        pointed to that directory, set max_post_process_passes to 0, and build the
+        expected `paths` mapping for post_process.
+
+        `files` is a dict mapping relative name -> bytes content.
+        """
+        for name, content in files.items():
+            full_path = os.path.join(self.temp_dir, name)
+            os.makedirs(os.path.dirname(full_path), exist_ok=True)
+            # Write bytes
+            with open(full_path, 'wb') as f:
+                f.write(content)
+        storage = ManifestStaticFilesStorage(location=self.temp_dir, base_url='/static/')
+        # The bug occurs when this is zero (for-loop skipped and substitutions would be undefined)
+        storage.max_post_process_passes = 0
+        paths = {name: (storage, name) for name in files.keys()}
+        return storage, paths
+
+    def _run_post_process(self, storage, paths):
+        """
+        Run post_process and collect results while making sure no UnboundLocalError
+        (or other unexpected error) occurs.
+        """
+        # post_process returns a generator; convert to list to execute the logic
+        results = list(storage.post_process(paths, dry_run=False))
+        return results
+
+    def test_no_adjustable_files_only_image(self):
+        # Only a binary file (not adjustable by patterns) should be processed.
+        storage, paths = self._make_storage_and_paths({
+            'image.png': b'binaryimagecontent',
+        })
+        results = self._run_post_process(storage, paths)
+        # Ensure the file was processed (yielded) and a hashed entry was recorded.
+        self.assertTrue(any(name == 'image.png' for name, _, _ in results))
+        self.assertIn('image.png', storage.hashed_files)
+        # The saved hashed file should exist on disk.
+        hashed_name = storage.hashed_files[storage.hash_key('image.png')]
+        self.assertTrue(storage.exists(hashed_name))
+
+    def test_single_css_adjustable_references_image(self):
+        # CSS referencing an image should be adjusted and saved as a hashed file.
+        storage, paths = self._make_storage_and_paths({
+            'image.png': b'img',
+            'styles.css': b'body { background: url("image.png"); }',
+        })
+        results = self._run_post_process(storage, paths)
+        # Find the processed CSS entry
+        css_result = next((r for r in results if r[0] == 'styles.css'), None)
+        self.assertIsNotNone(css_result, "styles.css was not yielded from post_process")
+        _, hashed_css, processed = css_result
+        self.assertTrue(processed)
+        self.assertTrue(storage.exists(hashed_css))
+        # Content of processed CSS should reference a hashed image filename
+        with storage.open(hashed_css) as fh:
+            content = fh.read()
+        self.assertIn(b'image.', content)
+        self.assertIn(b'.png', content)
+
+    def test_nested_css_relative_image(self):
+        # CSS in nested directory referencing a relative image
+        storage, paths = self._make_storage_and_paths({
+            'css/main.css': b'body { background: url("../img/pic.png"); }',
+            'img/pic.png': b'picdata',
+        })
+        results = self._run_post_process(storage, paths)
+        main = next((r for r in results if r[0] == 'css/main.css'), None)
+        self.assertIsNotNone(main)
+        _, hashed_main, processed = main
+        self.assertTrue(processed)
+        self.assertTrue(storage.exists(hashed_main))
+        with storage.open(hashed_main) as fh:
+            content = fh.read()
+        # Should reference a hashed version of pic.png
+        self.assertIn(b'pic.', content)
+        self.assertIn(b'.png', content)
+
+    def test_absolute_static_reference_in_css(self):
+        # CSS referencing an absolute STATIC_URL path should be handled.
+        storage, paths = self._make_storage_and_paths({
+            'css/abs.css': b'body { background: url("/static/img/abs.png"); }',
+            'img/abs.png': b'absdata',
+        })
+        results = self._run_post_process(storage, paths)
+        abs_css = next((r for r in results if r[0] == 'css/abs.css'), None)
+        self.assertIsNotNone(abs_css)
+        _, hashed_abs_css, processed = abs_css
+        self.assertTrue(processed)
+        self.assertTrue(storage.exists(hashed_abs_css))
+        with storage.open(hashed_abs_css) as fh:
+            content = fh.read()
+        # Absolute reference should be rewritten to hashed filename under STATIC_URL
+        self.assertIn(b'/static/', content)
+        self.assertIn(b'.png', content)
+
+    def test_js_module_imports_updated(self):
+        # JS file that imports another JS module (relative import)
+        storage, paths = self._make_storage_and_paths({
+            'js/module.js': b'export const x = 1;',
+            'js/main.js': b'import x from "./module.js"; console.log(x);',
+        })
+        results = self._run_post_process(storage, paths)
+        main = next((r for r in results if r[0] == 'js/main.js'), None)
+        self.assertIsNotNone(main)
+        _, hashed_main, processed = main
+        self.assertTrue(processed)
+        self.assertTrue(storage.exists(hashed_main))
+        with storage.open(hashed_main) as fh:
+            content = fh.read()
+        # The import should reference a hashed module filename
+        self.assertIn(b'module.', content)
+        self.assertIn(b'.js', content)
+
+    def test_multiple_adjustable_files_interdependent(self):
+        # Two CSS files referencing each other and an image - exercise multiple passes (but max_passes=0)
+        storage, paths = self._make_storage_and_paths({
+            'a.css': b'@import "b.css"; url("img.png")',
+            'b.css': b'@import "a.css";',
+            'img.png': b'imgdata',
+        })
+        results = self._run_post_process(storage, paths)
+        # Both CSS files should be present in results and processed without error
+        self.assertTrue(any(r[0] == 'a.css' for r in results))
+        self.assertTrue(any(r[0] == 'b.css' for r in results))
+        # Check hashed files exist for css entries
+        for entry in results:
+            name, hashed_name, _ = entry
+            # only check existence for files that were saved (hashed_name may be None for errors)
+            if hashed_name:
+                self.assertTrue(storage.exists(hashed_name))
+
+    def test_font_face_with_fragment(self):
+        # font-face with the '?#iefix' fragment special-case
+        storage, paths = self._make_storage_and_paths({
+            'fonts/font.eot': b'fontdata',
+            'css/font.css': b'@font-face { src: url("../fonts/font.eot?#iefix"); }',
+        })
+        results = self._run_post_process(storage, paths)
+        font_css = next((r for r in results if r[0] == 'css/font.css'), None)
+        self.assertIsNotNone(font_css)
+        _, hashed_font_css, processed = font_css
+        self.assertTrue(processed)
+        self.assertTrue(storage.exists(hashed_font_css))
+        with storage.open(hashed_font_css) as fh:
+            content = fh.read()
+        # The special ?# fragment should be preserved or indicated as per storage logic
+        self.assertIn(b'font.', content)
+        self.assertIn(b'.eot', content)
+
+    def test_file_with_query_like_name(self):
+        # File name that might look like a query shouldn't break processing
+        storage, paths = self._make_storage_and_paths({
+            'weird/file?name.css': b'body { color: red; }',
+        })
+        # The post_process API expects keys to be paths; simulate that unusual name
+        # by passing the same mapping - ensure no UnboundLocalError happens.
+        results = self._run_post_process(storage, paths)
+        self.assertTrue(any(r[0] == 'weird/file?name.css' for r in results))
+        # Hashed files map should contain the key according to storage.hash_key
+        self.assertIn(storage.hash_key('weird/file?name.css'), storage.hashed_files)
+
+    def test_large_number_of_small_files(self):
+        # Many small non-adjustable files - ensure loop with max_passes=0 finishes
+        files = {'f%d.txt' % i: b'content-%d' % i for i in range(20)}
+        storage, paths = self._make_storage_and_paths(files)
+        results = self._run_post_process(storage, paths)
+        # All original names should appear in the results
+        result_names = {r[0] for r in results}
+        self.assertTrue(set(files.keys()).issubset(result_names))
+        # Confirm hashed files exist for a sample
+        sample_hashed = storage.hashed_files.get(storage.hash_key('f0.txt'))
+        self.assertIsNotNone(sample_hashed)
+        self.assertTrue(storage.exists(sample_hashed))

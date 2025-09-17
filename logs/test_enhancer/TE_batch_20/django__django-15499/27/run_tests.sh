@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_optimizer_llm.ExtraOptimizerManagersTests.assertDoesNotOptimize migrations.test_optimizer_llm.ExtraOptimizerManagersTests.assertOptimizesTo migrations.test_optimizer_llm.ExtraOptimizerManagersTests.optimize migrations.test_optimizer_llm.ExtraOptimizerManagersTests.serialize migrations.test_optimizer_llm.ExtraOptimizerManagersTests.test_create_addfield_then_alter_managers migrations.test_optimizer_llm.ExtraOptimizerManagersTests.test_create_alter_managers_then_addfield migrations.test_optimizer_llm.ExtraOptimizerManagersTests.test_create_remove_field_and_alter_managers migrations.test_optimizer_llm.ExtraOptimizerManagersTests.test_create_rename_model_and_alter_managers migrations.test_optimizer_llm.ExtraOptimizerManagersTests.test_create_then_alter_managers_immediate migrations.test_optimizer_llm.ExtraOptimizerManagersTests.test_create_with_intervening_elidable_optimizes migrations.test_optimizer_llm.ExtraOptimizerManagersTests.test_create_with_options_and_alter_managers migrations.test_optimizer_llm.ExtraOptimizerManagersTests.test_managers_order_preserved migrations.test_optimizer_llm.ExtraOptimizerManagersTests.test_multiple_alter_managers_following_create
+coverage json -o coverage.json
+: '>>>>> End Test Output'

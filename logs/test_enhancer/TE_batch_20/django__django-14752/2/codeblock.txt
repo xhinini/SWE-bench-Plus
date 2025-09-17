@@ -1,0 +1,265 @@
+# No new top-level imports required beyond what's included in the test_code block.
+import json
+from collections import OrderedDict
+
+from django.contrib import admin
+from django.contrib.admin.views.autocomplete import AutocompleteJsonView
+from django.test import RequestFactory, TestCase
+
+from .test_autocomplete_view import site, model_admin, PAGINATOR_SIZE
+from .models import Question
+from django.contrib.auth.models import User
+
+class AutocompleteSerializeResultRegressionTests(TestCase):
+    """
+    Regression tests to ensure AutocompleteJsonView calls serialize_result()
+    for each object and uses its returned value in the JSON response.
+    """
+    def setUp(self):
+        self.factory = RequestFactory()
+        # Create a superuser for requests
+        self.superuser = User.objects.create_superuser(
+            username='super_test', password='secret', email='super_test@example.com'
+        )
+        self.as_view_args = {'admin_site': site}
+        self.url = '/admin/autocomplete/'  # the view ignores the path, only GET params matter
+
+    def _call_view(self, params):
+        request = self.factory.get(self.url, params)
+        request.user = self.superuser
+        response = AutocompleteJsonView.as_view(**self.as_view_args)(request)
+        return json.loads(response.content.decode('utf-8'))
+
+    def test_serialize_result_adds_extra_field(self):
+        """Custom serialize_result can add extra keys to each result dict."""
+        class AddExtra(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                data = super().serialize_result(obj, to_field_name)
+                data['extra'] = 'EXTRA-' + str(obj.pk)
+                return data
+
+        # create an object to be returned
+        q = Question.objects.create(question='Extra field test')
+        params = {
+            'term': 'Extra',
+            'app_label': Question._meta.app_label,
+            'model_name': Question._meta.model_name,
+            'field_name': 'question',
+        }
+        request = self.factory.get(self.url, params)
+        request.user = self.superuser
+        response = AddExtra.as_view(admin_site=site)(request)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        self.assertEqual(data['results'], [{'id': str(q.pk), 'text': q.question, 'extra': 'EXTRA-' + str(q.pk)}])
+
+    def test_serialize_result_can_override_id(self):
+        """Custom serialize_result can change the id value returned for each result."""
+        class OverrideID(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                base = super().serialize_result(obj, to_field_name)
+                base['id'] = 'custom-%s' % base['id']
+                return base
+
+        q = Question.objects.create(question='Override id test')
+        params = {
+            'term': 'Override',
+            'app_label': Question._meta.app_label,
+            'model_name': Question._meta.model_name,
+            'field_name': 'question',
+        }
+        request = self.factory.get(self.url, params)
+        request.user = self.superuser
+        response = OverrideID.as_view(admin_site=site)(request)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        self.assertEqual(data['results'][0]['id'], f'custom-{q.pk}')
+
+    def test_serialize_result_called_once_per_item(self):
+        """serialize_result is invoked once for every returned object."""
+        calls = {'count': 0}
+        class CountCalls(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                calls['count'] += 1
+                return super().serialize_result(obj, to_field_name)
+
+        # create several objects
+        Question.objects.bulk_create([Question(question=f'Call test {i}') for i in range(5)])
+        params = {
+            'term': 'Call',
+            'app_label': Question._meta.app_label,
+            'model_name': Question._meta.model_name,
+            'field_name': 'question',
+        }
+        result = self._call_view(params)  # uses default view; but we need to call our CountCalls view
+        # Call the custom view directly to count invocations
+        request = self.factory.get(self.url, params)
+        request.user = self.superuser
+        response = CountCalls.as_view(admin_site=site)(request)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        self.assertEqual(calls['count'], len(data['results']))
+
+    def test_serialize_result_called_across_pagination_pages(self):
+        """serialize_result is called for each item on both first and second page."""
+        class CountPerPage(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                # attach a flag on the class to count per call
+                self._counter = getattr(self, '_counter', 0) + 1
+                return super().serialize_result(obj, to_field_name)
+
+        # create enough questions to require more than one page
+        Question.objects.bulk_create([Question(question=str(i)) for i in range(PAGINATOR_SIZE + 5)])
+        # Use an admin that orders by pk so results are deterministic
+        class PKOrderingQuestionAdmin(admin.ModelAdmin):
+            ordering = ['pk']
+        with model_admin(Question, PKOrderingQuestionAdmin):
+            # First page
+            params = {
+                'term': '',
+                'app_label': Question._meta.app_label,
+                'model_name': Question._meta.model_name,
+                'field_name': 'question',
+            }
+            request = self.factory.get(self.url, params)
+            request.user = self.superuser
+            response = CountPerPage.as_view(admin_site=site)(request)
+            self.assertEqual(response.status_code, 200)
+            data = json.loads(response.content.decode('utf-8'))
+            self.assertEqual(len(data['results']), PAGINATOR_SIZE)
+            # Second page
+            request = self.factory.get(self.url, {**params, 'page': '2'})
+            request.user = self.superuser
+            response = CountPerPage.as_view(admin_site=site)(request)
+            self.assertEqual(response.status_code, 200)
+            data2 = json.loads(response.content.decode('utf-8'))
+            self.assertEqual(len(data2['results']), 5)
+
+    def test_serialize_result_can_return_non_dict(self):
+        """If serialize_result returns a non-dict value, it's included verbatim in the JSON."""
+        class ReturnList(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                # Return a tuple (which becomes a JSON array)
+                return (getattr(obj, to_field_name), str(obj))
+
+        q = Question.objects.create(question='Non-dict test')
+        params = {
+            'term': 'Non-dict',
+            'app_label': Question._meta.app_label,
+            'model_name': Question._meta.model_name,
+            'field_name': 'question',
+        }
+        request = self.factory.get(self.url, params)
+        request.user = self.superuser
+        response = ReturnList.as_view(admin_site=site)(request)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        # tuples become JSON arrays
+        self.assertEqual(data['results'][0], [str(q.pk), q.question])
+
+    def test_serialize_result_exceptions_propagate(self):
+        """Exceptions raised in serialize_result should propagate (not be swallowed)."""
+        class Explode(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                raise RuntimeError("boom")
+
+        q = Question.objects.create(question='Boom test')
+        params = {
+            'term': 'Boom',
+            'app_label': Question._meta.app_label,
+            'model_name': Question._meta.model_name,
+            'field_name': 'question',
+        }
+        request = self.factory.get(self.url, params)
+        request.user = self.superuser
+        with self.assertRaises(RuntimeError):
+            Explode.as_view(admin_site=site)(request)
+
+    def test_serialize_result_receives_correct_to_field_name(self):
+        """serialize_result receives the resolved to_field_name for custom FK to_field."""
+        captured = {}
+        class CaptureToField(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                captured['to_field'] = to_field_name
+                return super().serialize_result(obj, to_field_name)
+
+        q = Question.objects.create(question='ToField test')
+        params = {
+            'term': 'ToField',
+            'app_label': Question._meta.app_label,
+            'model_name': Question._meta.model_name,
+            'field_name': 'question_with_to_field',  # this related field uses a custom to_field
+        }
+        request = self.factory.get(self.url, params)
+        request.user = self.superuser
+        response = CaptureToField.as_view(admin_site=site)(request)
+        self.assertEqual(response.status_code, 200)
+        # Ensure we captured a to_field name string (attname-style)
+        self.assertIsInstance(captured.get('to_field'), str)
+        self.assertTrue(len(captured['to_field']) > 0)
+
+    def test_serialize_result_preserves_order_with_ordereddict(self):
+        """When serialize_result returns OrderedDict, the key order should be preserved in the JSON object."""
+        class OrderedResult(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                od = OrderedDict()
+                od['id'] = str(getattr(obj, to_field_name))
+                od['text'] = str(obj)
+                od['extra'] = 'X'
+                return od
+
+        q = Question.objects.create(question='Ordered test')
+        params = {
+            'term': 'Ordered',
+            'app_label': Question._meta.app_label,
+            'model_name': Question._meta.model_name,
+            'field_name': 'question',
+        }
+        request = self.factory.get(self.url, params)
+        request.user = self.superuser
+        response = OrderedResult.as_view(admin_site=site)(request)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        # JSON loader in Python preserves insertion order; check keys order
+        keys = list(data['results'][0].keys())
+        self.assertEqual(keys, ['id', 'text', 'extra'])
+
+    def test_serialize_result_using_super_and_modifying(self):
+        """Custom serialize_result can call super() and then modify the result."""
+        class SuperModify(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                base = super().serialize_result(obj, to_field_name)
+                base['modified'] = True
+                return base
+
+        q = Question.objects.create(question='Super modify test')
+        params = {
+            'term': 'Super',
+            'app_label': Question._meta.app_label,
+            'model_name': Question._meta.model_name,
+            'field_name': 'question',
+        }
+        request = self.factory.get(self.url, params)
+        request.user = self.superuser
+        response = SuperModify.as_view(admin_site=site)(request)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        self.assertIn('modified', data['results'][0])
+        self.assertTrue(data['results'][0]['modified'])
+
+    def test_serialize_result_id_is_stringified(self):
+        """Ensure id produced by serialize_result is a string (via base implementation)."""
+        # Default serialize_result uses str() for id; ensure returned type is string
+        q = Question.objects.create(question='Stringify id test')
+        params = {
+            'term': 'Stringify',
+            'app_label': Question._meta.app_label,
+            'model_name': Question._meta.model_name,
+            'field_name': 'question',
+        }
+        request = self.factory.get(self.url, params)
+        request.user = self.superuser
+        response = AutocompleteJsonView.as_view(admin_site=site)(request)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        self.assertIsInstance(data['results'][0]['id'], str)

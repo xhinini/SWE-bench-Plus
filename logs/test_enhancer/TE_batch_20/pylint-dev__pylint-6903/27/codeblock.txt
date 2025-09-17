@@ -1,0 +1,203 @@
+import io
+import types
+# Licensed under the GPL: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+# For details: https://github.com/PyCQA/pylint/blob/main/LICENSE
+# Copyright (c) https://github.com/PyCQA/pylint/blob/main/CONTRIBUTORS.txt
+# pylint: disable=missing-module-docstring, missing-function-docstring, protected-access
+import builtins
+import io
+import os
+import types
+from unittest.mock import patch
+
+import pytest
+
+from pylint.lint import run as run_module
+
+def _make_open_mock(file_contents):
+    """Return a mock open that serves contents for specified paths and delegates otherwise."""
+    real_open = builtins.open
+
+    def _mock_open(file, *args, **kwargs):
+        # Accept Path objects as well
+        fname = file if isinstance(file, str) else str(file)
+        if fname in file_contents:
+            # StringIO supports the file read() and .readline() usage
+            return io.StringIO(file_contents[fname])
+        return real_open(file, *args, **kwargs)
+
+    return _mock_open
+
+class _FakePath:
+    """Fake Path that reports existence based on provided mapping."""
+    def __init__(self, path, exists_map):
+        self._path = path
+        self._exists_map = exists_map
+
+    def is_file(self):
+        return self._path in self._exists_map and self._exists_map[self._path]
+
+    def __fspath__(self):
+        return self._path
+
+def _patch_paths(monkeypatch, exists_map):
+    """Patch run_module.Path to a factory returning _FakePath instances checking exists_map."""
+    def _factory(path):
+        return _FakePath(path, exists_map)
+    monkeypatch.setattr(run_module, "Path", _factory)
+
+def _patch_open(monkeypatch, file_contents):
+    monkeypatch.setattr(builtins, "open", _make_open_mock(file_contents))
+
+# 1) Quota/period that yields fractional < 1 should produce 1 (quota smaller than period).
+def test_query_cpu_quota_fractional_zero(monkeypatch):
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "50000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    exists_map = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": True,
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": True,
+    }
+    _patch_open(monkeypatch, file_contents)
+    _patch_paths(monkeypatch, exists_map)
+    assert run_module._query_cpu() == 1
+
+# 2) Quota/period that yields exactly 1
+def test_query_cpu_quota_one(monkeypatch):
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "100000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    exists_map = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": True,
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": True,
+    }
+    _patch_open(monkeypatch, file_contents)
+    _patch_paths(monkeypatch, exists_map)
+    assert run_module._query_cpu() == 1
+
+# 3) cpu.shares small value (below 1024) should yield 1
+def test_query_cpu_shares_small(monkeypatch):
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.shares": "2\n",
+    }
+    exists_map = {
+        "/sys/fs/cgroup/cpu/cpu.shares": True,
+    }
+    _patch_open(monkeypatch, file_contents)
+    _patch_paths(monkeypatch, exists_map)
+    assert run_module._query_cpu() == 1
+
+# 4) cpu.shares large value -> multiple CPUs
+def test_query_cpu_shares_large(monkeypatch):
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.shares": "3072\n",
+    }
+    exists_map = {
+        "/sys/fs/cgroup/cpu/cpu.shares": True,
+    }
+    _patch_open(monkeypatch, file_contents)
+    _patch_paths(monkeypatch, exists_map)
+    assert run_module._query_cpu() == 3
+
+# 5) Quota == -1 (ignored) and small shares -> fallback to shares -> 1
+def test_query_cpu_quota_negative_then_shares(monkeypatch):
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",
+        "/sys/fs/cgroup/cpu/cpu.shares": "2\n",
+    }
+    exists_map = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": True,
+        "/sys/fs/cgroup/cpu/cpu.shares": True,
+    }
+    _patch_open(monkeypatch, file_contents)
+    _patch_paths(monkeypatch, exists_map)
+    assert run_module._query_cpu() == 1
+
+# Helper to test _cpu_count under different system facilities
+def _run_cpu_count_with_files(monkeypatch, file_contents, exists_map, sched_affinity=None, multiprocessing_obj=None):
+    # Patch file system
+    _patch_open(monkeypatch, file_contents)
+    _patch_paths(monkeypatch, exists_map)
+    # Patch sched_getaffinity on os if requested
+    if sched_affinity is not None:
+        monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(sched_affinity)))
+    else:
+        # Ensure attribute is absent to test multiprocessing branch
+        if hasattr(os, "sched_getaffinity"):
+            monkeypatch.delattr(os, "sched_getaffinity")
+    # Patch the run_module multiprocessing reference
+    monkeypatch.setattr(run_module, "multiprocessing", multiprocessing_obj)
+    return run_module._cpu_count()
+
+# 6) If quota/period yields 0 and sched_getaffinity exists, _cpu_count must be >= 1
+def test_cpu_count_with_sched_getaffinity_and_quota_zero(monkeypatch):
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "50000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    exists_map = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": True,
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": True,
+    }
+    result = _run_cpu_count_with_files(monkeypatch, file_contents, exists_map, sched_affinity=4, multiprocessing_obj=None)
+    # Should never be 0; with sched affinity of 4 the returned count must be min(1,4)=1
+    assert result >= 1
+
+# 7) If quota/period yields 0 and multiprocessing is used, _cpu_count must be >= 1
+def test_cpu_count_with_multiprocessing_and_quota_zero(monkeypatch):
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "50000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    exists_map = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": True,
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": True,
+    }
+    # Create fake multiprocessing with cpu_count=8
+    fake_mp = types.SimpleNamespace(cpu_count=lambda: 8)
+    result = _run_cpu_count_with_files(monkeypatch, file_contents, exists_map, sched_affinity=None, multiprocessing_obj=fake_mp)
+    # Should be min(1,8) == 1
+    assert result >= 1
+
+# 8) If quota/period yields 0 and neither sched_getaffinity nor multiprocessing is present, _cpu_count must be 1
+def test_cpu_count_no_multiprocessing_and_quota_zero(monkeypatch):
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "50000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    exists_map = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": True,
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": True,
+    }
+    result = _run_cpu_count_with_files(monkeypatch, file_contents, exists_map, sched_affinity=None, multiprocessing_obj=None)
+    assert result == 1
+
+# 9) When no cgroup files exist _query_cpu returns None and _cpu_count falls back to multiprocessing.cpu_count
+def test_query_cpu_no_files_fallback_to_multiprocessing(monkeypatch):
+    file_contents = {}
+    exists_map = {}
+    fake_mp = types.SimpleNamespace(cpu_count=lambda: 5)
+    monkeypatch.setattr(run_module, "multiprocessing", fake_mp)
+    _patch_open(monkeypatch, file_contents)
+    _patch_paths(monkeypatch, exists_map)
+    assert run_module._query_cpu() is None
+    # Now _cpu_count should return multiprocessing value since sched_getaffinity absent
+    if hasattr(os, "sched_getaffinity"):
+        monkeypatch.delattr(os, "sched_getaffinity")
+    assert run_module._cpu_count() == 5
+
+# 10) Quota/period explicit zero string should be treated as 1
+def test_query_cpu_quota_zero_string(monkeypatch):
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "0\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    exists_map = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": True,
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": True,
+    }
+    _patch_open(monkeypatch, file_contents)
+    _patch_paths(monkeypatch, exists_map)
+    assert run_module._query_cpu() == 1

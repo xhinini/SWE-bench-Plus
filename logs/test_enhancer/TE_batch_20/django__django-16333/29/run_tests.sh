@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.SaveM2MRegressionTests._make_hidden_save_m2m_form_class auth_tests.test_forms_llm.SaveM2MRegressionTests.test_hidden_save_m2m_does_not_affect_unicode_usernames auth_tests.test_forms_llm.SaveM2MRegressionTests.test_hidden_save_m2m_on_distinct_form_instances auth_tests.test_forms_llm.SaveM2MRegressionTests.test_multiple_saves_with_hidden_save_m2m_do_not_interfere auth_tests.test_forms_llm.SaveM2MRegressionTests.test_save_with_hidden_save_m2m_does_not_prevent_password_validators auth_tests.test_forms_llm.SaveM2MRegressionTests.test_save_with_hidden_save_m2m_does_not_raise_and_creates_user auth_tests.test_forms_llm.SaveM2MRegressionTests.test_save_with_hidden_save_m2m_for_form_with_m2m_field_does_not_raise auth_tests.test_forms_llm.SaveM2MRegressionTests.test_save_with_hidden_save_m2m_on_custom_model_without_m2m_field auth_tests.test_forms_llm.SaveM2MRegressionTests.test_save_with_hidden_save_m2m_sets_password_correctly
+coverage json -o coverage.json
+: '>>>>> End Test Output'

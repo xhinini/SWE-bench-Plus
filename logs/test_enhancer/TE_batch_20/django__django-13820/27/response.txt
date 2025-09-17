@@ -1,0 +1,192 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests exercise MigrationLoader.load_disk() handling of various combinations
+  of module attributes (__file__ present/absent and __path__ types). They assert
+  whether an app is considered migrated or unmigrated, and one test verifies that
+  an actual migration file in a package is discovered. These tests are designed
+  to catch regressions in the logic that determines whether a migrations module
+  is a package, a namespace package, or just a module file, particularly the
+  cases introduced/modified by the candidate/model patch.
+test_code: |
+  import sys
+  import os
+  import tempfile
+  import shutil
+  import importlib
+  from types import ModuleType, SimpleNamespace
+  from django.test import TestCase, override_settings
+  from django.apps import apps
+  from django.db.migrations.loader import MigrationLoader
+
+  class LoaderNamespaceAndFileTests(TestCase):
+      """
+      Tests around detection of migration packages vs modules vs namespace packages.
+      """
+
+      def _run_with_module(self, module_name, module_obj, app_label, explicit=False):
+          """
+          Helper to run load_disk with a single fake module.
+
+          - module_name: full module name returned by migrations_module (e.g. 'fake.migrations')
+          - module_obj: ModuleType instance to insert into sys.modules under module_name
+          - app_label: label used for the fake app_config
+          - explicit: boolean returned by MigrationLoader.migrations_module (whether MIGRATION_MODULES specified)
+          """
+          # Backup things to restore later
+          orig_get_app_configs = apps.get_app_configs
+          orig_migrations_module = MigrationLoader.migrations_module
+          inserted = module_name in sys.modules
+          orig_module = sys.modules.get(module_name)
+          try:
+              # Insert our fake module into sys.modules
+              sys.modules[module_name] = module_obj
+
+              # Monkeypatch apps.get_app_configs to return a single fake app config
+              apps.get_app_configs = lambda: [SimpleNamespace(label=app_label, name=app_label)]
+
+              # Monkeypatch MigrationLoader.migrations_module to return our module_name
+              MigrationLoader.migrations_module = classmethod(lambda cls, label: (module_name, explicit))
+
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+              return loader
+          finally:
+              # Restore everything
+              apps.get_app_configs = orig_get_app_configs
+              MigrationLoader.migrations_module = orig_migrations_module
+              if inserted:
+                  if orig_module is None:
+                      del sys.modules[module_name]
+                  else:
+                      sys.modules[module_name] = orig_module
+
+      def test_non_package_with_file_marked_unmigrated(self):
+          # A module (not a package) with a __file__ should be treated as unmigrated
+          module = ModuleType('fake1.migrations')
+          module.__file__ = '/nonexistent/fake1/migrations.py'
+          loader = self._run_with_module('fake1.migrations', module, app_label='fake1', explicit=False)
+          self.assertIn('fake1', loader.unmigrated_apps)
+          self.assertNotIn('fake1', loader.migrated_apps)
+
+      def test_non_package_without_file_marked_unmigrated(self):
+          # A module without __path__ and without __file__ should also be unmigrated
+          module = ModuleType('fake2.migrations')
+          # no __file__, no __path__
+          loader = self._run_with_module('fake2.migrations', module, app_label='fake2', explicit=False)
+          self.assertIn('fake2', loader.unmigrated_apps)
+          self.assertNotIn('fake2', loader.migrated_apps)
+
+      def test_package_with_path_list_and_file_marked_migrated(self):
+          # A package with __path__ as a list and __file__ present -> migrated
+          module = ModuleType('fake3.migrations')
+          module.__file__ = '/somewhere/fake3/__init__.py'
+          module.__path__ = []  # empty list: no migrations but still a package
+          loader = self._run_with_module('fake3.migrations', module, app_label='fake3', explicit=False)
+          self.assertIn('fake3', loader.migrated_apps)
+          self.assertNotIn('fake3', loader.unmigrated_apps)
+
+      def test_package_with_path_list_no_file_marked_migrated(self):
+          # Regular package with __path__ list but no __file__ (frozen env) -> migrated
+          module = ModuleType('fake4.migrations')
+          # no __file__
+          module.__path__ = []  # regular package path list (empty is fine)
+          loader = self._run_with_module('fake4.migrations', module, app_label='fake4', explicit=False)
+          self.assertIn('fake4', loader.migrated_apps)
+          self.assertNotIn('fake4', loader.unmigrated_apps)
+
+      def test_namespace_package_without_file_marked_unmigrated(self):
+          # Namespace package (no __file__ and __path__ not a list) -> unmigrated
+          module = ModuleType('fake5.migrations')
+          module.__path__ = object()  # not a list, simulates namespace package path object
+          # ensure no __file__
+          loader = self._run_with_module('fake5.migrations', module, app_label='fake5', explicit=False)
+          self.assertIn('fake5', loader.unmigrated_apps)
+          self.assertNotIn('fake5', loader.migrated_apps)
+
+      def test_tuple_path_with_no_file_marked_unmigrated(self):
+          # __path__ is a tuple and no __file__ -> treated as namespace (unmigrated)
+          module = ModuleType('fake6.migrations')
+          module.__path__ = ('/some/path',)  # tuple, not list
+          loader = self._run_with_module('fake6.migrations', module, app_label='fake6', explicit=False)
+          self.assertIn('fake6', loader.unmigrated_apps)
+          self.assertNotIn('fake6', loader.migrated_apps)
+
+      def test_list_subclass_with_no_file_marked_migrated(self):
+          # __path__ is a list subclass and no __file__ -> treated as package (migrated)
+          class MyPath(list):
+              pass
+          module = ModuleType('fake7.migrations')
+          module.__path__ = MyPath()  # isinstance(..., list) should be True
+          # no __file__
+          loader = self._run_with_module('fake7.migrations', module, app_label='fake7', explicit=False)
+          self.assertIn('fake7', loader.migrated_apps)
+          self.assertNotIn('fake7', loader.unmigrated_apps)
+
+      def test_nonlist_path_but_with_file_marked_migrated(self):
+          # __path__ not a list but __file__ present -> treated as package (migrated)
+          module = ModuleType('fake8.migrations')
+          module.__path__ = object()
+          module.__file__ = '/somewhere/fake8/__init__.py'  # presence of __file__ should make it acceptable
+          loader = self._run_with_module('fake8.migrations', module, app_label='fake8', explicit=False)
+          self.assertIn('fake8', loader.migrated_apps)
+          self.assertNotIn('fake8', loader.unmigrated_apps)
+
+      def test_missing_path_and_missing_file_marked_unmigrated(self):
+          # No __path__ and no __file__ -> unmigrated (non-package module)
+          module = ModuleType('fake9.migrations')
+          # explicitly ensure no __file__ and no __path__
+          if hasattr(module, '__file__'):
+              delattr(module, '__file__')
+          loader = self._run_with_module('fake9.migrations', module, app_label='fake9', explicit=False)
+          self.assertIn('fake9', loader.unmigrated_apps)
+          self.assertNotIn('fake9', loader.migrated_apps)
+
+      def test_real_package_with_migration_file_discovered(self):
+          # Create a real temporary package with a migrations package containing one migration.
+          tmpdir = tempfile.mkdtemp()
+          try:
+              pkgdir = os.path.join(tmpdir, 'realpkg')
+              migrations_dir = os.path.join(pkgdir, 'migrations')
+              os.makedirs(migrations_dir)
+              # create __init__.py for package and migrations package
+              with open(os.path.join(pkgdir, '__init__.py'), 'w') as f:
+                  f.write('# package')
+              with open(os.path.join(migrations_dir, '__init__.py'), 'w') as f:
+                  f.write('# migrations package')
+              # create a simple migration file
+              with open(os.path.join(migrations_dir, '0001_initial.py'), 'w') as f:
+                  f.write('class Migration:\n')
+                  f.write('    def __init__(self, name, app_label):\n')
+                  f.write('        self.name = name\n')
+                  f.write('        self.app_label = app_label\n')
+              # Add tmpdir to sys.path so importlib can find it
+              sys.path.insert(0, tmpdir)
+              try:
+                  # Ensure the package is importable and use its migrations package
+                  module_name = 'realpkg.migrations'
+                  # Import it to ensure the import machinery caches things suitably
+                  importlib.invalidate_caches()
+                  imported = importlib.import_module(module_name)
+                  # Now run loader to load disk migrations for app labelled 'realpkg'
+                  loader = MigrationLoader(connection=None, load=False)
+                  # Monkeypatch as in helper but inline to ensure import machinery uses real files
+                  orig_get_app_configs = apps.get_app_configs
+                  orig_migrations_module = MigrationLoader.migrations_module
+                  try:
+                      apps.get_app_configs = lambda: [SimpleNamespace(label='realpkg', name='realpkg')]
+                      MigrationLoader.migrations_module = classmethod(lambda cls, label: (module_name, False))
+                      loader.load_disk()
+                  finally:
+                      apps.get_app_configs = orig_get_app_configs
+                      MigrationLoader.migrations_module = orig_migrations_module
+                  # Check that the migration file was discovered
+                  migrations = [name for app, name in loader.disk_migrations if app == 'realpkg']
+                  self.assertIn('0001_initial', migrations)
+              finally:
+                  if tmpdir in sys.path:
+                      sys.path.remove(tmpdir)
+          finally:
+              shutil.rmtree(tmpdir)
+new_imports_code: |
+  # No extra imports required outside the test file.

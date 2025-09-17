@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 backends.sqlite.test_features_llm.BuildInstanceStateDbTests.test_natural_key_accesses_nested_state_db_attribute backends.sqlite.test_features_llm.BuildInstanceStateDbTests.test_natural_key_casts_db_to_string_then_uses_it backends.sqlite.test_features_llm.BuildInstanceStateDbTests.test_natural_key_combines_db_and_multiple_fields backends.sqlite.test_features_llm.BuildInstanceStateDbTests.test_natural_key_reads_state_db_and_sets_pk_with_none_db backends.sqlite.test_features_llm.BuildInstanceStateDbTests.test_natural_key_reads_state_db_and_sets_pk_with_string_db backends.sqlite.test_features_llm.BuildInstanceStateDbTests.test_natural_key_reads_state_db_for_complex_object_db backends.sqlite.test_features_llm.BuildInstanceStateDbTests.test_natural_key_reads_state_db_when_db_is_boolean backends.sqlite.test_features_llm.BuildInstanceStateDbTests.test_natural_key_uses_db_and_integer_db_value backends.sqlite.test_features_llm.BuildInstanceStateDbTests.test_natural_key_uses_db_when_db_is_empty_string backends.sqlite.test_features_llm.BuildInstanceStateDbTests.test_natural_key_with_single_element_tuple_including_db backends.sqlite.test_features_llm.DummyPK.__init__ backends.sqlite.test_features_llm.DummyPK.to_python backends.sqlite.test_features_llm.ManagerReturningPK.__init__ backends.sqlite.test_features_llm.ManagerReturningPK.db_manager backends.sqlite.test_features_llm.ManagerReturningPK.get_by_natural_key backends.sqlite.test_features_llm.make_model_class
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 file_storage.test_models_llm.FileFieldDeconstructTests.test_callable_class_included file_storage.test_models_llm.FileFieldDeconstructTests.test_callable_returns_default_included file_storage.test_models_llm.FileFieldDeconstructTests.test_callable_returns_non_default_included file_storage.test_models_llm.FileFieldDeconstructTests.test_callable_storage_object_identity_in_kwargs file_storage.test_models_llm.FileFieldDeconstructTests.test_deconstruct_preserves_upload_to_and_drops_default_max_length file_storage.test_models_llm.FileFieldDeconstructTests.test_default_storage_no_kwarg file_storage.test_models_llm.FileFieldDeconstructTests.test_manual_set_storage_callable_attribute_to_default_excluded file_storage.test_models_llm.FileFieldDeconstructTests.test_manual_set_storage_callable_attribute_to_non_default_included file_storage.test_models_llm.FileFieldDeconstructTests.test_non_default_instance_included file_storage.test_models_llm.FileFieldDeconstructTests.test_non_default_storage_instance_survives_roundtrip_identity
+coverage json -o coverage.json
+: '>>>>> End Test Output'

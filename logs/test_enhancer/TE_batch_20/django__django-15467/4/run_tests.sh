@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_widgets.tests_llm.RadioFieldsEmptyLabelTests.test_blank_false_ignores_overrides admin_widgets.tests_llm.RadioFieldsEmptyLabelTests.test_default_empty_label_when_blank_true_and_no_override admin_widgets.tests_llm.RadioFieldsEmptyLabelTests.test_formfield_for_dbfield_kwargs_preserved admin_widgets.tests_llm.RadioFieldsEmptyLabelTests.test_kwargs_override_formfield_overrides_and_preserved admin_widgets.tests_llm.RadioFieldsEmptyLabelTests.test_preserve_empty_string_via_formfield_for_foreignkey_kwargs admin_widgets.tests_llm.RadioFieldsEmptyLabelTests.test_preserve_empty_string_via_formfield_overrides admin_widgets.tests_llm.RadioFieldsEmptyLabelTests.test_preserve_false_via_formfield_overrides admin_widgets.tests_llm.RadioFieldsEmptyLabelTests.test_preserve_false_via_kwargs admin_widgets.tests_llm.RadioFieldsEmptyLabelTests.test_preserve_none_via_formfield_for_foreignkey_kwargs admin_widgets.tests_llm.RadioFieldsEmptyLabelTests.test_preserve_none_via_formfield_overrides
+coverage json -o coverage.json
+: '>>>>> End Test Output'

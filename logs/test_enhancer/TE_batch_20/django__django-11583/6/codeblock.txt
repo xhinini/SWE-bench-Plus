@@ -1,0 +1,174 @@
+from pathlib import Path
+import tempfile
+import shutil
+import sys
+import types
+from unittest import mock
+import sys
+import types
+import tempfile
+import shutil
+from importlib import import_module
+from pathlib import Path
+from unittest import mock
+
+from django.test import SimpleTestCase
+from django.utils import autoreload
+
+class ValueErrorPathHandlingTests(SimpleTestCase):
+    def setUp(self):
+        # Keep original sys.path and error files state
+        self._orig_sys_path = list(sys.path)
+        self._orig_error_files = list(getattr(autoreload, '_error_files', []))
+        autoreload.iter_modules_and_files.cache_clear()
+
+        # Create a real temporary directory and file to act as a good path.
+        self.tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tempdir)
+        self.good_file = Path(self.tempdir) / 'good.py'
+        self.good_file.touch()
+
+    def tearDown(self):
+        sys.path[:] = self._orig_sys_path
+        # Restore _error_files
+        autoreload._error_files[:] = self._orig_error_files
+        autoreload.iter_modules_and_files.cache_clear()
+
+    def test_iter_modules_and_files_ignores_value_error_for_extra_files_string(self):
+        # Simulate Path.resolve raising ValueError for any path.
+        with mock.patch('django.utils.autoreload.Path.resolve', side_effect=ValueError('some filesystem error')):
+            autoreload.iter_modules_and_files.cache_clear()
+            # extra_files as a string entry (replicating current callers which may pass strings)
+            result = autoreload.iter_modules_and_files((), frozenset(['bad/path']))
+        self.assertEqual(result, frozenset())
+
+    def test_iter_modules_and_files_ignores_value_error_for_extra_files_path_object(self):
+        with mock.patch('django.utils.autoreload.Path.resolve', side_effect=ValueError('another error')):
+            autoreload.iter_modules_and_files.cache_clear()
+            result = autoreload.iter_modules_and_files((), frozenset([Path('bad/path')]))
+        self.assertEqual(result, frozenset())
+
+    def test_iter_modules_and_files_ignores_value_error_from_module_origin(self):
+        # Create a real ModuleType so it is processed by iter_modules_and_files
+        mod = types.ModuleType('test_bad_origin')
+        # Create a fake spec with has_location True and an origin that will trigger the resolve error.
+        class FakeSpec:
+            has_location = True
+            loader = object()
+            origin = '/some/bad/origin'
+        mod.__spec__ = FakeSpec()
+        with mock.patch('django.utils.autoreload.Path.resolve', side_effect=ValueError('origin resolution error')):
+            autoreload.iter_modules_and_files.cache_clear()
+            result = autoreload.iter_modules_and_files((mod,), frozenset())
+        # The bad module should be ignored, resulting in an empty frozenset.
+        self.assertEqual(result, frozenset())
+
+    def test_sys_path_directories_ignores_value_error_entries(self):
+        bad_entry = '/tmp/some\x00bad'
+        sys.path.append(bad_entry)
+        try:
+            with mock.patch('django.utils.autoreload.Path.resolve', side_effect=ValueError('sys.path resolve failure')):
+                directories = list(autoreload.sys_path_directories())
+            # The bad entry should be ignored; at least it should not raise and
+            # the returned list should be a list (possibly empty).
+            self.assertIsInstance(directories, list)
+            # Ensure the bad entry is not included.
+            self.assertTrue(all(bad_entry not in str(p) for p in directories))
+        finally:
+            # cleanup restored in tearDown
+            pass
+
+    def test_iter_all_python_module_files_ignores_value_error_from_error_files(self):
+        # Place a problematic filename into _error_files which iter_all_python_module_files
+        # will pass through to iter_modules_and_files as extra_files.
+        autoreload._error_files[:] = ['/path/with\x00null']
+        with mock.patch('django.utils.autoreload.Path.resolve', side_effect=ValueError('null in path')):
+            autoreload.iter_modules_and_files.cache_clear()
+            result = list(autoreload.iter_all_python_module_files())
+        # Should not raise and should be empty because resolving failed for the only file.
+        self.assertEqual(result, [])
+
+    def test_iter_modules_and_files_skips_only_problematic_path_when_mixed(self):
+        # Two entries: one good (self.good_file), one bad.
+        bad = '/tmp/very/bad\x00path.py'
+        # Side effect: raise ValueError for paths that contain 'bad', otherwise call real resolve.
+        real_resolve = Path.resolve
+
+        def side_effect(self, *args, **kwargs):
+            if 'bad' in str(self):
+                raise ValueError('mixed-case error')
+            return real_resolve(self, *args, **kwargs)
+
+        with mock.patch('django.utils.autoreload.Path.resolve', side_effect=side_effect):
+            autoreload.iter_modules_and_files.cache_clear()
+            result = autoreload.iter_modules_and_files((), frozenset([str(self.good_file), bad]))
+        # Only the good file should be present (resolved Path).
+        expected = {self.good_file.resolve()}
+        self.assertEqual(result, frozenset(expected))
+
+    def test_sys_path_directories_skips_only_problematic_entry_when_mixed(self):
+        bad = '/tmp/some\x00bad'
+        # Add both a good directory and a bad entry to sys.path.
+        sys.path.insert(0, str(self.tempdir))
+        sys.path.append(bad)
+        real_resolve = Path.resolve
+
+        def side_effect(self, *args, **kwargs):
+            if 'some' in str(self):
+                raise ValueError('sys path mixed error')
+            return real_resolve(self, *args, **kwargs)
+
+        with mock.patch('django.utils.autoreload.Path.resolve', side_effect=side_effect):
+            directories = list(autoreload.sys_path_directories())
+        # The good tempdir should be present (resolved), the bad entry must not cause an exception.
+        self.assertIn(Path(self.tempdir).resolve(), directories)
+        self.assertTrue(all('some' not in str(p) for p in directories))
+
+    def test_iter_modules_and_files_handles_mixed_module_origins(self):
+        # Create two modules: one good, one with a bad origin.
+        good_mod = types.ModuleType('good_mod')
+        class GoodSpec:
+            has_location = True
+            loader = object()
+            origin = str(self.good_file)
+        good_mod.__spec__ = GoodSpec()
+
+        bad_mod = types.ModuleType('bad_mod')
+        class BadSpec:
+            has_location = True
+            loader = object()
+            origin = '/weird\x00origin.py'
+        bad_mod.__spec__ = BadSpec()
+
+        real_resolve = Path.resolve
+
+        def side_effect(self, *args, **kwargs):
+            if 'weird' in str(self):
+                raise ValueError('module origin error')
+            return real_resolve(self, *args, **kwargs)
+
+        with mock.patch('django.utils.autoreload.Path.resolve', side_effect=side_effect):
+            autoreload.iter_modules_and_files.cache_clear()
+            result = autoreload.iter_modules_and_files((good_mod, bad_mod), frozenset())
+        # Only the good module's origin should be present.
+        self.assertEqual(result, frozenset({Path(str(self.good_file)).resolve()}))
+
+    def test_iter_modules_and_files_with_path_objects_and_mixed_behavior(self):
+        # Pass Path objects in extra_files; one good Path, one bad Path.
+        bad_path = Path('/tmp/another\x00bad.py')
+        real_resolve = Path.resolve
+
+        def side_effect(self, *args, **kwargs):
+            if 'another' in str(self):
+                raise ValueError('another error')
+            return real_resolve(self, *args, **kwargs)
+
+        with mock.patch('django.utils.autoreload.Path.resolve', side_effect=side_effect):
+            autoreload.iter_modules_and_files.cache_clear()
+            result = autoreload.iter_modules_and_files((), frozenset([self.good_file, bad_path]))
+        self.assertEqual(result, frozenset({self.good_file.resolve()}))
+
+if __name__ == '__main__':
+    # Run tests directly if executed as a script.
+    import unittest
+    unittest.main()

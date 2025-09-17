@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.StartAppPathNormalizationTests._expected_top_dir admin_scripts.tests_llm.StartAppPathNormalizationTests._make_dirs admin_scripts.tests_llm.StartAppPathNormalizationTests._run_and_assert_created admin_scripts.tests_llm.StartAppPathNormalizationTests.test_absolute_path_ending_with_dot admin_scripts.tests_llm.StartAppPathNormalizationTests.test_combined_dot_and_parent_segments admin_scripts.tests_llm.StartAppPathNormalizationTests.test_ends_with_dot_and_slash admin_scripts.tests_llm.StartAppPathNormalizationTests.test_ends_with_dotdot_and_slash admin_scripts.tests_llm.StartAppPathNormalizationTests.test_multiple_current_dir_components admin_scripts.tests_llm.StartAppPathNormalizationTests.test_path_with_multiple_redundant_slashes_and_dot admin_scripts.tests_llm.StartAppPathNormalizationTests.test_path_with_parent_segment_before_dot admin_scripts.tests_llm.StartAppPathNormalizationTests.test_relative_path_with_leading_dot_slash_and_dot admin_scripts.tests_llm.StartAppPathNormalizationTests.test_relative_path_with_trailing_dot admin_scripts.tests_llm.StartAppPathNormalizationTests.test_trailing_dotdot_resolves_to_parent_directory
+coverage json -o coverage.json
+: '>>>>> End Test Output'

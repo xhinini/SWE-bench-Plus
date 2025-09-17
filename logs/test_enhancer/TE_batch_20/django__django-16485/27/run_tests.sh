@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroTests.test_arg_as_string_zero_on_float template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroTests.test_decimal_value_with_arg_zero template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroTests.test_float_value_with_arg_zero template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroTests.test_grouping_with_zero_and_g_de_locale template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroTests.test_grouping_with_zero_and_g_en_locale template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroTests.test_int_value_with_arg_zero template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroTests.test_large_integer_with_arg_zero template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroTests.test_mark_safe_string_with_arg_zero template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroTests.test_negative_float_with_arg_zero template_tests.filter_tests.test_floatformat_llm.FloatformatPZeroTests.test_string_numeric_with_arg_zero
+coverage json -o coverage.json
+: '>>>>> End Test Output'

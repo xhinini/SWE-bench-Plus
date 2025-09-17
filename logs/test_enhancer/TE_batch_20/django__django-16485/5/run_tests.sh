@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.filter_tests.test_floatformat_llm.FloatformatQuantizePrecisionTests._capture_prec_call template_tests.filter_tests.test_floatformat_llm.FloatformatQuantizePrecisionTests.test_decimal_zero_exponent6_p6 template_tests.filter_tests.test_floatformat_llm.FloatformatQuantizePrecisionTests.test_decimal_zero_large_p10 template_tests.filter_tests.test_floatformat_llm.FloatformatQuantizePrecisionTests.test_decimal_zero_scale_p3 template_tests.filter_tests.test_floatformat_llm.FloatformatQuantizePrecisionTests.test_floatformat_decimal_zero_string_input_p5 template_tests.filter_tests.test_floatformat_llm.FloatformatQuantizePrecisionTests.test_int_zero_prec_and_output_p6 template_tests.filter_tests.test_floatformat_llm.FloatformatQuantizePrecisionTests.test_int_zero_with_localcontext_low_precision template_tests.filter_tests.test_floatformat_llm.FloatformatQuantizePrecisionTests.test_negative_decimal_zero_scale_p2 template_tests.filter_tests.test_floatformat_llm.FloatformatQuantizePrecisionTests.test_p_zero_early_return_no_quantize_called template_tests.filter_tests.test_floatformat_llm.FloatformatQuantizePrecisionTests.test_string_zero_prec_and_output_p4
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,305 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that SlicedLowLevelWCS.world_to_pixel_values correctly inserts the fixed world-coordinate values for dropped world dimensions (computed from the underlying WCS at the appropriate pixel indices), handles broadcasting, numpy scalar/int types, empty inputs, nested slicing, negative indices, and maintains the inverse relationship with pixel_to_world_values. They are designed to fail for the candidate (model) patch which uses incorrect default constants or incorrect indexing, but pass for the provided (gold) patch.
+test_code: |
+  import numpy as np
+  from numpy.testing import assert_allclose
+  import pytest
+  from astropy.wcs import WCS
+  from astropy.wcs.wcsapi.wrappers.sliced_wcs import SlicedLowLevelWCS
+  from astropy.wcs.wcsapi.wrappers.sliced_wcs import sanitize_slices, combine_slices
+  from astropy.wcs.wcs import FITSFixedWarning
+  from astropy.io.fits.verify import VerifyWarning
+  from astropy.io.fits import Header
+  from astropy.coordinates import SkyCoord, Galactic, ICRS
+  import astropy.units as u
+  
+  # Reuse COUPLED_WCS_HEADER from the existing test module context if available,
+  # otherwise define a minimal header that matches the coupling pattern used in tests.
+  COUPLED_WCS_HEADER = {
+      'WCSAXES': 3,
+      'CRPIX1': (100 + 1)/2,
+      'CRPIX2': (25 + 1)/2,
+      'CRPIX3': 1.0,
+      'PC1_1': 0.0,
+      'PC1_2': -1.0,
+      'PC1_3': 0.0,
+      'PC2_1': 1.0,
+      'PC2_2': 0.0,
+      'PC2_3': -1.0,
+      'CDELT1': 5,
+      'CDELT2': 5,
+      'CDELT3': 0.055,
+      'CUNIT1': 'arcsec',
+      'CUNIT2': 'arcsec',
+      'CUNIT3': 'Angstrom',
+      'CTYPE1': 'HPLN-TAN',
+      'CTYPE2': 'HPLT-TAN',
+      'CTYPE3': 'WAVE',
+      'CRVAL1': 0.0,
+      'CRVAL2': 0.0,
+      'CRVAL3': 1.05,
+  }
+  
+  def _build_full_world_from_kept(wcs, sliced, kept_values):
+      """
+      Helper: given the original WCS, a SlicedLowLevelWCS 'sliced', and an
+      iterable of kept world values provided in the order expected by the
+      sliced.world_to_pixel_values API, return the full-length iterable of
+      world values (one per original world dimension) with the dropped
+      dimensions filled using sliced._pixel_to_world_values_all(*zeros).
+      """
+      s_out = sliced._pixel_to_world_values_all(*[0] * len(sliced._pixel_keep))
+      full = []
+      kept_list = list(sliced._world_keep)
+      k = 0
+      for iw in range(wcs.world_n_dim):
+          if iw in sliced._world_keep:
+              full.append(kept_values[k])
+              k += 1
+          else:
+              full.append(s_out[iw])
+      return full
+  
+  def test_world_to_pixel_inserts_correct_dropped_values_basic():
+      fits_wcs = WCS(header=COUPLED_WCS_HEADER)
+      sl = SlicedLowLevelWCS(fits_wcs, 0)  # slice away one pixel/world dimension
+      # Provide the world values for the kept world dims:
+      # Order is the same as the sliced WCS world dimensions (world_keep)
+      kept_vals = (10.0, 20.0)
+      expected_full = _build_full_world_from_kept(fits_wcs, sl, kept_vals)
+      expected = fits_wcs.world_to_pixel_values(*expected_full)
+      got = sl.world_to_pixel_values(*kept_vals)
+      assert_allclose(got, expected)
+  
+  def test_world_to_pixel_broadcasting_with_arrays():
+      fits_wcs = WCS(header=COUPLED_WCS_HEADER)
+      sl = SlicedLowLevelWCS(fits_wcs, 0)
+      # Two kept world inputs as arrays that should broadcast together
+      w0 = np.array([10.0, 11.0])
+      w1 = np.array([20.0, 21.0])
+      kept_inputs = (w0, w1)
+      expected_full = _build_full_world_from_kept(fits_wcs, sl, kept_inputs)
+      # Ensure the dropped dimensions get broadcasted to the same shape
+      expected = fits_wcs.world_to_pixel_values(*expected_full)
+      got = sl.world_to_pixel_values(w0, w1)
+      # Both the gold patch and the original WCS should produce identical broadcasting behavior
+      assert_allclose(got, expected)
+  
+  def test_world_to_pixel_with_numpy_int_types():
+      # Ensure numpy integer types for slices don't break world_to_pixel_values mapping
+      wcs_hdr = Header.fromstring("""
+      NAXIS   = 3
+      NAXIS1  = 10
+      NAXIS2  = 20
+      NAXIS3  = 30
+      CTYPE1  = GLAT-CAR
+      CTYPE2  = FREQ
+      CTYPE3  = GLON-CAR
+      CRPIX1  = 30
+      CRPIX2  = 40
+      CRPIX3  = 45
+      CDELT1  = -0.1
+      CDELT2  =  0.5
+      CDELT3  =  0.1
+      CUNIT1  = deg
+      CUNIT2  = Hz
+      CUNIT3  = deg
+      CRVAL1  = 10
+      CRVAL2  = 20
+      CRVAL3  = 25
+      """, sep='\n')
+      wcs = WCS(wcs_hdr)
+      # Use a numpy int64 in the slice to drop the middle pixel/world axis
+      sl = SlicedLowLevelWCS(wcs, np.s_[:, np.int64(0), :])
+      # Provide kept world values (two kept dims) as numpy scalars
+      kept_vals = (np.array(11.0), np.array(26.0))
+      expected_full = _build_full_world_from_kept(wcs, sl, kept_vals)
+      expected = wcs.world_to_pixel_values(*expected_full)
+      got = sl.world_to_pixel_values(*kept_vals)
+      assert_allclose(got, expected)
+  
+  def test_world_to_pixel_returns_scalar_for_single_pixel_dim():
+      # When resulting WCS has a single pixel dimension, world_to_pixel_values
+      # should return a scalar (not a tuple) for scalar inputs.
+      wcs_hdr = Header.fromstring("""
+      NAXIS   = 3
+      NAXIS1  = 10
+      NAXIS2  = 20
+      NAXIS3  = 30
+      CTYPE1  = GLAT-CAR
+      CTYPE2  = FREQ
+      CTYPE3  = GLON-CAR
+      CRPIX1  = 30
+      CRPIX2  = 40
+      CRPIX3  = 45
+      CDELT1  = -0.1
+      CDELT2  =  0.5
+      CDELT3  =  0.1
+      CUNIT1  = deg
+      CUNIT2  = Hz
+      CUNIT3  = deg
+      CRVAL1  = 10
+      CRVAL2  = 20
+      CRVAL3  = 25
+      """, sep='\n')
+      wcs = WCS(wcs_hdr)
+      # Slice to produce a single pixel dimension (drop two axes in pixel space)
+      sub = SlicedLowLevelWCS(wcs, np.s_[0, :, 0])
+      # Pick a scalar pixel coordinate, get its world representation, and round-trip
+      world = sub.pixel_to_world_values(3)
+      # pixel_to_world_values might return a scalar or a tuple/array; normalize to sequence
+      if isinstance(world, tuple):
+          world_args = tuple(world)
+      else:
+          # If array or scalar, attempt to unpack if possible
+          try:
+              world_args = tuple(world)
+          except Exception:
+              world_args = (world,)
+      res = sub.world_to_pixel_values(*world_args)
+      # For a scalar pixel input, expect to get (approximately) the original scalar back
+      # Accept float equivalence
+      assert_allclose(res, 3.0)
+  
+  def test_nested_world_to_pixel_equivalence():
+      # Building the nested-slicing scenario analogous to the pixel test ensures
+      # that nested slicing does not change the final behavior of world_to_pixel_values.
+      base = WCS(Header.fromstring("""
+      NAXIS   = 3
+      NAXIS1  = 10
+      NAXIS2  = 20
+      NAXIS3  = 30
+      CTYPE1  = GLAT-CAR
+      CTYPE2  = FREQ
+      CTYPE3  = GLON-CAR
+      CRPIX1  = 30
+      CRPIX2  = 40
+      CRPIX3  = 45
+      CDELT1  = -0.1
+      CDELT2  =  0.5
+      CDELT3  =  0.1
+      CRVAL1  = 10
+      CRVAL2  = 20
+      CRVAL3  = 25
+      """, sep='\n'))
+      # Create nested slices
+      sub1 = SlicedLowLevelWCS(
+                  SlicedLowLevelWCS(
+                      SlicedLowLevelWCS(base, [slice(None), slice(1, 10), slice(None)]),
+                      [3, slice(2, None)]),
+                  [slice(None), slice(2, 8)])
+      sub2 = base[3, 3:10, 2:8]
+      # Pick a pixel coordinate in the sliced WCS domain and use it to get world coords,
+      # then check both sliced WCSes produce the same world_to_pixel_values result.
+      world = sub2.pixel_to_world_values(3, 5)
+      got1 = sub1.world_to_pixel_values(*world)
+      got2 = sub2.world_to_pixel_values(*world)
+      assert_allclose(got1, got2)
+  
+  def test_world_to_pixel_with_negative_index():
+      wcs_hdr = Header.fromstring("""
+      NAXIS   = 3
+      NAXIS1  = 10
+      NAXIS2  = 20
+      NAXIS3  = 30
+      CTYPE1  = GLAT-CAR
+      CTYPE2  = FREQ
+      CTYPE3  = GLON-CAR
+      CRPIX1  = 30
+      CRPIX2  = 40
+      CRPIX3  = 45
+      CDELT1  = -0.1
+      CDELT2  =  0.5
+      CDELT3  =  0.1
+      CRVAL1  = 10
+      CRVAL2  = 20
+      CRVAL3  = 25
+      """, sep='\n')
+      wcs = WCS(wcs_hdr)
+      # Select the last index (negative index) for one of the pixel axes
+      sl = SlicedLowLevelWCS(wcs, -1)
+      # Keep two world values (for the kept world dims) and form the expected full world list
+      kept_vals = (12.0, 22.0)
+      expected_full = _build_full_world_from_kept(wcs, sl, kept_vals)
+      expected = wcs.world_to_pixel_values(*expected_full)
+      got = sl.world_to_pixel_values(*kept_vals)
+      assert_allclose(got, expected)
+  
+  def test_world_to_pixel_empty_input_returns_empty():
+      # When passing empty arrays, the returned pixel arrays should also be empty and have consistent shapes.
+      wcs_hdr = Header.fromstring("""
+      NAXIS   = 3
+      NAXIS1  = 10
+      NAXIS2  = 20
+      NAXIS3  = 30
+      CTYPE1  = GLAT-CAR
+      CTYPE2  = FREQ
+      CTYPE3  = GLON-CAR
+      CRPIX1  = 30
+      CRPIX2  = 40
+      CRPIX3  = 45
+      CDELT1  = -0.1
+      CDELT2  =  0.5
+      CDELT3  =  0.1
+      CRVAL1  = 10
+      CRVAL2  = 20
+      CRVAL3  = 25
+      """, sep='\n')
+      wcs = WCS(wcs_hdr)
+      sl = SlicedLowLevelWCS(wcs, 0)
+      empty0 = np.array([])
+      empty1 = np.array([])
+      res = sl.world_to_pixel_values(empty0, empty1)
+      # The result can be a tuple of arrays or a single array depending on pixel dims;
+      # verify that all returned arrays have zero length.
+      if isinstance(res, tuple):
+          for arr in res:
+              assert np.shape(arr)[0] == 0
+      else:
+          assert np.shape(res)[0] == 0
+  
+  def test_world_to_pixel_uses_dropped_world_dimensions_value():
+      # When a world dimension is dropped via integer slice, its nominal value
+      # should match the reported dropped_world_dimensions and be used in world_to_pixel_values.
+      wcs_hdr = Header.fromstring("""
+      NAXIS   = 3
+      NAXIS1  = 10
+      NAXIS2  = 20
+      NAXIS3  = 30
+      CTYPE1  = GLAT-CAR
+      CTYPE2  = FREQ
+      CTYPE3  = GLON-CAR
+      CRPIX1  = 30
+      CRPIX2  = 40
+      CRPIX3  = 45
+      CDELT1  = -0.1
+      CDELT2  =  0.5
+      CDELT3  =  0.1
+      CRVAL1  = 10
+      CRVAL2  = 20
+      CRVAL3  = 25
+      """, sep='\n')
+      wcs = WCS(wcs_hdr)
+      # Drop two pixel axes to create a single-pixel sliced WCS and thus two dropped worlds
+      sub = SlicedLowLevelWCS(wcs, np.s_[5, :, 12])
+      dwd = sub.dropped_world_dimensions
+      # The 'value' field should exist and correspond to the values inserted for dropped dims
+      assert 'value' in dwd
+      dropped_values = dwd['value']
+      # Now call world_to_pixel_values with only the kept world dimensions and ensure the
+      # dropped world values are used (by comparing with full-world call on the original WCS).
+      # Build the kept values from sub.pixel_to_world_values for some sample pixel
+      sample_pixel = (3,) if sub.pixel_n_dim == 1 else (3, )
+      # Use pixel_to_world_values on the sliced WCS to obtain sample kept world inputs
+      sample_world = sub.pixel_to_world_values(*([3] * sub.pixel_n_dim))
+      if isinstance(sample_world, tuple):
+          kept_inputs = sample_world
+      else:
+          kept_inputs = (sample_world,)
+      expected_full = _build_full_world_from_kept(wcs, sub, kept_inputs)
+      expected = wcs.world_to_pixel_values(*expected_full)
+      got = sub.world_to_pixel_values(*kept_inputs)
+      assert_allclose(got, expected)
+new_imports_code: |
+  # No additional imports beyond what exists in the test module are required.

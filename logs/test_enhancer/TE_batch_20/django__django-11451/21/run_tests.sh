@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_auth_backends_llm.AuthenticateNoneValuesTests.setUp auth_tests.test_auth_backends_llm.AuthenticateNoneValuesTests.test_authenticate_does_not_call_usermodel_set_password_when_username_is_none auth_tests.test_auth_backends_llm.AuthenticateNoneValuesTests.test_authenticate_explicit_none_password_with_username_no_queries_or_hash auth_tests.test_auth_backends_llm.AuthenticateNoneValuesTests.test_authenticate_explicit_none_username_and_password_no_queries_or_hash auth_tests.test_auth_backends_llm.AuthenticateNoneValuesTests.test_authenticate_explicit_none_username_with_password_no_queries_or_hash auth_tests.test_auth_backends_llm.AuthenticateNoneValuesTests.test_authenticate_username_field_in_kwargs_both_none_no_queries_or_hash auth_tests.test_auth_backends_llm.AuthenticateNoneValuesTests.test_authenticate_username_field_in_kwargs_password_none_username_provided_no_queries_or_hash auth_tests.test_auth_backends_llm.AuthenticateNoneValuesTests.test_authenticate_username_field_in_kwargs_username_none_password_provided_no_queries_or_hash auth_tests.test_auth_backends_llm.AuthenticateNoneValuesTests.test_remoteuser_authenticate_empty_remote_user_no_queries auth_tests.test_auth_backends_llm.AuthenticateNoneValuesTests.test_remoteuser_authenticate_none_remote_user_no_queries
+coverage json -o coverage.json
+: '>>>>> End Test Output'

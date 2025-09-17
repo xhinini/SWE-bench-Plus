@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_writer_llm.NestedMethodSerializationTests.test_bound_method_serializes_outerone_inner_using_methodtype migrations.test_writer_llm.NestedMethodSerializationTests.test_bound_method_serializes_outertwo_innertwo_using_methodtype migrations.test_writer_llm.NestedMethodSerializationTests.test_bound_method_serializes_writertests_nestedchoices_using_methodtype migrations.test_writer_llm.NestedMethodSerializationTests.test_classmethod_serializes_outerone_inner_cm migrations.test_writer_llm.NestedMethodSerializationTests.test_classmethod_serializes_outertwo_innertwo_cm2 migrations.test_writer_llm.NestedMethodSerializationTests.test_deep_nesting_all_levels_present_in_serialized_path migrations.test_writer_llm.NestedMethodSerializationTests.test_deeply_nested_bound_method_via_methodtype migrations.test_writer_llm.NestedMethodSerializationTests.test_deeply_nested_classmethod_serialized_with_full_qualname migrations.test_writer_llm.NestedMethodSerializationTests.test_outerone_inner_classmethod_includes_outer_class_name migrations.test_writer_llm.NestedMethodSerializationTests.test_writertests_nestedchoices_bound_method_includes_outer_class migrations.test_writer_llm.bound_deep_level2 migrations.test_writer_llm.bound_to_outerone_inner migrations.test_writer_llm.bound_to_outertwo_innertwo migrations.test_writer_llm.cm'] (migrations.test_writer_llm.OuterOne.['Inner) migrations.test_writer_llm.cm2'] (migrations.test_writer_llm.OuterTwo.['InnerTwo) migrations.test_writer_llm.deep_cm']"] (migrations.test_writer_llm.OuterDeep.["Level1.['Level2)
+coverage json -o coverage.json
+: '>>>>> End Test Output'

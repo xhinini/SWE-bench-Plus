@@ -1,0 +1,629 @@
+from unittest import mock
+from django.contrib.auth.models import User
+from django.db import DatabaseError, router
+from django.test import TestCase, override_settings
+from django.urls import reverse
+from admin_changelist.models import Swallow
+
+@override_settings(ROOT_URLCONF='admin_changelist.urls')
+class ChangeListAtomicUsingArgTests(TestCase):
+
+    def _base_post_data(self):
+        return {'form-TOTAL_FORMS': '3', 'form-INITIAL_FORMS': '3', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(self.a.pk), 'form-1-uuid': str(self.b.pk), 'form-2-uuid': str(self.c.pk), '_save': 'Save'}
+
+    def test_atomic_called_with_using_on_single_form_change(self):
+        data = self._base_post_data()
+        data.update({'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-load': '2.0', 'form-1-speed': '2.0', 'form-2-load': '5.0', 'form-2-speed': '5.0'})
+        with mock.patch('django.contrib.admin.options.transaction.atomic') as atomic_mock:
+            response = self.client.post(self.changelist_url, data)
+            self._assert_atomic_called_with_using_for_model(atomic_mock, Swallow)
+
+    def test_atomic_called_with_using_even_if_no_forms_changed(self):
+        data = self._base_post_data()
+        data.update({'form-0-load': str(self.a.load), 'form-0-speed': str(self.a.speed), 'form-1-load': str(self.b.load), 'form-1-speed': str(self.b.speed), 'form-2-load': str(self.c.load), 'form-2-speed': str(self.c.speed)})
+        with mock.patch('django.contrib.admin.options.transaction.atomic') as atomic_mock:
+            response = self.client.post(self.changelist_url, data)
+            self._assert_atomic_called_with_using_for_model(atomic_mock, Swallow)
+
+    def test_atomic_called_with_using_on_multiple_forms_changed(self):
+        data = self._base_post_data()
+        data.update({'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-load': '5.0', 'form-1-speed': '4.0', 'form-2-load': '7.0', 'form-2-speed': '6.0'})
+        with mock.patch('django.contrib.admin.options.transaction.atomic') as atomic_mock:
+            response = self.client.post(self.changelist_url, data)
+            self._assert_atomic_called_with_using_for_model(atomic_mock, Swallow)
+
+from django.test import TestCase, override_settings
+from django.urls import reverse
+from django.db import DatabaseError
+from unittest import mock
+from .models import Swallow
+from .admin import SwallowAdmin
+from django.contrib.admin.options import router
+
+@override_settings(ROOT_URLCONF='admin_changelist.urls')
+class TransactionAtomicUsageTests(TestCase):
+
+    def test_atomic_called_when_no_form_changed(self):
+        a = Swallow.objects.create(origin='A', load=1, speed=1)
+        b = Swallow.objects.create(origin='B', load=2, speed=2)
+        data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-0-load': str(float(a.load)), 'form-0-speed': str(float(a.speed)), 'form-1-uuid': str(b.pk), 'form-1-load': str(float(b.load)), 'form-1-speed': str(float(b.speed)), '_save': 'Save'}
+        with mock.patch('django.contrib.admin.options.transaction.atomic') as mock_atomic:
+            with mock.patch('django.contrib.admin.options.router.db_for_write', return_value='mydb') as mock_db_for_write:
+                response = self.client.post(self.changelist_url, data)
+                mock_atomic.assert_called_with(using='mydb')
+                mock_db_for_write.assert_called_with(Swallow)
+
+from django.db import router
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_on_list_editable_success(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    self.client.force_login(self.superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-1-uuid': str(b.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-load': '5.0', 'form-1-speed': '1.0', '_save': 'Save'}
+    expected_db = router.db_for_write(Swallow)
+    with mock.patch('django.db.transaction.atomic') as mock_atomic:
+        mock_atomic.return_value.__enter__.return_value = None
+        mock_atomic.return_value.__exit__.return_value = None
+        response = self.client.post(changelist_url, data)
+    mock_atomic.assert_any_call(using=expected_db)
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_when_multiple_forms_changed(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    c = Swallow.objects.create(origin='Swallow C', load=5, speed=5)
+    self.client.force_login(self.superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '3', 'form-INITIAL_FORMS': '3', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-uuid': str(b.pk), 'form-1-load': '5.0', 'form-1-speed': '1.0', 'form-2-uuid': str(c.pk), 'form-2-load': '6.0', 'form-2-speed': '2.0', '_save': 'Save'}
+    expected_db = router.db_for_write(Swallow)
+    with mock.patch('django.db.transaction.atomic') as mock_atomic:
+        mock_atomic.return_value.__enter__.return_value = None
+        mock_atomic.return_value.__exit__.return_value = None
+        response = self.client.post(changelist_url, data)
+    mock_atomic.assert_any_call(using=expected_db)
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_even_if_no_forms_changed(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    self.client.force_login(self.superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-1-uuid': str(b.pk), 'form-0-load': str(a.load), 'form-0-speed': str(a.speed), 'form-1-load': str(b.load), 'form-1-speed': str(b.speed), '_save': 'Save'}
+    expected_db = router.db_for_write(Swallow)
+    with mock.patch('django.db.transaction.atomic') as mock_atomic:
+        mock_atomic.return_value.__enter__.return_value = None
+        mock_atomic.return_value.__exit__.return_value = None
+        response = self.client.post(changelist_url, data)
+    mock_atomic.assert_any_call(using=expected_db)
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_not_used_when_formset_invalid(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    self.client.force_login(self.superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-0-load': 'not-a-number', 'form-0-speed': '3.0', 'form-1-uuid': str(b.pk), 'form-1-load': 'also-invalid', 'form-1-speed': '1.0', '_save': 'Save'}
+    with mock.patch('django.db.transaction.atomic') as mock_atomic:
+        mock_atomic.return_value.__enter__.return_value = None
+        mock_atomic.return_value.__exit__.return_value = None
+        response = self.client.post(changelist_url, data)
+    mock_atomic.assert_not_called()
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_when_save_model_raises(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    self.client.force_login(self.superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-uuid': str(b.pk), 'form-1-load': '5.0', 'form-1-speed': '1.0', '_save': 'Save'}
+    expected_db = router.db_for_write(Swallow)
+    with mock.patch('django.contrib.admin.ModelAdmin.save_model', side_effect=DatabaseError):
+        with mock.patch('django.db.transaction.atomic') as mock_atomic:
+            mock_atomic.return_value.__enter__.return_value = None
+            mock_atomic.return_value.__exit__.return_value = None
+            with self.assertRaises(DatabaseError):
+                self.client.post(changelist_url, data)
+    mock_atomic.assert_any_call(using=expected_db)
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_when_save_related_raises(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    self.client.force_login(self.superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-uuid': str(b.pk), 'form-1-load': '5.0', 'form-1-speed': '1.0', '_save': 'Save'}
+    expected_db = router.db_for_write(Swallow)
+    with mock.patch('django.contrib.admin.ModelAdmin.save_related', side_effect=DatabaseError):
+        with mock.patch('django.db.transaction.atomic') as mock_atomic:
+            mock_atomic.return_value.__enter__.return_value = None
+            mock_atomic.return_value.__exit__.return_value = None
+            with self.assertRaises(DatabaseError):
+                self.client.post(changelist_url, data)
+    mock_atomic.assert_any_call(using=expected_db)
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_when_save_form_raises(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    self.client.force_login(self.superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-uuid': str(b.pk), 'form-1-load': '5.0', 'form-1-speed': '1.0', '_save': 'Save'}
+    expected_db = router.db_for_write(Swallow)
+    with mock.patch('django.contrib.admin.ModelAdmin.save_form', side_effect=DatabaseError):
+        with mock.patch('django.db.transaction.atomic') as mock_atomic:
+            mock_atomic.return_value.__enter__.return_value = None
+            mock_atomic.return_value.__exit__.return_value = None
+            with self.assertRaises(DatabaseError):
+                self.client.post(changelist_url, data)
+    mock_atomic.assert_any_call(using=expected_db)
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_when_log_change_raises(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    self.client.force_login(self.superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-uuid': str(b.pk), 'form-1-load': '5.0', 'form-1-speed': '1.0', '_save': 'Save'}
+    expected_db = router.db_for_write(Swallow)
+    with mock.patch('django.contrib.admin.ModelAdmin.log_change', side_effect=DatabaseError):
+        with mock.patch('django.db.transaction.atomic') as mock_atomic:
+            mock_atomic.return_value.__enter__.return_value = None
+            mock_atomic.return_value.__exit__.return_value = None
+            with self.assertRaises(DatabaseError):
+                self.client.post(changelist_url, data)
+    mock_atomic.assert_any_call(using=expected_db)
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_respects_router_db_for_write_override(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    self.client.force_login(self.superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-uuid': str(b.pk), 'form-1-load': '5.0', 'form-1-speed': '1.0', '_save': 'Save'}
+    with mock.patch('django.db.router.db_for_write', return_value='custom_db'):
+        with mock.patch('django.db.transaction.atomic') as mock_atomic:
+            mock_atomic.return_value.__enter__.return_value = None
+            mock_atomic.return_value.__exit__.return_value = None
+            response = self.client.post(changelist_url, data)
+    mock_atomic.assert_any_call(using='custom_db')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_changelist_atomic_uses_router_db_for_simple_save(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    superuser = self._create_superuser('superuser')
+    self.client.force_login(superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-1-uuid': str(b.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-load': '5.0', 'form-1-speed': '1.0', '_save': 'Save'}
+    with mock.patch('django.db.router.db_for_write') as mock_db_for_write, mock.patch('django.db.transaction.atomic') as mock_atomic:
+        mock_db_for_write.return_value = 'other'
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = None
+        cm.__exit__.return_value = False
+        mock_atomic.return_value = cm
+        response = self.client.post(changelist_url, data)
+        mock_db_for_write.assert_called_with(Swallow)
+        mock_atomic.assert_called_with(using='other')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_changelist_atomic_called_even_if_no_forms_changed(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    superuser = self._create_superuser('superuser')
+    self.client.force_login(superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-1-uuid': str(b.pk), 'form-0-load': str(a.load), 'form-0-speed': str(a.speed), 'form-1-load': str(b.load), 'form-1-speed': str(b.speed), '_save': 'Save'}
+    with mock.patch('django.db.router.db_for_write') as mock_db_for_write, mock.patch('django.db.transaction.atomic') as mock_atomic:
+        mock_db_for_write.return_value = 'other'
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = None
+        cm.__exit__.return_value = False
+        mock_atomic.return_value = cm
+        response = self.client.post(changelist_url, data)
+        mock_db_for_write.assert_called_with(Swallow)
+        mock_atomic.assert_called_with(using='other')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_changelist_atomic_called_with_ordering_param(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    superuser = self._create_superuser('superuser')
+    self.client.force_login(superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist') + '?o=-2'
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-1-uuid': str(b.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-load': '5.0', 'form-1-speed': '1.0', '_save': 'Save'}
+    with mock.patch('django.db.router.db_for_write') as mock_db_for_write, mock.patch('django.db.transaction.atomic') as mock_atomic:
+        mock_db_for_write.return_value = 'other'
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = None
+        cm.__exit__.return_value = False
+        mock_atomic.return_value = cm
+        response = self.client.post(changelist_url, data)
+        mock_db_for_write.assert_called_with(Swallow)
+        mock_atomic.assert_called_with(using='other')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_changelist_atomic_used_when_log_change_raises(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    superuser = self._create_superuser('superuser')
+    self.client.force_login(superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-1-uuid': str(b.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-load': '5.0', 'form-1-speed': '1.0', '_save': 'Save'}
+    with mock.patch('django.db.router.db_for_write') as mock_db_for_write, mock.patch('django.db.transaction.atomic') as mock_atomic, mock.patch('django.contrib.admin.ModelAdmin.log_change', side_effect=DatabaseError):
+        mock_db_for_write.return_value = 'other'
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = None
+        cm.__exit__.return_value = False
+        mock_atomic.return_value = cm
+        with self.assertRaises(DatabaseError):
+            self.client.post(changelist_url, data)
+        mock_db_for_write.assert_called_with(Swallow)
+        mock_atomic.assert_called_with(using='other')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_changelist_atomic_called_when_log_change_raises_on_second(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    superuser = self._create_superuser('superuser')
+    self.client.force_login(superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-1-uuid': str(b.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-load': '5.0', 'form-1-speed': '1.0', '_save': 'Save'}
+    with mock.patch('django.db.router.db_for_write') as mock_db_for_write, mock.patch('django.db.transaction.atomic') as mock_atomic, mock.patch('django.contrib.admin.ModelAdmin.log_change', side_effect=[None, DatabaseError]):
+        mock_db_for_write.return_value = 'other'
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = None
+        cm.__exit__.return_value = False
+        mock_atomic.return_value = cm
+        with self.assertRaises(DatabaseError):
+            self.client.post(changelist_url, data)
+        mock_db_for_write.assert_called_with(Swallow)
+        mock_atomic.assert_called_with(using='other')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_changelist_atomic_called_with_single_form(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    superuser = self._create_superuser('superuser')
+    self.client.force_login(superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '1', 'form-INITIAL_FORMS': '1', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-0-load': '10.0', 'form-0-speed': '3.0', '_save': 'Save'}
+    with mock.patch('django.db.router.db_for_write') as mock_db_for_write, mock.patch('django.db.transaction.atomic') as mock_atomic:
+        mock_db_for_write.return_value = 'other'
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = None
+        cm.__exit__.return_value = False
+        mock_atomic.return_value = cm
+        response = self.client.post(changelist_url, data)
+        mock_db_for_write.assert_called_with(Swallow)
+        mock_atomic.assert_called_with(using='other')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_changelist_atomic_called_with_three_forms(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    c = Swallow.objects.create(origin='Swallow C', load=5, speed=5)
+    superuser = self._create_superuser('superuser')
+    self.client.force_login(superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '3', 'form-INITIAL_FORMS': '3', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-1-uuid': str(b.pk), 'form-2-uuid': str(c.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-load': '5.0', 'form-1-speed': '1.0', 'form-2-load': '6.0', 'form-2-speed': '2.0', '_save': 'Save'}
+    with mock.patch('django.db.router.db_for_write') as mock_db_for_write, mock.patch('django.db.transaction.atomic') as mock_atomic:
+        mock_db_for_write.return_value = 'other'
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = None
+        cm.__exit__.return_value = False
+        mock_atomic.return_value = cm
+        response = self.client.post(changelist_url, data)
+        mock_db_for_write.assert_called_with(Swallow)
+        mock_atomic.assert_called_with(using='other')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_changelist_atomic_called_with_extra_post_params(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    superuser = self._create_superuser('superuser')
+    self.client.force_login(superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-1-uuid': str(b.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-load': '5.0', 'form-1-speed': '1.0', 'some-other-param': 'value', '_save': 'Save'}
+    with mock.patch('django.db.router.db_for_write') as mock_db_for_write, mock.patch('django.db.transaction.atomic') as mock_atomic:
+        mock_db_for_write.return_value = 'other'
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = None
+        cm.__exit__.return_value = False
+        mock_atomic.return_value = cm
+        response = self.client.post(changelist_url, data)
+        mock_db_for_write.assert_called_with(Swallow)
+        mock_atomic.assert_called_with(using='other')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_changelist_atomic_called_when_action_selected_but_saving_list_editable(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    superuser = self._create_superuser('superuser')
+    self.client.force_login(superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-1-uuid': str(b.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-load': '5.0', 'form-1-speed': '1.0', 'action': 'delete_selected', '_save': 'Save'}
+    with mock.patch('django.db.router.db_for_write') as mock_db_for_write, mock.patch('django.db.transaction.atomic') as mock_atomic:
+        mock_db_for_write.return_value = 'other'
+        cm = mock.MagicMock()
+        cm.__enter__.return_value = None
+        cm.__exit__.return_value = False
+        mock_atomic.return_value = cm
+        response = self.client.post(changelist_url, data)
+        mock_db_for_write.assert_called_with(Swallow)
+        mock_atomic.assert_called_with(using='other')
+
+from django.db import router
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_with_swallow_admin(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    self.client.force_login(self.superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-uuid': str(b.pk), 'form-1-load': '5.0', 'form-1-speed': '1.0', '_save': 'Save'}
+    with mock.patch('django.contrib.admin.options.transaction.atomic') as atomic:
+        response = self.client.post(changelist_url, data)
+    calls = atomic.call_args_list
+    self.assertTrue(any((call[1].get('using') == router.db_for_write(Swallow) for call in calls)), 'transaction.atomic must be called with using=router.db_for_write(Swallow)')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_with_swallow_admin_multiple_changes(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    c = Swallow.objects.create(origin='Swallow C', load=5, speed=5)
+    self.client.force_login(self.superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '3', 'form-INITIAL_FORMS': '3', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-0-load': '8.0', 'form-0-speed': '2.0', 'form-1-uuid': str(b.pk), 'form-1-load': '6.0', 'form-1-speed': '1.0', 'form-2-uuid': str(c.pk), 'form-2-load': '5.0', 'form-2-speed': '4.0', '_save': 'Save'}
+    with mock.patch('django.contrib.admin.options.transaction.atomic') as atomic:
+        response = self.client.post(changelist_url, data)
+    calls = atomic.call_args_list
+    self.assertTrue(any((call[1].get('using') == router.db_for_write(Swallow) for call in calls)), 'transaction.atomic must be called with using=router.db_for_write(Swallow)')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_when_log_change_raises(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    self.client.force_login(self.superuser)
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-uuid': str(b.pk), 'form-1-load': '5.0', 'form-1-speed': '1.0', '_save': 'Save'}
+    with mock.patch('django.contrib.admin.ModelAdmin.log_change', side_effect=DatabaseError):
+        with mock.patch('django.contrib.admin.options.transaction.atomic') as atomic:
+            with self.assertRaises(DatabaseError):
+                self.client.post(changelist_url, data)
+    calls = atomic.call_args_list
+    self.assertTrue(any((call[1].get('using') == router.db_for_write(Swallow) for call in calls)), 'transaction.atomic must be called with using=router.db_for_write(Swallow) even when exceptions occur')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_with_child_admin_via_factory(self):
+    parent = Parent.objects.create(name='Parent X')
+    c1 = Child.objects.create(name='c1', parent=parent)
+    c2 = Child.objects.create(name='c2', parent=parent)
+    m = ChildAdmin(Child, custom_site)
+    m.list_display = ['id', 'name', 'parent']
+    m.list_display_links = ['id']
+    m.list_editable = ['name']
+    request = self.factory.post(reverse('admin:admin_changelist_child_changelist'), data={'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-id': str(c1.pk), 'form-0-name': 'newc1', 'form-1-id': str(c2.pk), 'form-1-name': 'newc2', '_save': 'Save'})
+    request.user = self.superuser
+    request._messages = CookieStorage(request)
+    with mock.patch('django.contrib.admin.options.transaction.atomic') as atomic:
+        m.changelist_view(request)
+    calls = atomic.call_args_list
+    self.assertTrue(any((call[1].get('using') == router.db_for_write(Child) for call in calls)), 'transaction.atomic must be called with using=router.db_for_write(Child)')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_with_child_admin_multiple_forms(self):
+    parent = Parent.objects.create(name='Parent Y')
+    c1 = Child.objects.create(name='c1', parent=parent)
+    c2 = Child.objects.create(name='c2', parent=parent)
+    c3 = Child.objects.create(name='c3', parent=parent)
+    m = ChildAdmin(Child, custom_site)
+    m.list_display = ['id', 'name', 'parent']
+    m.list_display_links = ['id']
+    m.list_editable = ['name']
+    request = self.factory.post(reverse('admin:admin_changelist_child_changelist'), data={'form-TOTAL_FORMS': '3', 'form-INITIAL_FORMS': '3', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-id': str(c1.pk), 'form-0-name': 'nc1', 'form-1-id': str(c2.pk), 'form-1-name': 'nc2', 'form-2-id': str(c3.pk), 'form-2-name': 'nc3', '_save': 'Save'})
+    request.user = self.superuser
+    request._messages = CookieStorage(request)
+    with mock.patch('django.contrib.admin.options.transaction.atomic') as atomic:
+        m.changelist_view(request)
+    calls = atomic.call_args_list
+    self.assertTrue(any((call[1].get('using') == router.db_for_write(Child) for call in calls)), 'transaction.atomic must be called with using=router.db_for_write(Child) for multiple edited forms')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_with_group_admin(self):
+    g1 = Group.objects.create(name='G1')
+    g2 = Group.objects.create(name='G2')
+    m = GroupAdmin(Group, custom_site)
+    m.list_display = ['id', 'name']
+    m.list_display_links = ['id']
+    m.list_editable = ['name']
+    request = self.factory.post(reverse('admin:admin_changelist_group_changelist'), data={'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-id': str(g1.pk), 'form-0-name': 'New G1', 'form-1-id': str(g2.pk), 'form-1-name': 'New G2', '_save': 'Save'})
+    request.user = self.superuser
+    request._messages = CookieStorage(request)
+    with mock.patch('django.contrib.admin.options.transaction.atomic') as atomic:
+        m.changelist_view(request)
+    calls = atomic.call_args_list
+    self.assertTrue(any((call[1].get('using') == router.db_for_write(Group) for call in calls)), 'transaction.atomic must be called with using=router.db_for_write(Group)')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_with_concert_admin(self):
+    band = Group.objects.create(name='Band1')
+    c1 = Concert.objects.create(name='C1', group=band)
+    c2 = Concert.objects.create(name='C2', group=band)
+    m = ConcertAdmin(Concert, custom_site)
+    m.list_display = ['id', 'name', 'group']
+    m.list_display_links = ['id']
+    m.list_editable = ['name']
+    request = self.factory.post(reverse('admin:admin_changelist_concert_changelist'), data={'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-id': str(c1.pk), 'form-0-name': 'New C1', 'form-1-id': str(c2.pk), 'form-1-name': 'New C2', '_save': 'Save'})
+    request.user = self.superuser
+    request._messages = CookieStorage(request)
+    with mock.patch('django.contrib.admin.options.transaction.atomic') as atomic:
+        m.changelist_view(request)
+    calls = atomic.call_args_list
+    self.assertTrue(any((call[1].get('using') == router.db_for_write(Concert) for call in calls)), 'transaction.atomic must be called with using=router.db_for_write(Concert)')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_with_band_admin(self):
+    b1 = Band.objects.create(name='B1', nr_of_members=1)
+    b2 = Band.objects.create(name='B2', nr_of_members=2)
+    m = BandAdmin(Band, custom_site)
+    m.list_display = ['id', 'name']
+    m.list_display_links = ['id']
+    m.list_editable = ['name']
+    request = self.factory.post(reverse('admin:admin_changelist_band_changelist'), data={'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-id': str(b1.pk), 'form-0-name': 'New B1', 'form-1-id': str(b2.pk), 'form-1-name': 'New B2', '_save': 'Save'})
+    request.user = self.superuser
+    request._messages = CookieStorage(request)
+    with mock.patch('django.contrib.admin.options.transaction.atomic') as atomic:
+        m.changelist_view(request)
+    calls = atomic.call_args_list
+    self.assertTrue(any((call[1].get('using') == router.db_for_write(Band) for call in calls)), 'transaction.atomic must be called with using=router.db_for_write(Band)')
+
+@skipUnlessDBFeature('supports_transactions')
+def test_atomic_used_with_parent_admin(self):
+    p1 = Parent.objects.create(name='P1')
+    p2 = Parent.objects.create(name='P2')
+    m = ParentAdmin(Parent, custom_site)
+    m.list_display = ['id', 'name']
+    m.list_display_links = ['id']
+    m.list_editable = ['name']
+    request = self.factory.post(reverse('admin:admin_changelist_parent_changelist'), data={'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-id': str(p1.pk), 'form-0-name': 'New P1', 'form-1-id': str(p2.pk), 'form-1-name': 'New P2', '_save': 'Save'})
+    request.user = self.superuser
+    request._messages = CookieStorage(request)
+    with mock.patch('django.contrib.admin.options.transaction.atomic') as atomic:
+        m.changelist_view(request)
+    calls = atomic.call_args_list
+    self.assertTrue(any((call[1].get('using') == router.db_for_write(Parent) for call in calls)), 'transaction.atomic must be called with using=router.db_for_write(Parent)')
+
+def _post_changelist_swallow(self, data, patch_db_for_write='other_db', side_effect=None):
+    """
+    Helper to POST changelist data for Swallow model while patching
+    router.db_for_write and transaction.atomic.
+
+    Returns the atomic mock used (so tests can inspect call args).
+    """
+    changelist_url = reverse('admin:admin_changelist_swallow_changelist')
+    self.client.force_login(self.superuser)
+    with mock.patch('django.db.router.db_for_write', return_value=patch_db_for_write):
+        with mock.patch('django.db.transaction.atomic') as atomic_mock:
+            atomic_cm = mock.MagicMock()
+            atomic_mock.return_value = atomic_cm
+            if side_effect is None:
+                response = self.client.post(changelist_url, data)
+            else:
+                with mock.patch('django.contrib.admin.ModelAdmin.log_change', side_effect=side_effect):
+                    response = None
+                    try:
+                        response = self.client.post(changelist_url, data)
+                    finally:
+                        pass
+            return (atomic_mock, response)
+
+def _make_swallow_data(self):
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-0-load': '9.0', 'form-0-speed': '3.0', 'form-1-uuid': str(b.pk), 'form-1-load': '5.0', 'form-1-speed': '1.0', '_save': 'Save'}
+    return (a, b, data)
+
+def test_atomic_called_with_using_alias_on_list_editable_save(self):
+    """transaction.atomic must be called with using=router.db_for_write(self.model)."""
+    _, _, data = self._make_swallow_data()
+    atomic_mock, response = self._post_changelist_swallow(data, patch_db_for_write='other_db')
+    self.assertTrue(atomic_mock.called)
+    self.assertIn('using', atomic_mock.call_args.kwargs)
+    self.assertEqual(atomic_mock.call_args.kwargs['using'], 'other_db')
+
+def test_atomic_called_with_using_when_log_change_raises(self):
+    """Even when log_change raises, transaction.atomic must be called with the proper using arg."""
+    _, _, data = self._make_swallow_data()
+    atomic_mock, _ = self._post_changelist_swallow(data, patch_db_for_write='db_alias', side_effect=DatabaseError)
+    self.assertTrue(atomic_mock.called)
+    self.assertIn('using', atomic_mock.call_args.kwargs)
+    self.assertEqual(atomic_mock.call_args.kwargs['using'], 'db_alias')
+
+def test_atomic_called_with_using_for_default_alias(self):
+    """router.db_for_write may return 'default' and atomic should be called with that alias."""
+    _, _, data = self._make_swallow_data()
+    atomic_mock, response = self._post_changelist_swallow(data, patch_db_for_write='default')
+    self.assertTrue(atomic_mock.called)
+    self.assertIn('using', atomic_mock.call_args.kwargs)
+    self.assertEqual(atomic_mock.call_args.kwargs['using'], 'default')
+
+def test_atomic_called_even_if_no_forms_changed(self):
+    """
+    If formset is valid but none of the forms have changed, the atomic
+    context is still entered (transaction.atomic is used with using arg).
+    """
+    a = Swallow.objects.create(origin='Swallow A', load=4, speed=1)
+    b = Swallow.objects.create(origin='Swallow B', load=2, speed=2)
+    data = {'form-TOTAL_FORMS': '2', 'form-INITIAL_FORMS': '2', 'form-MIN_NUM_FORMS': '0', 'form-MAX_NUM_FORMS': '1000', 'form-0-uuid': str(a.pk), 'form-0-load': str(a.load), 'form-0-speed': str(a.speed), 'form-1-uuid': str(b.pk), 'form-1-load': str(b.load), 'form-1-speed': str(b.speed), '_save': 'Save'}
+    atomic_mock, response = self._post_changelist_swallow(data, patch_db_for_write='x_db')
+    self.assertTrue(atomic_mock.called)
+    self.assertIn('using', atomic_mock.call_args.kwargs)
+    self.assertEqual(atomic_mock.call_args.kwargs['using'], 'x_db')
+
+def test_atomic_called_with_using_when_multiple_forms_and_second_log_change_raises(self):
+    """
+    When multiple forms are changed and the second log_change raises, atomic must
+    still be invoked with the using kwarg so the whole operation can be rolled back.
+    """
+    a, b, data = self._make_swallow_data()
+    with mock.patch('django.db.router.db_for_write', return_value='my_db'):
+        with mock.patch('django.db.transaction.atomic') as atomic_mock:
+            atomic_cm = mock.MagicMock()
+            atomic_mock.return_value = atomic_cm
+            with mock.patch('django.contrib.admin.ModelAdmin.log_change', side_effect=[None, DatabaseError]):
+                with self.assertRaises(DatabaseError):
+                    self.client.post(reverse('admin:admin_changelist_swallow_changelist'), data)
+    self.assertTrue(atomic_mock.called)
+    self.assertIn('using', atomic_mock.call_args.kwargs)
+    self.assertEqual(atomic_mock.call_args.kwargs['using'], 'my_db')
+
+def test_atomic_called_with_using_when_router_returns_none(self):
+    """
+    If router.db_for_write returns None, the atomic call should still receive
+    a 'using' kwarg with value None (the gold patch passes the value through).
+    """
+    _, _, data = self._make_swallow_data()
+    atomic_mock, response = self._post_changelist_swallow(data, patch_db_for_write=None)
+    self.assertTrue(atomic_mock.called)
+    self.assertIn('using', atomic_mock.call_args.kwargs)
+    self.assertIsNone(atomic_mock.call_args.kwargs['using'])
+
+def test_atomic_called_with_using_for_unusual_alias(self):
+    """DB alias with special characters should be passed through to transaction.atomic."""
+    _, _, data = self._make_swallow_data()
+    weird_alias = 'other-db-alias'
+    atomic_mock, response = self._post_changelist_swallow(data, patch_db_for_write=weird_alias)
+    self.assertTrue(atomic_mock.called)
+    self.assertIn('using', atomic_mock.call_args.kwargs)
+    self.assertEqual(atomic_mock.call_args.kwargs['using'], weird_alias)
+
+def test_atomic_called_with_using_when_save_model_raises(self):
+    """
+    Ensure that when save_model raises an exception, the atomic context is still
+    entered and called with the correct using arg.
+    """
+    a, b, data = self._make_swallow_data()
+    with mock.patch('django.db.router.db_for_write', return_value='save_db'):
+        with mock.patch('django.db.transaction.atomic') as atomic_mock:
+            atomic_cm = mock.MagicMock()
+            atomic_mock.return_value = atomic_cm
+            with mock.patch('django.contrib.admin.ModelAdmin.save_model', side_effect=DatabaseError):
+                with self.assertRaises(DatabaseError):
+                    self.client.post(reverse('admin:admin_changelist_swallow_changelist'), data)
+    self.assertTrue(atomic_mock.called)
+    self.assertIn('using', atomic_mock.call_args.kwargs)
+    self.assertEqual(atomic_mock.call_args.kwargs['using'], 'save_db')
+
+def test_atomic_called_once_per_list_editable_save(self):
+    """
+    The atomic context manager should be entered exactly once for the
+    list_editable save operation.
+    """
+    _, _, data = self._make_swallow_data()
+    with mock.patch('django.db.router.db_for_write', return_value='once_db'):
+        with mock.patch('django.db.transaction.atomic') as atomic_mock:
+            atomic_cm = mock.MagicMock()
+            atomic_mock.return_value = atomic_cm
+            self.client.post(reverse('admin:admin_changelist_swallow_changelist'), data)
+    self.assertEqual(atomic_mock.call_count, 1)

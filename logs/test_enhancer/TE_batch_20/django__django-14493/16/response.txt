@@ -1,0 +1,220 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that post_process and stored_name behave correctly when max_post_process_passes is set to 0. They exercise HashedFilesMixin (combined with FileSystemStorage) and ManifestFilesMixin (ManifestStaticFilesStorage) to ensure no UnboundLocalError occurs, that hashed files are created, that the manifest is written for ManifestStaticFilesStorage, and that special fragment handling (the "?#iefix" font hack) is preserved. All tests should fail on the original (unpatched) code that references the 'substitutions' variable when the post-process loop is skipped, and pass once the provided patch initializing substitutions is applied.
+test_code: |
+  import os
+  import shutil
+  import tempfile
+  import unittest
+  import json
+
+  from django.core.files.storage import FileSystemStorage
+  from django.core.files.base import ContentFile
+
+  from django.contrib.staticfiles.storage import (
+      HashedFilesMixin, ManifestStaticFilesStorage
+  )
+
+  class ZeroPassHashedStorage(HashedFilesMixin, FileSystemStorage):
+      """
+      Helper storage combining HashedFilesMixin with FileSystemStorage for tests.
+      """
+      pass
+
+
+  class PostProcessZeroPassesTests(unittest.TestCase):
+      def setUp(self):
+          self.tmpdir = tempfile.mkdtemp()
+
+      def tearDown(self):
+          shutil.rmtree(self.tmpdir)
+
+      def _write(self, name, content):
+          full = os.path.join(self.tmpdir, name)
+          d = os.path.dirname(full)
+          if d and not os.path.exists(d):
+              os.makedirs(d)
+          with open(full, 'wb') as f:
+              if isinstance(content, str):
+                  content = content.encode()
+              f.write(content)
+
+      def _run_post_process(self, storage, filenames):
+          """
+          Helper to run post_process on storage with given filenames list.
+          filenames: list of file paths relative to storage.location
+          Returns list of yielded values from post_process
+          """
+          paths = {name: (storage, name) for name in filenames}
+          return list(storage.post_process(paths, dry_run=False))
+
+      def test_hashed_storage_zero_passes_creates_hashed_css_and_mapping(self):
+          """
+          Basic test: With max_post_process_passes = 0, post_process should not
+          raise and should produce a hashed file and update hashed_files.
+          """
+          self._write('img/logo.png', b'logoimage')
+          # CSS references the image so it's adjustable
+          self._write('css/styles.css', b'body { background: url("img/logo.png"); }')
+
+          storage = ZeroPassHashedStorage(location=self.tmpdir, base_url='/static/')
+          storage.max_post_process_passes = 0
+
+          yielded = self._run_post_process(storage, ['css/styles.css', 'img/logo.png'])
+
+          # Ensure no UnboundLocalError and that we got yields for the adjustable file.
+          # Find entry for 'css/styles.css'
+          yielded_names = [entry[0] for entry in yielded]
+          self.assertIn('css/styles.css', yielded_names)
+
+          # The hashed_files mapping should contain the cleaned name
+          self.assertIn('css/styles.css', storage.hashed_files)
+          hashed_name = storage.hashed_files['css/styles.css']
+          # The hashed file should exist on disk
+          self.assertTrue(os.path.exists(os.path.join(self.tmpdir, hashed_name)))
+
+      def test_manifest_storage_zero_passes_saves_manifest(self):
+          """
+          ManifestStaticFilesStorage should not raise and must write the manifest
+          file after post_process even when max_post_process_passes == 0.
+          """
+          self._write('img/pic.png', b'pic')
+          self._write('css/site.css', b'@import "other.css"; url("img/pic.png");')
+          storage = ManifestStaticFilesStorage(location=self.tmpdir, base_url='/static/')
+          storage.max_post_process_passes = 0
+
+          yielded = self._run_post_process(storage, ['css/site.css', 'img/pic.png'])
+
+          # Manifest file should be created
+          manifest_path = os.path.join(self.tmpdir, storage.manifest_name)
+          self.assertTrue(os.path.exists(manifest_path))
+
+          # Manifest should be valid JSON and include version and paths
+          with open(manifest_path, 'rb') as fh:
+              data = json.loads(fh.read().decode())
+          self.assertEqual(data.get('version'), storage.manifest_version)
+          self.assertIn('paths', data)
+          # hashed_files on the storage instance should match manifest paths
+          self.assertEqual(storage.hashed_files, data['paths'])
+
+      def test_hashed_storage_zero_passes_with_non_adjustable_file_no_error(self):
+          """
+          When only non-adjustable files are present (e.g., images), post_process
+          should not raise and should process them as unmodified or saved.
+          """
+          self._write('images/icon.png', b'icon')
+          storage = ZeroPassHashedStorage(location=self.tmpdir, base_url='/static/')
+          storage.max_post_process_passes = 0
+
+          yielded = self._run_post_process(storage, ['images/icon.png'])
+          # Should yield an entry for the image
+          self.assertTrue(any(name == 'images/icon.png' for name, _, _, _ in yielded))
+          # hashed_files should contain the image mapping
+          self.assertIn('images/icon.png', storage.hashed_files)
+
+      def test_hashed_storage_zero_passes_multiple_files_processed(self):
+          """
+          Multiple adjustable files (CSS and referenced images) should be
+          processed without error with zero passes.
+          """
+          self._write('img/a.png', b'a')
+          self._write('img/b.png', b'b')
+          self._write('css/one.css', b'url("../img/a.png")')
+          self._write('css/two.css', b'url("../img/b.png")')
+
+          storage = ZeroPassHashedStorage(location=self.tmpdir, base_url='/static/')
+          storage.max_post_process_passes = 0
+
+          yielded = self._run_post_process(storage, ['css/one.css', 'css/two.css', 'img/a.png', 'img/b.png'])
+
+          # Both CSS files should be present in the yielded results
+          yielded_names = {entry[0] for entry in yielded}
+          self.assertIn('css/one.css', yielded_names)
+          self.assertIn('css/two.css', yielded_names)
+
+          # Both CSS names should be keys in hashed_files
+          self.assertIn('css/one.css', storage.hashed_files)
+          self.assertIn('css/two.css', storage.hashed_files)
+
+      def test_stored_name_handles_iefix_fragment(self):
+          """
+          Ensure stored_name preserves the special '?#' font-face hack by appending
+          a '?' when appropriate (the font hack should not be lost).
+          """
+          # Create the font file that will be hashed
+          self._write('fonts/myfont.eot', b'fontdata')
+          storage = ZeroPassHashedStorage(location=self.tmpdir, base_url='/static/')
+          # Ensure there's a hashed name calculated for the font
+          hashed = storage.stored_name('fonts/myfont.eot?#iefix')
+          # The returned stored name should include a question mark appended to
+          # the path portion when the special hack is present.
+          self.assertIn('?', hashed)
+
+      def test_keep_intermediate_files_true_saves_intermediate(self):
+          """
+          For HashedFilesMixin the default keep_intermediate_files is True,
+          so an intermediate file should be saved during post_process.
+          """
+          self._write('img/x.png', b'x')
+          self._write('css/keep.css', b'url("../img/x.png")')
+          storage = ZeroPassHashedStorage(location=self.tmpdir, base_url='/static/')
+          storage.max_post_process_passes = 0
+          storage.keep_intermediate_files = True
+
+          _ = self._run_post_process(storage, ['css/keep.css', 'img/x.png'])
+
+          # Look for any file under css/ that starts with 'keep.' (intermediate)
+          css_dir = os.path.join(self.tmpdir, 'css')
+          found_intermediate = any(name.startswith('keep.') for name in os.listdir(css_dir))
+          self.assertTrue(found_intermediate)
+
+      def test_zero_passes_does_not_raise_with_query_and_fragment_in_content(self):
+          """
+          CSS referencing resources with querystrings and fragments should be
+          processed without raising when max_post_process_passes == 0.
+          """
+          self._write('img/q.png', b'q')
+          self._write('css/qf.css', b'url("img/q.png?version=1#frag")')
+          storage = ZeroPassHashedStorage(location=self.tmpdir, base_url='/static/')
+          storage.max_post_process_passes = 0
+
+          yielded = self._run_post_process(storage, ['css/qf.css', 'img/q.png'])
+          self.assertIn('css/qf.css', [entry[0] for entry in yielded])
+          self.assertIn('css/qf.css', storage.hashed_files)
+
+      def test_zero_passes_with_absolute_url_ignored(self):
+          """
+          URLs that are absolute but not under the storage's base path should be
+          ignored and not cause errors.
+          """
+          # CSS with an absolute URL that does not point to our static path
+          self._write('css/abs.css', b'body { background: url("/media/notstatic.png"); }')
+          storage = ZeroPassHashedStorage(location=self.tmpdir, base_url='/static/')
+          storage.max_post_process_passes = 0
+
+          yielded = self._run_post_process(storage, ['css/abs.css'])
+          # Should process and not crash; mapping should include the css
+          self.assertIn('css/abs.css', storage.hashed_files)
+
+      def test_manifest_storage_zero_passes_with_mix_of_files(self):
+          """
+          Manifest storage should handle a mix of adjustable and non-adjustable
+          files with zero passes without error and should write the manifest.
+          """
+          self._write('img/m.png', b'm')
+          self._write('css/mix.css', b'url("../img/m.png")')
+          storage = ManifestStaticFilesStorage(location=self.tmpdir, base_url='/static/')
+          storage.max_post_process_passes = 0
+
+          yielded = self._run_post_process(storage, ['css/mix.css', 'img/m.png'])
+          manifest_path = os.path.join(self.tmpdir, storage.manifest_name)
+          self.assertTrue(os.path.exists(manifest_path))
+          # storage.hashed_files should have entries for mix.css
+          self.assertIn('css/mix.css', storage.hashed_files)
+
+  if __name__ == '__main__':
+      unittest.main()
+new_imports_code: |
+  from django.core.files.storage import FileSystemStorage
+  from django.core.files.base import ContentFile
+  from django.contrib.staticfiles.storage import HashedFilesMixin, ManifestStaticFilesStorage

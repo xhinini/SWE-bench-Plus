@@ -1,0 +1,194 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise build_instance() behavior when a Model.natural_key() implementation expects the instance _state.db attribute to be set before natural_key() is called. The gold patch sets obj._state.db before calling natural_key(), whereas the candidate patch does not, causing natural_key() to raise AttributeError (which the candidate patch swallows) and preventing the primary key from being filled in. Each test constructs a minimal fake Model class and manager to simulate get_by_natural_key() returning an object with a pk. The tests assert that build_instance() correctly populates the model primary key (via the Meta.pk.to_python conversion) for various db values and natural_key implementations. These tests would fail under the candidate patch but pass with the provided gold patch.
+test_code: |
+  from types import SimpleNamespace
+  import unittest
+  
+  from django.core.serializers.base import build_instance
+  
+  
+  class DummyPK:
+      def __init__(self, attname="id"):
+          self.attname = attname
+  
+      def to_python(self, v):
+          # Simulate typical to_python behavior converting to int
+          return int(v)
+  
+  
+  class ManagerReturningPK:
+      def __init__(self, pk_value):
+          self.pk_value = pk_value
+          self.last_db_manager_arg = None
+          self.last_get_args = None
+  
+      def db_manager(self, db):
+          # db_manager is called with the db argument; return self to keep things simple
+          self.last_db_manager_arg = db
+          return self
+  
+      def get_by_natural_key(self, *args):
+          # Record args for debugging/inspection and return an object with a pk attr
+          self.last_get_args = args
+          return SimpleNamespace(pk=self.pk_value)
+  
+  
+  def make_model_class(pk_value, natural_key_func):
+      """
+      Build a minimal Model-like class usable with build_instance().
+      - pk_value: the value the manager should return for pk
+      - natural_key_func: function to be attached as Model.natural_key(self)
+      """
+      manager = ManagerReturningPK(pk_value)
+  
+      class Meta:
+          pk = DummyPK(attname="id")
+          default_manager = manager
+  
+      class Model:
+          # Emulate Django model exception name
+          class DoesNotExist(Exception):
+              pass
+  
+          _meta = Meta()
+  
+          def __init__(self, **kwargs):
+              # The real bug depends on _state existing but not having .db set.
+              # __init__ should accept arbitrary kwargs and set as attributes.
+              self._state = SimpleNamespace()  # no .db attribute initially
+              for k, v in kwargs.items():
+                  setattr(self, k, v)
+  
+      # Attach the natural_key implementation
+      Model.natural_key = natural_key_func
+      return Model, manager
+  
+  
+  class BuildInstanceStateDbTests(unittest.TestCase):
+      def test_natural_key_reads_state_db_and_sets_pk_with_string_db(self):
+          def nk(self):
+              # natural_key requires ._state.db to be present
+              return (self._state.db, getattr(self, "name", None))
+  
+          Model, manager = make_model_class(42, nk)
+          data = {"name": "alice"}
+          inst = build_instance(Model, data, db="other_db")
+          # The returned instance should have an id set (converted by pk.to_python)
+          self.assertEqual(getattr(inst, "id"), 42)
+          # The manager should have been called through db_manager with the db argument
+          self.assertEqual(manager.last_db_manager_arg, "other_db")
+          # natural_key should have been passed through to get_by_natural_key
+          self.assertEqual(manager.last_get_args, ("other_db", "alice"))
+  
+      def test_natural_key_reads_state_db_and_sets_pk_with_none_db(self):
+          def nk(self):
+              return (self._state.db, getattr(self, "name", None))
+  
+          Model, manager = make_model_class(7, nk)
+          data = {"name": "bob"}
+          inst = build_instance(Model, data, db=None)
+          self.assertEqual(getattr(inst, "id"), 7)
+          self.assertIs(manager.last_db_manager_arg, None)
+          self.assertEqual(manager.last_get_args, (None, "bob"))
+  
+      def test_natural_key_uses_db_and_integer_db_value(self):
+          def nk(self):
+              return (self._state.db, getattr(self, "username", None))
+  
+          Model, manager = make_model_class(101, nk)
+          data = {"username": "charlie"}
+          inst = build_instance(Model, data, db=0)
+          self.assertEqual(getattr(inst, "id"), 101)
+          self.assertEqual(manager.last_db_manager_arg, 0)
+          self.assertEqual(manager.last_get_args, (0, "charlie"))
+  
+      def test_natural_key_casts_db_to_string_then_uses_it(self):
+          def nk(self):
+              # Use string conversion of db to exercise non-string db values
+              return (str(self._state.db), getattr(self, "code", None))
+  
+          Model, manager = make_model_class(500, nk)
+          data = {"code": "X1"}
+          inst = build_instance(Model, data, db=123)
+          self.assertEqual(getattr(inst, "id"), 500)
+          self.assertEqual(manager.last_db_manager_arg, 123)
+          # natural_key returns (str(123), 'X1')
+          self.assertEqual(manager.last_get_args, ("123", "X1"))
+  
+      def test_natural_key_accesses_nested_state_db_attribute(self):
+          def nk(self):
+              # emulate more complex attribute access (getattr chain)
+              dbval = getattr(self._state, "db", None)
+              return (dbval, getattr(self, "slug", None))
+  
+          Model, manager = make_model_class(88, nk)
+          data = {"slug": "item-88"}
+          inst = build_instance(Model, data, db="nested-db")
+          self.assertEqual(getattr(inst, "id"), 88)
+          self.assertEqual(manager.last_db_manager_arg, "nested-db")
+          self.assertEqual(manager.last_get_args, ("nested-db", "item-88"))
+  
+      def test_natural_key_with_single_element_tuple_including_db(self):
+          def nk(self):
+              # natural key that only returns the db
+              return (self._state.db,)
+  
+          Model, manager = make_model_class(300, nk)
+          data = {}
+          inst = build_instance(Model, data, db="onlydb")
+          self.assertEqual(getattr(inst, "id"), 300)
+          self.assertEqual(manager.last_get_args, ("onlydb",))
+  
+      def test_natural_key_combines_db_and_multiple_fields(self):
+          def nk(self):
+              return (self._state.db, getattr(self, "a", None), getattr(self, "b", None))
+  
+          Model, manager = make_model_class(999, nk)
+          data = {"a": "A", "b": "B"}
+          inst = build_instance(Model, data, db="multi")
+          self.assertEqual(getattr(inst, "id"), 999)
+          self.assertEqual(manager.last_get_args, ("multi", "A", "B"))
+  
+      def test_natural_key_uses_db_when_db_is_empty_string(self):
+          def nk(self):
+              return (self._state.db, getattr(self, "tag", None))
+  
+          Model, manager = make_model_class(11, nk)
+          data = {"tag": "empty"}
+          inst = build_instance(Model, data, db="")
+          self.assertEqual(getattr(inst, "id"), 11)
+          self.assertEqual(manager.last_get_args, ("", "empty"))
+  
+      def test_natural_key_reads_state_db_when_db_is_boolean(self):
+          def nk(self):
+              return (self._state.db, getattr(self, "flag", None))
+  
+          Model, manager = make_model_class(2, nk)
+          data = {"flag": True}
+          inst = build_instance(Model, data, db=False)
+          self.assertEqual(getattr(inst, "id"), 2)
+          self.assertEqual(manager.last_get_args, (False, True))
+  
+      def test_natural_key_reads_state_db_for_complex_object_db(self):
+          class ComplexDB:
+              def __repr__(self):
+                  return "<ComplexDB>"
+  
+          def nk(self):
+              # natural_key includes representation of a complex db object
+              return (self._state.db, getattr(self, "meta", None))
+  
+          Model, manager = make_model_class(77, nk)
+          data = {"meta": "m"}
+          complex_db = ComplexDB()
+          inst = build_instance(Model, data, db=complex_db)
+          self.assertEqual(getattr(inst, "id"), 77)
+          self.assertIs(manager.last_db_manager_arg, complex_db)
+          self.assertEqual(manager.last_get_args, (complex_db, "m"))
+  
+  
+  if __name__ == "__main__":
+      unittest.main()
+new_imports_code: |
+  # No new module-level imports are required beyond those included in the test module.

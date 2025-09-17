@@ -1,0 +1,159 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that RenameContentType._rename uses the schema editor's database alias when saving (i.e., passes using=db to save), that it behaves correctly on IntegrityError (restores the in-memory model and does not persist the failed rename), that cache clearing is invoked on successful rename, that the rename backward path also uses the correct DB, that nothing is performed when migrations are disallowed by the router, that inject_rename_contenttypes_operations inserts operations at the correct positions, and that get_contenttypes_and_models respects router.allow_migrate_model.
+test_code: |
+  from django.apps.registry import apps
+  from django.contrib.contenttypes import management as contenttypes_management
+  from django.contrib.contenttypes.models import ContentType
+  from django.db import connections, IntegrityError
+  from django.db import router
+  from django.db import migrations
+  from django.test import TransactionTestCase, override_settings
+  from unittest.mock import patch, Mock
+
+  class RenameContentTypeUsingTests(TransactionTestCase):
+      databases = {'default', 'other'}
+      available_apps = ['django.contrib.contenttypes']
+
+      def test_save_called_with_using_db_forward(self):
+          # Create a content type in the 'other' DB.
+          ContentType.objects.using('other').create(app_label='tests', model='oldmodel')
+          op = contenttypes_management.RenameContentType('tests', 'oldmodel', 'newmodel')
+
+          with connections['other'].schema_editor() as schema_editor:
+              with patch('django.db.router.allow_migrate_model', return_value=True):
+                  with patch.object(ContentType, 'save', autospec=True) as mock_save:
+                      op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+                      self.assertTrue(mock_save.called)
+                      _, kwargs = mock_save.call_args
+                      # The save must be called with using equal to the schema_editor alias.
+                      self.assertEqual(kwargs.get('using'), 'other')
+
+      def test_missing_content_type_does_not_save(self):
+          # No content type created for this app/model; save should not be called.
+          op = contenttypes_management.RenameContentType('tests', 'nonexistent', 'whatever')
+          with connections['other'].schema_editor() as schema_editor:
+              with patch('django.db.router.allow_migrate_model', return_value=True):
+                  with patch.object(ContentType, 'save', autospec=True) as mock_save:
+                      op._rename(apps, schema_editor, 'nonexistent', 'whatever')
+                      self.assertFalse(mock_save.called)
+
+      def test_integrity_error_restores_model_and_uses_db(self):
+          # When save raises IntegrityError, in-memory model should be restored and DB unchanged.
+          ContentType.objects.using('other').create(app_label='tests', model='oldmodel')
+          op = contenttypes_management.RenameContentType('tests', 'oldmodel', 'newmodel')
+
+          def raise_integrity(self, *args, **kwargs):
+              raise IntegrityError("simulated")
+
+          with connections['other'].schema_editor() as schema_editor:
+              with patch('django.db.router.allow_migrate_model', return_value=True):
+                  with patch.object(ContentType, 'save', autospec=True, side_effect=raise_integrity) as mock_save:
+                      op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+                      # save was attempted and raised
+                      self.assertTrue(mock_save.called)
+                      _, kwargs = mock_save.call_args
+                      self.assertEqual(kwargs.get('using'), 'other')
+                      # Database content type should still have the old model name.
+                      ct = ContentType.objects.using('other').get(app_label='tests')
+                      self.assertEqual(ct.model, 'oldmodel')
+
+      def test_clear_cache_called_on_success(self):
+          ContentType.objects.using('other').create(app_label='tests', model='oldmodel')
+          op = contenttypes_management.RenameContentType('tests', 'oldmodel', 'newmodel')
+
+          with connections['other'].schema_editor() as schema_editor:
+              with patch('django.db.router.allow_migrate_model', return_value=True):
+                  with patch.object(ContentType.objects, 'clear_cache', autospec=True) as mock_clear:
+                      op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+                      self.assertTrue(mock_clear.called)
+
+      def test_rename_backward_uses_using_db(self):
+          ContentType.objects.using('other').create(app_label='tests', model='newmodel')
+          op = contenttypes_management.RenameContentType('tests', 'oldmodel', 'newmodel')
+
+          with connections['other'].schema_editor() as schema_editor:
+              with patch('django.db.router.allow_migrate_model', return_value=True):
+                  with patch.object(ContentType, 'save', autospec=True) as mock_save:
+                      op.rename_backward = op.rename_backward  # no-op just to emphasize API
+                      op.rename_backward(apps, schema_editor)
+                      self.assertTrue(mock_save.called)
+                      _, kwargs = mock_save.call_args
+                      self.assertEqual(kwargs.get('using'), 'other')
+
+      def test_no_save_when_router_disallows_migrate_model(self):
+          ContentType.objects.using('other').create(app_label='tests', model='oldmodel')
+          op = contenttypes_management.RenameContentType('tests', 'oldmodel', 'newmodel')
+
+          with connections['other'].schema_editor() as schema_editor:
+              with patch('django.db.router.allow_migrate_model', return_value=False) as mock_allow:
+                  with patch.object(ContentType, 'save', autospec=True) as mock_save:
+                      op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+                      # No save attempted because allow_migrate_model returned False.
+                      self.assertFalse(mock_save.called)
+
+      def test_save_uses_schema_editor_alias_even_if_router_db_for_write_differs(self):
+          # Simulate router.db_for_write returning 'default' while schema_editor alias is 'other'.
+          ContentType.objects.using('other').create(app_label='tests', model='oldmodel')
+          op = contenttypes_management.RenameContentType('tests', 'oldmodel', 'newmodel')
+
+          with connections['other'].schema_editor() as schema_editor:
+              with patch('django.db.router.allow_migrate_model', return_value=True):
+                  with patch('django.db.router.db_for_write', return_value='default'):
+                      with patch.object(ContentType, 'save', autospec=True) as mock_save:
+                          op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+                          self.assertTrue(mock_save.called)
+                          _, kwargs = mock_save.call_args
+                          # Important: save must still be called with using='other', not the router db_for_write value.
+                          self.assertEqual(kwargs.get('using'), 'other')
+
+      def test_inject_rename_operations_inserts_renamecontenttype(self):
+          # Build a migration containing a single RenameModel operation.
+          migration = migrations.Migration('0002_test', 'myapp')
+          rename_op = migrations.RenameModel('OldModel', 'NewModel')
+          migration.operations = [rename_op]
+          plan = [(migration, False)]
+
+          # Ensure the ContentType model is available and migrations allowed.
+          with patch('django.apps.apps.get_model', wraps=apps.get_model) as get_model_wrap:
+              with patch('django.db.router.allow_migrate_model', return_value=True):
+                  contenttypes_management.inject_rename_contenttypes_operations(plan=plan, apps=apps, using='default')
+
+          # After injection, each RenameModel should be followed by a RenameContentType.
+          self.assertEqual(len(migration.operations), 2)
+          from django.contrib.contenttypes.management import RenameContentType
+          self.assertIsInstance(migration.operations[0], migrations.RenameModel)
+          self.assertIsInstance(migration.operations[1], RenameContentType)
+          self.assertEqual(migration.operations[1].app_label, migration.app_label)
+          self.assertEqual(migration.operations[1].old_model, migration.operations[0].old_name_lower)
+          self.assertEqual(migration.operations[1].new_model, migration.operations[0].new_name_lower)
+
+      def test_get_contenttypes_and_models_respects_router_disallow(self):
+          # When allow_migrate_model is False, get_contenttypes_and_models should return (None, None).
+          ContentTypeModel = ContentType
+          app_config = apps.get_app_config('contenttypes')
+          with patch('django.db.router.allow_migrate_model', return_value=False):
+              cts, models_map = contenttypes_management.get_contenttypes_and_models(app_config, using='default', ContentType=ContentTypeModel)
+              self.assertEqual((cts, models_map), (None, None))
+
+      def test_multiple_rename_ops_inserted_in_correct_positions(self):
+          # Create a migration with two RenameModel operations and verify two inserts.
+          migration = migrations.Migration('0003_test', 'myapp')
+          rename1 = migrations.RenameModel('A', 'B')
+          rename2 = migrations.RenameModel('C', 'D')
+          migration.operations = [rename1, rename2]
+          plan = [(migration, False)]
+
+          with patch('django.db.router.allow_migrate_model', return_value=True):
+              contenttypes_management.inject_rename_contenttypes_operations(plan=plan, apps=apps, using='default')
+
+          # Expect sequence: RenameModel, RenameContentType, RenameModel, RenameContentType
+          from django.contrib.contenttypes.management import RenameContentType
+          self.assertIsInstance(migration.operations[0], migrations.RenameModel)
+          self.assertIsInstance(migration.operations[1], RenameContentType)
+          self.assertIsInstance(migration.operations[2], migrations.RenameModel)
+          self.assertIsInstance(migration.operations[3], RenameContentType)
+new_imports_code: |
+  from unittest.mock import patch, Mock
+  from django.db import connections, IntegrityError
+  from django.db import migrations

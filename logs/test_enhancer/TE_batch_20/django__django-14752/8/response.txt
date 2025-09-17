@@ -1,0 +1,173 @@
+language: Python
+number_of_tests: 10
+test_behavior: These 10 tests verify that AutocompleteJsonView uses the serialize_result() hook to produce the JSON results. They check that subclasses can (1) return non-string ids (JSON numbers), (2) add extra fields, (3) customize the text value, (4) have the customization apply on subsequent pages, (5) have the customization applied for MTI-related targets, (6) have the customization applied for FK PK targets, (7) return non-string/text types for the "text" key, (8) return date objects (JSON encoded by Django) as extra fields, (9) correctly handle unicode in custom text, and (10) preserve customizations when the view is constructed via as_view(admin_site=...). These tests would fail if the view ignored serialize_result() and always emitted the inline {'id': str(...), 'text': str(...)} dictionary.
+test_code: |
+  def _make_request(self, opts, user=None, extra_query=None):
+      query = {'term': '', **opts}
+      if extra_query:
+          query.update(extra_query)
+      request = self.factory.get(self.url, query)
+      request.user = user or self.superuser
+      return request
+
+  def test_regression_serialize_returns_non_string_id(self):
+      class IntIdView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              # Return the id as an integer, not a string.
+              return {'id': getattr(obj, to_field_name), 'text': str(obj)}
+
+      q = Question.objects.create(question='Question IntId')
+      request = self._make_request(self.opts)
+      response = IntIdView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      # Ensure id is an integer (JSON number), not a string.
+      self.assertEqual(data['results'][0]['id'], q.pk)
+      self.assertIsInstance(data['results'][0]['id'], int)
+
+  def test_regression_serialize_adds_extra_field(self):
+      class ExtraFieldView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              base = super().serialize_result(obj, to_field_name)
+              base['extra'] = f"extra-{obj.pk}"
+              return base
+
+      q = Question.objects.create(question='Question Extra')
+      request = self._make_request(self.opts)
+      response = ExtraFieldView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertIn('extra', data['results'][0])
+      self.assertEqual(data['results'][0]['extra'], f"extra-{q.pk}")
+
+  def test_regression_serialize_changes_text(self):
+      class PrefixTextView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              return {'id': str(getattr(obj, to_field_name)), 'text': f"PREFIX: {obj}"}
+
+      q = Question.objects.create(question='Question Prefix')
+      request = self._make_request(self.opts)
+      response = PrefixTextView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertTrue(data['results'][0]['text'].startswith('PREFIX: '))
+      self.assertIn('Question Prefix', data['results'][0]['text'])
+
+  def test_regression_serialize_applies_on_second_page(self):
+      class PkEchoView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              return {'id': str(getattr(obj, to_field_name)), 'text': str(obj), 'pk': obj.pk}
+
+      # Create enough objects to have a second page.
+      Question.objects.bulk_create(Question(question=str(i)) for i in range(PAGINATOR_SIZE + 5))
+      # Request the second page.
+      request = self._make_request(self.opts, extra_query={'page': '2'})
+      response = PkEchoView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      # Ensure all returned results include 'pk' added by the custom serializer.
+      for r in data['results']:
+          self.assertIn('pk', r)
+          self.assertIsInstance(r['pk'], int)
+
+  def test_regression_serialize_with_mti_remote_model(self):
+      class MtiExtraView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              d = super().serialize_result(obj, to_field_name)
+              d['mti'] = type(obj).__name__
+              return d
+
+      # Create a target Employee and a WorkHour related instance.
+      emp = Employee.objects.create(name="Frida Mti", gender=2, code="x", alive=False)
+      WorkHour.objects.create(employee=emp, hours=8)
+      opts = {
+          'app_label': WorkHour._meta.app_label,
+          'model_name': WorkHour._meta.model_name,
+          'field_name': 'employee',
+      }
+      request = self._make_request(opts)
+      response = MtiExtraView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertEqual(data['results'][0]['mti'], type(emp).__name__)
+
+  def test_regression_serialize_with_fk_pk_remote_model(self):
+      class FKExtraView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              base = super().serialize_result(obj, to_field_name)
+              base['child_name'] = getattr(obj, 'name', '')
+              return base
+
+      p = Parent.objects.create(name="Parent X")
+      child = PKChild.objects.create(parent=p, name="Child FK")
+      toy = Toy.objects.create(child=child, name="Toy")
+      opts = {
+          'app_label': Toy._meta.app_label,
+          'model_name': Toy._meta.model_name,
+          'field_name': 'child',
+      }
+      request = self._make_request(opts)
+      response = FKExtraView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      # The serializer should have added 'child_name' with the child's name.
+      self.assertIn('child_name', data['results'][0])
+      self.assertEqual(data['results'][0]['child_name'], child.name)
+
+  def test_regression_serialize_allows_non_string_text(self):
+      class NonStringTextView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              # Return a non-string (dict) as the "text" value.
+              return {'id': str(getattr(obj, to_field_name)), 'text': {'pk': obj.pk, 'label': str(obj)}}
+
+      q = Question.objects.create(question='Question DictText')
+      request = self._make_request(self.opts)
+      response = NonStringTextView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      # The "text" key should be the dict we returned (JSON decoded to Python dict).
+      self.assertIsInstance(data['results'][0]['text'], dict)
+      self.assertEqual(data['results'][0]['text']['pk'], q.pk)
+
+  def test_regression_serialize_handles_date_fields(self):
+      class DateExtraView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              base = super().serialize_result(obj, to_field_name)
+              base['when'] = datetime.date(2020, 1, 2)
+              return base
+
+      Question.objects.create(question='Dated Q', posted=datetime.date(2020, 1, 2))
+      request = self._make_request(self.opts)
+      response = DateExtraView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      # Dates should be JSON-serializable (Django's JSON encoder handles date -> string).
+      self.assertEqual(data['results'][0]['when'], '2020-01-02')
+
+  def test_regression_serialize_handles_unicode_text(self):
+      class UnicodeTextView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              return {'id': str(getattr(obj, to_field_name)), 'text': f"✓ {obj}"}
+
+      q = Question.objects.create(question='Ünicode Q')
+      request = self._make_request(self.opts)
+      response = UnicodeTextView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertTrue(data['results'][0]['text'].startswith('✓'))
+      self.assertIn('Ünicode Q', data['results'][0]['text'])
+
+  def test_regression_serialize_preserved_when_using_as_view_with_admin_site(self):
+      class AsViewExtra(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              return {'id': str(getattr(obj, to_field_name)), 'text': str(obj), 'from_as_view': True}
+
+      q = Question.objects.create(question='AsView Q')
+      request = self._make_request(self.opts)
+      # Create view via as_view explicitly passing the admin_site to ensure
+      # the method resolution still picks up the overridden serialize_result.
+      response = AsViewExtra.as_view(admin_site=site)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertTrue(data['results'][0].get('from_as_view', False) is True)
+new_imports_code: ""

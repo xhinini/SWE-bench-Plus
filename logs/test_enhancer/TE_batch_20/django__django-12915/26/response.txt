@@ -1,0 +1,236 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These tests verify that StaticFilesHandlerMixin.get_response_async runs the
+  synchronous serve and response_for_exception callables in a threadpool (i.e.
+  not on the main/asyncio event loop thread) and that exceptions are propagated
+  correctly. They would fail if get_response_async called serve/response_for_exception
+  directly on the event loop thread (the defect in the candidate patch).
+test_code: |
+  import asyncio
+  import threading
+  import types
+  import unittest
+  from unittest.mock import patch
+
+  import django
+  from django.http import Http404
+
+  from django.contrib.staticfiles import handlers
+
+  class GetResponseAsyncThreadingTests(unittest.TestCase):
+      def run_async(self, coro):
+          return asyncio.run(coro)
+
+      def test_get_response_async_executes_serve_in_thread_bound_method_on_mixin_instance_success(self):
+          called = {}
+
+          class DummyHandler(handlers.StaticFilesHandlerMixin):
+              pass
+
+          handler = DummyHandler()
+
+          def serve(self, request):
+              # record thread id where serve ran
+              called['serve_thread'] = threading.get_ident()
+              return "OK"
+
+          # bind as method
+          handler.serve = types.MethodType(serve, handler)
+
+          main_thread = threading.get_ident()
+          result = self.run_async(handler.get_response_async(object()))
+          self.assertEqual(result, "OK")
+          # serve must run off the main thread (sync_to_async runs it in threadpool)
+          self.assertIn('serve_thread', called)
+          self.assertNotEqual(called['serve_thread'], main_thread)
+
+      def test_get_response_async_executes_response_for_exception_in_thread_on_http404(self):
+          called = {}
+
+          class DummyHandler(handlers.StaticFilesHandlerMixin):
+              pass
+
+          handler = DummyHandler()
+
+          def serve(self, request):
+              # raise Http404 to force response_for_exception path
+              called['serve_thread'] = threading.get_ident()
+              raise Http404("not found")
+
+          handler.serve = types.MethodType(serve, handler)
+
+          def fake_response_for_exception(request, exc):
+              # record thread where response_for_exception ran
+              called['response_thread'] = threading.get_ident()
+              return "RESPONSE_FOR_404"
+
+          main_thread = threading.get_ident()
+          with patch.object(handlers, 'response_for_exception', fake_response_for_exception):
+              result = self.run_async(handler.get_response_async(object()))
+          self.assertEqual(result, "RESPONSE_FOR_404")
+          # response_for_exception must run off the main thread
+          self.assertIn('response_thread', called)
+          self.assertNotEqual(called['response_thread'], main_thread)
+          # serve itself should also have been executed (in threadpool)
+          self.assertIn('serve_thread', called)
+          self.assertNotEqual(called['serve_thread'], main_thread)
+
+      def test_get_response_async_returns_value_from_serve_when_serve_is_function_attribute(self):
+          called = {}
+
+          class DummyHandler(handlers.StaticFilesHandlerMixin):
+              pass
+
+          handler = DummyHandler()
+
+          # assign a plain function (not bound) but store it as attribute; sync_to_async
+          # should still call it with the instance bound automatically when accessed.
+          def serve(request):
+              called['serve_thread'] = threading.get_ident()
+              return "FUNC_OK"
+
+          # store as attribute that ignores self (served signature is single arg in mixin)
+          handler.serve = serve
+
+          main_thread = threading.get_ident()
+          result = self.run_async(handler.get_response_async(object()))
+          self.assertEqual(result, "FUNC_OK")
+          self.assertIn('serve_thread', called)
+          self.assertNotEqual(called['serve_thread'], main_thread)
+
+      def test_get_response_async_called_multiple_times_runs_in_thread_each_time(self):
+          called_threads = []
+
+          class DummyHandler(handlers.StaticFilesHandlerMixin):
+              pass
+
+          handler = DummyHandler()
+
+          def serve(self, request):
+              tid = threading.get_ident()
+              called_threads.append(tid)
+              return tid
+
+          handler.serve = types.MethodType(serve, handler)
+
+          main_thread = threading.get_ident()
+          r1 = self.run_async(handler.get_response_async(object()))
+          r2 = self.run_async(handler.get_response_async(object()))
+          self.assertNotEqual(r1, main_thread)
+          self.assertNotEqual(r2, main_thread)
+          # Expect at least that calls were executed (possibly both in same worker thread,
+          # but definitely not in main thread).
+          self.assertTrue(all(tid != main_thread for tid in called_threads))
+
+      def test_get_response_async_propagates_non_http404_exception(self):
+          class DummyHandler(handlers.StaticFilesHandlerMixin):
+              pass
+
+          handler = DummyHandler()
+
+          def serve(self, request):
+              raise ValueError("boom")
+
+          handler.serve = types.MethodType(serve, handler)
+
+          with self.assertRaises(ValueError):
+              self.run_async(handler.get_response_async(object()))
+
+      def test_get_response_async_with_asgi_handler_success_threaded(self):
+          # The ASGI handler inherits the mixin; patch get_base_url to avoid settings access
+          with patch.object(handlers.StaticFilesHandlerMixin, 'get_base_url', lambda self: '/static/'):
+              app = lambda *a, **kw: None
+              asgi_handler = handlers.ASGIStaticFilesHandler(app)
+
+              called = {}
+              def serve(self, request):
+                  called['serve_thread'] = threading.get_ident()
+                  return "ASGI_OK"
+
+              asgi_handler.serve = types.MethodType(serve, asgi_handler)
+              main_thread = threading.get_ident()
+              result = self.run_async(asgi_handler.get_response_async(object()))
+              self.assertEqual(result, "ASGI_OK")
+              self.assertIn('serve_thread', called)
+              self.assertNotEqual(called['serve_thread'], main_thread)
+
+      def test_get_response_async_with_asgi_handler_exception_threaded(self):
+          with patch.object(handlers.StaticFilesHandlerMixin, 'get_base_url', lambda self: '/static/'):
+              app = lambda *a, **kw: None
+              asgi_handler = handlers.ASGIStaticFilesHandler(app)
+
+              called = {}
+              def serve(self, request):
+                  called['serve_thread'] = threading.get_ident()
+                  raise Http404("miss")
+
+              asgi_handler.serve = types.MethodType(serve, asgi_handler)
+
+              def fake_response_for_exception(request, exc):
+                  called['response_thread'] = threading.get_ident()
+                  # ensure the exc is the Http404 instance
+                  assert isinstance(exc, Http404)
+                  return "ASGI_404_RESP"
+
+              main_thread = threading.get_ident()
+              with patch.object(handlers, 'response_for_exception', fake_response_for_exception):
+                  result = self.run_async(asgi_handler.get_response_async(object()))
+              self.assertEqual(result, "ASGI_404_RESP")
+              self.assertIn('serve_thread', called)
+              self.assertIn('response_thread', called)
+              self.assertNotEqual(called['serve_thread'], main_thread)
+              self.assertNotEqual(called['response_thread'], main_thread)
+
+      def test_get_response_async_serve_is_lambda_threaded(self):
+          called = {}
+          class DummyHandler(handlers.StaticFilesHandlerMixin):
+              pass
+          handler = DummyHandler()
+
+          handler.serve = lambda request: called.setdefault('serve_thread', threading.get_ident()) or "LAMBDA_OK"
+
+          main_thread = threading.get_ident()
+          result = self.run_async(handler.get_response_async(object()))
+          self.assertEqual(result, "LAMBDA_OK")
+          self.assertIn('serve_thread', called)
+          self.assertNotEqual(called['serve_thread'], main_thread)
+
+      def test_get_response_async_response_for_exception_receives_correct_args_and_threaded(self):
+          class DummyHandler(handlers.StaticFilesHandlerMixin):
+              pass
+          handler = DummyHandler()
+
+          def serve(self, request):
+              raise Http404("not-here")
+
+          handler.serve = types.MethodType(serve, handler)
+
+          received = {}
+          def fake_response_for_exception(request, exc):
+              received['request'] = request
+              received['exc'] = exc
+              received['thread'] = threading.get_ident()
+              return "RESP_OK"
+
+          main_thread = threading.get_ident()
+          with patch.object(handlers, 'response_for_exception', fake_response_for_exception):
+              req_obj = object()
+              result = self.run_async(handler.get_response_async(req_obj))
+          self.assertEqual(result, "RESP_OK")
+          self.assertIs(received['request'], req_obj)
+          self.assertIsInstance(received['exc'], Http404)
+          self.assertNotEqual(received['thread'], main_thread)
+
+
+  if __name__ == '__main__':
+      unittest.main()
+
+new_imports_code: |
+  import asyncio
+  import threading
+  import types
+  import unittest
+  from unittest.mock import patch
+  from django.http import Http404
+  from django.contrib.staticfiles import handlers

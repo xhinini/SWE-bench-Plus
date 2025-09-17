@@ -1,0 +1,110 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise FileBasedCache.has_key() under race conditions and error scenarios: they ensure FileNotFoundError raised by open() is handled (returning False), other exceptions propagate, versioned keys are respected, expired/empty files are treated as expired (and deleted), and internal helpers (_is_expired, _key_to_file, make_and_validate_key) are invoked as expected.
+test_code: |
+  from django.test import override_settings, TestCase
+  from django.core.cache import caches, cache, InvalidCacheKey
+  from django.test.signals import setting_changed
+  import tempfile
+  import shutil
+  import os
+  import time
+  from unittest import mock
+  import builtins
+
+  @override_settings(
+      CACHES=caches_setting_for_tests(
+          BACKEND="django.core.cache.backends.filebased.FileBasedCache",
+      )
+  )
+  class FileBasedCacheHasKeyRegressionTests(TestCase):
+      """
+      Additional regression tests for FileBasedCache.has_key() to catch TOCTOU
+      and exception-handling issues.
+      """
+
+      def setUp(self):
+          super().setUp()
+          self.dirname = tempfile.mkdtemp()
+          # Update the configured caches to use our temp dir.
+          for cache_params in settings.CACHES.values():
+              cache_params["LOCATION"] = self.dirname
+          # Notify the system that settings changed so the cache backend is reloaded.
+          setting_changed.send(self.__class__, setting="CACHES", enter=False)
+
+      def tearDown(self):
+          super().tearDown()
+          shutil.rmtree(self.dirname)
+
+      def test_has_key_handles_filenotfound_with_exists_true(self):
+          # Simulate a race: os.path.exists reports True but open raises FileNotFoundError.
+          with mock.patch("os.path.exists", return_value=True):
+              with mock.patch("builtins.open", side_effect=FileNotFoundError) as m_open:
+                  self.assertIs(cache.has_key("somekey"), False)
+                  # open should have been attempted.
+                  self.assertTrue(m_open.called)
+
+      def test_has_key_propagates_other_os_errors(self):
+          # Non-FileNotFoundError exceptions raised by open() should not be swallowed.
+          with mock.patch("builtins.open", side_effect=OSError("boom")):
+              with self.assertRaises(OSError):
+                  cache.has_key("foo")
+
+      def test_has_key_with_version_uses_key_and_handles_filenotfound(self):
+          # Ensure version is passed to _key_to_file and FileNotFoundError is handled.
+          with mock.patch.object(cache, "_key_to_file", return_value=os.path.join(self.dirname, "vfile")) as m_key:
+              with mock.patch("builtins.open", side_effect=FileNotFoundError) as m_open:
+                  self.assertIs(cache.has_key("k", version=2), False)
+                  m_key.assert_called_with("k", version=2)
+                  m_open.assert_called_with(os.path.join(self.dirname, "vfile"), "rb")
+
+      def test_has_key_returns_true_when_not_expired(self):
+          cache.set("alive", "value", timeout=10)
+          self.assertTrue(cache.has_key("alive"))
+
+      def test_has_key_returns_false_when_expired(self):
+          cache.set("soon", "v", timeout=1)
+          time.sleep(2)
+          self.assertFalse(cache.has_key("soon"))
+
+      def test_has_key_empty_file_considered_expired_and_deleted(self):
+          # Create an empty cache file to simulate a truncated write.
+          fname = cache._key_to_file("emptykey")
+          # Ensure directory exists.
+          os.makedirs(os.path.dirname(fname), exist_ok=True)
+          with open(fname, "wb") as fh:
+              fh.write(b"")
+          # has_key should consider this expired and delete it.
+          self.assertFalse(cache.has_key("emptykey"))
+          self.assertFalse(os.path.exists(fname))
+
+      def test_has_key_open_called_in_rb_mode(self):
+          # Ensure builtins.open is invoked in 'rb' mode for has_key.
+          fake_path = os.path.join(self.dirname, "somefile")
+          with mock.patch.object(cache, "_key_to_file", return_value=fake_path):
+              with mock.patch("builtins.open", side_effect=FileNotFoundError) as m_open:
+                  # Should handle FileNotFoundError internally and return False.
+                  self.assertFalse(cache.has_key("ignored"))
+                  m_open.assert_called_with(fake_path, "rb")
+
+      def test_has_key_does_not_swallow_permissionerror_even_if_exists_true(self):
+          # PermissionError should propagate (only FileNotFoundError is caught).
+          with mock.patch("os.path.exists", return_value=True):
+              with mock.patch("builtins.open", side_effect=PermissionError):
+                  with self.assertRaises(PermissionError):
+                      cache.has_key("perm")
+
+      def test_has_key_calls_is_expired(self):
+          # When a cache file exists, _is_expired should be consulted.
+          cache.set("checkexpired", "val", timeout=10)
+          with mock.patch.object(cache, "_is_expired", return_value=False) as is_exp:
+              self.assertTrue(cache.has_key("checkexpired"))
+              self.assertTrue(is_exp.called)
+
+      def test_has_key_propagates_invalid_cache_key_errors(self):
+          # If make_and_validate_key raises InvalidCacheKey, it should propagate.
+          with mock.patch.object(cache, "make_and_validate_key", side_effect=InvalidCacheKey("bad")):
+              with self.assertRaises(InvalidCacheKey):
+                  cache.has_key("badkey")
+new_imports_code: |
+  # No new top-level imports required; tests reuse existing imports in the test module.

@@ -1,0 +1,178 @@
+import types
+from collections import namedtuple
+
+import pytest
+import matplotlib.pyplot as plt
+from matplotlib.backend_bases import MouseEvent, MouseButton
+
+from matplotlib.offsetbox import (
+    DraggableBase, DraggableAnnotation
+)
+
+EventLike = namedtuple("EventLike", ("artist", "mouseevent"))
+
+def _callback_counts(canvas):
+    # CallbackRegistry stores per-event dicts in .callbacks attribute.
+    # .callbacks is a dict mapping event name to dict of {cid: func}
+    cb = canvas.callbacks.callbacks
+    return {k: len(v) for k, v in cb.items()}
+
+def test_draggable_registers_and_disconnects_callbacks():
+    fig, ax = plt.subplots()
+    ann = ax.annotate("foo", (0.5, 0.5))
+    before = _callback_counts(fig.canvas)
+
+    dr = DraggableAnnotation(ann, use_blit=False)
+    # After construction, the registry should have additional callbacks for:
+    # 'pick_event', 'button_release_event', 'motion_notify_event'
+    after_connect = _callback_counts(fig.canvas)
+    assert after_connect.get("pick_event", 0) >= before.get("pick_event", 0) + 1
+    assert after_connect.get("button_release_event", 0) >= before.get("button_release_event", 0) + 1
+    assert after_connect.get("motion_notify_event", 0) >= before.get("motion_notify_event", 0) + 1
+
+    # Disconnect should remove those specific callbacks (counts decrease).
+    dr.disconnect()
+    after_disconnect = _callback_counts(fig.canvas)
+    assert after_disconnect.get("pick_event", 0) == before.get("pick_event", 0)
+    assert after_disconnect.get("button_release_event", 0) == before.get("button_release_event", 0)
+    # Motion notify may be absent entirely in some backends; ensure it is cleaned up back to before-count.
+    assert after_disconnect.get("motion_notify_event", 0) == before.get("motion_notify_event", 0)
+
+def test_disconnect_is_idempotent_and_safe():
+    fig, ax = plt.subplots()
+    ann = ax.annotate("bar", (0.4, 0.4))
+    before = _callback_counts(fig.canvas)
+
+    dr = DraggableAnnotation(ann, use_blit=False)
+    # Call disconnect multiple times should not raise and should still clean up.
+    dr.disconnect()
+    dr.disconnect()
+    after = _callback_counts(fig.canvas)
+    assert after.get("pick_event", 0) == before.get("pick_event", 0)
+    assert after.get("button_release_event", 0) == before.get("button_release_event", 0)
+
+def test_on_pick_sets_got_artist_and_mouse_coordinates():
+    fig, ax = plt.subplots()
+    ann = ax.annotate("pickme", (0.2, 0.3))
+    dr = DraggableAnnotation(ann, use_blit=False)
+
+    # Create a MouseEvent to represent the mouse event portion.
+    me = MouseEvent("button_press_event", fig.canvas, 10, 20, MouseButton.LEFT)
+    evt = EventLike(artist=ann, mouseevent=me)
+
+    # Call on_pick directly and check internal state set.
+    dr.on_pick(evt)
+    assert getattr(dr, "got_artist", False) is True
+    assert dr.mouse_x == me.x and dr.mouse_y == me.y
+
+    # cleanup
+    dr.disconnect()
+
+def test_on_release_finalizes_and_unsets_got_artist():
+    fig, ax = plt.subplots()
+    ann = ax.annotate("release", (0.3, 0.6))
+    class MyDr(DraggableAnnotation):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.finalized = False
+        def finalize_offset(self):
+            self.finalized = True
+
+    dr = MyDr(ann, use_blit=False)
+
+    me = MouseEvent("button_press_event", fig.canvas, 15, 25, MouseButton.LEFT)
+    evt = EventLike(artist=ann, mouseevent=me)
+    dr.on_pick(evt)
+    # now release
+    dr.on_release(None)
+    assert getattr(dr, "got_artist", False) is False
+    assert dr.finalized is True
+
+    dr.disconnect()
+
+def test_on_motion_calls_update_offset_with_correct_delta():
+    fig, ax = plt.subplots()
+    ann = ax.annotate("move", (0.7, 0.8))
+    class MyDr(DraggableAnnotation):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.updates = []
+        def save_offset(self):
+            # pretend the initial offset is 0,0
+            self.saved = True
+        def update_offset(self, dx, dy):
+            self.updates.append((dx, dy))
+
+    dr = MyDr(ann, use_blit=False)
+
+    me_pick = MouseEvent("button_press_event", fig.canvas, 100, 110, MouseButton.LEFT)
+    evt_pick = EventLike(artist=ann, mouseevent=me_pick)
+    dr.on_pick(evt_pick)
+    # simulate motion event 10px right, 20px down
+    me_move = MouseEvent("motion_notify_event", fig.canvas, 110, 130, None)
+    dr.on_motion(me_move)
+    assert dr.updates, "update_offset should have been called"
+    dx, dy = dr.updates[-1]
+    assert dx == 10 and dy == 20
+
+    dr.disconnect()
+
+def test_disconnect_cleans_up_even_if_artist_figure_removed():
+    fig, ax = plt.subplots()
+    ann = ax.annotate("later_removed", (0.1, 0.1))
+    before = _callback_counts(fig.canvas)
+
+    dr = DraggableAnnotation(ann, use_blit=False)
+    after_connect = _callback_counts(fig.canvas)
+    assert after_connect.get("pick_event", 0) >= before.get("pick_event", 0) + 1
+
+    # Now simulate removal of the artist from the figure.
+    # In real code .remove() will detach the artist from the axes/figure.
+    ann.remove()
+    # At this point ann.figure may be None. Call _check_still_parented which
+    # is expected to call disconnect() and return False.
+    still = dr._check_still_parented()
+    assert still is False
+
+    # After _check_still_parented, the callbacks should have been removed
+    after_cleanup = _callback_counts(fig.canvas)
+    assert after_cleanup.get("pick_event", 0) == before.get("pick_event", 0)
+    assert after_cleanup.get("button_release_event", 0) == before.get("button_release_event", 0)
+
+def test_multiple_draggables_cleanup_independent():
+    fig, ax = plt.subplots()
+    a1 = ax.annotate("a1", (0.2, 0.2))
+    a2 = ax.annotate("a2", (0.3, 0.3))
+    before = _callback_counts(fig.canvas)
+
+    d1 = DraggableAnnotation(a1, use_blit=False)
+    d2 = DraggableAnnotation(a2, use_blit=False)
+    after = _callback_counts(fig.canvas)
+    assert after.get("pick_event", 0) >= before.get("pick_event", 0) + 2
+
+    # Disconnect only one, counts should decrement by one
+    d1.disconnect()
+    after_one = _callback_counts(fig.canvas)
+    assert after_one.get("pick_event", 0) == before.get("pick_event", 0) + 1
+
+    # Now disconnect second, should go back to before state
+    d2.disconnect()
+    final = _callback_counts(fig.canvas)
+    assert final.get("pick_event", 0) == before.get("pick_event", 0)
+
+def test_cids_property_exposes_connection_ids():
+    fig, ax = plt.subplots()
+    ann = ax.annotate("cids", (0.5, 0.5))
+    dr = DraggableAnnotation(ann, use_blit=False)
+
+    # cids should be a property that yields a list-like of integer ids for
+    # the primary (pick/release) connections.
+    cids = dr.cids
+    assert isinstance(cids, list)
+    assert len(cids) >= 2
+    for cid in cids:
+        assert isinstance(cid, int)
+
+    dr.disconnect()
+new_imports_code: |
+  from matplotlib.offsetbox import DraggableAnnotation, DraggableBase

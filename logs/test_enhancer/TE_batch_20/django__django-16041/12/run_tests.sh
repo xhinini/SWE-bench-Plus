@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_accepts_overlapping_auto_id forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_accepts_overlapping_prefix forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_accepts_overlapping_renderer forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_all_overlapping_keys_no_error forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_field_names_prefix_correctness forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_multiple_instances_with_conflicts forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_overrides_empty_permitted_from_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_overrides_use_required_attribute forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_respects_formset_auto_id_even_if_form_kwargs_sets_different forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_empty_form_with_get_form_kwargs_method_overlap
+coverage json -o coverage.json
+: '>>>>> End Test Output'

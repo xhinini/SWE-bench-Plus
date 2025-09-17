@@ -1,0 +1,227 @@
+# No additional imports required beyond the test file itself.
+from unittest import TestCase
+from types import SimpleNamespace
+from django.core.serializers.base import build_instance
+
+
+class DummyDoesNotExist(Exception):
+    pass
+
+
+class DummyManagerResult:
+    def __init__(self, pk):
+        self.pk = pk
+
+
+class DummyDBManager:
+    def __init__(self, result=None, to_raise=None, record_args_container=None):
+        self._result = result
+        self._to_raise = to_raise
+        self._record_args_container = record_args_container
+
+    def get_by_natural_key(self, *args):
+        if self._record_args_container is not None:
+            self._record_args_container.append(args)
+        if self._to_raise is not None:
+            raise self._to_raise
+        return DummyManagerResult(self._result)
+
+
+class DummyDefaultManager:
+    def __init__(self, db_manager_obj):
+        self._db_manager_obj = db_manager_obj
+
+    def db_manager(self, db):
+        # Return the preconfigured db manager object
+        return self._db_manager_obj
+
+
+class DummyPK:
+    def __init__(self, attname="id"):
+        self.attname = attname
+
+    def to_python(self, value):
+        # emulate conversion used in Django's pk field
+        return int(value)
+
+
+def make_model_class(default_manager, pk=None, natural_key_fn=None):
+    """
+    Create a lightweight dummy Model-like class for testing build_instance.
+    """
+    class ModelLike:
+        DoesNotExist = DummyDoesNotExist
+        _meta = SimpleNamespace(default_manager=default_manager, pk=(pk or DummyPK()))
+
+        def __init__(self, **data):
+            # Set passed data as attributes
+            for k, v in data.items():
+                setattr(self, k, v)
+            # mimic Django model internal state
+            self._state = SimpleNamespace(db=None)
+
+        # Allow injection of a natural_key function for different tests
+        if natural_key_fn is None:
+            def natural_key(self):
+                raise NotImplementedError("natural_key not provided")
+        else:
+            # natural_key_fn may be a function expecting self
+            def natural_key(self, _fn=natural_key_fn):
+                return _fn(self)
+
+    return ModelLike
+
+
+class BuildInstanceTests(TestCase):
+    def test_sets_pk_and_mutates_data_when_natural_key_found_and_state_db_set(self):
+        # Manager returns pk '123', to_python should convert to int
+        db_manager = DummyDBManager(result='123')
+        default_manager = DummyDefaultManager(db_manager)
+
+        def nk(self):
+            # natural_key relies on _state.db being set to the provided db
+            if not hasattr(self, "_state"):
+                raise AttributeError("no _state")
+            if self._state.db != "other_db":
+                raise AssertionError("state.db not set correctly")
+            return ("nkval",)
+
+        Model = make_model_class(default_manager, pk=DummyPK("id"), natural_key_fn=nk)
+        data = {}
+        inst = build_instance(Model, data, db="other_db")
+        # pk should be set and data mutated
+        self.assertEqual(getattr(inst, "id"), 123)
+        self.assertEqual(data["id"], 123)
+
+    def test_does_not_use_natural_key_when_pk_present(self):
+        # When pk provided, natural_key should not be invoked
+        called = []
+
+        def nk(self):
+            called.append(True)
+            return ("x",)
+
+        db_manager = DummyDBManager(result='9')
+        default_manager = DummyDefaultManager(db_manager)
+        Model = make_model_class(default_manager, pk=DummyPK("id"), natural_key_fn=nk)
+        data = {"id": "7"}
+        inst = build_instance(Model, data, db="any_db")
+        # returned instance must reflect the provided pk (no conversion happens here)
+        self.assertEqual(getattr(inst, "id"), "7")
+        self.assertFalse(called, "natural_key should not have been called when pk present")
+
+    def test_does_not_set_pk_when_get_by_natural_key_raises_DoesNotExist(self):
+        db_manager = DummyDBManager(to_raise=DummyDoesNotExist())
+        default_manager = DummyDefaultManager(db_manager)
+
+        def nk(self):
+            return ("nope",)
+
+        Model = make_model_class(default_manager, pk=DummyPK("id"), natural_key_fn=nk)
+        data = {}
+        inst = build_instance(Model, data, db="db")
+        # No pk should be present since the manager raised DoesNotExist and it should be swallowed
+        self.assertFalse(hasattr(inst, "id"))
+        self.assertFalse("id" in data)
+
+    def test_passes_multiple_natural_key_components_to_manager(self):
+        recorded = []
+        db_manager = DummyDBManager(result='42', record_args_container=recorded)
+        default_manager = DummyDefaultManager(db_manager)
+
+        def nk(self):
+            return ("a", "b", 3)
+
+        Model = make_model_class(default_manager, pk=DummyPK("id"), natural_key_fn=nk)
+        data = {}
+        inst = build_instance(Model, data, db="dbx")
+        self.assertEqual(getattr(inst, "id"), 42)
+        # The manager should have been called with the exact tuple expanded as args
+        self.assertEqual(recorded[0], (("a", "b", 3),))
+
+    def test_converts_pk_using_to_python(self):
+        db_manager = DummyDBManager(result='005')
+        default_manager = DummyDefaultManager(db_manager)
+
+        def nk(self):
+            return ("nk",)
+
+        Model = make_model_class(default_manager, pk=DummyPK("id"), natural_key_fn=nk)
+        data = {}
+        inst = build_instance(Model, data, db="dbconv")
+        # to_python('005') -> 5
+        self.assertEqual(getattr(inst, "id"), 5)
+
+    def test_attribute_error_from_natural_key_propagates(self):
+        # natural_key raises AttributeError; this should propagate (not be swallowed)
+        db_manager = DummyDBManager(result='1')
+        default_manager = DummyDefaultManager(db_manager)
+
+        def nk(self):
+            raise AttributeError("boom")
+
+        Model = make_model_class(default_manager, pk=DummyPK("id"), natural_key_fn=nk)
+        data = {}
+        with self.assertRaises(AttributeError):
+            build_instance(Model, data, db="somedb")
+
+    def test_skips_natural_key_when_manager_missing_method(self):
+        # If default_manager does not have get_by_natural_key, natural_key path is not used
+        default_manager = object()  # no get_by_natural_key attribute
+        def nk(self):
+            # should not be called
+            raise AssertionError("natural_key should not be called")
+
+        Model = make_model_class(default_manager, pk=DummyPK("id"), natural_key_fn=nk)
+        data = {}
+        inst = build_instance(Model, data, db="db")
+        # no pk added
+        self.assertFalse(hasattr(inst, "id"))
+
+    def test_handles_natural_key_returning_string_by_splatting_chars(self):
+        # If natural_key returns a string, it will be splatted into individual chars.
+        recorded = []
+        db_manager = DummyDBManager(result='3', record_args_container=recorded)
+        default_manager = DummyDefaultManager(db_manager)
+
+        def nk(self):
+            return "xy"
+
+        Model = make_model_class(default_manager, pk=DummyPK("id"), natural_key_fn=nk)
+        data = {}
+        inst = build_instance(Model, data, db="d")
+        self.assertEqual(getattr(inst, "id"), 3)
+        # 'xy' should be expanded to ('x','y') when calling get_by_natural_key
+        self.assertEqual(recorded[0], (('x', 'y'),))
+
+    def test_handles_empty_natural_key_components(self):
+        # natural_key returns empty iterable -> manager called with no args
+        recorded = []
+        db_manager = DummyDBManager(result='77', record_args_container=recorded)
+        default_manager = DummyDefaultManager(db_manager)
+
+        def nk(self):
+            return ()
+
+        Model = make_model_class(default_manager, pk=DummyPK("id"), natural_key_fn=nk)
+        data = {}
+        inst = build_instance(Model, data, db="db-empty")
+        self.assertEqual(getattr(inst, "id"), 77)
+        self.assertEqual(recorded[0], ((),))
+
+    def test_multiple_calls_preserve_and_update_data_correctly(self):
+        # Calling build_instance should update the provided dict with the pk when found
+        db_manager = DummyDBManager(result='300')
+        default_manager = DummyDefaultManager(db_manager)
+
+        def nk(self):
+            return ("only",)
+
+        Model = make_model_class(default_manager, pk=DummyPK("id"), natural_key_fn=nk)
+        data = {}
+        inst1 = build_instance(Model, data, db="db1")
+        # After first call, data should have been updated
+        self.assertEqual(data.get("id"), 300)
+        # Subsequent call (with pk already present) should not perform lookup again
+        inst2 = build_instance(Model, data, db="db1")
+        self.assertEqual(getattr(inst2, "id"), 300)

@@ -1,0 +1,184 @@
+# No additional imports required beyond those already used in the test file.
+from unittest import mock
+import os
+import pickle
+import zlib
+import shutil
+import tempfile
+import time
+
+from django.conf import settings
+from django.core.cache import cache
+from django.test import TestCase, override_settings
+from django.test.signals import setting_changed
+
+@override_settings(
+    CACHES={
+        "default": {
+            "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
+        }
+    }
+)
+class AdditionalFileBasedCacheRegressionTests(TestCase):
+    """
+    Additional regression tests for the file-based cache backend focusing on
+    has_key() race handling and expiration behavior.
+    """
+
+    def setUp(self):
+        # Create a temporary directory and point the file-based cache there.
+        self.dirname = tempfile.mkdtemp()
+        for cache_params in settings.CACHES.values():
+            cache_params["LOCATION"] = self.dirname
+        # Notify settings machinery that CACHES changed (mirrors existing test setup).
+        setting_changed.send(self.__class__, setting="CACHES", enter=False)
+
+    def tearDown(self):
+        try:
+            cache.clear()
+        finally:
+            shutil.rmtree(self.dirname)
+
+    def _write_cache_file(self, fname, expiry, value):
+        # Helper to write a valid cache file (expiry + compressed pickled value).
+        with open(fname, "wb") as fh:
+            fh.write(pickle.dumps(expiry, pickle.HIGHEST_PROTOCOL))
+            fh.write(zlib.compress(pickle.dumps(value, pickle.HIGHEST_PROTOCOL)))
+
+    def test_has_key_handles_exists_then_open_missing(self):
+        """
+        Simulate the race where os.path.exists() returns True but open() raises
+        FileNotFoundError (file removed between the calls). has_key() should
+        return False and not raise.
+        """
+        key = "race_exists_then_missing"
+        fname = cache._key_to_file(key)
+        # Ensure os.path.exists() returns True (so pre-patch code would try to open)
+        with mock.patch("os.path.exists", return_value=True), mock.patch(
+            "builtins.open", side_effect=FileNotFoundError
+        ):
+            self.assertIs(cache.has_key(key), False)
+
+    def test_has_key_open_raises_oso_error_is_propagated(self):
+        """
+        If open() raises a generic OSError, it should not be swallowed by
+        has_key() (only FileNotFoundError is handled).
+        """
+        key = "raise_oserror"
+        with mock.patch("builtins.open", side_effect=OSError("boom")):
+            with self.assertRaises(OSError):
+                cache.has_key(key)
+
+    def test_has_key_open_raises_permission_error_is_propagated(self):
+        """
+        PermissionError (subclass of OSError) should also be propagated.
+        """
+        key = "raise_permission"
+        with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+            with self.assertRaises(PermissionError):
+                cache.has_key(key)
+
+    def test_has_key_considers_empty_file_as_expired_and_removes_it(self):
+        """
+        An empty cache file should be considered expired. has_key() should
+        return False and the file should be removed.
+        """
+        key = "empty_file"
+        fname = cache._key_to_file(key)
+        # create an empty file
+        with open(fname, "wb"):
+            pass
+        self.assertFalse(cache.has_key(key))
+        self.assertFalse(os.path.exists(fname))
+
+    def test_has_key_removes_expired_file(self):
+        """
+        A cache file with an expiry in the past should be considered expired,
+        removed, and has_key() should return False.
+        """
+        key = "expired_file"
+        fname = cache._key_to_file(key)
+        expiry = time.time() - 10  # already expired
+        self._write_cache_file(fname, expiry, "value")
+        self.assertFalse(cache.has_key(key))
+        self.assertFalse(os.path.exists(fname))
+
+    def test_has_key_returns_true_for_non_expired_file(self):
+        """
+        A cache file with a future expiry should be considered present.
+        """
+        key = "not_expired_file"
+        fname = cache._key_to_file(key)
+        expiry = time.time() + 1000
+        self._write_cache_file(fname, expiry, {"a": 1})
+        try:
+            self.assertTrue(cache.has_key(key))
+            # File should still exist afterwards
+            self.assertTrue(os.path.exists(fname))
+        finally:
+            # cleanup
+            try:
+                os.remove(fname)
+            except OSError:
+                pass
+
+    def test_has_key_respects_version_parameter(self):
+        """
+        has_key() should respect versioning: a key set with a specific version
+        should only be visible via the same version.
+        """
+        key = "versioned_key"
+        # store with version=2
+        cache.set(key, "v2", version=2)
+        try:
+            # default/no version should not find it
+            self.assertIs(cache.has_key(key), False)
+            # version=2 should find it
+            self.assertIs(cache.has_key(key, version=2), True)
+        finally:
+            cache.delete(key, version=2)
+
+    def test_has_key_calls_open_with_rb_mode_and_handles_filenotfound(self):
+        """
+        Verify that the backend attempts to open the cache file in 'rb'
+        mode and that FileNotFoundError from open() is handled as False.
+        """
+        key = "open_mode_check"
+        fname = cache._key_to_file(key)
+        with mock.patch("os.path.exists", return_value=True), mock.patch(
+            "builtins.open"
+        ) as mocked_open:
+            mocked_open.side_effect = FileNotFoundError
+            self.assertIs(cache.has_key(key), False)
+            # Ensure open was attempted and was called with the filepath and 'rb'
+            self.assertTrue(mocked_open.called)
+            args, kwargs = mocked_open.call_args
+            # first positional arg is filename, second is mode
+            self.assertEqual(args[0], fname)
+            # Mode might be explicitly provided as 'rb'
+            self.assertEqual(args[1], "rb")
+
+    def test_has_key_does_not_swallow_unrelated_exceptions(self):
+        """
+        Ensure that an unexpected exception (e.g., ValueError) from open()
+        is not swallowed by has_key().
+        """
+        key = "valueerror_on_open"
+        with mock.patch("builtins.open", side_effect=ValueError("fail")):
+            with self.assertRaises(ValueError):
+                cache.has_key(key)
+
+    def test_has_key_deletes_expired_when_is_expired_triggers_delete(self):
+        """
+        Ensure that when _is_expired() decides the file is expired, the backend
+        removes it via _delete(). We mock _delete() to assert it was called.
+        """
+        key = "expired_delete_call"
+        fname = cache._key_to_file(key)
+        expiry = time.time() - 5
+        self._write_cache_file(fname, expiry, "v")
+        with mock.patch.object(cache, "_delete", wraps=cache._delete) as mocked_delete:
+            self.assertFalse(cache.has_key(key))
+            mocked_delete.assert_called()
+            # Ensure the file is gone after the call
+            self.assertFalse(os.path.exists(fname))

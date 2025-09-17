@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 staticfiles_tests.test_storage_llm.PostProcessTests._make_storage staticfiles_tests.test_storage_llm.PostProcessTests._save staticfiles_tests.test_storage_llm.PostProcessTests.setUp staticfiles_tests.test_storage_llm.PostProcessTests.tearDown staticfiles_tests.test_storage_llm.PostProcessTests.test_hashed_name_preserves_question_fragment_for_fonthack staticfiles_tests.test_storage_llm.PostProcessTests.test_manifest_non_strict_computes_name_when_file_exists staticfiles_tests.test_storage_llm.PostProcessTests.test_manifest_strict_missing_entry_raises_value_error staticfiles_tests.test_storage_llm.PostProcessTests.test_post_process_no_adjustable_paths_no_unboundlocal staticfiles_tests.test_storage_llm.PostProcessTests.test_post_process_single_pass_resolves_nonlooping_reference staticfiles_tests.test_storage_llm.PostProcessTests.test_post_process_zero_max_passes_looping_files_produces_runtime_error_marker staticfiles_tests.test_storage_llm.PostProcessTests.test_save_manifest_creates_manifest_file staticfiles_tests.test_storage_llm.PostProcessTests.test_stored_name_preserves_query_marker_for_font_face
+coverage json -o coverage.json
+: '>>>>> End Test Output'

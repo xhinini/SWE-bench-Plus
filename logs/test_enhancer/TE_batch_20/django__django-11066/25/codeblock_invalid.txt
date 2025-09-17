@@ -1,0 +1,142 @@
+from django.apps.registry import apps
+from django.contrib.contenttypes.management import RenameContentType
+from django.contrib.contenttypes.models import ContentType
+from django.db import connections, IntegrityError
+from django.test import TransactionTestCase, override_settings
+from django.db import router
+
+
+class DBRouterAllowOther:
+    """
+    Router that allows migrations only on the 'other' DB.
+    """
+    def allow_migrate_model(self, db, model):
+        return db == 'other'
+
+class DBRouterDenyAll:
+    """
+    Router that denies migrations for the ContentType model on any DB.
+    """
+    def allow_migrate_model(self, db, model):
+        return False
+
+class AdditionalRenameContentTypeTests(TransactionTestCase):
+    databases = {'default', 'other'}
+    available_apps = ['django.contrib.contenttypes']
+
+    def setUp(self):
+        # Ensure a clean slate for ContentType in both DBs
+        ContentType.objects.using('default').all().delete()
+        ContentType.objects.using('other').all().delete()
+
+    def tearDown(self):
+        ContentType.objects.using('default').all().delete()
+        ContentType.objects.using('other').all().delete()
+
+    def _get_schema_editor(self, using):
+        return connections[using].schema_editor()
+
+    def test_rename_direct_to_other_db(self):
+        # Create a content type in 'other' DB and rename it using that DB's schema_editor
+        ContentType.objects.using('other').create(app_label='testapp', model='oldmodel')
+        rename_op = RenameContentType('testapp', 'oldmodel', 'newmodel')
+        with self._get_schema_editor('other') as schema_editor:
+            rename_op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+
+        # Ensure rename happened in 'other' DB
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='testapp', model='newmodel').exists())
+        # Ensure default DB was not modified
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='testapp', model='newmodel').exists())
+
+    def test_rename_forward_uses_db(self):
+        ContentType.objects.using('other').create(app_label='testapp2', model='a')
+        rename_op = RenameContentType('testapp2', 'a', 'b')
+        with self._get_schema_editor('other') as schema_editor:
+            rename_op.rename_forward(apps, schema_editor)
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='testapp2', model='b').exists())
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='testapp2', model='b').exists())
+
+    def test_rename_backward_uses_db(self):
+        ContentType.objects.using('other').create(app_label='testapp3', model='x')
+        # First rename forward
+        rename_op = RenameContentType('testapp3', 'x', 'y')
+        with self._get_schema_editor('other') as schema_editor:
+            rename_op.rename_forward(apps, schema_editor)
+        # Then rename backward
+        with self._get_schema_editor('other') as schema_editor:
+            rename_op.rename_backward(apps, schema_editor)
+        # After backward, original should exist again in 'other'
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='testapp3', model='x').exists())
+        self.assertFalse(ContentType.objects.using('other').filter(app_label='testapp3', model='y').exists())
+
+    def test_missing_content_type_noop_other_db(self):
+        # No ContentType is created. Running _rename should not create anything.
+        rename_op = RenameContentType('missingapp', 'nomodel', 'newmodel')
+        with self._get_schema_editor('other') as schema_editor:
+            rename_op._rename(apps, schema_editor, 'nomodel', 'newmodel')
+        self.assertFalse(ContentType.objects.using('other').filter(app_label='missingapp').exists())
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='missingapp').exists())
+
+    @override_settings(DATABASE_ROUTERS=[DBRouterDenyAll()])
+    def test_disallow_migrate_model_noop(self):
+        # Router denies migration for ContentType; operation should be a no-op.
+        ContentType.objects.using('other').create(app_label='denyapp', model='a')
+        rename_op = RenameContentType('denyapp', 'a', 'b')
+        with self._get_schema_editor('other') as schema_editor:
+            rename_op._rename(apps, schema_editor, 'a', 'b')
+        # No change expected
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='denyapp', model='a').exists())
+        self.assertFalse(ContentType.objects.using('other').filter(app_label='denyapp', model='b').exists())
+
+    @override_settings(DATABASE_ROUTERS=[DBRouterAllowOther()])
+    def test_conflict_integrityerror_keeps_old_model(self):
+        # Create both old and new so that renaming old->new would violate unique constraint.
+        ContentType.objects.using('other').create(app_label='conflictapp', model='old')
+        ContentType.objects.using('other').create(app_label='conflictapp', model='new')
+        rename_op = RenameContentType('conflictapp', 'old', 'new')
+        with self._get_schema_editor('other') as schema_editor:
+            # If the save is done on the wrong DB (default), this would behave differently.
+            rename_op._rename(apps, schema_editor, 'old', 'new')
+        # Both should still exist and no data should have been lost
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='conflictapp', model='old').exists())
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='conflictapp', model='new').exists())
+
+    def test_cache_cleared_after_rename(self):
+        # Populate the cache by calling get_by_natural_key
+        ContentType.objects.using('other').create(app_label='cacheapp', model='c1')
+        # Prime cache
+        ContentType.objects.db_manager('other').get_by_natural_key('cacheapp', 'c1')
+        rename_op = RenameContentType('cacheapp', 'c1', 'c2')
+        with self._get_schema_editor('other') as schema_editor:
+            rename_op._rename(apps, schema_editor, 'c1', 'c2')
+        # After rename, the manager should be able to get the content type by its new natural key
+        ct = ContentType.objects.db_manager('other').get_by_natural_key('cacheapp', 'c2')
+        self.assertIsNotNone(ct)
+        # Default DB should not have the new key
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='cacheapp', model='c2').exists())
+
+    def test_rename_does_not_affect_default_db(self):
+        # Ensure content type exists only in 'other' DB and not in default
+        ContentType.objects.using('other').create(app_label='isolateapp', model='m1')
+        rename_op = RenameContentType('isolateapp', 'm1', 'm2')
+        with self._get_schema_editor('other') as schema_editor:
+            rename_op._rename(apps, schema_editor, 'm1', 'm2')
+        # 'other' should have the renamed content type
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='isolateapp', model='m2').exists())
+        # 'default' should remain untouched
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='isolateapp').exists())
+
+    @override_settings(DATABASE_ROUTERS=[DBRouterAllowOther()])
+    def test_rename_with_db_manager_consistency(self):
+        # Create content type via db_manager and rename; ensure db_manager queries reflect change
+        ContentType.objects.db_manager('other').create(app_label='dbmgrapp', model='orig')
+        rename_op = RenameContentType('dbmgrapp', 'orig', 'renamed')
+        with self._get_schema_editor('other') as schema_editor:
+            rename_op._rename(apps, schema_editor, 'orig', 'renamed')
+        # Using db_manager should find the new name on 'other'
+        self.assertTrue(ContentType.objects.db_manager('other').filter(app_label='dbmgrapp', model='renamed').exists())
+        # Ensure default DB not affected
+        self.assertFalse(ContentType.objects.db_manager('default').filter(app_label='dbmgrapp', model='renamed').exists())
+new_imports_code: |
+  from django.db import connections
+  from django.contrib.contenttypes.management import RenameContentType

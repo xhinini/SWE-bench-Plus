@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 check_framework.test_translation_llm.TranslationGetSupportedVariantRegressionTests._assert_E004_for check_framework.test_translation_llm.TranslationGetSupportedVariantRegressionTests._reload_with_stub check_framework.test_translation_llm.TranslationGetSupportedVariantRegressionTests.setUp check_framework.test_translation_llm.TranslationGetSupportedVariantRegressionTests.tearDown check_framework.test_translation_llm.TranslationGetSupportedVariantRegressionTests.test_ca_es_valencia_reports_inconsistency_when_stub_rejects_it check_framework.test_translation_llm.TranslationGetSupportedVariantRegressionTests.test_en_reports_inconsistency_when_stub_rejects_it check_framework.test_translation_llm.TranslationGetSupportedVariantRegressionTests.test_en_us_reports_inconsistency_when_stub_rejects_it check_framework.test_translation_llm.TranslationGetSupportedVariantRegressionTests.test_es_419_reports_inconsistency_when_stub_rejects_it check_framework.test_translation_llm.TranslationGetSupportedVariantRegressionTests.test_fr_ca_reports_inconsistency_when_stub_rejects_it check_framework.test_translation_llm.TranslationGetSupportedVariantRegressionTests.test_fr_reports_inconsistency_when_stub_rejects_it check_framework.test_translation_llm.TranslationGetSupportedVariantRegressionTests.test_multiple_reloads_with_stub_rejecting_en check_framework.test_translation_llm.TranslationGetSupportedVariantRegressionTests.test_zh_hans_reports_inconsistency_when_stub_rejects_it
+coverage json -o coverage.json
+: '>>>>> End Test Output'

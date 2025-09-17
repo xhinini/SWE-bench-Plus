@@ -1,0 +1,217 @@
+def test_y_single_digit_year(self):
+    self.assertEqual(dateformat.format(datetime(7, 9, 8, 5, 0), 'y'), '07')
+
+def test_y_year_100_returns_00(self):
+    self.assertEqual(dateformat.format(datetime(100, 1, 1, 0, 0), 'y'), '00')
+
+def test_y_year_2000_returns_00(self):
+    self.assertEqual(dateformat.format(datetime(2000, 6, 15, 12, 0), 'y'), '00')
+
+def test_y_year_1999_returns_99(self):
+    self.assertEqual(dateformat.format(datetime(1999, 12, 31, 23, 59), 'y'), '99')
+
+def test_y_year_123_returns_23(self):
+    self.assertEqual(dateformat.format(datetime(123, 4, 5, 6, 7), 'y'), '23')
+
+def test_y_date_object_returns_two_digits(self):
+    self.assertEqual(dateformat.format(date(2001, 1, 1), 'y'), '01')
+
+def test_y_using_dateformat_class_directly(self):
+    df = dateformat.DateFormat(datetime(9, 2, 3, 4, 5))
+    self.assertEqual(df.format('y'), '09')
+
+def test_y_combined_with_Y(self):
+    self.assertEqual(dateformat.format(datetime(100, 10, 10, 0, 0), 'Y y'), '100 00')
+
+def test_y_max_year_9999(self):
+    self.assertEqual(dateformat.format(datetime(9999, 1, 1, 0, 0), 'y'), '99')
+
+def test_y_two_digit_year_99(self):
+    self.assertEqual(dateformat.format(datetime(99, 3, 3, 0, 0), 'y'), '99')
+
+from datetime import datetime
+from django.test import SimpleTestCase, override_settings
+from django.utils import dateformat, translation
+
+@override_settings(TIME_ZONE='Europe/Copenhagen')
+class DateFormatYRegressionTests(SimpleTestCase):
+
+    def setUp(self):
+        self._orig_lang = translation.get_language()
+        translation.activate('en-us')
+
+    def tearDown(self):
+        translation.activate(self._orig_lang)
+
+from datetime import datetime
+from django.utils.dateformat import format
+
+def test_year_format_1():
+    assert format(datetime(1, 9, 8, 5, 0), 'y') == '01'
+
+def test_year_format_9():
+    assert format(datetime(9, 9, 8, 5, 0), 'y') == '09'
+
+def test_year_format_12():
+    assert format(datetime(12, 9, 8, 5, 0), 'y') == '12'
+
+def test_year_format_99():
+    assert format(datetime(99, 9, 8, 5, 0), 'y') == '99'
+
+def test_year_format_100():
+    assert format(datetime(100, 9, 8, 5, 0), 'y') == '00'
+
+def test_year_format_101():
+    assert format(datetime(101, 9, 8, 5, 0), 'y') == '01'
+
+def test_year_format_123():
+    assert format(datetime(123, 9, 8, 5, 0), 'y') == '23'
+
+def test_year_format_200():
+    assert format(datetime(200, 9, 8, 5, 0), 'y') == '00'
+
+def test_year_format_909():
+    assert format(datetime(909, 9, 8, 5, 0), 'y') == '09'
+
+def test_year_format_999():
+    assert format(datetime(999, 9, 8, 5, 0), 'y') == '99'
+
+from datetime import date, datetime
+from django.test import SimpleTestCase
+from django.utils import dateformat, translation
+
+class DateFormatYearEdgeCasesTests(SimpleTestCase):
+
+    def setUp(self):
+        self._orig_lang = translation.get_language()
+        translation.activate('en-us')
+
+    def tearDown(self):
+        translation.activate(self._orig_lang)
+
+def test_y_year_10(self):
+    self.assertEqual(dateformat.format(datetime(10, 9, 8, 5, 0), 'y'), '10')
+
+def test_y_year_1(self):
+    self.assertEqual(dateformat.format(datetime(1, 9, 8, 5, 0), 'y'), '01')
+
+def test_y_year_99(self):
+    self.assertEqual(dateformat.format(datetime(99, 9, 8, 5, 0), 'y'), '99')
+
+def test_y_year_100(self):
+    self.assertEqual(dateformat.format(datetime(100, 9, 8, 5, 0), 'y'), '00')
+
+def test_y_year_101(self):
+    self.assertEqual(dateformat.format(datetime(101, 9, 8, 5, 0), 'y'), '01')
+
+def test_y_year_123(self):
+    self.assertEqual(dateformat.format(datetime(123, 9, 8, 5, 0), 'y'), '23')
+
+def test_y_year_999(self):
+    self.assertEqual(dateformat.format(datetime(999, 9, 8, 5, 0), 'y'), '99')
+
+def test_y_year_1000(self):
+    self.assertEqual(dateformat.format(datetime(1000, 9, 8, 5, 0), 'y'), '00')
+
+def test_y_year_2003(self):
+    self.assertEqual(dateformat.format(datetime(2003, 9, 8, 5, 0), 'y'), '03')
+
+def test_y_year_200(self):
+    self.assertEqual(dateformat.format(datetime(200, 9, 8, 5, 0), 'y'), '00')
+
+def test_year_two_digit_edge_cases(self):
+    """
+    Regression tests for two-digit year formatting ('y'). Verify a variety of years,
+    including 1-digit, 2-digit, 3-digit, centuries and millennium boundaries, produce
+    the expected zero-padded two-digit result.
+    """
+    cases = [(1, '01'), (10, '10'), (90, '90'), (100, '00'), (123, '23'), (200, '00'), (201, '01'), (999, '99'), (1000, '00'), (1900, '00')]
+    for year, expected in cases:
+        with self.subTest(year=year):
+            self.assertEqual(dateformat.format(datetime(year, 9, 8, 5, 0), 'y'), expected)
+
+def test_y_padding_single_digit(self):
+    dt = datetime(9, 1, 1, 0, 0)
+    self.assertEqual(dateformat.format(dt, 'y'), '09')
+
+def test_y_padding_year_100(self):
+    dt = datetime(100, 1, 1, 0, 0)
+    self.assertEqual(dateformat.format(dt, 'y'), '00')
+
+def test_y_padding_year_1000(self):
+    dt = datetime(1000, 1, 1, 0, 0)
+    self.assertEqual(dateformat.format(dt, 'y'), '00')
+
+def test_y_padding_year_2000(self):
+    dt = datetime(2000, 1, 1, 0, 0)
+    self.assertEqual(dateformat.format(dt, 'y'), '00')
+
+def test_date_object_y_padding(self):
+    d = date(4, 1, 1)
+    self.assertEqual(dateformat.format(d, 'y'), '04')
+
+def test_multiple_y_repeats(self):
+    dt = datetime(2001, 5, 6, 7, 8)
+    self.assertEqual(dateformat.format(dt, 'y y y'), '01 01 01')
+
+def test_escaped_y_not_interpreted(self):
+    dt = datetime(2003, 7, 8, 9, 10)
+    self.assertEqual(dateformat.format(dt, '\\y'), 'y')
+
+def test_wrapper_and_module_format_agree(self):
+    dt = datetime(1999, 1, 1, 0, 0)
+    self.assertEqual(format(dt, 'y'), dateformat.format(dt, 'y'))
+
+def test_y_output_length_two_for_various_years(self):
+    years = [1, 9, 10, 42, 99, 100, 101, 476, 999, 2003]
+    for y in years:
+        with self.subTest(year=y):
+            dt = datetime(y, 1, 1, 0, 0)
+            out = dateformat.format(dt, 'y')
+            self.assertIsInstance(out, str)
+            self.assertEqual(len(out), 2)
+
+def test_expected_values_for_some_edge_years(self):
+    self.assertEqual(dateformat.format(datetime(476, 9, 8, 5, 0), 'y'), '76')
+    self.assertEqual(dateformat.format(datetime(42, 9, 8, 5, 0), 'y'), '42')
+    self.assertEqual(dateformat.format(datetime(4, 9, 8, 5, 0), 'y'), '04')
+
+def test_two_digit_year_format_various_years(self):
+    """
+    Regression tests for the 'y' format (two-digit year). Covers a variety of
+    year lengths to ensure correct zero-padding and truncation behaviour.
+    """
+    cases = [(1, '01'), (9, '09'), (10, '10'), (99, '99'), (100, '00'), (123, '23'), (200, '00'), (476, '76'), (999, '99'), (2003, '03')]
+    for year, expected in cases:
+        with self.subTest(year=year):
+            self.assertEqual(dateformat.format(datetime(year, 9, 8, 5, 0), 'y'), expected)
+
+def test_year_123_returns_23(self):
+    self.assertEqual(dateformat.format(datetime(123, 9, 8, 5, 0), 'y'), '23')
+
+def test_year_999_returns_99(self):
+    self.assertEqual(dateformat.format(datetime(999, 9, 8, 5, 0), 'y'), '99')
+
+def test_year_100_returns_00(self):
+    self.assertEqual(dateformat.format(datetime(100, 9, 8, 5, 0), 'y'), '00')
+
+def test_year_99_returns_99(self):
+    self.assertEqual(dateformat.format(datetime(99, 9, 8, 5, 0), 'y'), '99')
+
+def test_year_1_returns_01(self):
+    self.assertEqual(dateformat.format(datetime(1, 9, 8, 5, 0), 'y'), '01')
+
+def test_year_2000_returns_00(self):
+    self.assertEqual(dateformat.format(datetime(2000, 9, 8, 5, 0), 'y'), '00')
+
+def test_year_1900_returns_00(self):
+    self.assertEqual(dateformat.format(datetime(1900, 9, 8, 5, 0), 'y'), '00')
+
+def test_year_2005_returns_05(self):
+    self.assertEqual(dateformat.format(datetime(2005, 9, 8, 5, 0), 'y'), '05')
+
+def test_year_1234_returns_34(self):
+    self.assertEqual(dateformat.format(datetime(1234, 9, 8, 5, 0), 'y'), '34')
+
+def test_date_object_year_4_returns_04(self):
+    self.assertEqual(dateformat.format(date(4, 9, 8), 'y'), '04')

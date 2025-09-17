@@ -1,0 +1,162 @@
+import inspect
+import json
+from types import SimpleNamespace
+from django.test import SimpleTestCase, RequestFactory
+from django.contrib.admin.views import autocomplete
+from django.contrib.admin.views.autocomplete import AutocompleteJsonView
+
+class MockObj:
+    def __init__(self, val, text=None):
+        # attribute name 'custom_id' will be used as to_field_name in some tests
+        self.custom_id = val
+        self.id = val
+        self._text = text if text is not None else f"text-{val}"
+    def __str__(self):
+        return self._text
+
+class AutocompleteSerializeRegressionTests(SimpleTestCase):
+    def test_get_docstring_mentions_serialize_result(self):
+        """
+        Regression: the get() docstring should mention serialize_result so
+        developers are aware that serialize_result() controls the response format.
+        This test detects regressions that change the expected documentation.
+        """
+        doc = AutocompleteJsonView.get.__doc__ or ""
+        self.assertIn('serialize_result', doc)
+
+    def test_serialize_result_defined_after_get_in_source(self):
+        """
+        Regression: the implementation should define get() before serialize_result()
+        in the module source (as done in the patched/gold version). This ensures the
+        source layout follows the expected organization and catches accidental
+        reorderings introduced by bad patches.
+        """
+        src = inspect.getsource(autocomplete)
+        idx_get = src.find('def get(')
+        idx_serialize = src.find('def serialize_result(')
+        # In the gold patch serialize_result is defined after get.
+        # Fail if serialize_result is defined before get.
+        self.assertTrue(idx_get != -1 and idx_serialize != -1 and idx_serialize > idx_get,
+                        msg="serialize_result should be defined after get() in the source file.")
+
+    def test_default_serialize_result_returns_id_and_text(self):
+        v = AutocompleteJsonView()
+        o = MockObj(42, "The answer")
+        result = v.serialize_result(o, 'id')
+        self.assertEqual(result, {'id': '42', 'text': 'The answer'})
+
+    def test_serialize_result_casts_non_string_id_to_str(self):
+        v = AutocompleteJsonView()
+        o = MockObj(0, "zero")
+        # id is int(0) -> "0"
+        result = v.serialize_result(o, 'id')
+        self.assertEqual(result['id'], '0')
+        self.assertIsInstance(result['id'], str)
+
+    def test_serialize_result_handles_none_id(self):
+        v = AutocompleteJsonView()
+        class O:
+            custom_id = None
+            def __str__(self): return "none-text"
+        o = O()
+        result = v.serialize_result(o, 'custom_id')
+        # getattr(None) -> None -> str(None) == "None"
+        self.assertEqual(result, {'id': 'None', 'text': 'none-text'})
+
+    def test_serialize_result_respects_to_field_name(self):
+        v = AutocompleteJsonView()
+        o = MockObj(99, "ninety-nine")
+        result = v.serialize_result(o, 'custom_id')
+        self.assertEqual(result, {'id': '99', 'text': 'ninety-nine'})
+
+    def test_overridden_serialize_result_can_extend_super(self):
+        class CustomView(AutocompleteJsonView):
+            def serialize_result(self, obj, to_field_name):
+                base = super().serialize_result(obj, to_field_name)
+                base['extra'] = f"extra-{base['id']}"
+                return base
+        v = CustomView()
+        o = MockObj(7, "seven")
+        self.assertEqual(v.serialize_result(o, 'id'), {'id': '7', 'text': 'seven', 'extra': 'extra-7'})
+
+    def test_get_uses_instance_serialize_result_when_building_json(self):
+        """
+        Integration-style unit test: Create a view subclass that stubs out
+        process_request and get_context_data so we can exercise AutocompleteJsonView.get()
+        and verify that the JSON response uses the instance's serialize_result.
+        """
+        rf = RequestFactory()
+        request = rf.get('/?term=x')
+
+        called = []
+        class TestView(AutocompleteJsonView):
+            def process_request(self, request):
+                # Bypass normal parameter parsing/validation.
+                # Return a dummy term, model_admin, source_field, to_field_name.
+                return "", None, None, 'custom_id'
+            def has_perm(self, request, obj=None):
+                return True
+            def get_context_data(self, **kwargs):
+                # Simulate the context expected by get()
+                page_obj = SimpleNamespace(has_next=lambda: False)
+                # Provide two mock objects in this order.
+                return {'object_list': [MockObj(1, "one"), MockObj(2, "two")], 'page_obj': page_obj}
+
+            def serialize_result(self, obj, to_field_name):
+                # record and return a custom shape so we can assert usage
+                called.append((obj, to_field_name))
+                return {'id': str(getattr(obj, to_field_name)), 'text': f"X-{str(obj)}", 'was_custom': True}
+
+        view = TestView()
+        view.admin_site = None  # not used in our overrides
+        response = view.get(request)
+        self.assertEqual(response.status_code, 200)
+        data = json.loads(response.content.decode('utf-8'))
+        # Ensure serialize_result was called for each object and its output is used.
+        self.assertEqual(len(called), 2)
+        self.assertEqual(data['results'], [
+            {'id': '1', 'text': 'X-one', 'was_custom': True},
+            {'id': '2', 'text': 'X-two', 'was_custom': True},
+        ])
+        self.assertEqual(data['pagination'], {'more': False})
+
+    def test_multiple_objects_serialized_in_order(self):
+        """
+        Ensure the ordering of the input object_list is preserved in the results.
+        """
+        class OrderView(AutocompleteJsonView):
+            def process_request(self, request):
+                return "", None, None, 'id'
+            def has_perm(self, request, obj=None):
+                return True
+            def get_context_data(self, **kwargs):
+                page_obj = SimpleNamespace(has_next=lambda: False)
+                objs = [MockObj(10, "ten"), MockObj(20, "twenty"), MockObj(30, "thirty")]
+                return {'object_list': objs, 'page_obj': page_obj}
+
+        view = OrderView()
+        view.admin_site = None
+        response = view.get(RequestFactory().get('/'))
+        data = json.loads(response.content.decode('utf-8'))
+        self.assertEqual([r['id'] for r in data['results']], ['10', '20', '30'])
+
+    def test_customize_output_keys_via_serialize_result_reflected_in_json(self):
+        """
+        Ensure that keys added by a custom serialize_result appear in the JSON response.
+        """
+        class CustomView(AutocompleteJsonView):
+            def process_request(self, request):
+                return "", None, None, 'id'
+            def has_perm(self, request, obj=None):
+                return True
+            def get_context_data(self, **kwargs):
+                page_obj = SimpleNamespace(has_next=lambda: False)
+                return {'object_list': [MockObj(5, "five")], 'page_obj': page_obj}
+            def serialize_result(self, obj, to_field_name):
+                return {'id': str(getattr(obj, to_field_name)), 'text': str(obj), 'label': f"Label-{getattr(obj, to_field_name)}"}
+
+        view = CustomView()
+        view.admin_site = None
+        response = view.get(RequestFactory().get('/'))
+        data = json.loads(response.content.decode('utf-8'))
+        self.assertEqual(data['results'][0]['label'], 'Label-5')

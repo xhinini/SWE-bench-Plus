@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_widgets.tests_llm.RegressionFormfieldForManyToManyTests._assert_override_used admin_widgets.tests_llm.RegressionFormfieldForManyToManyTests._make_admin_with_override admin_widgets.tests_llm.RegressionFormfieldForManyToManyTests.test_explicit_widget_kwarg_to_formfield_for_manytomany_avoids_get_autocomplete_fields admin_widgets.tests_llm.RegressionFormfieldForManyToManyTests.test_formfield_overrides_class_widget_avoids_get_autocomplete_fields admin_widgets.tests_llm.RegressionFormfieldForManyToManyTests.test_formfield_overrides_instance_widget_avoids_get_autocomplete_fields admin_widgets.tests_llm.RegressionFormfieldForManyToManyTests.test_formfield_overrides_on_different_model_field_name_avoids_get_autocomplete_fields admin_widgets.tests_llm.RegressionFormfieldForManyToManyTests.test_formfield_overrides_with_autocomplete_fields_avoids_get_autocomplete_fields admin_widgets.tests_llm.RegressionFormfieldForManyToManyTests.test_formfield_overrides_with_filter_horizontal_avoids_get_autocomplete_fields admin_widgets.tests_llm.RegressionFormfieldForManyToManyTests.test_formfield_overrides_with_filter_vertical_avoids_get_autocomplete_fields admin_widgets.tests_llm.RegressionFormfieldForManyToManyTests.test_formfield_overrides_with_multiple_attrs_avoids_get_autocomplete_fields admin_widgets.tests_llm.RegressionFormfieldForManyToManyTests.test_formfield_overrides_with_raw_id_fields_avoids_get_autocomplete_fields
+coverage json -o coverage.json
+: '>>>>> End Test Output'

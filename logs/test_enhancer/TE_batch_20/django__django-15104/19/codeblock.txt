@@ -1,0 +1,176 @@
+# No new imports required; tests reuse imports already present in the test module.
+# Added regression tests for only_relation_agnostic_fields handling of missing 'to' kwarg
+from django.test import SimpleTestCase
+from django.db import models
+from django.db.migrations.autodetector import MigrationAutodetector
+from django.db.migrations.questioner import MigrationQuestioner
+from django.db.migrations.state import ModelState, ProjectState
+
+class OnlyRelationAgnosticFieldsTests(SimpleTestCase):
+    def test_custom_fk_without_to_does_not_raise_and_removes_to(self):
+        class FKWithoutTo(models.ForeignKey):
+            def deconstruct(self):
+                name, path, args, kwargs = super().deconstruct()
+                # Simulate a deconstruct that intentionally removes 'to'
+                kwargs.pop('to', None)
+                return name, path, args, kwargs
+
+        fk = FKWithoutTo('app.Model', on_delete=models.CASCADE)
+        autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+        fields_def = autodetector.only_relation_agnostic_fields({'f': fk})
+        # Ensure we got a deconstruction and 'to' is not present (no KeyError)
+        self.assertEqual(len(fields_def), 1)
+        self.assertNotIn('to', fields_def[0][2])
+
+    def test_standard_foreign_key_had_to_and_is_removed(self):
+        fk = models.ForeignKey('app.Model', on_delete=models.CASCADE)
+        autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+        fields_def = autodetector.only_relation_agnostic_fields({'f': fk})
+        # The 'to' kwarg should be removed by only_relation_agnostic_fields
+        self.assertEqual(len(fields_def), 1)
+        self.assertNotIn('to', fields_def[0][2])
+
+    def test_mixed_fields_some_with_and_without_to(self):
+        class FKWithoutTo(models.ForeignKey):
+            def deconstruct(self):
+                name, path, args, kwargs = super().deconstruct()
+                kwargs.pop('to', None)
+                # Add an extra kwarg to ensure other kwargs are preserved
+                kwargs['db_column'] = 'col_x'
+                return name, path, args, kwargs
+
+        fk1 = models.ForeignKey('app.Model', on_delete=models.CASCADE)
+        fk2 = FKWithoutTo('app.Model', on_delete=models.CASCADE)
+        autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+        fields_def = autodetector.only_relation_agnostic_fields({'a': fk1, 'b': fk2})
+        # Both entries should exist and neither should contain 'to'
+        self.assertEqual(len(fields_def), 2)
+        for decon in fields_def:
+            self.assertNotIn('to', decon[2])
+        # Ensure the extra kwarg on the custom field survived
+        self.assertTrue(any(decon[2].get('db_column') == 'col_x' for decon in fields_def))
+
+    def test_remote_field_model_none_keeps_to(self):
+        # Create a normal FK and then make its remote_field.model falsy
+        fk = models.ForeignKey('app.Model', on_delete=models.CASCADE)
+        # Force remote_field.model to None (simulating incomplete relation)
+        fk.remote_field.model = None
+        autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+        fields_def = autodetector.only_relation_agnostic_fields({'f': fk})
+        # Because remote_field.model is falsy, 'to' should NOT be removed
+        self.assertEqual(len(fields_def), 1)
+        self.assertIn('to', fields_def[0][2])
+
+    def test_many_to_many_custom_deconstruct_without_to(self):
+        class M2MWithoutTo(models.ManyToManyField):
+            def deconstruct(self):
+                name, path, args, kwargs = super().deconstruct()
+                kwargs.pop('to', None)
+                return name, path, args, kwargs
+
+        m2m = M2MWithoutTo('app.Model')
+        autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+        fields_def = autodetector.only_relation_agnostic_fields({'m': m2m})
+        self.assertEqual(len(fields_def), 1)
+        # Should not raise and should not contain 'to'
+        self.assertNotIn('to', fields_def[0][2])
+
+    def test_generate_renamed_models_with_custom_fk_no_to(self):
+        # Integration: ensure generate_renamed_models (called from _detect_changes)
+        # doesn't raise when deep_deconstruct for fields lacks 'to'
+        class FKWithoutTo(models.ForeignKey):
+            def deconstruct(self):
+                name, path, args, kwargs = super().deconstruct()
+                kwargs.pop('to', None)
+                return name, path, args, kwargs
+
+        before = ProjectState()
+        before.add_model(ModelState('myapp', 'Old', [
+            ('id', models.AutoField(primary_key=True)),
+            ('rel', FKWithoutTo('otherapp.Pub', on_delete=models.CASCADE)),
+        ]))
+        after = ProjectState()
+        after.add_model(ModelState('myapp', 'New', [
+            ('id', models.AutoField(primary_key=True)),
+            ('rel', FKWithoutTo('otherapp.Pub', on_delete=models.CASCADE)),
+        ]))
+        # Ensure questioner will accept renaming
+        autodetector = MigrationAutodetector(before, after, MigrationQuestioner({'ask_rename_model': True}))
+        changes = autodetector._detect_changes()
+        # Should have produced a RenameModel for myapp
+        self.assertIn('myapp', changes)
+        self.assertTrue(any(op.__class__.__name__ == 'RenameModel' for m in changes['myapp'] for op in m.operations))
+
+    def test_create_model_with_custom_fk_no_to_does_not_error(self):
+        # Integration: creating a model with a field whose deconstruct removes 'to'
+        class FKWithoutTo(models.ForeignKey):
+            def deconstruct(self):
+                name, path, args, kwargs = super().deconstruct()
+                kwargs.pop('to', None)
+                kwargs.setdefault('db_column', 'col_custom')
+                return name, path, args, kwargs
+
+        after = ProjectState()
+        after.add_model(ModelState('myapp', 'Person', [
+            ('id', models.AutoField(primary_key=True)),
+            ('ref', FKWithoutTo('otherapp.Pub', on_delete=models.CASCADE)),
+        ]))
+        autodetector = MigrationAutodetector(ProjectState(), after)
+        changes = autodetector._detect_changes()
+        # Should generate a CreateModel operation for myapp without crashing
+        self.assertIn('myapp', changes)
+        self.assertTrue(any(op.__class__.__name__ == 'CreateModel' for m in changes['myapp'] for op in m.operations))
+        # Validate the CreateModel field preserved other kwargs
+        create_ops = [op for m in changes['myapp'] for op in m.operations if op.__class__.__name__ == 'CreateModel']
+        self.assertTrue(create_ops)
+        fields = create_ops[0].fields
+        # Find our FK field in fields list and ensure db_column preserved
+        fk_field_kwargs = None
+        for name, field in fields:
+            if name == 'ref':
+                fk_field_kwargs = field.deconstruct()[2]
+        # Ensure db_column was preserved even if 'to' was removed
+        self.assertIsNotNone(fk_field_kwargs)
+        self.assertEqual(fk_field_kwargs.get('db_column'), 'col_custom')
+
+    def test_only_relation_agnostic_fields_preserves_other_kwargs_besides_to(self):
+        class FKWithoutTo(models.ForeignKey):
+            def deconstruct(self):
+                name, path, args, kwargs = super().deconstruct()
+                # remove 'to' but leave other kwargs intact
+                kwargs.pop('to', None)
+                kwargs['null'] = True
+                kwargs['db_index'] = True
+                return name, path, args, kwargs
+
+        fk = FKWithoutTo('app.Model', on_delete=models.CASCADE)
+        autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+        fields_def = autodetector.only_relation_agnostic_fields({'f': fk})
+        self.assertEqual(len(fields_def), 1)
+        kwargs = fields_def[0][2]
+        self.assertNotIn('to', kwargs)
+        self.assertTrue(kwargs.get('null'))
+        self.assertTrue(kwargs.get('db_index'))
+
+    def test_multiple_fields_varied_deconstructs_no_keyerror(self):
+        # Mix of fields to ensure robust behavior when list contains many cases
+        class FKWithoutTo(models.ForeignKey):
+            def deconstruct(self):
+                name, path, args, kwargs = super().deconstruct()
+                kwargs.pop('to', None)
+                return name, path, args, kwargs
+
+        fk_with_to = models.ForeignKey('app.Model', on_delete=models.CASCADE)
+        fk_without_to = FKWithoutTo('app.Model', on_delete=models.CASCADE)
+        char = models.CharField(max_length=10)
+        autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+        fields_def = autodetector.only_relation_agnostic_fields({
+            'a': fk_with_to,
+            'b': fk_without_to,
+            'c': char,
+        })
+        # All processed and no KeyError; fk entries should have 'to' removed,
+        # char field won't have 'to' in its kwargs anyway.
+        self.assertEqual(len(fields_def), 3)
+        for path, args, kwargs in fields_def:
+            self.assertNotIn('to', kwargs)

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.UserChangeFormPasswordLinkTest._extract_href auth_tests.test_forms_llm.UserChangeFormPasswordLinkTest.setUp auth_tests.test_forms_llm.UserChangeFormPasswordLinkTest.test_helptext_anchor_href_exact_bound_form auth_tests.test_forms_llm.UserChangeFormPasswordLinkTest.test_helptext_anchor_href_exact_direct_form auth_tests.test_forms_llm.UserChangeFormPasswordLinkTest.test_helptext_contains_expected_relative_path_direct_form auth_tests.test_forms_llm.UserChangeFormPasswordLinkTest.test_helptext_does_not_contain_single_parent_prefix auth_tests.test_forms_llm.UserChangeFormPasswordLinkTest.test_helptext_embeds_pk_segment auth_tests.test_forms_llm.UserChangeFormPasswordLinkTest.test_helptext_for_unsaved_instance_includes_none_pk auth_tests.test_forms_llm.UserChangeFormPasswordLinkTest.test_helptext_from_admin_get_form auth_tests.test_forms_llm.UserChangeFormPasswordLinkTest.test_helptext_from_admin_get_form_with_to_field auth_tests.test_forms_llm.UserChangeFormPasswordLinkTest.test_helptext_starts_with_double_parent_prefix auth_tests.test_forms_llm.UserChangeFormPasswordLinkTest.test_urljoin_resolves_to_password_change_with_to_field_base
+coverage json -o coverage.json
+: '>>>>> End Test Output'

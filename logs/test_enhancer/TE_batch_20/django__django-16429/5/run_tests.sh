@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 utils_tests.test_timesince_llm.TimesincePivotTZTests.test_depth_with_aware_months_and_weeks utils_tests.test_timesince_llm.TimesincePivotTZTests.test_different_timezones_months_preserve_tzinfo utils_tests.test_timesince_llm.TimesincePivotTZTests.test_large_years_aware_preserves_tzinfo utils_tests.test_timesince_llm.TimesincePivotTZTests.test_mixed_naive_aware_inputs_raise_type_error utils_tests.test_timesince_llm.TimesincePivotTZTests.test_month_boundary_preserves_tzinfo utils_tests.test_timesince_llm.TimesincePivotTZTests.test_pivot_day_rollover_preserves_tzinfo_for_february utils_tests.test_timesince_llm.TimesincePivotTZTests.test_pivot_month_overflow_adjusts_year_and_preserves_tzinfo utils_tests.test_timesince_llm.TimesincePivotTZTests.test_pivot_preserves_tzinfo_when_now_has_different_offset utils_tests.test_timesince_llm.TimesincePivotTZTests.test_timeuntil_with_aware_datetimes_months utils_tests.test_timesince_llm.TimesincePivotTZTests.test_year_boundary_preserves_tzinfo
+coverage json -o coverage.json
+: '>>>>> End Test Output'

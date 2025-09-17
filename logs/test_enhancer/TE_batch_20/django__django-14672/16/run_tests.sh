@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.setUp invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_can_be_used_as_dict_key_equivalence invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_empty_list_hash_stable_and_not_equal_to_none_hash invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_empty_list_vs_none_through_fields_not_equal invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_empty_tuple_vs_none_through_fields_not_equal invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_hashable_with_non_empty_list_no_error_and_matches_tuple invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_identity_changes_with_db_constraint invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_identity_tuple_tail_is_expected_make_hashable_result invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_list_vs_tuple_same_elements_equal invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_list_with_none_element_handled
+coverage json -o coverage.json
+: '>>>>> End Test Output'

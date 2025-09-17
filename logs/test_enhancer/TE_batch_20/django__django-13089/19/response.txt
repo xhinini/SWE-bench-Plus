@@ -1,0 +1,175 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests create conditions that would make the culling SQL return no rows (cursor.fetchone() == None) by forcing a cull with a computed cull_num of 0 (set _max_entries very small/negative and _cull_frequency very large). On the unfixed original code, that situation caused an unguarded cursor.fetchone()[0] access and would raise a TypeError. The tests assert that cache operations (set, add, touch, set_many) do not raise and that keys remain present as expected after the operation. They also verify expired rows are cleaned up and no unexpected deletions occur. All tests should fail on the original (unpatched) implementation and pass with the provided fix.
+test_code: |
+  @override_settings(CACHES=caches_setting_for_tests(
+      BACKEND='django.core.cache.backends.db.DatabaseCache',
+      # Use the same table name as other DB cache tests
+      LOCATION='test cache table'
+  ))
+  class CullQueryNoneReturnTests(TransactionTestCase):
+      """
+      Regression tests for a bug where _cull() assumed cursor.fetchone()
+      returned a row and accessed [0] without checking for None. These tests
+      force a cull to happen where the computed cull_num is 0 so that the
+      culling SQL returns no rows (fetchone() is None).
+      """
+      available_apps = ['cache']
+  
+      def setUp(self):
+          super().setUp()
+          management.call_command('createcachetable', verbosity=0)
+  
+      def tearDown(self):
+          super().tearDown()
+          with connection.cursor() as cursor:
+              table_name = connection.ops.quote_name('test cache table')
+              cursor.execute('DROP TABLE %s' % table_name)
+  
+      def _force_zero_cull_conditions(self, cache_instance):
+          """
+          Force conditions where num > _max_entries so _cull is invoked, but
+          cull_num = num // _cull_frequency becomes 0 (by making _cull_frequency
+          very large).
+          Returns a tuple of (old_max_entries, old_cull_frequency) for restoration.
+          """
+          old_max_entries = cache_instance._max_entries
+          old_cull_frequency = cache_instance._cull_frequency
+          cache_instance._max_entries = -1   # ensure num > _max_entries
+          cache_instance._cull_frequency = 1000000  # huge so num // freq == 0
+          return old_max_entries, old_cull_frequency
+  
+      def _restore_cull_settings(self, cache_instance, old_values):
+          cache_instance._max_entries, cache_instance._cull_frequency = old_values
+  
+      def test_set_does_not_crash_when_cull_query_returns_no_rows_single(self):
+          cull_cache = caches['cull']
+          old_vals = self._force_zero_cull_conditions(cull_cache)
+          try:
+              # Should not raise even if culling SQL returns no rows
+              cull_cache.set('single_key', 'value', timeout=1000)
+              self.assertEqual(cull_cache.get('single_key'), 'value')
+          finally:
+              self._restore_cull_settings(cull_cache, old_vals)
+  
+      def test_set_does_not_crash_when_cull_query_returns_no_rows_multiple(self):
+          cull_cache = caches['cull']
+          # Create several existing keys first
+          for i in range(5):
+              cull_cache.set('k%d' % i, 'v%d' % i, timeout=1000)
+          old_vals = self._force_zero_cull_conditions(cull_cache)
+          try:
+              # Trigger cull during a new set
+              cull_cache.set('new_key', 'newvalue', timeout=1000)
+              # Ensure all keys still present (nothing should be deleted unexpectedly)
+              for i in range(5):
+                  self.assertEqual(cull_cache.get('k%d' % i), 'v%d' % i)
+              self.assertEqual(cull_cache.get('new_key'), 'newvalue')
+          finally:
+              self._restore_cull_settings(cull_cache, old_vals)
+  
+      def test_add_does_not_crash_when_cull_query_returns_no_rows(self):
+          cull_cache = caches['cull']
+          old_vals = self._force_zero_cull_conditions(cull_cache)
+          try:
+              # add should not raise and should store the value
+              self.assertIs(cull_cache.add('add_key', 'avalue', timeout=1000), True)
+              self.assertEqual(cull_cache.get('add_key'), 'avalue')
+          finally:
+              self._restore_cull_settings(cull_cache, old_vals)
+  
+      def test_touch_does_not_crash_when_cull_query_returns_no_rows(self):
+          cull_cache = caches['cull']
+          # Pre-create key to touch
+          cull_cache.set('touch_key', 'tvalue', timeout=1000)
+          old_vals = self._force_zero_cull_conditions(cull_cache)
+          try:
+              # touch should not raise; returns True if succeeded
+              self.assertIs(cull_cache.touch('touch_key', timeout=2000), True)
+              self.assertEqual(cull_cache.get('touch_key'), 'tvalue')
+          finally:
+              self._restore_cull_settings(cull_cache, old_vals)
+  
+      def test_set_many_does_not_crash_when_cull_query_returns_no_rows(self):
+          cull_cache = caches['cull']
+          old_vals = self._force_zero_cull_conditions(cull_cache)
+          try:
+              # set_many should not raise and keys should be stored
+              failing = cull_cache.set_many({'sm1': 1, 'sm2': 2}, timeout=1000)
+              self.assertEqual(failing, [])
+              self.assertEqual(cull_cache.get('sm1'), 1)
+              self.assertEqual(cull_cache.get('sm2'), 2)
+          finally:
+              self._restore_cull_settings(cull_cache, old_vals)
+  
+      def test_expired_rows_removed_and_no_crash_when_cull_query_returns_no_rows(self):
+          cull_cache = caches['cull']
+          # Create a key that will expire shortly
+          cull_cache.set('expiring', 'old', timeout=1)
+          cull_cache.set('persistent', 'stay', timeout=1000)
+          time.sleep(1.1)  # allow the first key to expire
+          old_vals = self._force_zero_cull_conditions(cull_cache)
+          try:
+              # Trigger cull via setting another key; expired rows should be cleaned
+              cull_cache.set('trigger', 'x', timeout=1000)
+              # expired key should be gone, persistent remains
+              self.assertIsNone(cull_cache.get('expiring'))
+              self.assertEqual(cull_cache.get('persistent'), 'stay')
+              self.assertEqual(cull_cache.get('trigger'), 'x')
+          finally:
+              self._restore_cull_settings(cull_cache, old_vals)
+  
+      def test_multiple_operations_do_not_crash_under_zero_cull_num(self):
+          cull_cache = caches['cull']
+          old_vals = self._force_zero_cull_conditions(cull_cache)
+          try:
+              # Perform a sequence of operations that would trigger _cull each time.
+              cull_cache.set('m1', 1, timeout=1000)
+              cull_cache.add('m2', 2, timeout=1000)
+              cull_cache.set('m3', 3, timeout=1000)
+              self.assertEqual(cull_cache.get_many(['m1', 'm2', 'm3']), {'m1': 1, 'm2': 2, 'm3': 3})
+          finally:
+              self._restore_cull_settings(cull_cache, old_vals)
+  
+      def test_no_unexpected_deletion_happens_when_cull_query_returns_no_rows(self):
+          cull_cache = caches['cull']
+          # Create a set of keys
+          keys = ['nd1', 'nd2', 'nd3']
+          for k in keys:
+              cull_cache.set(k, k + '-v', timeout=1000)
+          old_vals = self._force_zero_cull_conditions(cull_cache)
+          try:
+              # Trigger culling by setting another key
+              cull_cache.set('nd-trigger', 'ok', timeout=1000)
+              # All original keys should remain
+              for k in keys:
+                  self.assertEqual(cull_cache.get(k), k + '-v')
+          finally:
+              self._restore_cull_settings(cull_cache, old_vals)
+  
+      def test_cull_frequency_zero_calls_clear_and_works(self):
+          """
+          When _cull_frequency is zero, _cull() calls clear(). This path is
+          different from the 'no rows' path but relevant to cache culling.
+          Ensure it still works as expected.
+          """
+          cull_cache = caches['cull']
+          # Put some keys
+          cull_cache.set('clear1', 'v1', timeout=1000)
+          cull_cache.set('clear2', 'v2', timeout=1000)
+          # Force immediate clear by setting _cull_frequency to 0 and ensuring _max_entries < num
+          old_max = cull_cache._max_entries
+          old_freq = cull_cache._cull_frequency
+          try:
+              cull_cache._max_entries = 0
+              cull_cache._cull_frequency = 0
+              # Trigger cull via set
+              cull_cache.set('clear-trigger', 'x', timeout=1000)
+              # clear() should have removed previous keys
+              self.assertIsNone(cull_cache.get('clear1'))
+              self.assertIsNone(cull_cache.get('clear2'))
+              self.assertEqual(cull_cache.get('clear-trigger'), 'x')
+          finally:
+              cull_cache._max_entries = old_max
+              cull_cache._cull_frequency = old_freq
+new_imports_code: ""

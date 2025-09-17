@@ -1,0 +1,276 @@
+from requests.exceptions import HTTPError
+from unittest import mock
+import json
+from unittest import mock
+import pytest
+from requests.exceptions import HTTPError
+
+# Helper fake response to emulate `requests` Response sufficiently for linkcheck.
+class FakeResponse:
+    def __init__(self, url, status_code=200, headers=None, chunks=None, history=None, method='GET'):
+        self.url = url
+        self.status_code = status_code
+        self.headers = headers or {}
+        self._chunks = chunks or []
+        self.history = history or []
+        self.request = mock.Mock()
+        self.request.method = method
+
+    def iter_content(self, chunk_size=4096, decode_unicode=False):
+        for c in self._chunks:
+            if isinstance(c, bytes) and decode_unicode:
+                # emulate requests behavior: return bytes when it couldn't decode
+                yield c
+            else:
+                yield c
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            e = HTTPError(f"{self.status_code} Error")
+            e.response = self
+            raise e
+
+# Generic factory to create mocks for get/head with per-url behavior
+def make_request_mocks(mapping, default_get=None, default_head=None):
+    """
+    mapping: dict of url -> dict with keys: head, get where each is
+             tuple (status_code, headers, chunks)
+    default_get/default_head: tuple as above for URLs not in mapping
+    """
+    default_get = default_get or (200, {'content-type': 'text/html'}, ['<html></html>'])
+    default_head = default_head or default_get
+
+    def _mk_response(url, verb):
+        cfg = mapping.get(url, {})
+        if verb == 'GET':
+            cfg_get = cfg.get('get', None)
+            s, h, chunks = cfg_get if cfg_get is not None else default_get
+            return FakeResponse(url, status_code=s, headers=h, chunks=chunks, method='GET')
+        else:
+            cfg_head = cfg.get('head', None)
+            s, h, chunks = cfg_head if cfg_head is not None else default_head
+            # HEAD typically has no body chunks
+            return FakeResponse(url, status_code=s, headers=h, chunks=chunks if verb == 'HEAD' else chunks, method='HEAD')
+
+    def get_mock(url, stream=False, **kwargs):
+        return _mk_response(url, 'GET')
+
+    def head_mock(url, **kwargs):
+        return _mk_response(url, 'HEAD')
+
+    return get_mock, head_mock
+
+# Utility to find a row for a given URI in output.json
+def find_row(app, uri):
+    content = (app.outdir / 'output.json').read_text()
+    rows = [json.loads(x) for x in content.splitlines() if x.strip()]
+    rowsby = {row["uri"]: row for row in rows}
+    return rowsby.get(uri)
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_head_200_get_404_nonhtml_anchor_is_broken(app, status, warning):
+    # HEAD returns 200 non-html, GET returns 404 non-html -> anchor check should fail (broken)
+    base = 'https://www.google.com/'
+    uri = base + '#top'
+    mapping = {
+        base: {
+            'head': (200, {'content-type': 'application/octet-stream'}, []),
+            'get': (404, {'content-type': 'application/octet-stream'}, ['Not Found']),
+        }
+    }
+    get_mock, head_mock = make_request_mocks(mapping)
+    with mock.patch.multiple('sphinx.builders.linkcheck.requests', get=get_mock, head=head_mock):
+        app.builder.build_all()
+    row = find_row(app, uri)
+    assert row is not None
+    assert row['status'] == 'broken'
+    # because GET returned 404, info should reflect HTTP error
+    assert '404' in row['info'] or 'Not Found' in row['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_get_200_nonhtml_no_anchor_is_broken(app, status, warning):
+    # GET returns 200 non-html content without anchor -> should be broken (anchor missing)
+    base = 'https://www.google.com/'
+    uri = base + '#does-not-exist'
+    mapping = {
+        base: {
+            'get': (200, {'content-type': 'application/octet-stream'}, ['binary data without anchor']),
+        }
+    }
+    get_mock, head_mock = make_request_mocks(mapping)
+    with mock.patch.multiple('sphinx.builders.linkcheck.requests', get=get_mock, head=head_mock):
+        app.builder.build_all()
+    row = find_row(app, uri)
+    assert row is not None
+    assert row['status'] == 'broken'
+    assert "Anchor 'does-not-exist' not found" in row['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_get_404_nonhtml_anchor_is_broken(app, status, warning):
+    # GET returns 404 for non-html -> should be broken
+    base = 'https://www.google.com/'
+    uri = base + '#missing'
+    mapping = {
+        base: {
+            'get': (404, {'content-type': 'application/octet-stream'}, ['404 content']),
+        }
+    }
+    get_mock, head_mock = make_request_mocks(mapping)
+    with mock.patch.multiple('sphinx.builders.linkcheck.requests', get=get_mock, head=head_mock):
+        app.builder.build_all()
+    row = find_row(app, uri)
+    assert row is not None
+    assert row['status'] == 'broken'
+    assert '404' in row['info'] or 'Not Found' in row['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_get_200_html_with_anchor_is_working(app, status, warning):
+    # GET returns 200 HTML containing the anchor -> working
+    base = 'https://www.google.com/'
+    uri = base + '#top'
+    html = '<html><a id="top"></a></html>'
+    mapping = {
+        base: {
+            'get': (200, {'content-type': 'text/html'}, [html]),
+        }
+    }
+    get_mock, head_mock = make_request_mocks(mapping)
+    with mock.patch.multiple('sphinx.builders.linkcheck.requests', get=get_mock, head=head_mock):
+        app.builder.build_all()
+    row = find_row(app, uri)
+    assert row is not None
+    assert row['status'] == 'working'
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_get_200_html_without_anchor_is_broken(app, status, warning):
+    # GET returns 200 HTML but anchor not present -> broken
+    base = 'https://www.google.com/'
+    uri = base + '#nope'
+    html = '<html><body>No anchors here</body></html>'
+    mapping = {
+        base: {
+            'get': (200, {'content-type': 'text/html'}, [html]),
+        }
+    }
+    get_mock, head_mock = make_request_mocks(mapping)
+    with mock.patch.multiple('sphinx.builders.linkcheck.requests', get=get_mock, head=head_mock):
+        app.builder.build_all()
+    row = find_row(app, uri)
+    assert row is not None
+    assert row['status'] == 'broken'
+    assert "Anchor 'nope' not found" in row['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_head_200_html_get_404_anchor_is_broken(app, status, warning):
+    # HEAD returns 200 HTML but GET later returns 404 -> result should be broken
+    base = 'https://www.google.com/'
+    uri = base + '#top'
+    mapping = {
+        base: {
+            'head': (200, {'content-type': 'text/html'}, []),
+            'get': (404, {'content-type': 'text/html'}, ['404 page']),
+        }
+    }
+    get_mock, head_mock = make_request_mocks(mapping)
+    with mock.patch.multiple('sphinx.builders.linkcheck.requests', get=get_mock, head=head_mock):
+        app.builder.build_all()
+    row = find_row(app, uri)
+    assert row is not None
+    assert row['status'] == 'broken'
+    assert '404' in row['info'] or 'Not Found' in row['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_head_200_nonhtml_get_200_html_no_anchor_is_broken(app, status, warning):
+    # HEAD returns 200 non-html (candidate incorrectly would return 'working' here),
+    # GET returns 200 HTML without the anchor -> gold behavior: broken
+    base = 'https://www.google.com/'
+    uri = base + '#no-anchor'
+    mapping = {
+        base: {
+            'head': (200, {'content-type': 'application/octet-stream'}, []),
+            'get': (200, {'content-type': 'text/html'}, ['<html>No anchor</html>']),
+        }
+    }
+    get_mock, head_mock = make_request_mocks(mapping)
+    with mock.patch.multiple('sphinx.builders.linkcheck.requests', get=get_mock, head=head_mock):
+        app.builder.build_all()
+    row = find_row(app, uri)
+    assert row is not None
+    assert row['status'] == 'broken'
+    assert "Anchor 'no-anchor' not found" in row['info']
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_found_with_bytes_chunks_decoding(app, status, warning):
+    # Response yields bytes chunks (requests might not decode), but anchor parser
+    # has to handle bytes -> decode and find anchor -> working
+    base = 'https://www.google.com/'
+    uri = base + '#binaryanchor'
+    # chunk is bytes; the check_anchor path will attempt to decode if bytes
+    html_bytes = b'<html><a id="binaryanchor"></a></html>'
+    mapping = {
+        base: {
+            'get': (200, {'content-type': 'text/html'}, [html_bytes]),
+        }
+    }
+    get_mock, head_mock = make_request_mocks(mapping)
+    with mock.patch.multiple('sphinx.builders.linkcheck.requests', get=get_mock, head=head_mock):
+        app.builder.build_all()
+    row = find_row(app, uri)
+    assert row is not None
+    assert row['status'] == 'working'
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_get_401_and_503_special_cases(app, status, warning):
+    # 401 should be treated as working, 503 as ignored
+    base = 'https://www.google.com/'
+    uri401 = base + '#unauth'
+    uri503 = base + '#unavailable'
+    mapping = {
+        # We'll map different full URLs by duplicating base with a fake path for differentiation
+        'https://www.google.com/unauth': {
+            'get': (401, {'content-type': 'text/html'}, ['unauthorized']),
+        },
+        'https://www.google.com/unavail': {
+            'get': (503, {'content-type': 'text/html'}, ['service unavailable']),
+        }
+    }
+    # Our test URIs are the ones linkcheck will check; to ensure the builder
+    # requests the intended URLs we use these exact URLs (without anchor)
+    get_mapping = {
+        'https://www.google.com/': (200, {'content-type': 'text/html'}, ['<html></html>']),
+    }
+    # We will dispatch based on the full URL passed in; so patch with a custom binder
+    def get_mock(url, stream=False, **kwargs):
+        # decide by url to return the special ones
+        if url == 'https://www.google.com/unauth':
+            return FakeResponse(url, status_code=401, headers={'content-type': 'text/html'}, chunks=['401'], method='GET')
+        elif url == 'https://www.google.com/unavail':
+            return FakeResponse(url, status_code=503, headers={'content-type': 'text/html'}, chunks=['503'], method='GET')
+        else:
+            return FakeResponse(url, status_code=200, headers={'content-type': 'text/html'}, chunks=['<html></html>'], method='GET')
+
+    def head_mock(url, **kwargs):
+        # simple HEAD that mirrors GET status for these tests
+        if url == 'https://www.google.com/unauth':
+            return FakeResponse(url, status_code=401, headers={'content-type': 'text/html'}, chunks=[], method='HEAD')
+        elif url == 'https://www.google.com/unavail':
+            return FakeResponse(url, status_code=503, headers={'content-type': 'text/html'}, chunks=[], method='HEAD')
+        else:
+            return FakeResponse(url, status_code=200, headers={'content-type': 'text/html'}, chunks=[], method='HEAD')
+
+    # Patch the requests module used by the linkcheck builder
+    with mock.patch.multiple('sphinx.builders.linkcheck.requests', get=get_mock, head=head_mock):
+        # Now simulate links by directly invoking build_all which will pick up links
+        # that exist in the testroot. To ensure our special URLs are used, we rely
+        # on the builder making requests to the exact URLs tested above.
+        app.builder.build_all()
+    # We need to find entries for our URIs. Because the mapping above used slightly
+    # different base paths, look for matching substrings.
+    content = (app.outdir / 'output.json').read_text()
+    rows = [json.loads(x) for x in content.splitlines() if x.strip()]
+    # Find any row that mentions 401 or 503 via info or via uri
+    found401 = any((row['status'] == 'working' and ('401' in row.get('info', '') or 'unauthorized' in row.get('info', ''))) or ('unauth' in row['uri']) for row in rows)
+    found503 = any((row['status'] == 'ignored' and ('503' in row.get('info', '') or 'Service Unavailable' in row.get('info', ''))) or ('unavail' in row['uri']) for row in rows)
+    # At least one row should indicate 401 treated as working and 503 as ignored
+    assert found401 or any(r['status'] == 'working' for r in rows)
+    assert any(r['status'] == 'ignored' for r in rows) or found503

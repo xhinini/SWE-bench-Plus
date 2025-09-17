@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.test_autoreloader_llm.AdditionalTemplateReloadTests.make_backend template_tests.test_autoreloader_llm.AdditionalTemplateReloadTests.test_deduplicates_duplicate_directories template_tests.test_autoreloader_llm.AdditionalTemplateReloadTests.test_ignores_empty_string_among_dir_entries template_tests.test_autoreloader_llm.AdditionalTemplateReloadTests.test_loader_get_dirs_filters_empty_and_django_paths template_tests.test_autoreloader_llm.AdditionalTemplateReloadTests.test_multiple_backends_and_loaders_combined template_tests.test_autoreloader_llm.AdditionalTemplateReloadTests.test_normalizes_path_objects_and_strings template_tests.test_autoreloader_llm.AdditionalTemplateReloadTests.test_watch_for_template_changes_ignores_empty_dir template_tests.test_autoreloader_llm.AdditionalTemplateReloadTests.test_watch_for_template_changes_watches_all_directories
+coverage json -o coverage.json
+: '>>>>> End Test Output'

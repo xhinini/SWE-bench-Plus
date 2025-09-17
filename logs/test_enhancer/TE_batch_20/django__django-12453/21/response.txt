@@ -1,0 +1,179 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests assert that deserialize_db_from_string disables constraint checks during object saves and calls check_constraints afterwards. They also verify the constraint-checking context manager is entered/exited properly and that the module-level atomic is used. The tests would fail against the candidate patch (which omits the constraint_checks_disabled/context handling and check_constraints call and doesn't call the module-level atomic), and pass against the gold patch.
+test_code: |
+  import types
+  from unittest import mock
+  
+  from django.db import connection
+  from django.core import serializers
+  
+  # All tests use the default database.
+  class TestDeserializeDbConstraintHandling(SimpleTestCase):
+      databases = {'default'}
+  
+      def _make_cm_toggle(self, conn):
+          """
+          Return a context manager object whose __enter__/__exit__ toggle
+          conn._constraint_checks_disabled_active and record exit_called.
+          """
+          class CM:
+              def __enter__(self_inner):
+                  conn._constraint_checks_disabled_active = True
+                  return self_inner
+              def __exit__(self_inner, exc_type, exc, tb):
+                  conn._constraint_checks_disabled_active = False
+                  conn._cm_exit_called = True
+                  # Don't suppress exceptions
+                  return False
+          return CM()
+  
+      def test_constraint_checks_disabled_called(self):
+          # Ensure the constraint_checks_disabled context manager is invoked.
+          conn = connection
+          cm = self._make_cm_toggle(conn)
+          conn.constraint_checks_disabled = mock.MagicMock(return_value=cm)
+          # Patch serializers.deserialize to be a no-op iterator.
+          with mock.patch('django.core.serializers.deserialize', return_value=iter(())):
+              conn.creation.deserialize_db_from_string('[]')
+          conn.constraint_checks_disabled.assert_called_once()
+  
+      def test_check_constraints_called(self):
+          # Ensure check_constraints is called after deserialization.
+          conn = connection
+          conn.check_constraints = mock.MagicMock()
+          with mock.patch('django.core.serializers.deserialize', return_value=iter(())):
+              conn.creation.deserialize_db_from_string('[]')
+          conn.check_constraints.assert_called_once()
+  
+      def test_constraint_disabled_before_save(self):
+          # Ensure the constraint_checks_disabled context is active during save().
+          conn = connection
+          conn._constraint_checks_disabled_active = False
+          cm = self._make_cm_toggle(conn)
+          conn.constraint_checks_disabled = mock.MagicMock(return_value=cm)
+  
+          class FakeObj:
+              def save(self_inner, *args, **kwargs):
+                  # This should be true only if the context manager was entered.
+                  if not getattr(conn, '_constraint_checks_disabled_active', False):
+                      raise AssertionError("Constraint checks were not disabled during save()")
+  
+          with mock.patch('django.core.serializers.deserialize', return_value=iter([FakeObj()])):
+              conn.creation.deserialize_db_from_string('[]')
+  
+      def test_check_constraints_called_after_save(self):
+          # Ensure check_constraints is executed after all saves (order).
+          conn = connection
+          ops = []
+          cm = self._make_cm_toggle(conn)
+          conn.constraint_checks_disabled = mock.MagicMock(return_value=cm)
+  
+          class FakeObj:
+              def __init__(self, idx):
+                  self.idx = idx
+              def save(self_inner, *args, **kwargs):
+                  ops.append(('save', self_inner.idx))
+  
+          def fake_check_constraints():
+              ops.append(('check', None))
+  
+          conn.check_constraints = mock.MagicMock(side_effect=fake_check_constraints)
+  
+          with mock.patch('django.core.serializers.deserialize', return_value=iter([FakeObj(1), FakeObj(2)])):
+              conn.creation.deserialize_db_from_string('[]')
+  
+          # Last operation should be the check_constraints call
+          assert ops[-1][0] == 'check'
+          assert ops[0] == ('save', 1)
+          assert ops[1] == ('save', 2)
+  
+      def test_constraint_context_exit_on_exception(self):
+          # If a save() raises, the constraint context manager __exit__ must still run.
+          conn = connection
+          conn._cm_exit_called = False
+          cm = self._make_cm_toggle(conn)
+          conn.constraint_checks_disabled = mock.MagicMock(return_value=cm)
+  
+          class BadObj:
+              def save(self_inner, *args, **kwargs):
+                  raise ValueError("boom")
+  
+          with mock.patch('django.core.serializers.deserialize', return_value=iter([BadObj()])):
+              with self.assertRaises(ValueError):
+                  conn.creation.deserialize_db_from_string('[]')
+  
+          # __exit__ should have been called (sets _cm_exit_called)
+          self.assertTrue(getattr(conn, '_cm_exit_called', False))
+  
+      def test_empty_data_still_calls_constraint_and_check(self):
+          # Even if no objects are deserialized, the constraint context and check should be used.
+          conn = connection
+          conn.check_constraints = mock.MagicMock()
+          cm = self._make_cm_toggle(conn)
+          conn.constraint_checks_disabled = mock.MagicMock(return_value=cm)
+  
+          with mock.patch('django.core.serializers.deserialize', return_value=iter(())):
+              conn.creation.deserialize_db_from_string('\n  \n')
+  
+          conn.constraint_checks_disabled.assert_called_once()
+          conn.check_constraints.assert_called_once()
+  
+      def test_multiple_objects_save_order_with_checks(self):
+          # Multiple saves must happen before check_constraints runs.
+          conn = connection
+          ops = []
+          cm = self._make_cm_toggle(conn)
+          conn.constraint_checks_disabled = mock.MagicMock(return_value=cm)
+  
+          class FakeObj:
+              def __init__(self, name):
+                  self.name = name
+              def save(self_inner, *args, **kwargs):
+                  ops.append(self_inner.name)
+  
+          def fake_check():
+              ops.append('check')
+  
+          conn.check_constraints = mock.MagicMock(side_effect=fake_check)
+  
+          with mock.patch('django.core.serializers.deserialize', return_value=iter([FakeObj('a'), FakeObj('b'), FakeObj('c')])):
+              conn.creation.deserialize_db_from_string('[]')
+  
+          self.assertEqual(ops, ['a', 'b', 'c', 'check'])
+  
+      def test_deserialize_uses_module_level_atomic(self):
+          # The creation module should use its own atomic symbol so we can detect it.
+          # Patch the module-level atomic symbol used by the creation module.
+          import django.db.backends.base.creation as creation_mod
+          with mock.patch.object(creation_mod, 'atomic', wraps=creation_mod.atomic) as mocked_atomic:
+              # serializers.deserialize -> empty to avoid DB activity
+              with mock.patch('django.core.serializers.deserialize', return_value=iter(())):
+                  connection.creation.deserialize_db_from_string('[]')
+              mocked_atomic.assert_called_once_with(using=connection.alias)
+  
+      def test_check_constraints_called_on_connection_copy(self):
+          # Behavior should also hold for a copied connection's creation instance.
+          test_connection = get_connection_copy()
+          test_connection.check_constraints = mock.MagicMock()
+          cm = self._make_cm_toggle(test_connection)
+          test_connection.constraint_checks_disabled = mock.MagicMock(return_value=cm)
+          creation = test_connection.creation_class(test_connection)
+          with mock.patch('django.core.serializers.deserialize', return_value=iter(())):
+              creation.deserialize_db_from_string('[]')
+          test_connection.constraint_checks_disabled.assert_called_once()
+          test_connection.check_constraints.assert_called_once()
+  
+      def test_constraint_manager_used_with_whitespace_data(self):
+          # Similar to empty data test but with explicit whitespace/newline JSON.
+          conn = connection
+          conn.check_constraints = mock.MagicMock()
+          cm = self._make_cm_toggle(conn)
+          conn.constraint_checks_disabled = mock.MagicMock(return_value=cm)
+          with mock.patch('django.core.serializers.deserialize', return_value=iter(())):
+              conn.creation.deserialize_db_from_string('  \n  ')
+          conn.constraint_checks_disabled.assert_called_once()
+          conn.check_constraints.assert_called_once()
+new_imports_code: |
+  from django.test import SimpleTestCase
+  from .test_creation import get_connection_copy  # re-use helper defined earlier in the module

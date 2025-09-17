@@ -1,0 +1,128 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise KeyTransformIsNull.as_oracle and KeyTransformIsNull.as_sqlite SQL generation and parameter handling. They assert that for isnull=True the lookup produces the combined "NOT has_key OR <lhs> IS NULL" expression on Oracle and uses the JSON_TYPE(... ) IS NULL template on SQLite, and that parameters from the lhs preprocessing are preserved and ordered correctly. These tests would fail against the candidate (incorrect) patch which returns a plain NOT(has_key) for isnull=True on Oracle/SQLite and/or loses lhs parameters; they pass with the provided (gold) patch.
+test_code: |
+  from types import SimpleNamespace
+  from unittest import mock
+
+  from django.test import SimpleTestCase
+
+  from django.db.models.fields.json import (
+      KeyTransformIsNull, KeyTransform, HasKey, compile_json_path,
+  )
+
+  class KeyTransformIsNullSQLTests(SimpleTestCase):
+      def test_oracle_isnull_true_includes_is_null_and_lhs_params(self):
+          compiler = mock.Mock()
+          # compiler.compile returns LHS SQL and its params
+          compiler.compile.return_value = ('"t"."c"', ('LHS_PARAM',))
+          conn = SimpleNamespace(vendor='oracle', features=SimpleNamespace())
+          expr = KeyTransformIsNull(KeyTransform('a', 'value'), True)
+          sql, params = expr.as_oracle(compiler, conn)
+          # Should contain IS NULL and a NOT (has_key) part
+          self.assertIn('IS NULL', sql)
+          self.assertIn('NOT', sql)
+          # lhs params from compiler.compile must be preserved and appended to params
+          self.assertEqual(params, ('LHS_PARAM',))
+
+      def test_oracle_isnull_true_uses_haskey_params_then_lhs_params(self):
+          compiler = mock.Mock()
+          compiler.compile.return_value = ('"t"."c"', ('LHS_PARAM',))
+          conn = SimpleNamespace(vendor='oracle', features=SimpleNamespace())
+          # Patch HasKey.as_oracle to return SQL and some params (simulating a non-empty param list)
+          with mock.patch.object(HasKey, 'as_oracle', return_value=('HAS_KEY_SQL', ('HP1', 'HP2'))):
+              expr = KeyTransformIsNull(KeyTransform('b', 'value'), True)
+              sql, params = expr.as_oracle(compiler, conn)
+          # Gold behavior: params from HasKey first, then lhs params appended.
+          self.assertEqual(params, ('HP1', 'HP2', 'LHS_PARAM'))
+          self.assertIn('IS NULL', sql)
+          # Contains the inlined HasKey SQL portion returned by the patched HasKey.as_oracle
+          self.assertIn('HAS_KEY_SQL', sql)
+
+      def test_oracle_isnull_false_returns_haskey_as_oracle(self):
+          compiler = mock.Mock()
+          compiler.compile.return_value = ('"t"."c"', ('LP',))
+          conn = SimpleNamespace(vendor='oracle', features=SimpleNamespace())
+          # Patch HasKey.as_oracle to verify passthrough when isnull=False
+          with mock.patch.object(HasKey, 'as_oracle', return_value=('HK_SQL', ('P',))):
+              expr = KeyTransformIsNull(KeyTransform('c', 'value'), False)
+              sql, params = expr.as_oracle(compiler, conn)
+          self.assertEqual(sql, 'HK_SQL')
+          self.assertEqual(params, ('P',))
+
+      def test_oracle_handles_integer_key_in_path_for_isnull_true(self):
+          compiler = mock.Mock()
+          compiler.compile.return_value = ('"col"', ('LP',))
+          conn = SimpleNamespace(vendor='oracle', features=SimpleNamespace())
+          # Nested KeyTransform with an integer key should produce a path with [1]
+          expr = KeyTransformIsNull(KeyTransform('1', KeyTransform('d', 'value')), True)
+          sql, params = expr.as_oracle(compiler, conn)
+          # Expect JSON path bracket style for numeric key
+          self.assertIn('[1]', sql)
+          self.assertIn('IS NULL', sql)
+          self.assertEqual(params, ('LP',))
+
+      def test_oracle_percent_in_key_is_escaped_in_path(self):
+          compiler = mock.Mock()
+          compiler.compile.return_value = ('"col"', ('LP',))
+          conn = SimpleNamespace(vendor='oracle', features=SimpleNamespace())
+          # Key containing '%' should be escaped to '%%' by preprocess_lhs on Oracle
+          expr = KeyTransformIsNull(KeyTransform('%weird%', 'value'), True)
+          sql, params = expr.as_oracle(compiler, conn)
+          # The JSON path inserted into the SQL should contain the doubled percent signs
+          # (json.dumps will quote the string, so check for '%%' inside the SQL)
+          self.assertIn('%%', sql)
+          self.assertIn('IS NULL', sql)
+          self.assertEqual(params, ('LP',))
+
+      def test_sqlite_isnull_true_uses_json_type_is_null_and_params(self):
+          compiler = mock.Mock()
+          # compile returns SQL for the base column and its params
+          compiler.compile.return_value = ('"t"."c"', ('LHS_P',))
+          conn = SimpleNamespace(vendor='sqlite', features=SimpleNamespace())
+          expr = KeyTransformIsNull(KeyTransform('a', 'value'), True)
+          sql, params = expr.as_sqlite(compiler, conn)
+          # For isnull=True we expect the template to use IS NULL
+          self.assertIn('JSON_TYPE(', sql)
+          self.assertIn('IS NULL', sql)
+          # Params should include the lhs params first and at least one JSON path param
+          self.assertTrue(params[0] == 'LHS_P')
+          self.assertTrue(any(isinstance(p, str) and p.startswith('$') for p in params[1:]))
+
+      def test_sqlite_isnull_false_uses_json_type_is_not_null(self):
+          compiler = mock.Mock()
+          compiler.compile.return_value = ('"t"."c"', ('LHS_P',))
+          conn = SimpleNamespace(vendor='sqlite', features=SimpleNamespace())
+          expr = KeyTransformIsNull(KeyTransform('a', 'value'), False)
+          sql, params = expr.as_sqlite(compiler, conn)
+          # For isnull=False we expect IS NOT NULL template
+          self.assertIn('JSON_TYPE(', sql)
+          self.assertIn('IS NOT NULL', sql)
+          self.assertEqual(params[0], 'LHS_P')
+
+      def test_sqlite_param_ordering_with_mocked_haskey_returns(self):
+          compiler = mock.Mock()
+          compiler.compile.return_value = ('col_sql', ('LP',))
+          conn = SimpleNamespace(vendor='sqlite', features=SimpleNamespace())
+          # Patch HasKey.as_sql to return some params; ensure KeyTransformIsNull appends lhs params correctly
+          with mock.patch.object(HasKey, 'as_sql', return_value=('HAS_SQL', ('HP',))):
+              expr = KeyTransformIsNull(KeyTransform('z', 'value'), True)
+              sql, params = expr.as_sqlite(compiler, conn)
+          # Expect HasKey params first then lhs params
+          self.assertEqual(params[0], 'HP')
+          self.assertEqual(params[-1], 'LP')
+          self.assertIn('IS NULL', sql)
+
+      def test_sqlite_integer_key_path_in_isnull_true(self):
+          compiler = mock.Mock()
+          compiler.compile.return_value = ('col', ('LP',))
+          conn = SimpleNamespace(vendor='sqlite', features=SimpleNamespace())
+          expr = KeyTransformIsNull(KeyTransform('2', KeyTransform('arr', 'value')), True)
+          sql, params = expr.as_sqlite(compiler, conn)
+          # JSON_EXTRACT/JSON_TYPE path for integer keys should include [2]
+          # Params should include the path string generated for the RHS
+          self.assertIn('[2]', ''.join(params) if any(isinstance(p, str) for p in params) else str(params))
+          self.assertIn('IS NULL', sql)
+new_imports_code: |
+  from unittest import mock
+  from types import SimpleNamespace

@@ -1,0 +1,239 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise django.core.serializers.base.build_instance for models that implement natural_key() which may depend on related data and on the instance's _state.db. The candidate (incorrect) patch created instances without setting relation attributes and swallowed AttributeError, causing natural_key resolution to fail silently. The tests assert that when a primary key is missing, build_instance will attempt to resolve the natural key (calling the model manager with the provided db) and populate the pk using the manager's result (converted via pk.to_python). They also cover cases where get_by_natural_key raises DoesNotExist, when pk is already present (no resolution attempted), and when a manager does not provide get_by_natural_key. These tests will FAIL under the candidate (incorrect) patch and PASS under the provided gold patch.
+test_code: |
+  from django.test import TestCase
+  from django.core.serializers.base import build_instance, DEFER_FIELD
+  import types
+  
+  
+  class FakePK:
+      def __init__(self, attname='id', remote_field=None):
+          self.attname = attname
+          self.remote_field = remote_field
+  
+      def to_python(self, value):
+          # convert string representations of ints to int
+          try:
+              return int(value)
+          except Exception:
+              return value
+  
+  
+  class FakeManager:
+      def __init__(self, result_pk=None, raise_doesnotexist=False):
+          self._result_pk = result_pk
+          self.raise_doesnotexist = raise_doesnotexist
+          self.last_db = None
+  
+      def db_manager(self, db):
+          # Return a simple proxy that records the db used.
+          mgr = types.SimpleNamespace()
+  
+          def get_by_natural_key(*args, **kwargs):
+              if self.raise_doesnotexist:
+                  raise self._model.DoesNotExist()
+              # Return an object with a pk attribute
+              return types.SimpleNamespace(pk=self._result_pk)
+  
+          mgr.get_by_natural_key = get_by_natural_key
+          # record db used for assertions
+          self.last_db = db
+          return mgr
+  
+  
+  class FakeMeta:
+      def __init__(self, default_manager, pk_field, fields_remote_map=None, app_label='app', model_name='mymodel'):
+          self.default_manager = default_manager
+          self.pk = pk_field
+          self._fields_remote = fields_remote_map or {}
+          self.app_label = app_label
+          self.model_name = model_name
+  
+      def get_field(self, name):
+          # Return a simple object with .remote_field attribute.
+          class F:
+              def __init__(self, remote):
+                  self.remote_field = remote
+                  self.attname = name
+                  self.name = name
+          remote = self._fields_remote.get(name, None)
+          return F(remote)
+  
+  
+  class Author:
+      class DoesNotExist(Exception):
+          pass
+  
+      def __init__(self, **data):
+          # Accept id and name
+          self.id = data.get('id')
+          self.name = data.get('name')
+          self._state = types.SimpleNamespace(db=None)
+  
+      def natural_key(self):
+          return (self.name,)
+  
+  # Prepare Author meta/manager
+  Author._meta = types.SimpleNamespace()
+  author_mgr = FakeManager(result_pk=7)
+  author_mgr._model = Author
+  Author._meta.default_manager = author_mgr
+  Author._meta.pk = FakePK(attname='id')
+  
+  class Book:
+      class DoesNotExist(Exception):
+          pass
+  
+      def __init__(self, **data):
+          # Accept id, title, author (either tuple/list natural key, string, or Author instance)
+          self.id = data.get('id')
+          self.title = data.get('title')
+          self.author = data.get('author')
+          # _state should exist; gold patch sets _state.db before calling natural_key
+          self._state = types.SimpleNamespace(db=None)
+  
+      def natural_key(self):
+          # Natural key: (title,) + author's natural key.
+          # If author is a tuple/list (a natural key), resolve via Author manager using self._state.db.
+          if isinstance(self.author, (list, tuple)):
+              # Resolve the author object using its manager and the instance's state DB.
+              mgr = Author._meta.default_manager.db_manager(self._state.db)
+              author_obj = mgr.get_by_natural_key(*self.author)
+              # Return combined natural key (title, author's natural key tuple flattened)
+              return (self.title,) + (author_obj.pk,)
+          elif isinstance(self.author, Author):
+              return (self.title,) + self.author.natural_key()
+          elif isinstance(self.author, str):
+              # treat author as name
+              return (self.title, self.author)
+          else:
+              # Missing author attribute will raise AttributeError (this is what the
+              # gold patch preserves and the candidate patch swallowed).
+              author_obj = self.author
+              return (self.title,) + author_obj.natural_key()
+  
+  # Prepare Book meta/manager
+  book_mgr = FakeManager(result_pk='42')  # string to test to_python conversion
+  book_mgr._model = Book
+  Book._meta = FakeMeta(default_manager=book_mgr, pk_field=FakePK(attname='id'), fields_remote_map={'author': True})
+  
+  # Convert book manager pk using model pk to_python: connect pk conversion function
+  Book._meta.pk = FakePK(attname='id')
+  Book._meta.default_manager = book_mgr
+  
+  # Attach back-reference for managers to allow raising DoesNotExist as intended
+  Book._meta.default_manager._model = Book
+  Author._meta.default_manager._model = Author
+  
+  
+  class BuildInstanceTests(TestCase):
+      def test_natural_key_with_related_tuple_sets_pk_and_to_python(self):
+          data = {'title': 'My Book', 'author': ('Alice',)}
+          obj = build_instance(Book, data.copy(), db='other')
+          # pk should be set and converted to int by to_python
+          self.assertEqual(getattr(obj, 'id', None), 42)
+  
+      def test_natural_key_with_related_instance_sets_pk(self):
+          # If author is provided as an Author instance, natural_key should work too.
+          author_inst = Author(id=7, name='Alice')
+          data = {'title': 'My Book', 'author': author_inst}
+          # Ensure Author manager will be used if necessary; here natural_key uses instance path.
+          # Use a custom book manager that will return '100' when resolving natural key.
+          Book._meta.default_manager = FakeManager(result_pk='100')
+          Book._meta.default_manager._model = Book
+          obj = build_instance(Book, data.copy(), db='default')
+          self.assertEqual(getattr(obj, 'id', None), 100)
+  
+      def test_db_forwarded_to_author_manager(self):
+          # Ensure that the instance _state.db is respected when resolving nested natural keys.
+          bm = FakeManager(result_pk='55')
+          bm._model = Book
+          Book._meta.default_manager = bm
+          # Use author natural key tuple, and call build_instance with a specific db name.
+          data = {'title': 'My Book', 'author': ('Alice',)}
+          obj = build_instance(Book, data.copy(), db='my_special_db')
+          # BookManager.db_manager should have recorded the db argument that build_instance used.
+          # The FakeManager.db_manager implementation stores last_db on the manager instance.
+          self.assertEqual(bm.last_db, 'my_special_db')
+          # And the resulting pk should be converted correctly to int
+          self.assertEqual(getattr(obj, 'id', None), 55)
+  
+      def test_doesnotexist_leaves_pk_none(self):
+          # If manager.get_by_natural_key raises DoesNotExist, the pk should remain unset.
+          bm = FakeManager(result_pk=None, raise_doesnotexist=True)
+          bm._model = Book
+          Book._meta.default_manager = bm
+          data = {'title': 'Ghost Book', 'author': ('Unknown',)}
+          obj = build_instance(Book, data.copy(), db='other')
+          # No pk set
+          self.assertIsNone(getattr(obj, 'id', None))
+  
+      def test_string_author_natural_key_sets_pk(self):
+          # When author is provided as a simple string (name), natural_key handles it.
+          bm = FakeManager(result_pk='7')
+          bm._model = Book
+          Book._meta.default_manager = bm
+          data = {'title': 'S Book', 'author': 'Alice'}
+          obj = build_instance(Book, data.copy(), db='db1')
+          self.assertEqual(getattr(obj, 'id', None), 7)
+  
+      def test_multiple_field_types(self):
+          # Ensure arbitrary extra fields don't break resolution.
+          bm = FakeManager(result_pk='13')
+          bm._model = Book
+          Book._meta.default_manager = bm
+          data = {'title': 'Complex', 'author': ('Alice',), 'isbn': '123-456'}
+          obj = build_instance(Book, data.copy(), db='default')
+          self.assertEqual(getattr(obj, 'id', None), 13)
+          self.assertEqual(getattr(obj, 'isbn', None), '123-456')
+  
+      def test_to_python_conversion_returns_int(self):
+          # Manager returns a string pk; pk.to_python should convert to int.
+          bm = FakeManager(result_pk='300')
+          bm._model = Book
+          Book._meta.default_manager = bm
+          data = {'title': 'ConvertBook', 'author': ('Alice',)}
+          obj = build_instance(Book, data.copy(), db='some-db')
+          self.assertIsInstance(getattr(obj, 'id', None), int)
+          self.assertEqual(getattr(obj, 'id', None), 300)
+  
+      def test_no_get_by_natural_key_manager_returns_instance_without_pk(self):
+          # If default_manager doesn't implement get_by_natural_key, build_instance should not attempt resolution.
+          class NoNKManager:
+              pass
+          Book._meta.default_manager = NoNKManager()
+          data = {'title': 'NoNK', 'author': ('Alice',)}
+          obj = build_instance(Book, data.copy(), db='db')
+          # Because default_manager does not have get_by_natural_key, pk remains whatever was in data (None)
+          self.assertIsNone(getattr(obj, 'id', None))
+  
+      def test_data_contains_pk_already_should_return_same_pk(self):
+          # If pk provided in data, build_instance should not try to resolve natural key.
+          bm = FakeManager(result_pk='999')
+          bm._model = Book
+          Book._meta.default_manager = bm
+          data = {'id': 5, 'title': 'HasPK', 'author': ('Alice',)}
+          obj = build_instance(Book, data.copy(), db='other')
+          # Because id provided, the existing id should be preserved (not overwritten).
+          self.assertEqual(getattr(obj, 'id', None), 5)
+  
+      def test_missing_author_attribute_raises_attributeerror_in_gold_patch(self):
+          # This test ensures that missing relation attribute does not get silently swallowed.
+          # Simulate a mis-constructed data where 'author' isn't provided at all. In the gold patch,
+          # Book(**data) is created and natural_key() will raise AttributeError; build_instance should
+          # not silently swallow unexpected AttributeError (the candidate patch would catch it).
+          bm = FakeManager(result_pk='1')
+          bm._model = Book
+          Book._meta.default_manager = bm
+          data = {'title': 'NoAuthor'}  # no 'author' key
+          # Under the correct (gold) implementation, an AttributeError is expected here because
+          # natural_key() accesses self.author; assert that build_instance raises AttributeError.
+          raised = False
+          try:
+              build_instance(Book, data.copy(), db='db')
+          except AttributeError:
+              raised = True
+          self.assertTrue(raised, "Expected AttributeError when missing relation attribute (gold behavior)")
+new_imports_code: |
+  # No new imports required beyond those in the test module.

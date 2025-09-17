@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.TemplateCommandTargetValidationTests._run_handle_and_assert admin_scripts.tests_llm.TemplateCommandTargetValidationTests.setUp admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_absolute_with_redundant_components admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_internal_dot_and_trailing_dot admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_mixed_dot_and_dotdot admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_multiple_trailing_slashes_and_dot admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_relative_leading_dot_with_trailing_dot admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_trailing_dot admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_trailing_dot_on_parent_level admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_trailing_double_dot admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_trailing_parent_with_extra_components
+coverage json -o coverage.json
+: '>>>>> End Test Output'

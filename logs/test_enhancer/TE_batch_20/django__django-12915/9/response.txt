@@ -1,0 +1,221 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These tests validate the StaticFilesHandlerMixin and ASGIStaticFilesHandler behavior.
+  They specifically assert that:
+  - get_response_async uses the module-level sync_to_async for both successful serve calls
+    and when handling Http404 via response_for_exception.
+  - get_response catches Http404 and delegates to response_for_exception synchronously.
+  - _should_handle correctly ignores base URLs that include a host and only accepts matching prefixes.
+  - file_path correctly decodes percent-encoded paths.
+  - ASGIStaticFilesHandler.__init__ does not call ASGIHandler.__init__ (ensuring lazy initialization).
+  - load_middleware retains its original signature (only self), preventing an unexpected new parameter.
+test_code: |
+  import asyncio
+  import inspect
+  from urllib.parse import urlparse
+  
+  import pytest
+  from django.http import Http404, HttpResponse
+  
+  import django.contrib.staticfiles.handlers as handlers
+  from django.core.handlers.asgi import ASGIHandler
+  
+  class DummyRequest:
+      def __init__(self, path):
+          self.path = path
+  
+  class DummyHandler(handlers.StaticFilesHandlerMixin):
+      def __init__(self, base_url='/static/'):
+          # set base_url directly to avoid triggering get_base_url checks
+          self.base_url = urlparse(base_url)
+  
+  def test_get_response_async_uses_sync_to_async_on_success():
+      called = {'sync_to_async': 0}
+  
+      original_sync_to_async = handlers.sync_to_async
+      try:
+          def spy_sync_to_async(func):
+              # return an async wrapper that calls the original func
+              async def wrapper(*args, **kwargs):
+                  called['sync_to_async'] += 1
+                  return func(*args, **kwargs)
+              return wrapper
+          handlers.sync_to_async = spy_sync_to_async
+  
+          class H(DummyHandler):
+              def serve(self, request):
+                  return HttpResponse('ok-async')
+  
+          h = H()
+          request = DummyRequest('/static/test.txt')
+          response = asyncio.run(h.get_response_async(request))
+          assert called['sync_to_async'] == 1, "sync_to_async must be used once for serve()"
+          assert isinstance(response, HttpResponse)
+          assert response.content == b'ok-async'
+      finally:
+          handlers.sync_to_async = original_sync_to_async
+  
+  def test_get_response_async_uses_sync_to_async_on_404():
+      calls = {'serve': 0, 'response_for_exception': 0}
+      original_sync_to_async = handlers.sync_to_async
+      original_response_for_exception = handlers.response_for_exception
+      try:
+          def spy_sync_to_async(func):
+              # Distinguish between serve and response_for_exception by function name
+              async def wrapper(*args, **kwargs):
+                  if func is serve_impl:
+                      calls['serve'] += 1
+                      # raise the same Http404 as serve would
+                      return func(*args, **kwargs)
+                  if func is original_response_for_exception:
+                      calls['response_for_exception'] += 1
+                      return func(*args, **kwargs)
+                  # fallback: call the function
+                  return func(*args, **kwargs)
+              return wrapper
+  
+          def serve_impl(request):
+              raise Http404("not found")
+  
+          handlers.sync_to_async = spy_sync_to_async
+  
+          class H(DummyHandler):
+              def serve(self, request):
+                  return serve_impl(request)
+  
+          # Patch the module's response_for_exception so the spy can detect it by identity
+          handlers.response_for_exception = original_response_for_exception
+  
+          h = H()
+          request = DummyRequest('/static/missing.txt')
+          response = asyncio.run(h.get_response_async(request))
+          # ensure the spy's wrapper was used for serve (and for response_for_exception)
+          assert calls['serve'] == 1
+          assert calls['response_for_exception'] == 1
+          assert isinstance(response, HttpResponse)
+      finally:
+          handlers.sync_to_async = original_sync_to_async
+          handlers.response_for_exception = original_response_for_exception
+  
+  def test_get_response_sync_handles_404_calls_response_for_exception():
+      called = {'response_for_exception': 0}
+      original_response_for_exception = handlers.response_for_exception
+      try:
+          def spy_response_for_exception(request, exc):
+              called['response_for_exception'] += 1
+              return HttpResponse('handled-exc', status=404)
+  
+          handlers.response_for_exception = spy_response_for_exception
+  
+          class H(DummyHandler):
+              def serve(self, request):
+                  raise Http404("gone")
+  
+          h = H()
+          request = DummyRequest('/static/gone.txt')
+          response = h.get_response(request)
+          assert called['response_for_exception'] == 1
+          assert isinstance(response, HttpResponse)
+          assert response.status_code == 404
+      finally:
+          handlers.response_for_exception = original_response_for_exception
+  
+  def test__should_handle_ignores_host_in_base_url():
+      h = DummyHandler(base_url='http://example.com/static/')
+      # path under static but base_url contains a host -> should not handle
+      assert h._should_handle('/static/file.txt') is False
+  
+  def test__should_handle_accepts_correct_prefix():
+      h = DummyHandler(base_url='/static/')
+      assert h._should_handle('/static/file.txt') is True
+      assert h._should_handle('/static/') is True
+      assert h._should_handle('/other/file.txt') is False
+  
+  def test_file_path_decodes_url_encoded_paths():
+      h = DummyHandler(base_url='/static/')
+      # simulate a URL containing percent-encoding
+      url = '/static/some%20file.txt'
+      # file_path returns a filesystem path (url2pathname will decode percent-escapes)
+      result = h.file_path(url)
+      # Ensure the percent-encoding is decoded to a space
+      assert ' ' in result
+      assert result.endswith('some file.txt')
+  
+  def test_get_response_async_returns_same_as_get_response_for_success():
+      class H(DummyHandler):
+          def serve(self, request):
+              return HttpResponse('sync-or-async')
+  
+      h = H()
+      request = DummyRequest('/static/x.txt')
+      sync_resp = h.get_response(request)
+      async_resp = asyncio.run(h.get_response_async(request))
+      assert isinstance(sync_resp, HttpResponse)
+      assert isinstance(async_resp, HttpResponse)
+      assert sync_resp.content == async_resp.content == b'sync-or-async'
+  
+  def test_get_response_async_awaits_response_for_exception_call():
+      # Ensure that when serve raises, get_response_async ends up calling
+      # response_for_exception via the module-level sync_to_async (i.e., sync_to_async used twice).
+      counters = {'called': 0}
+      original_sync_to_async = handlers.sync_to_async
+      original_response_for_exception = handlers.response_for_exception
+      try:
+          def spy_sync_to_async(func):
+              async def wrapper(*args, **kwargs):
+                  counters['called'] += 1
+                  # If it's the real response_for_exception, return a HttpResponse
+                  if func is original_response_for_exception:
+                      return func(*args, **kwargs)
+                  # Otherwise call serve, which will raise Http404
+                  return func(*args, **kwargs)
+              return wrapper
+          handlers.sync_to_async = spy_sync_to_async
+  
+          class H(DummyHandler):
+              def serve(self, request):
+                  raise Http404("missing")
+  
+          handlers.response_for_exception = lambda req, exc: HttpResponse('exc-handled', status=404)
+  
+          h = H()
+          request = DummyRequest('/static/m.txt')
+          response = asyncio.run(h.get_response_async(request))
+          # Expect at least two uses of sync_to_async: one for serve and one for response_for_exception
+          assert counters['called'] >= 2
+          assert isinstance(response, HttpResponse)
+          assert response.status_code == 404
+      finally:
+          handlers.sync_to_async = original_sync_to_async
+          handlers.response_for_exception = original_response_for_exception
+  
+  def test_asgi_handler_init_does_not_call_super():
+      # Monkeypatch ASGIHandler.__init__ to raise if called. ASGIStaticFilesHandler
+      # must not call super().__init__ during its own __init__.
+      original_asgi_init = ASGIHandler.__init__
+      try:
+          def raising_init(self, *args, **kwargs):
+              raise RuntimeError("ASGIHandler.__init__ should not be called")
+          ASGIHandler.__init__ = raising_init
+  
+          # instantiate ASGIStaticFilesHandler; it should not propagate the RuntimeError
+          # (gold implementation does not call super().__init__ here).
+          app = lambda scope, receive, send: None
+          # If __init__ calls super().__init__, this will raise. We expect no raise.
+          handlers.ASGIStaticFilesHandler(app)
+      finally:
+          ASGIHandler.__init__ = original_asgi_init
+  
+  def test_load_middleware_signature_has_no_extra_parameters():
+      sig = inspect.signature(handlers.StaticFilesHandlerMixin.load_middleware)
+      # Expect only 'self' parameter in the signature (no unexpected is_async parameter)
+      params = list(sig.parameters.values())
+      assert len(params) == 1
+      assert params[0].name == 'self'
+new_imports_code: |
+  import asyncio
+  import inspect
+  from urllib.parse import urlparse
+  import pytest
+  from django.http import Http404, HttpResponse

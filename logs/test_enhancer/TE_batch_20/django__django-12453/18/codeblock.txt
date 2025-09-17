@@ -1,0 +1,229 @@
+from django.db import connections, DEFAULT_DB_ALIAS
+import copy
+import types
+from unittest import mock
+
+from django.db import connection
+from django.test import SimpleTestCase
+
+from django.core import serializers
+
+# Helper to get a shallow copy of the connection like existing tests do.
+from django.db import connections, DEFAULT_DB_ALIAS
+import copy
+def get_connection_copy_for_tests():
+    test_connection = copy.copy(connections[DEFAULT_DB_ALIAS])
+    test_connection.settings_dict = copy.deepcopy(
+        connections[DEFAULT_DB_ALIAS].settings_dict
+    )
+    return test_connection
+
+class TestDeserializeDbFromStringRegression(SimpleTestCase):
+    databases = {'default'}
+
+    def test_check_constraints_called_on_empty_data(self):
+        entered = {'at_least_once': False}
+        class DummyCM:
+            def __enter__(self):
+                entered['at_least_once'] = True
+            def __exit__(self, exc_type, exc, tb):
+                pass
+
+        with mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM()) as mocked_cm:
+            with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                connection.creation.deserialize_db_from_string('[]')
+                mocked_check.assert_called_once()
+                self.assertTrue(entered['at_least_once'])
+                mocked_cm.assert_called_once()
+
+    def test_constraint_checks_disabled_before_saving_single_object(self):
+        # Ensure the constraint_checks_disabled context manager is entered
+        # before any object's save() is invoked by deserialize_db_from_string.
+        entered = {'entered': False}
+        class DummyCM:
+            def __enter__(self):
+                entered['entered'] = True
+            def __exit__(self, exc_type, exc, tb):
+                entered['entered'] = False
+
+        class FakeObj:
+            def save(self):
+                # Fail if constraint checks were not disabled while saving.
+                if not entered['entered']:
+                    raise AssertionError("constraint_checks_disabled() was not active during save()")
+        fake_iter = iter([FakeObj()])
+
+        with mock.patch('django.core.serializers.deserialize', return_value=fake_iter):
+            with mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM()):
+                with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                    connection.creation.deserialize_db_from_string('irrelevant')
+                    mocked_check.assert_called_once()
+
+    def test_constraint_checks_disabled_before_saving_multiple_objects(self):
+        entered = {'entered': False}
+        class DummyCM:
+            def __enter__(self):
+                entered['entered'] = True
+            def __exit__(self, exc_type, exc, tb):
+                entered['entered'] = False
+
+        class FakeObj:
+            def __init__(self, idx, events):
+                self.idx = idx
+                self.events = events
+            def save(self):
+                if not entered['entered']:
+                    raise AssertionError("constraint_checks_disabled() was not active during save()")
+                self.events.append(f'save{self.idx}')
+
+        events = []
+        fake_objs = [FakeObj(i, events) for i in range(3)]
+        fake_iter = iter(fake_objs)
+
+        with mock.patch('django.core.serializers.deserialize', return_value=fake_iter):
+            with mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM()):
+                with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                    connection.creation.deserialize_db_from_string('irrelevant')
+                    mocked_check.assert_called_once()
+                    self.assertEqual(events, ['save0', 'save1', 'save2'])
+
+    def test_check_constraints_called_on_circular_reference_data(self):
+        # Use realistic circular reference JSON (like existing tests).
+        data = """
+        [
+            {
+                "model": "backends.object",
+                "pk": 1,
+                "fields": {"obj_ref": 1, "related_objects": []}
+            },
+            {
+                "model": "backends.objectreference",
+                "pk": 1,
+                "fields": {"obj": 1}
+            }
+        ]
+        """
+        entered = {'at_least_once': False}
+        class DummyCM:
+            def __enter__(self):
+                entered['at_least_once'] = True
+            def __exit__(self, exc_type, exc, tb):
+                pass
+
+        with mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM()):
+            with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                # Use the real deserialization path so objects are created as in normal behavior.
+                connection.creation.deserialize_db_from_string(data)
+                mocked_check.assert_called_once()
+                self.assertTrue(entered['at_least_once'])
+
+    def test_constraint_checks_disabled_used_when_alias_non_default(self):
+        # Temporarily change the connection alias to ensure the using= behavior doesn't affect constraint checks usage.
+        old_alias = connection.alias
+        connection.alias = 'nondefault'
+        entered = {'entered': False}
+        class DummyCM:
+            def __enter__(self):
+                entered['entered'] = True
+            def __exit__(self, exc_type, exc, tb):
+                entered['entered'] = False
+
+        with mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM()):
+            with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                connection.creation.deserialize_db_from_string('[]')
+                mocked_check.assert_called_once()
+                self.assertTrue(entered['entered'] is False or entered['entered'] is False)  # ensure attribute access works
+        connection.alias = old_alias
+
+    def test_constraint_checks_disabled_with_separate_connection_copy(self):
+        # Ensure the method uses the connection instance it belongs to (use a connection copy).
+        test_conn = get_connection_copy_for_tests()
+        entered = {'entered': False}
+        class DummyCM:
+            def __enter__(self):
+                entered['entered'] = True
+            def __exit__(self, exc_type, exc, tb):
+                entered['entered'] = False
+
+        with mock.patch.object(test_conn, 'constraint_checks_disabled', return_value=DummyCM()):
+            with mock.patch.object(test_conn, 'check_constraints') as mocked_check:
+                # Patch serializers.deserialize so no DB operations occur.
+                with mock.patch('django.core.serializers.deserialize', return_value=iter([])):
+                    test_conn.creation.deserialize_db_from_string('[]')
+                    mocked_check.assert_called_once()
+                    self.assertFalse(entered['entered'])
+
+    def test_deserialize_calls_check_constraints_once_even_with_generator(self):
+        # serializers.deserialize returns a generator; ensure check_constraints is still called once.
+        entered = {'entered': False}
+        class DummyCM:
+            def __enter__(self):
+                entered['entered'] = True
+            def __exit__(self, exc_type, exc, tb):
+                entered['entered'] = False
+
+        def fake_gen():
+            for _ in range(2):
+                class O:
+                    def save(self): pass
+                yield O()
+
+        with mock.patch('django.core.serializers.deserialize', return_value=fake_gen()):
+            with mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM()):
+                with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                    connection.creation.deserialize_db_from_string('irrelevant')
+                    mocked_check.assert_called_once()
+
+    def test_constraint_checks_disabled_called_each_time_deserialize_invoked(self):
+        counter = {'count': 0}
+        class DummyCM:
+            def __enter__(self):
+                counter['count'] += 1
+            def __exit__(self, exc_type, exc, tb):
+                pass
+
+        with mock.patch('django.core.serializers.deserialize', return_value=iter([])):
+            with mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM()) as mocked_cm:
+                with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                    connection.creation.deserialize_db_from_string('[]')
+                    connection.creation.deserialize_db_from_string('[]')
+                    # Ensure our DummyCM.__enter__ ran twice.
+                    self.assertEqual(counter['count'], 2)
+                    self.assertEqual(mocked_check.call_count, 2)
+                    self.assertEqual(mocked_cm.call_count, 2)
+
+    def test_check_constraints_called_after_all_saves(self):
+        # Ensure check_constraints() is called after all saves have occurred.
+        events = []
+        entered = {'entered': False}
+        class DummyCM:
+            def __enter__(self):
+                entered['entered'] = True
+            def __exit__(self, exc_type, exc, tb):
+                entered['entered'] = False
+
+        class FakeObj:
+            def __init__(self, idx):
+                self.idx = idx
+            def save(self):
+                if not entered['entered']:
+                    raise AssertionError("save() occurred outside constraint_checks_disabled()")
+                events.append(f'save{self.idx}')
+
+        def fake_deserialize(_format, _stream, **kwargs):
+            # Return a generator to emulate django serializers returning an iterator.
+            def gen():
+                for i in range(3):
+                    yield FakeObj(i)
+            return gen()
+
+        def fake_check_constraints():
+            events.append('check')
+
+        with mock.patch('django.core.serializers.deserialize', side_effect=fake_deserialize):
+            with mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM()):
+                with mock.patch.object(connection, 'check_constraints', side_effect=fake_check_constraints):
+                    connection.creation.deserialize_db_from_string('irrelevant')
+                    # All saves should happen before the final 'check'
+                    self.assertEqual(events[-1], 'check')
+                    self.assertEqual(events, ['save0', 'save1', 'save2', 'check'])

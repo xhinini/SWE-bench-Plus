@@ -1,0 +1,179 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests create a small fake underlying WCS implementation to validate that SlicedLowLevelWCS.world_to_pixel_values constructs the full set of world coordinates passed to the underlying WCS by inserting the correct "sliced-out" world coordinate values (computed from pixel_to_world_values_all). They check behavior for various slice positions, broadcasting, slice starts, single kept world dimension, multiple dropped dimensions, and numpy scalar types. The tests would fail with the model-generated (incorrect) patch and pass with the provided gold patch.
+test_code: |
+  import numpy as np
+  import pytest
+  from numpy.testing import assert_allclose
+  from astropy.wcs.wcsapi.wrappers.sliced_wcs import SlicedLowLevelWCS
+
+  class FakeWCS:
+      """
+      Minimal fake low-level WCS to inspect what world arrays are passed to
+      world_to_pixel_values by SlicedLowLevelWCS. The pixel_to_world_values
+      returns for each world index a base offset (100*(i+1)) plus the sum of
+      incoming pixel values. This makes the "sliced out" values deterministic.
+      """
+      def __init__(self, pixel_n_dim, world_n_dim, axis_correlation_matrix):
+          self.pixel_n_dim = pixel_n_dim
+          self.world_n_dim = world_n_dim
+          self.axis_correlation_matrix = np.array(axis_correlation_matrix, dtype=bool)
+          # record last arguments passed to world_to_pixel_values
+          self.last_world_arrays_received = None
+
+      def pixel_to_world_values(self, *pix_arrays):
+          # Ensure arrays and broadcast
+          pix_arrays = tuple(np.asanyarray(p) for p in pix_arrays)
+          # sum across pixel arrays to create a simple dependency
+          sum_pix = np.sum(np.stack([np.asanyarray(p) for p in pix_arrays]), axis=0)
+          return tuple(100 * (i + 1) + sum_pix for i in range(self.world_n_dim))
+
+      def world_to_pixel_values(self, *world_arrays):
+          # store what was received for inspection by tests; convert to arrays
+          self.last_world_arrays_received = tuple(np.asanyarray(w) for w in world_arrays)
+          # Return dummy pixel arrays (length = pixel_n_dim)
+          return tuple(np.zeros(self.pixel_n_dim))
+
+  def test_world_to_pixel_uses_sliced_out_value_for_dropped_leading_world_dim():
+      # Create axis correlation such that world0 correlates only with pixel0.
+      # We'll drop underlying pixel0 via slices, so world0 should be filled.
+      axis_corr = [[True, False, False],
+                   [False, True, False],
+                   [False, False, True]]
+      fake = FakeWCS(pixel_n_dim=3, world_n_dim=3, axis_correlation_matrix=axis_corr)
+      # slices array: (slice(None), slice(None), 0) -> _slices_pixel = [0, slice(None), slice(None)]
+      # that drops underlying pixel index 0 (because _slices_pixel[0] is int)
+      sl = SlicedLowLevelWCS(fake, (slice(None), slice(None), 0))
+      # wrapper keeps world indices 1 and 2 in that configuration; pass values for those
+      sl.world_to_pixel_values(201, 302)
+      # sliced_out world0 should be computed from pixel_to_world_values_all with zeros
+      # which gives (100, 200, 300) since sum_pixels == 0
+      expected = (np.array(100), np.array(201), np.array(302))
+      assert len(fake.last_world_arrays_received) == 3
+      assert_allclose(fake.last_world_arrays_received[0], expected[0])
+      assert_allclose(fake.last_world_arrays_received[1], expected[1])
+      assert_allclose(fake.last_world_arrays_received[2], expected[2])
+
+  def test_world_to_pixel_uses_sliced_out_value_for_dropped_trailing_world_dim():
+      # Now arrange correlation so that world2 correlates only with pixel2.
+      # Drop underlying pixel2 by setting slices to have int at position 0.
+      axis_corr = [[True, False, False],
+                   [False, True, False],
+                   [False, False, True]]
+      fake = FakeWCS(pixel_n_dim=3, world_n_dim=3, axis_correlation_matrix=axis_corr)
+      # slices: (0, slice(None), slice(None)) -> _slices_pixel = [slice(None), slice(None), 0]
+      # that drops underlying pixel index 2
+      sl = SlicedLowLevelWCS(fake, (0, slice(None), slice(None)))
+      # Now wrapper will keep world indices 0 and 1; pass values for those
+      sl.world_to_pixel_values(101, 202)
+      # sliced out world2 should be 300 (from base formula)
+      expected = (np.array(101), np.array(202), np.array(300))
+      assert len(fake.last_world_arrays_received) == 3
+      assert_allclose(fake.last_world_arrays_received, expected)
+
+  def test_world_to_pixel_broadcasting_with_sliced_values():
+      # Test broadcasting when provided world arrays are arrays
+      axis_corr = [[True, False, False],
+                   [False, True, False],
+                   [False, False, True]]
+      fake = FakeWCS(pixel_n_dim=3, world_n_dim=3, axis_correlation_matrix=axis_corr)
+      sl = SlicedLowLevelWCS(fake, (slice(None), slice(None), 0))
+      w1 = np.array([201, 301])
+      w2 = np.array([302, 402])
+      sl.world_to_pixel_values(w1, w2)
+      # Expect sliced out world0 to be broadcasted array of 100
+      assert fake.last_world_arrays_received[0].shape == (2,)
+      assert_allclose(fake.last_world_arrays_received[0], np.array([100, 100]))
+      assert_allclose(fake.last_world_arrays_received[1], w1)
+      assert_allclose(fake.last_world_arrays_received[2], w2)
+
+  def test_world_to_pixel_single_world_dim_keeps_order_and_scalar_handling():
+      # Keep only a single world index after slicing. Confirm that a scalar input
+      # for the single axis is correctly placed into the full world array.
+      # Axis correlation: only world1 correlates with kept pixels.
+      axis_corr = [[False, False, True],
+                   [True, False, False],
+                   [False, True, False]]
+      fake = FakeWCS(pixel_n_dim=3, world_n_dim=3, axis_correlation_matrix=axis_corr)
+      # Drop underlying pixel index 0 to cause world0 (which correlates only with pixel0) to be sliced out.
+      sl = SlicedLowLevelWCS(fake, (slice(None), slice(None), 0))
+      # After slicing, only one world dim is kept (world1). Pass a scalar.
+      sl.world_to_pixel_values(555)
+      # Expect full world tuple: sliced_out world0 from base=100, then provided 555, then world2 base 300
+      assert_allclose(fake.last_world_arrays_received[0], 100)
+      assert_allclose(fake.last_world_arrays_received[1], 555)
+      assert_allclose(fake.last_world_arrays_received[2], 300)
+
+  def test_world_to_pixel_with_slice_start_offset_applies_offset_to_sliced_value():
+      # Test that when a slice has a non-zero start for an underlying pixel,
+      # the value used for the sliced-out world coordinate includes that start offset.
+      axis_corr = [[True, False, False],
+                   [False, True, False],
+                   [False, False, True]]
+      fake = FakeWCS(pixel_n_dim=3, world_n_dim=3, axis_correlation_matrix=axis_corr)
+      # Put a start on the first numpy-axis slice corresponding to underlying pixel index 2
+      # We choose slices so that _slices_pixel == [slice(5,None), slice(None), 0]
+      sl = SlicedLowLevelWCS(fake, (slice(None), 0, slice(5, None)))
+      # For pixel_to_world_values_all with zeros in pixel_keep positions, the sum includes the slice start (5)
+      sl.world_to_pixel_values(201, 302)
+      # The sliced-out world value (for world0) will be base(100) + sum_pixels (which includes start 5)
+      # So expected world0 = 100 + 5 = 105
+      assert_allclose(fake.last_world_arrays_received[0], 105)
+      assert_allclose(fake.last_world_arrays_received[1], 201)
+      assert_allclose(fake.last_world_arrays_received[2], 302)
+
+  def test_world_to_pixel_multiple_dropped_dimensions():
+      # Multiple world dimensions dropped: design axis correlation such that world0 and world2
+      # correlate only with pixel positions that will be dropped.
+      axis_corr = [[True, False, False],
+                   [False, True, False],
+                   [False, False, True]]
+      fake = FakeWCS(pixel_n_dim=3, world_n_dim=3, axis_correlation_matrix=axis_corr)
+      # Drop underlying pixel 0 and pixel 2 by setting corresponding elements in slices array to ints.
+      # To drop pixel0 and pixel2 we set slices such that _slices_pixel = [0, slice(None), 2]
+      # This corresponds to slices[::-1] = [0, slice(None), 2] -> slices = [2, slice(None), 0]
+      sl = SlicedLowLevelWCS(fake, (2, slice(None), 0))
+      # In this setup world0 and world2 are sliced out; only world1 is passed through.
+      sl.world_to_pixel_values(777)
+      # Expect last_world_arrays_received to be (world0_base, 777, world2_base)
+      assert_allclose(fake.last_world_arrays_received[0], 100)
+      assert_allclose(fake.last_world_arrays_received[1], 777)
+      assert_allclose(fake.last_world_arrays_received[2], 300)
+
+  def test_world_to_pixel_preserves_order_for_nontrivial_correlation():
+      # Complex correlation matrix, ensure order of inserted values is per original world indices.
+      axis_corr = [[False, True, False],
+                   [False, False, True],
+                   [True, False, False]]
+      fake = FakeWCS(pixel_n_dim=3, world_n_dim=3, axis_correlation_matrix=axis_corr)
+      # Drop underlying pixel index 1 -> slices with int at position len-1-1 = 1
+      sl = SlicedLowLevelWCS(fake, (slice(None), 0, slice(None)))
+      # Determine which worlds are kept by calculating world_keep
+      # Call wrapper.world_to_pixel_values with values for kept worlds in proper order
+      kept_worlds = [i for i in range(fake.world_n_dim) if fake.axis_correlation_matrix[i, [0,2]].any()]
+      # Build inputs in that order
+      inputs = tuple(1000 + 10 * i for i in range(len(kept_worlds)))
+      sl.world_to_pixel_values(*inputs)
+      # Ensure the underlying receives a tuple of length world_n_dim
+      assert len(fake.last_world_arrays_received) == 3
+      # Check that for kept indices the passed values match inputs in the correct order
+      for i, widx in enumerate(kept_worlds):
+          assert_allclose(fake.last_world_arrays_received[widx], inputs[i])
+
+  def test_world_to_pixel_handles_numpy_scalar_types_and_broadcasting():
+      # Ensure numpy scalar types are treated consistently
+      axis_corr = [[True, False, False],
+                   [False, True, False],
+                   [False, False, True]]
+      fake = FakeWCS(pixel_n_dim=3, world_n_dim=3, axis_correlation_matrix=axis_corr)
+      sl = SlicedLowLevelWCS(fake, (slice(None), slice(None), 0))
+      # Use numpy scalars
+      w1 = np.int64(201)
+      w2 = np.float64(302.5)
+      sl.world_to_pixel_values(w1, w2)
+      assert isinstance(fake.last_world_arrays_received[1], np.ndarray) or np.isscalar(fake.last_world_arrays_received[1])
+      assert_allclose(fake.last_world_arrays_received[1], 201)
+      assert_allclose(fake.last_world_arrays_received[2], 302.5)
+new_imports_code: |
+  import numpy as np
+  from numpy.testing import assert_allclose

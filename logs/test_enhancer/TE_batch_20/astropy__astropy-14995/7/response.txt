@@ -1,0 +1,146 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests focus on mask-handling in NDArithmeticMixin._arithmetic_mask and surrounding arithmetic behavior. They validate that when one operand has a mask and the other operand has no mask (i.e., mask is None), the resulting NDData keeps a deepcopy of the existing mask (rather than attempting to call the mask-handling callable with a None mask or otherwise producing an incorrect result). They also cover collapse operations (sum/mean/min/max) and bitmask masks to ensure consistent behavior across cases that exercised the bug fixed by the provided patch.
+test_code: |
+  # Licensed under a 3-clause BSD style license - see LICENSE.rst
+  import copy
+  import numpy as np
+  import pytest
+  from numpy.testing import assert_array_equal, assert_array_almost_equal
+  
+  from astropy.nddata import NDDataRef
+  from astropy.nddata.mixins.ndarithmetic import NDArithmeticMixin
+  
+  # 1) If left operand has a mask and right operand has mask=None, result should
+  #    get a deepcopy of left mask (not call handle_mask with a None second mask).
+  def test_mask_left_present_right_none_copy():
+      mask_left = np.array([[True, False], [False, True]])
+      a = NDDataRef(np.ones((2, 2)), mask=mask_left)
+      b = NDDataRef(np.ones((2, 2)), mask=None)
+  
+      # Use a custom mask function that would raise if called with a None mask
+      def require_both_masks(m1, m2):
+          # Ensure not called with None for either mask
+          if m1 is None or m2 is None:
+              raise AssertionError("mask function called with a None mask")
+          return np.logical_or(m1, m2)
+  
+      res = a.add(b, handle_mask=require_both_masks)
+      # Should have deepcopied left mask
+      assert_array_equal(res.mask, mask_left)
+      # Ensure deep copy
+      assert res.mask is not mask_left
+      mask_left[0, 0] = False
+      assert res.mask[0, 0]  # must be unchanged
+  
+  # 2) Mirror of (1): right operand has mask, left operand has mask=None
+  def test_mask_right_present_left_none_copy():
+      mask_right = np.array([True, False, True])
+      a = NDDataRef(np.ones(3), mask=None)
+      b = NDDataRef(np.ones(3), mask=mask_right)
+  
+      def require_both_masks(m1, m2):
+          if m1 is None or m2 is None:
+              raise AssertionError("mask function called with a None mask")
+          return np.logical_or(m1, m2)
+  
+      res = a.add(b, handle_mask=require_both_masks)
+      assert_array_equal(res.mask, mask_right)
+      assert res.mask is not mask_right
+      mask_right[1] = True
+      assert res.mask[1] == False  # deep copy requirement
+  
+  # 3) If both masks are present, use the provided callable normally
+  def test_both_masks_handle_callable_or():
+      m1 = np.array([True, False, True])
+      m2 = np.array([False, True, False])
+      a = NDDataRef(np.array([1, 2, 3]), mask=m1)
+      b = NDDataRef(np.array([1, 2, 3]), mask=m2)
+  
+      res = a.add(b, handle_mask=np.logical_or)
+      assert_array_equal(res.mask, np.logical_or(m1, m2))
+  
+  # 4) If both masks are None, result.mask must be None
+  def test_both_masks_none_result_none():
+      a = NDDataRef(np.array([1, 2, 3]), mask=None)
+      b = NDDataRef(np.array([1, 2, 3]), mask=None)
+      res = a.multiply(b, handle_mask=np.logical_or)
+      assert res.mask is None
+  
+  # 5) Using a bitmask (integer mask) on one side and None on the other
+  def test_bitmask_and_none_preserve_bitmask():
+      bitmask = np.array([[0, 1], [2, 4]], dtype=int)
+      a = NDDataRef(np.array([[1, 2], [3, 4]]), mask=bitmask)
+      b = NDDataRef(np.array([[1, 2], [3, 4]]), mask=None)
+  
+      res = a.multiply(b, handle_mask=np.bitwise_or)
+      assert_array_equal(res.mask, bitmask)
+      # modify original to ensure copy
+      bitmask[0, 0] = 99
+      assert res.mask[0, 0] != 99
+  
+  # 6) When operand is a plain scalar/array passed to classmethod (converted to NDDataRef),
+  #    mask behavior should be identical to instance-level behavior:
+  def test_classmethod_with_primitive_operand_preserves_mask():
+      left_mask = np.array([True, False])
+      a = NDDataRef(np.array([5, 6]), mask=left_mask)
+      # call as classmethod: this will convert primitive to NDDataRef internally
+      res = NDDataRef.add(a, [1, 1])
+      # default handle_mask is np.logical_or, and right operand will be wrapped with mask=None
+      assert_array_equal(res.mask, left_mask)
+  
+  # 7) Collapse operations (sum/mean/min/max) when only self has mask should preserve mask handling:
+  @pytest.mark.parametrize("method", ["sum", "mean", "min", "max"])
+  def test_collapse_operations_preserve_mask(method):
+      arr = np.array([[1, 2], [3, 4]])
+      mask = np.array([[False, True], [False, False]])
+      a = NDDataRef(arr, mask=mask)
+      # call collapse on instance (operand omitted)
+      fn = getattr(a, method)
+      res = fn(handle_mask=np.logical_or)
+      # For collapse operations with a mask, the constructor should pick up mask
+      # after the masked-array based reduction; mask should not be an alias
+      assert res.mask is not mask
+      # The reduced result's mask should be the mask reduced over axis None (i.e. global)
+      # The exact mask shape might be () for fully reduced scalar; ensure not raising and is array-like or None.
+      # At least ensure no exception and attribute exists (explicit checks of exact shape vary by operation)
+      assert (res.mask is None) or (hasattr(res.mask, "__array__"))
+  
+  # 8) If handle_mask is None, mask should be left untouched (i.e., result.mask is None)
+  def test_handle_mask_none_leaves_mask_none():
+      a = NDDataRef(np.ones(3), mask=np.array([True, False, True]))
+      b = NDDataRef(np.ones(3), mask=np.array([False, True, False]))
+      res = a.add(b, handle_mask=None)
+      assert res.mask is None
+  
+  # 9) Ensure that when mask of the right operand is explicitly None (not False/zero),
+  #    mask of left is preserved even for broadcasting shapes
+  def test_mask_preserved_with_broadcasting_and_none():
+      left_mask = np.array([[True, False, True], [False, False, False]])
+      a = NDDataRef(np.ones((2, 3)), mask=left_mask)
+      b = NDDataRef(np.ones(3), mask=None)
+      res = a.add(b, handle_mask=np.logical_or)
+      assert_array_equal(res.mask, left_mask)
+  
+  # 10) Ensure that providing a mask-handling callable that expects two arrays works
+  # without being passed a None second argument when one mask is None:
+  def test_custom_mask_callable_not_called_with_none():
+      left_mask = np.array([True, False, True])
+      a = NDDataRef(np.ones(3), mask=left_mask)
+      b = NDDataRef(np.ones(3), mask=None)
+  
+      called = {"count": 0}
+  
+      def custom_or(m1, m2):
+          called["count"] += 1
+          # If m2 is None, this callable should not be called at all in correct logic.
+          if m1 is None or m2 is None:
+              raise AssertionError("custom_or called with None mask")
+          return np.logical_or(m1, m2)
+  
+      res = a.add(b, handle_mask=custom_or)
+      # custom_or should not have been called; result mask should be copy of left_mask
+      assert called["count"] == 0
+      assert_array_equal(res.mask, left_mask)
+new_imports_code: |
+  # No new imports required beyond what's used above.

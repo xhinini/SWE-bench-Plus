@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_checks.tests_llm.SystemChecksTestCaseAdditionalTests.test_readonly_missing_field_dynamic_property admin_checks.tests_llm.SystemChecksTestCaseAdditionalTests.test_readonly_missing_field_list admin_checks.tests_llm.SystemChecksTestCaseAdditionalTests.test_readonly_missing_field_on_inline_multiple admin_checks.tests_llm.SystemChecksTestCaseAdditionalTests.test_readonly_missing_field_on_stacked_inline admin_checks.tests_llm.SystemChecksTestCaseAdditionalTests.test_readonly_missing_field_registered_site admin_checks.tests_llm.SystemChecksTestCaseAdditionalTests.test_readonly_missing_field_tuple admin_checks.tests_llm.SystemChecksTestCaseAdditionalTests.test_readonly_missing_field_two_registered_admins admin_checks.tests_llm.SystemChecksTestCaseAdditionalTests.test_readonly_missing_field_with_nonstandard_name admin_checks.tests_llm.SystemChecksTestCaseAdditionalTests.test_readonly_multiple_missing_fields
+coverage json -o coverage.json
+: '>>>>> End Test Output'

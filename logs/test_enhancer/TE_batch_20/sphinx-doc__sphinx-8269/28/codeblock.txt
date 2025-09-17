@@ -1,0 +1,211 @@
+from requests.exceptions import HTTPError
+from unittest import mock
+import queue
+from unittest import mock
+import pytest
+from requests.exceptions import HTTPError
+from sphinx.builders.linkcheck import CheckExternalLinksBuilder
+import sphinx.builders.linkcheck as linkcheck_mod
+
+
+class DummyConfig:
+    def __init__(self, **kwargs):
+        # Provide defaults resembling Sphinx config values used by the builder
+        self.linkcheck_anchors = kwargs.get('linkcheck_anchors', True)
+        self.linkcheck_timeout = kwargs.get('linkcheck_timeout', None)
+        self.linkcheck_request_headers = kwargs.get('linkcheck_request_headers', {})
+        self.linkcheck_retries = kwargs.get('linkcheck_retries', 1)
+
+class DummyApp:
+    def __init__(self, config=None):
+        self.config = config or DummyConfig()
+        self.warningiserror = False
+        self.quiet = False
+        self.statuscode = 0
+
+
+def make_builder(app=None):
+    # Create a builder-like object without invoking Sphinx internals
+    b = object.__new__(CheckExternalLinksBuilder)
+    b.app = app or DummyApp()
+    b.config = b.app.config  # code refers to self.config in places
+    b.wqueue = queue.Queue()
+    b.rqueue = queue.Queue()
+    b.anchors_ignore = []
+    b.to_ignore = []
+    b.auth = []
+    b.good = set()
+    b.broken = {}
+    b.redirected = {}
+    b.srcdir = ''
+    b.outdir = ''
+    return b
+
+
+def make_response(body='', status_code=200, headers=None, method='GET',
+                  url='http://example.com/page', history=None):
+    """Create a fake requests-like Response object for the builder to consume."""
+    resp = mock.MagicMock()
+    resp.status_code = status_code
+    resp.headers = headers or {}
+    resp.url = url
+    resp.history = history or []
+    # emulate the Request object attached to Response
+    req = mock.MagicMock()
+    req.method = method
+    resp.request = req
+    # iter_content should yield chunks; support decode_unicode=True
+    def iter_content(chunk_size=4096, decode_unicode=False):
+        if decode_unicode:
+            if isinstance(body, bytes):
+                yield body.decode('utf-8', errors='ignore')
+            else:
+                yield body
+        else:
+            if isinstance(body, str):
+                yield body.encode('utf-8')
+            else:
+                yield body
+    resp.iter_content = iter_content
+    # raise_for_status behavior
+    def raise_for_status():
+        if status_code >= 400:
+            err = HTTPError(f"{status_code} Error")
+            err.response = mock.MagicMock()
+            err.response.status_code = status_code
+            raise err
+    resp.raise_for_status = raise_for_status
+    return resp
+
+
+def run_check_and_get_result(builder, uri, head_resp, get_resp):
+    """Helper to run check_thread once for a single URI and collect the result."""
+    with mock.patch('sphinx.builders.linkcheck.requests.head', return_value=head_resp) as mock_head, \
+         mock.patch('sphinx.builders.linkcheck.requests.get', return_value=get_resp) as mock_get:
+        # enqueue the uri and a sentinel to stop the loop
+        builder.wqueue.put((uri, 'docname', 42))
+        builder.wqueue.put((None, None, None))
+        # run the check loop in this thread
+        builder.check_thread()
+        # read the result
+        return builder.rqueue.get()
+
+
+def assert_broken_anchor(result, anchor_text):
+    uri, docname, lineno, status, info, code = result
+    assert status == 'broken'
+    assert anchor_text in info
+
+
+# 1) Anchor missing, Content-Type header absent -> should be broken (gold)
+def test_anchor_missing_no_content_type():
+    builder = make_builder()
+    uri = 'http://example.com/page#missing'
+    head = make_response(body='', status_code=200, headers={}, method='HEAD', url='http://example.com/page')
+    # GET returns HTML body that does NOT contain the anchor
+    get = make_response(body='<html><body>No anchor here</body></html>', status_code=200,
+                        headers={}, method='GET', url='http://example.com/page')
+    result = run_check_and_get_result(builder, uri, head, get)
+    assert_broken_anchor(result, "Anchor 'missing' not found")
+
+# 2) Anchor missing, Content-Type is application/octet-stream -> broken (gold)
+def test_anchor_missing_non_html_content_type_octet_stream():
+    builder = make_builder()
+    uri = 'https://example.org/resource#frag'
+    head = make_response(body='', status_code=200, headers={'content-type': 'application/octet-stream'},
+                         method='HEAD', url='https://example.org/resource')
+    get = make_response(body='binary-data-without-fragment', status_code=200,
+                        headers={'content-type': 'application/octet-stream'}, method='GET',
+                        url='https://example.org/resource')
+    result = run_check_and_get_result(builder, uri, head, get)
+    assert_broken_anchor(result, "Anchor 'frag' not found")
+
+# 3) Anchor missing, Content-Type is text/plain -> broken
+def test_anchor_missing_text_plain():
+    builder = make_builder()
+    uri = 'http://localhost/page#nope'
+    head = make_response(body='', status_code=200, headers={'content-type': 'text/plain'},
+                         method='HEAD', url='http://localhost/page')
+    get = make_response(body='plain text body without anchor', status_code=200,
+                        headers={'content-type': 'text/plain'}, method='GET', url='http://localhost/page')
+    result = run_check_and_get_result(builder, uri, head, get)
+    assert_broken_anchor(result, "Anchor 'nope' not found")
+
+# 4) Anchor missing, Content-Type "application/json; charset=utf-8" -> broken
+def test_anchor_missing_json_with_charset():
+    builder = make_builder()
+    uri = 'http://api.example.com/data#section'
+    head = make_response(body='', status_code=200, headers={'content-type': 'application/json; charset=utf-8'},
+                         method='HEAD', url='http://api.example.com/data')
+    get = make_response(body='{"key":"value"}', status_code=200,
+                        headers={'content-type': 'application/json; charset=utf-8'}, method='GET',
+                        url='http://api.example.com/data')
+    result = run_check_and_get_result(builder, uri, head, get)
+    assert_broken_anchor(result, "Anchor 'section' not found")
+
+# 5) Anchor missing, HEAD fails (HTTPError) so GET is used; GET has non-HTML -> broken
+def test_anchor_missing_head_error_then_get_non_html():
+    builder = make_builder()
+    uri = 'http://example.com/broken#part'
+    # HEAD raises HTTPError
+    head = make_response(body='', status_code=404, headers={}, method='HEAD', url='http://example.com/broken')
+    get = make_response(body='no anchor in non-html body', status_code=200,
+                        headers={'content-type': 'application/octet-stream'}, method='GET',
+                        url='http://example.com/broken')
+    result = run_check_and_get_result(builder, uri, head, get)
+    assert_broken_anchor(result, "Anchor 'part' not found")
+
+# 6) Anchor missing, HEAD fails and GET has no Content-Type header -> broken
+def test_anchor_missing_head_error_get_no_content_type():
+    builder = make_builder()
+    uri = 'https://example.org/thing#x'
+    head = make_response(body='', status_code=503, headers={}, method='HEAD', url='https://example.org/thing')
+    get = make_response(body='<div>no x here</div>', status_code=200, headers={}, method='GET',
+                        url='https://example.org/thing')
+    result = run_check_and_get_result(builder, uri, head, get)
+    assert_broken_anchor(result, "Anchor 'x' not found")
+
+# 7) Anchor missing; GET returns bytes chunks (requests failed to decode path) and no content-type -> broken
+def test_anchor_missing_iter_content_bytes_no_content_type():
+    builder = make_builder()
+    uri = 'http://binary.example/item#anchor'
+    head = make_response(body='', status_code=200, headers={}, method='HEAD', url='http://binary.example/item')
+    # body provided as bytes; iter_content must handle bytes decoding path
+    get = make_response(body=b'<html><body>no-anchor-bytes</body></html>', status_code=200,
+                        headers={}, method='GET', url='http://binary.example/item')
+    result = run_check_and_get_result(builder, uri, head, get)
+    assert_broken_anchor(result, "Anchor 'anchor' not found")
+
+# 8) Anchor missing but content-type is text/html (with charset) -> broken (sanity control)
+def test_anchor_missing_html_with_charset():
+    builder = make_builder()
+    uri = 'http://site.example/doc#missing'
+    head = make_response(body='', status_code=200, headers={'content-type': 'text/html; charset=utf-8'},
+                         method='HEAD', url='http://site.example/doc')
+    get = make_response(body='<html><body>still no anchor</body></html>', status_code=200,
+                        headers={'content-type': 'text/html; charset=utf-8'}, method='GET',
+                        url='http://site.example/doc')
+    result = run_check_and_get_result(builder, uri, head, get)
+    assert_broken_anchor(result, "Anchor 'missing' not found")
+
+# 9) Anchor present in HTML -> working (control)
+def test_anchor_present_html():
+    builder = make_builder()
+    uri = 'http://example.com/page#found'
+    head = make_response(body='', status_code=200, headers={'content-type': 'text/html'}, method='HEAD',
+                         url='http://example.com/page')
+    get = make_response(body='<html><body><a id="found">here</a></body></html>', status_code=200,
+                        headers={'content-type': 'text/html'}, method='GET', url='http://example.com/page')
+    result = run_check_and_get_result(builder, uri, head, get)
+    assert result[3] == 'working'
+
+# 10) Percent-encoded anchor should be unquoted and checked even when Content-Type header is absent
+def test_percent_encoded_anchor_missing_no_content_type():
+    builder = make_builder()
+    uri = 'http://example.com/page#not%20there'
+    head = make_response(body='', status_code=200, headers={}, method='HEAD', url='http://example.com/page')
+    get = make_response(body='<html><body>No anchor here</body></html>', status_code=200,
+                        headers={}, method='GET', url='http://example.com/page')
+    result = run_check_and_get_result(builder, uri, head, get)
+    # unquoted 'not there' should be looked up by check_anchor and not found
+    assert_broken_anchor(result, "Anchor 'not there' not found")

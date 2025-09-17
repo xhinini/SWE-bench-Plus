@@ -1,0 +1,162 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests monkeypatch sklearn.cluster.KMeans to return unsorted (descending) cluster centers. They assert that KBinsDiscretizer (with strategy='kmeans') sorts centers internally so that bin_edges_ are strictly increasing, that transform/inverse_transform behavior is consistent with sorted centers, and that constant features remain handled correctly. The tests would fail if KBinsDiscretizer did not sort KMeans centers (i.e., the bug fixed by the patch).
+test_code: |
+  import numpy as np
+  import pytest
+  import sklearn.cluster as cluster
+  from sklearn.preprocessing import KBinsDiscretizer
+  from sklearn.utils.validation import FLOAT_DTYPES
+  
+  # Helper factory to monkeypatch sklearn.cluster.KMeans so that it returns
+  # descending (unsorted) centers. This simulates KMeans returning centers
+  # not in ascending order, which the KBinsDiscretizer must handle by sorting.
+  def _monkeypatch_descending_kmeans(monkeypatch):
+      class DescendingKMeans:
+          def __init__(self, n_clusters, init=None, n_init=None):
+              self.n_clusters = n_clusters
+              self.init = init
+              self.n_init = n_init
+  
+          def fit(self, X):
+              col = np.asarray(X).ravel()
+              col_min, col_max = col.min(), col.max()
+              # Create centers evenly spaced but reversed (descending)
+              centers = np.linspace(col_min, col_max, self.n_clusters)[::-1]
+              # shape should be (n_clusters, 1) to mimic sklearn's KMeans
+              self.cluster_centers_ = centers.reshape(-1, 1)
+              return self
+  
+      monkeypatch.setattr(cluster, "KMeans", DescendingKMeans)
+  
+  def _compute_expected_labels_from_sorted_centers(X_col, centers_sorted):
+      # Compute bin edges exactly as KBinsDiscretizer.fit does for kmeans:
+      col_min, col_max = X_col.min(), X_col.max()
+      bin_edges = np.r_[col_min, (centers_sorted[1:] + centers_sorted[:-1]) * 0.5, col_max]
+      # Emulate the transform behavior: add eps then digitize into bin_edges[1:]
+      rtol = 1.e-5
+      atol = 1.e-8
+      eps = atol + rtol * np.abs(X_col)
+      labels = np.digitize(X_col + eps, bin_edges[1:])
+      labels = np.clip(labels, 0, len(centers_sorted) - 1)
+      return labels.astype(float)  # transform returns float array for ordinal encode
+  
+  def _assert_strictly_increasing(arr):
+      # assert that differences are strictly positive
+      diffs = np.diff(np.asarray(arr, dtype=float))
+      assert np.all(diffs > 0), "Array is not strictly increasing: %r" % (arr,)
+  
+  def test_kmeans_unsorted_centers_monotonic_edges_bins3(monkeypatch):
+      _monkeypatch_descending_kmeans(monkeypatch)
+      X = np.array([0.0, 1.0, 2.0, 3.0, 4.0])[:, None]
+      kbd = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      kbd.fit(X)
+      # bin_edges_ for the single feature must be strictly increasing
+      bin_edges = kbd.bin_edges_[0]
+      _assert_strictly_increasing(bin_edges)
+  
+  def test_kmeans_unsorted_centers_monotonic_edges_bins4(monkeypatch):
+      _monkeypatch_descending_kmeans(monkeypatch)
+      X = np.linspace(-5.0, 5.0, 11)[:, None]
+      kbd = KBinsDiscretizer(n_bins=4, strategy='kmeans', encode='ordinal')
+      kbd.fit(X)
+      for edges in kbd.bin_edges_:
+          _assert_strictly_increasing(edges)
+  
+  def test_kmeans_unsorted_centers_multiple_features(monkeypatch):
+      _monkeypatch_descending_kmeans(monkeypatch)
+      # two features with different ranges
+      X = np.vstack([np.linspace(0, 10, 11), np.linspace(-2, 2, 11)]).T
+      kbd = KBinsDiscretizer(n_bins=[3, 4], strategy='kmeans', encode='ordinal')
+      kbd.fit(X)
+      # both features must have strictly increasing bin edges
+      for edges in kbd.bin_edges_:
+          _assert_strictly_increasing(edges)
+  
+  def test_kmeans_unsorted_transform_matches_expected_labels(monkeypatch):
+      _monkeypatch_descending_kmeans(monkeypatch)
+      X = np.array([0.0, 0.5, 2.0, 3.0, 9.0, 10.0]).reshape(-1, 1)
+      n_bins = 5
+      kbd = KBinsDiscretizer(n_bins=n_bins, strategy='kmeans', encode='ordinal')
+      kbd.fit(X)
+      # Obtain the centers that the fake KMeans would have produced and sort them
+      # We recreate the fake centers logic to compute expected labels.
+      # Note: DescendingKMeans produced centers = linspace(min, max, n_clusters)[::-1]
+      centers_desc = np.linspace(X.min(), X.max(), n_bins)[::-1]
+      centers_sorted = np.sort(centers_desc)
+      expected_labels = _compute_expected_labels_from_sorted_centers(X.ravel(), centers_sorted)
+      Xt = kbd.transform(X)
+      # transform returns a 2D array of floats for ordinal encode
+      assert np.array_equal(Xt.ravel(), expected_labels)
+  
+  def test_kmeans_unsorted_inverse_transform_roundtrip(monkeypatch):
+      _monkeypatch_descending_kmeans(monkeypatch)
+      rng = np.random.RandomState(0)
+      X = rng.randn(100, 3)
+      kbd = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      Xt = kbd.fit_transform(X)
+      Xinv = kbd.inverse_transform(Xt)
+      Xt2 = kbd.transform(Xinv)
+      # After inverse_transform -> transform we should get the same binned results
+      assert np.array_equal(Xt, Xt2)
+  
+  def test_kmeans_unsorted_with_int_input_dtype(monkeypatch):
+      _monkeypatch_descending_kmeans(monkeypatch)
+      X = np.array([0, 1, 2, 3, 4], dtype=np.int64)[:, None]
+      kbd = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      kbd.fit(X)
+      # bin_edges_ must be strictly increasing and transform must not error
+      _assert_strictly_increasing(kbd.bin_edges_[0])
+      Xt = kbd.transform(X)
+      assert Xt.shape == X.shape
+      assert Xt.dtype == np.dtype(FLOAT_DTYPES).type or Xt.dtype == float
+  
+  def test_kmeans_unsorted_repeated_values(monkeypatch):
+      _monkeypatch_descending_kmeans(monkeypatch)
+      # repeated values + spread values
+      X = np.array([0.0, 0.0, 0.0, 5.0, 10.0, 10.0])[:, None]
+      kbd = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      kbd.fit(X)
+      # edges monotonic
+      _assert_strictly_increasing(kbd.bin_edges_[0])
+      # transform works and returns values within [0, n_bins-1]
+      Xt = kbd.transform(X)
+      assert Xt.min() >= 0
+      assert Xt.max() <= kbd.n_bins_[0] - 1
+  
+  def test_kmeans_unsorted_large_bins(monkeypatch):
+      _monkeypatch_descending_kmeans(monkeypatch)
+      # more bins but enough samples
+      X = np.linspace(0, 100, 20)[:, None]
+      n_bins = 6
+      kbd = KBinsDiscretizer(n_bins=n_bins, strategy='kmeans', encode='ordinal')
+      kbd.fit(X)
+      # ensure edges are increasing
+      _assert_strictly_increasing(kbd.bin_edges_[0])
+      # ensure transform yields labels in expected range
+      Xt = kbd.transform(X)
+      assert Xt.min() >= 0
+      assert Xt.max() <= n_bins - 1
+  
+  def test_kmeans_unsorted_constant_feature_not_changed(monkeypatch):
+      _monkeypatch_descending_kmeans(monkeypatch)
+      # first feature constant, second feature varying
+      X = np.array([[1.0, 0.0],
+                    [1.0, 5.0],
+                    [1.0, 10.0],
+                    [1.0, 15.0]])
+      kbd = KBinsDiscretizer(n_bins=[1, 3], strategy='kmeans', encode='ordinal')
+      # Note: when n_bins provided as [1,3], _validate_n_bins would currently raise
+      # since n_bins must be at least 2. To test constant handling (which sets n_bins_[j]=1),
+      # we instead fit with n_bins=3 and rely on constant-feature branch to set n_bins_[0]=1.
+      kbd = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      # fitting should warn about feature 0 constant but still succeed
+      kbd.fit(X)
+      # feature 0 should have been marked as constant
+      assert kbd.n_bins_[0] == 1
+      # its bin_edges_ should be exactly [-inf, inf]
+      assert np.all(np.isinf(kbd.bin_edges_[0]))
+      # the second feature's edges must be strictly increasing
+      _assert_strictly_increasing(kbd.bin_edges_[1])
+new_imports_code: |
+  # No additional imports required beyond what's included in test_code.

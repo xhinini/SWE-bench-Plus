@@ -1,0 +1,162 @@
+from django.test import SimpleTestCase
+from django.db import migrations
+from django.db.migrations.writer import MigrationWriter
+from django.db.migrations.serializer import BaseSerializer
+import re
+
+
+class ImportSortingRegressionTests(SimpleTestCase):
+    """
+    Regression tests for import sorting in MigrationWriter.as_string().
+    These tests assert that "from <module> import <name>" lines that
+    share the same <module> preserve insertion order (stable sort on
+    the grouping key). The candidate patch sorts the entire string,
+    which reorders the imported-names alphabetically and fails these tests.
+    """
+
+    class GenericType:
+        def __init__(self, import_string):
+            # import_string should be a full import line, e.g. "from mypkg import b"
+            self.import_string = import_string
+
+    class GenericSerializer(BaseSerializer):
+        def serialize(self):
+            # Use the value's import_string directly
+            return ("None", {self.value.import_string})
+
+    class DummyOp:
+        def __init__(self, val):
+            self.val = val
+
+        def deconstruct(self):
+            # Provide a simple name and a single positional argument
+            return ("DummyOp", [self.val], {})
+
+    def _make_writer_for_imports(self, import_strings):
+        """
+        Register serializer for GenericType, create a Migration whose operations
+        serialize to the given import_strings in the given order, and return
+        the rendered migration string. The serializer is unregistered by the caller.
+        """
+        MigrationWriter.register_serializer(self.GenericType, self.GenericSerializer)
+        try:
+            ops = [self.DummyOp(self.GenericType(s)) for s in import_strings]
+            migration = type(
+                "Migration",
+                (migrations.Migration,),
+                {"operations": ops, "dependencies": []},
+            )
+            writer = MigrationWriter(migration)
+            return writer.as_string()
+        finally:
+            MigrationWriter.unregister_serializer(self.GenericType)
+
+    def _extract_imports_block(self, migration_string):
+        """
+        Extract the imports block from MigrationWriter output (everything between
+        the start and the blank line that precedes the class definition).
+        """
+        # The template places imports followed by a blank line then class.
+        # Find the first blank line after potential imports area.
+        # Simpler: grab lines until a line that starts with "class Migration"
+        lines = migration_string.splitlines(keepends=True)
+        imports_lines = []
+        for line in lines:
+            if line.startswith("class Migration"):
+                break
+            imports_lines.append(line)
+        return "".join(imports_lines)
+
+    def assertFromLinesInOrder(self, output, expected_from_lines):
+        """
+        Assert that the expected_from_lines appear in the imports block in the exact order.
+        """
+        imports_block = self._extract_imports_block(output)
+        # Keep only the 'from ' lines to avoid interference from 'import ' lines.
+        from_lines = [ln for ln in imports_block.splitlines() if ln.startswith("from ")]
+        # Normalize whitespace and trailing commas to exact expected text.
+        normalized = [ln.rstrip() for ln in from_lines]
+        expected_norm = [ln.rstrip() for ln in expected_from_lines]
+        self.assertEqual(normalized, expected_norm)
+
+    def test_from_same_module_preserve_insertion_order_simple(self):
+        # Two from-lines for the same module; insertion order: b then a
+        imports = ["from mypkg import b", "from mypkg import a"]
+        output = self._make_writer_for_imports(imports)
+        self.assertFromLinesInOrder(output, imports)
+
+    def test_from_same_module_with_multi_import_preserve_order(self):
+        # Second import has multiple names; insertion order preserved (b then a,c)
+        imports = ["from mypkg import b", "from mypkg import a, c"]
+        output = self._make_writer_for_imports(imports)
+        self.assertFromLinesInOrder(output, imports)
+
+    def test_from_same_module_with_alias_preserve_order(self):
+        # Using alias in first import should not cause reordering
+        imports = ["from mypkg import b as bar", "from mypkg import a"]
+        output = self._make_writer_for_imports(imports)
+        self.assertFromLinesInOrder(output, imports)
+
+    def test_many_from_same_module_preserve_sequence(self):
+        # Longer sequence to ensure stable ordering is preserved
+        imports = [
+            "from mypkg import b",
+            "from mypkg import d",
+            "from mypkg import a",
+            "from mypkg import c",
+        ]
+        output = self._make_writer_for_imports(imports)
+        self.assertFromLinesInOrder(output, imports)
+
+    def test_from_with_duplicate_and_combined_preserve_order(self):
+        # Slightly more complex: a simple name and a combined import
+        imports = ["from mypkg import z", "from mypkg import a, b"]
+        output = self._make_writer_for_imports(imports)
+        self.assertFromLinesInOrder(output, imports)
+
+    def test_mixed_import_and_from_grouping_and_order(self):
+        # Ensure 'import ' lines are grouped before 'from ' lines, and from-lines preserve insertion order.
+        inputs = [
+            "import zzz.module",
+            "from mypkg import b",
+            "from mypkg import a",
+        ]
+        output = self._make_writer_for_imports(inputs)
+        # First ensure the import group appears somewhere before from group
+        imports_block = self._extract_imports_block(output)
+        self.assertIn("import zzz.module", imports_block)
+        # Ensure from-lines are in the expected insertion order
+        self.assertFromLinesInOrder(output, ["from mypkg import b", "from mypkg import a"])
+
+    def test_from_with_underscore_names_preserve_order(self):
+        # Names that sort before alphabetic letters when compared, ensure insertion order preserved.
+        imports = ["from mypkg import x", "from mypkg import _x"]
+        output = self._make_writer_for_imports(imports)
+        self.assertFromLinesInOrder(output, imports)
+
+    def test_from_with_numeric_and_alpha_preserve_order(self):
+        imports = ["from mypkg import 3rd", "from mypkg import a_first"]
+        output = self._make_writer_for_imports(imports)
+        self.assertFromLinesInOrder(output, imports)
+
+    def test_multiple_modules_and_same_module_stability(self):
+        # Mixed modules; modules themselves are ordered by module name, but
+        # entries within the same module must keep insertion order.
+        # We'll craft so that 'amod' and 'bmod' both appear; within 'amod' ensure insertion order.
+        imports = [
+            "from amod import second",
+            "from bmod import only",
+            "from amod import first",
+        ]
+        output = self._make_writer_for_imports(imports)
+        # Extract only amod lines and assert their relative order as inserted.
+        imports_block = self._extract_imports_block(output)
+        amod_lines = [ln.rstrip() for ln in imports_block.splitlines() if ln.startswith("from amod")]
+        expected_amod = ["from amod import second", "from amod import first"]
+        self.assertEqual(amod_lines, expected_amod)
+
+    def test_preserve_order_when_from_lines_have_commas_and_spaces(self):
+        # Ensure whitespace and commas in the import line don't cause alphabetic reordering.
+        imports = ["from mypkg import z, y", "from mypkg import a"]
+        output = self._make_writer_for_imports(imports)
+        self.assertFromLinesInOrder(output, imports)

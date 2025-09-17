@@ -1,0 +1,180 @@
+# No extra imports required beyond what's included in the test snippet.
+from unittest import mock
+
+from django.contrib import admin
+from django.contrib.admin.options import router as options_router
+from django.contrib.admin.options import transaction as options_transaction
+from django.core.exceptions import ValidationError
+from django.db import DatabaseError, router
+from django.test import TransactionTestCase, override_settings
+from django.urls import reverse
+
+from admin_changelist.models import Swallow
+from admin_changelist.admin import SwallowAdmin
+
+@override_settings(
+    DATABASES={
+        "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": "default_db"},
+        "other": {"ENGINE": "django.db.backends.sqlite3", "NAME": "other_db"},
+    }
+)
+class ListEditableAtomicUsingTests(TransactionTestCase):
+    multi_db = True
+
+    def setUp(self):
+        # Superuser creation is handled by helper in existing tests; reuse a superuser
+        # created in ChangeListTests.setUpTestData when running within the whole suite.
+        # Here create a minimal superuser for these tests.
+        from django.contrib.auth.models import User
+
+        self.superuser = User.objects.create_superuser(
+            username="atomic_super", email="a@b.com", password="pwd"
+        )
+        # Create objects explicitly on the 'other' DB so their writes will be routed there.
+        self.a = Swallow.objects.using("other").create(origin="Swallow A", load=4, speed=1)
+        self.b = Swallow.objects.using("other").create(origin="Swallow B", load=2, speed=2)
+
+    def _post_changelist(self, data, expect_error=False):
+        self.client.force_login(self.superuser)
+        changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+        if expect_error:
+            return self.client.post(changelist_url, data)
+        return self.client.post(changelist_url, data, follow=True)
+
+    def _make_atomic_recorder(self):
+        """
+        Return a dummy context manager class that records the 'using' value it
+        was called with on init. It also acts as a no-op context manager.
+        """
+        called = []
+
+        class DummyAtomic:
+            def __init__(self, using=None):
+                called.append(using)
+
+            def __enter__(self):
+                return None
+
+            def __exit__(self, exc_type, exc, tb):
+                # Don't swallow exceptions.
+                return False
+
+        return DummyAtomic, called
+
+    def _base_data(self):
+        return {
+            "form-TOTAL_FORMS": "2",
+            "form-INITIAL_FORMS": "2",
+            "form-MIN_NUM_FORMS": "0",
+            "form-MAX_NUM_FORMS": "1000",
+            "form-0-uuid": str(self.a.pk),
+            "form-1-uuid": str(self.b.pk),
+            "form-0-load": "9.0",
+            "form-0-speed": "3.0",
+            "form-1-load": "5.0",
+            "form-1-speed": "1.0",
+            "_save": "Save",
+        }
+
+    def test_atomic_called_with_router_db_for_write_on_success_single_change(self):
+        DummyAtomic, called = self._make_atomic_recorder()
+        with mock.patch("django.contrib.admin.options.transaction.atomic", DummyAtomic):
+            # Ensure router.db_for_write returns the non-default alias
+            with mock.patch("django.contrib.admin.options.router.db_for_write", return_value="other"):
+                response = self._post_changelist(self._base_data())
+        # transaction.atomic should have been entered with using='other'
+        self.assertIn("other", called)
+
+    def test_atomic_called_with_router_db_for_write_on_success_two_changes(self):
+        DummyAtomic, called = self._make_atomic_recorder()
+        data = self._base_data()
+        # Change both rows
+        data["form-0-load"] = "10.0"
+        data["form-1-load"] = "11.0"
+        with mock.patch("django.contrib.admin.options.transaction.atomic", DummyAtomic):
+            with mock.patch("django.contrib.admin.options.router.db_for_write", return_value="other"):
+                response = self._post_changelist(data)
+        self.assertIn("other", called)
+
+    def test_atomic_called_when_log_change_raises(self):
+        DummyAtomic, called = self._make_atomic_recorder()
+        data = self._base_data()
+        # Make log_change raise DatabaseError to simulate failure during logging
+        with mock.patch("django.contrib.admin.options.transaction.atomic", DummyAtomic):
+            with mock.patch("django.contrib.admin.options.router.db_for_write", return_value="other"):
+                with mock.patch("django.contrib.admin.ModelAdmin.log_change", side_effect=DatabaseError):
+                    with self.assertRaises(DatabaseError):
+                        self._post_changelist(data, expect_error=True)
+        self.assertIn("other", called)
+
+    def test_atomic_called_when_save_model_raises(self):
+        DummyAtomic, called = self._make_atomic_recorder()
+        data = self._base_data()
+        # Make save_model raise DatabaseError to simulate failure during save
+        with mock.patch("django.contrib.admin.options.transaction.atomic", DummyAtomic):
+            with mock.patch("django.contrib.admin.options.router.db_for_write", return_value="other"):
+                with mock.patch("django.contrib.admin.ModelAdmin.save_model", side_effect=DatabaseError):
+                    with self.assertRaises(DatabaseError):
+                        self._post_changelist(data, expect_error=True)
+        self.assertIn("other", called)
+
+    def test_atomic_called_when_save_related_raises(self):
+        DummyAtomic, called = self._make_atomic_recorder()
+        data = self._base_data()
+        # Make save_related raise DatabaseError to simulate failure during related saving
+        with mock.patch("django.contrib.admin.options.transaction.atomic", DummyAtomic):
+            with mock.patch("django.contrib.admin.options.router.db_for_write", return_value="other"):
+                with mock.patch("django.contrib.admin.ModelAdmin.save_related", side_effect=DatabaseError):
+                    with self.assertRaises(DatabaseError):
+                        self._post_changelist(data, expect_error=True)
+        self.assertIn("other", called)
+
+    def test_atomic_called_even_if_one_form_invalid(self):
+        DummyAtomic, called = self._make_atomic_recorder()
+        data = self._base_data()
+        # Simulate an invalid form by sending non-numeric value for load
+        data["form-1-load"] = "not-a-number"
+        with mock.patch("django.contrib.admin.options.transaction.atomic", DummyAtomic):
+            with mock.patch("django.contrib.admin.options.router.db_for_write", return_value="other"):
+                response = self._post_changelist(data)
+        # Even when a form is invalid, the code path that constructs the formset/processing
+        # still reaches the atomic context (same behavior expected in gold patch).
+        # Ensure atomic was entered with the proper DB alias.
+        self.assertIn("other", called)
+
+    def test_atomic_called_with_router_db_for_write_when_partial_failure_second_raises(self):
+        DummyAtomic, called = self._make_atomic_recorder()
+        data = self._base_data()
+        # Make log_change succeed for first and raise for second. This should still enter atomic.
+        with mock.patch("django.contrib.admin.options.transaction.atomic", DummyAtomic):
+            with mock.patch("django.contrib.admin.options.router.db_for_write", return_value="other"):
+                with mock.patch("django.contrib.admin.ModelAdmin.log_change", side_effect=[None, DatabaseError]):
+                    with self.assertRaises(DatabaseError):
+                        self._post_changelist(data, expect_error=True)
+        self.assertIn("other", called)
+
+    def test_atomic_called_with_non_default_alias_multiple_posts(self):
+        DummyAtomic, called = self._make_atomic_recorder()
+        data = self._base_data()
+        # Post twice in a row; atomic should be used each time and target 'other'.
+        with mock.patch("django.contrib.admin.options.transaction.atomic", DummyAtomic):
+            with mock.patch("django.contrib.admin.options.router.db_for_write", return_value="other"):
+                response1 = self._post_changelist(data)
+                response2 = self._post_changelist(data)
+        # The atomic context should have been entered at least twice with 'other'.
+        self.assertTrue(any(c == "other" for c in called))
+
+    def test_atomic_called_with_router_db_for_write_even_when_no_changes(self):
+        DummyAtomic, called = self._make_atomic_recorder()
+        # When no forms have changed, the code still constructs the formset and may enter the atomic context.
+        data = self._base_data()
+        # Make sure values are the same as current so no change is detected.
+        data["form-0-load"] = str(self.a.load)
+        data["form-0-speed"] = str(self.a.speed)
+        data["form-1-load"] = str(self.b.load)
+        data["form-1-speed"] = str(self.b.speed)
+        with mock.patch("django.contrib.admin.options.transaction.atomic", DummyAtomic):
+            with mock.patch("django.contrib.admin.options.router.db_for_write", return_value="other"):
+                response = self._post_changelist(data)
+        # Even in this case, ensure atomic was invoked with the correct alias.
+        self.assertIn("other", called)

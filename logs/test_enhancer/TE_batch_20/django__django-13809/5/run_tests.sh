@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.RunserverSkipChecksTests.setUp admin_scripts.tests_llm.RunserverSkipChecksTests.test_add_arguments_registers_skip_checks_flag admin_scripts.tests_llm.RunserverSkipChecksTests.test_inner_run_skip_checks_migration_warning_shown admin_scripts.tests_llm.RunserverSkipChecksTests.test_inner_run_skip_checks_no_skipping_message admin_scripts.tests_llm.RunserverSkipChecksTests.test_inner_run_skip_checks_runs_migrations admin_scripts.tests_llm.RunserverSkipChecksTests.test_runserver_default_runs_checks_when_not_provided admin_scripts.tests_llm.RunserverSkipChecksTests.test_skip_checks_does_not_print_skipping_message_call_command admin_scripts.tests_llm.RunserverSkipChecksTests.test_skip_checks_false_runs_checks_and_migrations_call_command admin_scripts.tests_llm.RunserverSkipChecksTests.test_skip_checks_migration_warning_still_shown_call_command admin_scripts.tests_llm.RunserverSkipChecksTests.test_skip_checks_runs_migrations_call_command
+coverage json -o coverage.json
+: '>>>>> End Test Output'

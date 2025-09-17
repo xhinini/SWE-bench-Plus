@@ -1,0 +1,274 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  A suite of unit tests for django.core.serializers.base.build_instance that exercises
+  the natural-key lookup path. The tests use lightweight fake Model-like classes and fake
+  managers to simulate the ORM interactions (so no database is required). The tests verify:
+  - build_instance sets the temporary instance's _state.db before calling natural_key,
+    so the natural_key can observe the requested DB alias.
+  - build_instance calls default_manager.db_manager(db).get_by_natural_key with the
+    natural_key returned by the Model instance.
+  - DoesNotExist from get_by_natural_key is handled (no exception raised by build_instance).
+  - If Model.natural_key raises AttributeError (or natural_key depends on attributes
+    that weren't set), build_instance does not swallow the AttributeError (it should
+    propagate). The candidate (incorrect) patch swallows AttributeError and would make
+    these tests fail; the correct (gold) patch sets _state.db first and does not catch
+    AttributeError, so these tests will pass with the gold patch.
+test_code: |
+  import unittest
+  from types import SimpleNamespace
+  from django.core.serializers.base import build_instance
+
+  class FakePK:
+      def __init__(self, attname="id", to_python=None):
+          self.attname = attname
+          self._to_python = to_python or (lambda v: int(v) if v is not None else None)
+
+      def to_python(self, value):
+          return self._to_python(value)
+
+
+  class FakeManagerProxy:
+      def __init__(self, db_called_with_container, return_obj=None, raise_exc=None, record_args=None):
+          self._db_called_with_container = db_called_with_container
+          self._return_obj = return_obj
+          self._raise_exc = raise_exc
+          self._record_args = record_args  # a dict to record arguments
+
+      def get_by_natural_key(self, *args):
+          if self._record_args is not None:
+              self._record_args['called_with'] = args
+          if self._raise_exc:
+              raise self._raise_exc
+          return self._return_obj
+
+
+  class FakeDefaultManager:
+      def __init__(self, proxy_factory):
+          # proxy_factory(db) -> object with get_by_natural_key
+          self._proxy_factory = proxy_factory
+          self.db_manager_called_with = None
+
+      def db_manager(self, db):
+          # record the db used and return proxy
+          self.db_manager_called_with = db
+          return self._proxy_factory(db)
+
+
+  class BaseFakeModel:
+      # common attributes manipulated in tests
+      DoesNotExist = type("DoesNotExist", (Exception,), {})
+
+      def __init__(self, **kwargs):
+          # set attributes for the final returned instance
+          for k, v in kwargs.items():
+              setattr(self, k, v)
+          # provide a _state object like Django's
+          self._state = SimpleNamespace(db=None)
+
+      @classmethod
+      def _make_meta(cls, default_manager, pk_field, get_field_func=None):
+          meta = SimpleNamespace()
+          meta.default_manager = default_manager
+          meta.pk = pk_field
+          # Provide a simplistic get_field that tests can override or rely on.
+          if get_field_func is None:
+              def get_field(name):
+                  # default: no remote_field
+                  return SimpleNamespace(remote_field=None, name=name)
+              meta.get_field = get_field
+          else:
+              meta.get_field = get_field_func
+          return meta
+
+
+  class BuildInstanceTests(unittest.TestCase):
+      def test_sets_state_db_before_natural_key_and_calls_manager(self):
+          calls = {}
+          # manager proxy records args and returns object with pk attribute '7'
+          def proxy_factory(db):
+              calls['db'] = db
+              return FakeManagerProxy(calls, return_obj=SimpleNamespace(pk='7'), record_args=calls)
+
+          manager = FakeDefaultManager(proxy_factory)
+          pk_field = FakePK(attname="id")
+          # Model whose natural_key returns a tuple including self._state.db
+          class M(BaseFakeModel):
+              _meta = BaseFakeModel._make_meta(manager, pk_field)
+              def natural_key(self):
+                  # natural_key depends on _state.db being set by build_instance
+                  return (self._state.db, "name")
+
+          data = {}
+          res = build_instance(M, data, "other_db")
+          # The manager should have been asked to use the provided db alias
+          self.assertEqual(manager.db_manager_called_with, "other_db")
+          # get_by_natural_key should have been called with the tuple emitted by natural_key
+          self.assertEqual(calls.get('called_with'), (( "other_db", "name"),))
+          # data should have been updated with the pk converted via to_python
+          self.assertEqual(data.get("id"), 7)
+          # returned instance should reflect the updated data
+          self.assertEqual(getattr(res, "id"), 7)
+
+      def test_uses_provided_db_alias_variant(self):
+          calls = {}
+          def proxy_factory(db):
+              calls['db'] = db
+              return FakeManagerProxy(calls, return_obj=SimpleNamespace(pk='123'), record_args=calls)
+
+          manager = FakeDefaultManager(proxy_factory)
+          pk_field = FakePK(attname="pkval", to_python=lambda v: int(v))
+          class M(BaseFakeModel):
+              _meta = BaseFakeModel._make_meta(manager, pk_field)
+              def natural_key(self):
+                  return (self._state.db, "k2")
+
+          data = {}
+          res = build_instance(M, data, "custom_db")
+          self.assertEqual(manager.db_manager_called_with, "custom_db")
+          self.assertEqual(calls.get('called_with'), (("custom_db", "k2"),))
+          self.assertEqual(data.get("pkval"), 123)
+          self.assertEqual(getattr(res, "pkval"), 123)
+
+      def test_returns_model_when_pk_present_and_does_not_call_manager(self):
+          # Manager that would fail if called
+          def bad_proxy_factory(db):
+              def bad_get(*args):
+                  raise AssertionError("db_manager should not be called when pk present")
+              return FakeManagerProxy({}, return_obj=None, raise_exc=AssertionError("shouldn't be used"))
+          manager = FakeDefaultManager(bad_proxy_factory)
+          pk_field = FakePK(attname="id")
+          class M(BaseFakeModel):
+              _meta = BaseFakeModel._make_meta(manager, pk_field)
+              def natural_key(self):
+                  # should not be called because pk present
+                  raise AssertionError("natural_key should not be called when pk is present")
+          data = {"id": 42}
+          res = build_instance(M, data, "ignored_db")
+          self.assertEqual(getattr(res, "id"), 42)
+          # ensure manager was not requested
+          self.assertIsNone(manager.db_manager_called_with)
+
+      def test_handles_does_not_exist_from_get_by_natural_key(self):
+          calls = {}
+          # proxy will raise DoesNotExist
+          def proxy_factory(db):
+              return FakeManagerProxy(calls, raise_exc=BaseFakeModel.DoesNotExist())
+          manager = FakeDefaultManager(proxy_factory)
+          pk_field = FakePK(attname="id")
+          class M(BaseFakeModel):
+              _meta = BaseFakeModel._make_meta(manager, pk_field)
+              def natural_key(self):
+                  return ("dontcare",)
+          data = {}
+          # Should not raise; should just return a new instance built from data (no id set)
+          res = build_instance(M, data, "dbx")
+          self.assertFalse(hasattr(res, "id"))
+          self.assertIsNone(manager.db_manager_called_with is None or manager.db_manager_called_with == "dbx")
+
+      def test_propagates_attributeerror_from_natural_key(self):
+          calls = {}
+          def proxy_factory(db):
+              return FakeManagerProxy(calls, return_obj=SimpleNamespace(pk='1'), record_args=calls)
+          manager = FakeDefaultManager(proxy_factory)
+          pk_field = FakePK(attname="id")
+          class M(BaseFakeModel):
+              _meta = BaseFakeModel._make_meta(manager, pk_field)
+              def natural_key(self):
+                  # simulate attribute lookup inside natural_key that errors
+                  raise AttributeError("boom")
+          data = {}
+          # The correct implementation should not swallow AttributeError
+          with self.assertRaises(AttributeError):
+              build_instance(M, data, "x")
+
+      def test_calls_to_python_on_pk_conversion(self):
+          calls = {}
+          def proxy_factory(db):
+              return FakeManagerProxy(calls, return_obj=SimpleNamespace(pk='77'), record_args=calls)
+          manager = FakeDefaultManager(proxy_factory)
+          # custom to_python to track it was used
+          converted = {}
+          def to_python(v):
+              converted['val'] = v
+              return int(v) + 1
+          pk_field = FakePK(attname="id", to_python=to_python)
+          class M(BaseFakeModel):
+              _meta = BaseFakeModel._make_meta(manager, pk_field)
+              def natural_key(self):
+                  return ("k",)
+          data = {}
+          res = build_instance(M, data, "dby")
+          # to_python was called with the raw pk returned by manager
+          self.assertEqual(converted['val'], '77')
+          # value stored in data and returned instance should be incremented by to_python
+          self.assertEqual(data['id'], 78)
+          self.assertEqual(getattr(res, "id"), 78)
+
+      def test_does_nothing_when_default_manager_has_no_get_by_natural_key(self):
+          # Manager without get_by_natural_key attribute
+          class SimpleManager:
+              def db_manager(self, db):
+                  raise AssertionError("db_manager should not be used here")
+          manager = SimpleManager()
+          pk_field = FakePK(attname="id")
+          class M(BaseFakeModel):
+              _meta = BaseFakeModel._make_meta(manager, pk_field)
+              def natural_key(self):
+                  return ("irrelevant",)
+          data = {}
+          # build_instance should simply return an instance and not attempt db lookup
+          res = build_instance(M, data, "anydb")
+          self.assertFalse(hasattr(res, "id"))
+
+      def test_natural_key_dependent_on_relation_attribute_set_by_init(self):
+          # Here natural_key needs an attribute ('rel') that only Model(**data) initialization
+          # would set. The candidate (incorrect) patch that creates Model() then only sets
+          # non-remote fields would fail to set it; the correct implementation must set it.
+          calls = {}
+          def proxy_factory(db):
+              return FakeManagerProxy(calls, return_obj=SimpleNamespace(pk='9'), record_args=calls)
+          manager = FakeDefaultManager(proxy_factory)
+          pk_field = FakePK(attname="id")
+          # simulate get_field used by candidate patch; mark 'rel' as a non-remote field
+          def get_field(name):
+              # The data key we'll use is 'rel' and it's non-remote_field (so candidate might set it),
+              # but in the candidate's approach they attempt to get the field and may behave differently.
+              return SimpleNamespace(remote_field=None, name=name)
+          class M(BaseFakeModel):
+              _meta = BaseFakeModel._make_meta(manager, pk_field, get_field_func=get_field)
+              def __init__(self, **kwargs):
+                  super().__init__(**kwargs)
+              def natural_key(self):
+                  # depends on attribute set during __init__
+                  return (getattr(self, "rel"),)
+          data = {"rel": "the-rel"}
+          res = build_instance(M, data, "db_z")
+          # manager should have been called with natural_key from instance
+          self.assertEqual(calls.get('called_with'), (("the-rel",),))
+          self.assertEqual(data['id'], 9)
+          self.assertEqual(getattr(res, "id"), 9)
+
+      def test_natural_key_iterable_is_passed_through_to_manager(self):
+          calls = {}
+          def proxy_factory(db):
+              return FakeManagerProxy(calls, return_obj=SimpleNamespace(pk='5'), record_args=calls)
+          manager = FakeDefaultManager(proxy_factory)
+          pk_field = FakePK(attname="id")
+          class M(BaseFakeModel):
+              _meta = BaseFakeModel._make_meta(manager, pk_field)
+              def natural_key(self):
+                  # multi-element natural key
+                  return ("a", "b", 123)
+          data = {}
+          res = build_instance(M, data, "db9")
+          # ensure manager was called with the full tuple returned by natural_key
+          self.assertEqual(calls.get('called_with'), (( "a", "b", 123),))
+          self.assertEqual(data.get("id"), 5)
+          self.assertEqual(getattr(res, "id"), 5)
+
+
+  if __name__ == "__main__":
+      unittest.main()
+new_imports_code: |
+  # No new top-level imports required beyond what's used in the test code.

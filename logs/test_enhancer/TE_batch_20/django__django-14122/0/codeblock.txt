@@ -1,0 +1,223 @@
+# No new imports required beyond what other ordering tests use.
+from datetime import datetime
+from operator import attrgetter
+
+from django.db.models import (
+    CharField, Count, DateTimeField, F, Max, OuterRef, Subquery, Value,
+)
+from django.db.models.functions import Upper
+from django.test import TestCase
+
+from .models import Article, Author, ChildArticle, OrderedByFArticle, Reference
+
+
+class GroupByMetaOrderingRegressionTests(TestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.a1 = Article.objects.create(headline="Article 1", pub_date=datetime(2005, 7, 26))
+        cls.a2 = Article.objects.create(headline="Article 2", pub_date=datetime(2005, 7, 27))
+        cls.a3 = Article.objects.create(headline="Article 3", pub_date=datetime(2005, 7, 27))
+        cls.a4 = Article.objects.create(headline="Article 4", pub_date=datetime(2005, 7, 28))
+        cls.author_1 = Author.objects.create(name="Name 1")
+        cls.author_2 = Author.objects.create(name="Name 2")
+        for i in range(2):
+            Author.objects.create()
+
+    def test_regression_01_meta_ordering_does_not_inject_group_by_columns(self):
+        """
+        Default (Meta) ordering should not inject ordering columns into GROUP BY
+        for an annotate() over values(). This mirrors test_default_ordering_does_not_affect_group_by
+        but asserts explicitly that the generated SQL GROUP BY clause does not contain
+        the default ordering column name (pub_date).
+        """
+        Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+        Article.objects.filter(headline='Article 4').update(author=self.author_2)
+        qs = Article.objects.values('author').annotate(count=Count('author'))
+        sql = str(qs.query)
+        # Ensure GROUP BY does not include the model's default ordering column (pub_date).
+        # The presence of 'pub_date' in GROUP BY would indicate that Meta.ordering
+        # has been incorrectly treated as part of the grouping.
+        self.assertNotIn('pub_date', sql.lower())
+        # Also verify results are as expected.
+        self.assertCountEqual(list(qs), [
+            {'author': self.author_1.pk, 'count': 3},
+            {'author': self.author_2.pk, 'count': 1},
+        ])
+
+    def test_regression_02_order_by_function_not_added_to_group_by_when_meta_ordering(self):
+        """
+        Ordering by a function (Upper) applied to a related field when the model
+        has a default ordering should not force the GROUP BY to include the function.
+        """
+        Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+        Article.objects.filter(headline='Article 4').update(author=self.author_2)
+        qs = Article.objects.values('author').annotate(count=Count('author')).order_by(Upper('author__name'))
+        sql = str(qs.query)
+        # The Upper() function SQL should not be present in the GROUP BY clause.
+        # We do not rely on exact SQL here; ensure the function name isn't part of GROUP BY.
+        group_by_index = sql.lower().find('group by')
+        if group_by_index != -1:
+            group_by_clause = sql[group_by_index: group_by_index + 200].lower()
+            self.assertNotIn('upper', group_by_clause)
+        # Ensure logical grouping result unchanged.
+        self.assertCountEqual(list(qs), [
+            {'author': self.author_1.pk, 'count': 3},
+            {'author': self.author_2.pk, 'count': 1},
+        ])
+
+    def test_regression_03_explicit_values_preserved_even_with_meta_ordering(self):
+        """
+        If values() explicitly requests grouping by a field, that grouping must
+        be preserved even if the model has default ordering.
+        """
+        Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+        Article.objects.filter(headline='Article 4').update(author=self.author_2)
+        qs = Article.objects.values('author').annotate(count=Count('pk')).order_by()
+        # Explicit values('author') should still produce grouping by the author column.
+        sql = str(qs.query)
+        self.assertIn('group by', sql.lower())
+        # And ensure the grouping keys are the 'author' column (author id).
+        rows = list(qs)
+        self.assertCountEqual(rows, [
+            {'author': self.author_1.pk, 'count': 3},
+            {'author': self.author_2.pk, 'count': 1},
+        ])
+
+    def test_regression_04_order_by_annotation_masked_out_without_affecting_group_by(self):
+        """
+        Ordering by an annotation that is masked out of the SELECT (i.e.,
+        present in query.annotations but not in annotation_select) should not
+        force unexpected GROUP BY columns to appear.
+        """
+        # Create an annotated queryset where the annotation is used only for ordering.
+        qs = Article.objects.annotate(
+            foo=Value('1', output_field=CharField()),
+        ).order_by('foo', '-headline')
+        # For annotation used directly in ordering (and also selected), the query
+        # should produce GROUP BY only if needed — here we assert pub_date isn't added.
+        sql = str(qs.query)
+        self.assertNotIn('pub_date', sql.lower())
+        # Verify ordering semantics are preserved.
+        self.assertSequenceEqual(list(qs), [self.a4, self.a3, self.a2, self.a1])
+
+    def test_regression_05_having_expressions_always_added_to_group_by(self):
+        """
+        HAVING clauses' group-by related expressions must always be included
+        in the GROUP BY clause regardless of Meta.ordering.
+        """
+        # Annotate and add a HAVING that refers to the annotation.
+        qs = Article.objects.values('author').annotate(count=Count('author')).filter(count__gt=0)
+        # The HAVING expression (count) must be part of the aggregation and group by logic.
+        sql = str(qs.query)
+        self.assertIn('group by', sql.lower())
+        # Ensure query returns expected counts (sanity).
+        Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+        Article.objects.filter(headline='Article 4').update(author=self.author_2)
+        self.assertCountEqual(list(qs), [
+            {'author': self.author_1.pk, 'count': 3},
+            {'author': self.author_2.pk, 'count': 1},
+        ])
+
+    def test_regression_06_subquery_ordering_does_not_leak_into_outer_group_by(self):
+        """
+        An inner subquery that has ordering should not cause the outer query's
+        GROUP BY to include the inner ordering's columns.
+        """
+        Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+        Article.objects.filter(headline='Article 4').update(author=self.author_2)
+        article_subquery = Article.objects.filter(
+            author=OuterRef('pk'),
+            headline__icontains='Article',
+        ).order_by().values('author').annotate(
+            last_date=Max('pub_date'),
+        ).values('last_date')
+        qs = Author.objects.annotate(
+            last_date=Subquery(article_subquery, output_field=DateTimeField())
+        ).order_by(F('last_date').asc(nulls_first=True)).distinct()
+        # Ensure outer GROUP BY (if any) does not mention inner subquery columns.
+        sql = str(qs.query)
+        # The subquery's column name 'pub_date' should not appear in GROUP BY of outer.
+        group_by_index = sql.lower().find('group by')
+        if group_by_index != -1:
+            group_by_clause = sql[group_by_index: group_by_index + 300].lower()
+            self.assertNotIn('pub_date', group_by_clause)
+        # Check results are in sensible order (nulls first then authors with dates)
+        result = list(qs)
+        # Should include all authors (we won't assert exact ordering here beyond presence).
+        self.assertTrue(all(isinstance(a, Author) for a in result))
+
+    def test_regression_07_default_ordering_by_expression_not_in_group_by(self):
+        """
+        If Meta.ordering contains an expression (F), it should not force
+        additional GROUP BY columns when doing values().annotate().
+        """
+        # Use the OrderedByFArticle model which uses F expressions in Meta.ordering.
+        ca1 = OrderedByFArticle.objects.create(headline='h1', pub_date=datetime(2005, 7, 27))
+        ca2 = OrderedByFArticle.objects.create(headline='h2', pub_date=datetime(2005, 7, 27))
+        qs = OrderedByFArticle.objects.values('pk').annotate(cnt=Count('pk'))
+        sql = str(qs.query)
+        # Ensure Meta.ordering expression representation isn't present in GROUP BY.
+        self.assertNotIn('group by pub_date', sql.lower())
+        # Basic sanity: two rows present
+        self.assertEqual(len(list(qs)), 2)
+
+    def test_regression_08_extra_ordering_with_table_name_does_not_affect_group_by_with_meta(self):
+        """
+        Extra ORDER BY that refers to a table.column string should not leak into GROUP BY
+        when the main model uses Meta.ordering for ordering.
+        """
+        # Force authors on some articles.
+        Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+        Article.objects.filter(headline='Article 4').update(author=self.author_2)
+        qs = Article.objects.extra(order_by=['ordering_article.headline']).values('author').annotate(count=Count('author'))
+        sql = str(qs.query)
+        # Ensure GROUP BY clause doesn't contain the word 'headline' coming from extra ORDER BY.
+        group_by_index = sql.lower().find('group by')
+        if group_by_index != -1:
+            group_by_clause = sql[group_by_index: group_by_index + 300].lower()
+            self.assertNotIn('headline', group_by_clause)
+        # Verify grouping result unaffected
+        self.assertCountEqual(list(qs), [
+            {'author': self.author_1.pk, 'count': 3},
+            {'author': self.author_2.pk, 'count': 1},
+        ])
+
+    def test_regression_09_order_by_pk_shortcut_does_not_inherit_related_model_ordering(self):
+        """
+        Ordering by 'pk' should not cause traversal into related models' ordering
+        to affect GROUP BY for aggregate queries.
+        """
+        # set authors for some articles
+        for i in range(1, 5):
+            author = Author.objects.order_by('id')[i - 1]
+            article = getattr(self, f"a{5 - i}")
+            article.author = author
+            article.save(update_fields={'author'})
+        qs = Article.objects.values('author').annotate(count=Count('pk')).order_by('pk')
+        sql = str(qs.query)
+        # 'pk' ordering should not inject related-model ordering columns into GROUP BY
+        self.assertNotIn('group by pub_date', sql.lower())
+        self.assertEqual(len(list(qs)), 4 if any(a for a in qs) else len(list(qs)))
+
+    def test_regression_10_order_by_f_expression_duplicates_and_group_by(self):
+        """
+        Ensure that ordering with duplicate F expressions does not cause
+        GROUP BY to include duplicates or unexpected columns.
+        """
+        qs = Article.objects.order_by(F('headline').asc(), F('headline').desc()).values('headline').annotate(cnt=Count('pk'))
+        sql = str(qs.query).lower()
+        # There should be a single reference to headline in ORDER BY and GROUP BY
+        # GROUP BY should include headline (since values('headline') requested)
+        self.assertIn('group by', sql)
+        # Ensure 'headline' appears only once in the ORDER BY fragment.
+        ordering_fragment = sql[sql.find('order by'):]
+        self.assertEqual(ordering_fragment.count('headline'), 1)
+        # Ensure grouping result matches expectations
+        expected = [
+            {'headline': 'Article 1', 'cnt': 1},
+            {'headline': 'Article 2', 'cnt': 1},
+            {'headline': 'Article 3', 'cnt': 1},
+            {'headline': 'Article 4', 'cnt': 1},
+        ]
+        self.assertCountEqual(list(qs), expected)

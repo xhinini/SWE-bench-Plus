@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 queries.test_bulk_update_llm.BulkUpdateCustomExpressionTests.setUpTestData queries.test_bulk_update_llm.BulkUpdateCustomExpressionTests.test_custom_expr_batch_size_1 queries.test_bulk_update_llm.BulkUpdateCustomExpressionTests.test_custom_expr_duplicates_different_batches queries.test_bulk_update_llm.BulkUpdateCustomExpressionTests.test_custom_expr_duplicates_in_same_batch queries.test_bulk_update_llm.BulkUpdateCustomExpressionTests.test_custom_expr_mixed_fields_update queries.test_bulk_update_llm.BulkUpdateCustomExpressionTests.test_custom_expr_mixed_none_and_expression queries.test_bulk_update_llm.BulkUpdateCustomExpressionTests.test_custom_expr_on_boolean_field queries.test_bulk_update_llm.BulkUpdateCustomExpressionTests.test_custom_expr_resolve_expression_called queries.test_bulk_update_llm.BulkUpdateCustomExpressionTests.test_custom_expr_resolves_to_F_on_char_field queries.test_bulk_update_llm.BulkUpdateCustomExpressionTests.test_custom_expr_resolves_to_F_on_integer_field queries.test_bulk_update_llm.BulkUpdateCustomExpressionTests.test_custom_expr_resolves_to_Value_constant queries.test_bulk_update_llm.__repr__'] (queries.test_bulk_update_llm.BulkUpdateCustomExpressionTests.['CustomExpr.__init__', 'CustomExpr.resolve_expression', 'CustomExpr)
+coverage json -o coverage.json
+: '>>>>> End Test Output'

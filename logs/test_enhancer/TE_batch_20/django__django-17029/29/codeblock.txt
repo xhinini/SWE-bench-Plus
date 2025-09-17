@@ -1,0 +1,177 @@
+import threading
+from django.apps import apps
+from django.test import SimpleTestCase, override_settings, isolate_apps
+from django.contrib.admin.models import LogEntry
+import threading
+
+# Import models from the local test package (same pattern as existing tests).
+from .models import TotallyNormal
+
+class ClearCacheSwappableTests(SimpleTestCase):
+    def test_clear_cache_clears_both_caches(self):
+        """
+        Basic sanity: populating both caches and then clearing should result
+        in both caches being empty.
+        """
+        # Populate the swappable cache and the models cache.
+        self.assertIsNone(apps.get_swappable_settings_name("admin.LogEntry"))
+        apps.get_models()
+
+        apps.clear_cache()
+
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(apps.get_models.cache_info().currsize, 0)
+
+    def test_get_swappable_recomputed_after_clear(self):
+        """
+        After clearing the cache, subsequent calls should recompute (and can
+        repopulate) the swappable lookup. The cache size should start at 0
+        immediately after clear_cache().
+        """
+        # Populate cache
+        first = apps.get_swappable_settings_name("admin.LogEntry")
+        apps.get_models()
+        apps.clear_cache()
+        # After clear, cache should be empty
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        # Recompute: should return same value as before and populate cache anew
+        second = apps.get_swappable_settings_name("admin.LogEntry")
+        self.assertEqual(first, second)
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 1)
+
+    def test_clear_cache_idempotent(self):
+        """
+        Calling clear_cache() multiple times shouldn't raise and should leave
+        caches empty.
+        """
+        apps.get_swappable_settings_name("admin.LogEntry")
+        apps.get_models()
+        apps.clear_cache()
+        apps.clear_cache()
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(apps.get_models.cache_info().currsize, 0)
+
+    def test_clear_cache_when_not_ready(self):
+        """
+        If the registry isn't marked ready, clear_cache() should still clear
+        decorator caches and not attempt model expiration.
+        """
+        # Ensure registry is ready and populate caches first.
+        apps.get_swappable_settings_name("admin.LogEntry")
+        apps.get_models()
+        # Simulate not ready
+        ready_state = apps.ready
+        try:
+            apps.ready = False
+            apps.clear_cache()
+            self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+            self.assertEqual(apps.get_models.cache_info().currsize, 0)
+        finally:
+            apps.ready = ready_state
+
+    def test_clear_cache_after_repopulation_during_expire(self):
+        """
+        Simulate a model's _expire_cache() repopulating the swappable cache
+        during clear_cache(). clear_cache() must ensure the swappable cache is
+        empty once it returns (i.e. it must guard against repopulation during
+        the expiration loop).
+        """
+        # Prime the swappable cache.
+        apps.get_swappable_settings_name("admin.LogEntry")
+        # Make sure models cache exists too.
+        apps.get_models()
+
+        model_meta = TotallyNormal._meta
+        orig_expire = model_meta._expire_cache
+
+        def expire_and_repopulate():
+            # Repopulate the swappable cache during expiry (simulating a
+            # callback that accesses get_swappable_settings_name()).
+            apps.get_swappable_settings_name("admin.LogEntry")
+            return orig_expire()
+
+        try:
+            # Patch the Meta._expire_cache to repopulate on expiration.
+            model_meta._expire_cache = expire_and_repopulate
+            apps.clear_cache()
+            # The swappable cache must be empty after clear_cache() finishes.
+            self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        finally:
+            model_meta._expire_cache = orig_expire
+
+    def test_clear_cache_thread_safety(self):
+        """
+        Ensure that concurrent population and cache clearing results in a
+        cleared swappable cache once clear_cache() finishes.
+        """
+        # Helper to repeatedly call get_swappable_settings_name
+        stop = threading.Event()
+
+        def spam_cache():
+            while not stop.is_set():
+                apps.get_swappable_settings_name("admin.LogEntry")
+
+        thread = threading.Thread(target=spam_cache)
+        thread.start()
+        try:
+            # Give the thread a moment to populate the cache.
+            for _ in range(100):
+                if apps.get_swappable_settings_name.cache_info().currsize:
+                    break
+            apps.clear_cache()
+            # After clear, cache must be empty.
+            self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        finally:
+            stop.set()
+            thread.join()
+
+    @isolate_apps("apps", kwarg_name="local_apps")
+    def test_clear_cache_does_not_corrupt_other_registry(self, local_apps):
+        """
+        Clearing the global apps registry cache must not corrupt another Apps
+        instance created for isolation. Both registries should be usable.
+        """
+        # Create a separate registry and populate its caches.
+        local_registry = local_apps
+        local_registry.get_models()
+        local_registry.get_swappable_settings_name("apps.TotallyNormal")
+        # Populate global caches as well.
+        apps.get_models()
+        apps.get_swappable_settings_name("admin.LogEntry")
+        # Clear global caches.
+        apps.clear_cache()
+        # Global caches empty:
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(apps.get_models.cache_info().currsize, 0)
+        # Local registry caches should still be usable (they are separate objects).
+        # A call to a local registry method should return without raising.
+        # (We don't assert cache sizes of the local registry here since the
+        # callable decorators belong to the local Apps instance.)
+        local_registry.get_models()
+        local_registry.get_swappable_settings_name("apps.TotallyNormal")
+
+    def test_clear_cache_clears_multiple_keys(self):
+        """
+        Populate the swappable cache with multiple distinct lookups and ensure
+        clear_cache() clears all of them.
+        """
+        apps.get_swappable_settings_name("admin.LogEntry")
+        apps.get_swappable_settings_name("admin.LogEntry")  # idempotent call
+        # Use a second (likely-None) lookup to create another cache entry.
+        apps.get_swappable_settings_name("apps.TotallyNormal")
+        apps.get_models()
+        apps.clear_cache()
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+    def test_clear_cache_preserves_behavior_afterwards(self):
+        """
+        After a clear, normal operation must resume: get_swappable_settings_name
+        should recompute and repopulate cache on demand.
+        """
+        apps.get_swappable_settings_name("admin.LogEntry")
+        apps.get_models()
+        apps.clear_cache()
+        # Recompute should populate the cache again.
+        val = apps.get_swappable_settings_name("admin.LogEntry")
+        self.assertIsNone(val)  # same semantics as earlier tests
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 1)

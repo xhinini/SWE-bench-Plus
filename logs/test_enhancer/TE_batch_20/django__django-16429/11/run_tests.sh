@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 utils_tests.test_timesince_llm.AdditionalTimesinceTZTests.setUp utils_tests.test_timesince_llm.AdditionalTimesinceTZTests.test_aware_depth_behavior utils_tests.test_timesince_llm.AdditionalTimesinceTZTests.test_aware_leap_year_week utils_tests.test_timesince_llm.AdditionalTimesinceTZTests.test_aware_months_edge_feb28 utils_tests.test_timesince_llm.AdditionalTimesinceTZTests.test_aware_months_edge_same_results_as_naive_1 utils_tests.test_timesince_llm.AdditionalTimesinceTZTests.test_aware_months_edge_same_results_as_naive_2 utils_tests.test_timesince_llm.AdditionalTimesinceTZTests.test_aware_pivot_preserves_tzinfo_no_typeerror utils_tests.test_timesince_llm.AdditionalTimesinceTZTests.test_aware_thousand_years_ago utils_tests.test_timesince_llm.AdditionalTimesinceTZTests.test_aware_timesince_with_different_timezones utils_tests.test_timesince_llm.AdditionalTimesinceTZTests.test_aware_timesince_year_and_month utils_tests.test_timesince_llm.AdditionalTimesinceTZTests.test_aware_timeuntil_year_and_month
+coverage json -o coverage.json
+: '>>>>> End Test Output'

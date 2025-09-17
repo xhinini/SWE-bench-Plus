@@ -1,0 +1,171 @@
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
+import types
+from types import SimpleNamespace, ModuleType
+from unittest.mock import patch
+from django.test import TestCase, override_settings
+
+from django.db.migrations.loader import MigrationLoader
+
+class LoaderModuleAttributesTests(TestCase):
+    """
+    Tests for MigrationLoader.load_disk() handling of module __file__ and __path__.
+    """
+
+    def setUp(self):
+        # Simple Migration class to be returned by fake migration modules.
+        class SimpleMigration:
+            dependencies = []
+            run_before = []
+            replaces = []
+            atomic = True
+            def __init__(self, name, app_label):
+                self.name = name
+                self.app_label = app_label
+        self.SimpleMigration = SimpleMigration
+        # A fake app config to be returned by apps.get_app_configs()
+        self.app_config = SimpleNamespace(label='fakeapp', name='fakeapp')
+
+    def _run_loader_with_module(self, module_obj):
+        """
+        Helper that patches the loader's import_module, pkgutil.iter_modules,
+        and apps.get_app_configs to use the provided module_obj for
+        'fakeapp.migrations' and a fake migration submodule.
+        Returns the constructed loader after load_disk() is called.
+        """
+        migration_name = '0001_initial'
+        migration_path = 'fakeapp.migrations.%s' % migration_name
+        migration_module = SimpleNamespace(Migration=self.SimpleMigration)
+
+        def import_side_effect(name, *args, **kwargs):
+            if name == 'fakeapp.migrations':
+                return module_obj
+            if name == migration_path:
+                return migration_module
+            # For any other import, fall back to the real import_module
+            from importlib import import_module as _real_import
+            return _real_import(name)
+
+        # Make pkgutil.iter_modules yield our single migration name.
+        iter_result = [(None, migration_name, False)]
+
+        with patch('django.db.migrations.loader.import_module', side_effect=import_side_effect) as mocked_import:
+            with patch('django.db.migrations.loader.pkgutil.iter_modules', return_value=iter_result):
+                with patch('django.apps.apps.get_app_configs', return_value=[self.app_config]):
+                    loader = MigrationLoader(connection=None, load=False)
+                    loader.load_disk()
+                    return loader
+
+    @override_settings(MIGRATION_MODULES={'fakeapp': 'fakeapp.migrations'})
+    def test_regular_package_without_file_loads_migrations(self):
+        """Regular package with __file__ == None and __path__ as list should load."""
+        module = ModuleType('fakeapp.migrations')
+        module.__file__ = None
+        module.__path__ = ['/some/path']  # list => regular package
+        loader = self._run_loader_with_module(module)
+        self.assertIn(('fakeapp', '0001_initial'), loader.disk_migrations)
+        self.assertIn('fakeapp', loader.migrated_apps)
+        self.assertNotIn('fakeapp', loader.unmigrated_apps)
+
+    @override_settings(MIGRATION_MODULES={'fakeapp': 'fakeapp.migrations'})
+    def test_namespace_package_ignored_based_on_path_type(self):
+        """Namespace package (no __file__ and non-list __path__) should be ignored."""
+        module = ModuleType('fakeapp.migrations')
+        module.__file__ = None
+        # custom iterable, not a list
+        class CustomPath:
+            def __iter__(self): yield '/some/path'
+        module.__path__ = CustomPath()
+        loader = self._run_loader_with_module(module)
+        self.assertNotIn(('fakeapp', '0001_initial'), loader.disk_migrations)
+        self.assertIn('fakeapp', loader.unmigrated_apps)
+
+    @override_settings(MIGRATION_MODULES={'fakeapp': 'fakeapp.migrations'})
+    def test_module_file_without_path_ignored(self):
+        """Module file (no __path__) should be ignored regardless of __file__."""
+        module = ModuleType('fakeapp.migrations')
+        module.__file__ = '/some/path/migrations.py'  # normal module file
+        # deliberately no __path__ attribute
+        if hasattr(module, '__path__'):
+            delattr(module, '__path__')
+        loader = self._run_loader_with_module(module)
+        self.assertNotIn(('fakeapp', '0001_initial'), loader.disk_migrations)
+        self.assertIn('fakeapp', loader.unmigrated_apps)
+
+    @override_settings(MIGRATION_MODULES={'fakeapp': 'fakeapp.migrations'})
+    def test_package_with_non_none_file_and_path_list_loads(self):
+        """Regular package with __file__ present and list __path__ should load."""
+        module = ModuleType('fakeapp.migrations')
+        module.__file__ = '/some/path/__init__.py'
+        module.__path__ = ['/some/path']
+        loader = self._run_loader_with_module(module)
+        self.assertIn(('fakeapp', '0001_initial'), loader.disk_migrations)
+        self.assertIn('fakeapp', loader.migrated_apps)
+
+    @override_settings(MIGRATION_MODULES={'fakeapp': 'fakeapp.migrations'})
+    def test_list_subclass_path_with_no_file_loads(self):
+        """__path__ as a list subclass and __file__ == None should be treated as package."""
+        class MyList(list):
+            pass
+        module = ModuleType('fakeapp.migrations')
+        module.__file__ = None
+        module.__path__ = MyList(['/some/path'])
+        loader = self._run_loader_with_module(module)
+        self.assertIn(('fakeapp', '0001_initial'), loader.disk_migrations)
+        self.assertIn('fakeapp', loader.migrated_apps)
+
+    @override_settings(MIGRATION_MODULES={'fakeapp': 'fakeapp.migrations'})
+    def test_tuple_path_and_no_file_ignored(self):
+        """__path__ as a tuple (not list) with __file__ None is a namespace -> ignored."""
+        module = ModuleType('fakeapp.migrations')
+        module.__file__ = None
+        module.__path__ = ('/some/path',)  # tuple, not list
+        loader = self._run_loader_with_module(module)
+        self.assertNotIn(('fakeapp', '0001_initial'), loader.disk_migrations)
+        self.assertIn('fakeapp', loader.unmigrated_apps)
+
+    @override_settings(MIGRATION_MODULES={'fakeapp': 'fakeapp.migrations'})
+    def test_empty_list_path_with_no_file_counts_as_migrated(self):
+        """
+        An empty list __path__ with __file__ == None should still be considered
+        a regular package (not a namespace), so the app is treated as migrated
+        even if no migration modules are found.
+        """
+        module = ModuleType('fakeapp.migrations')
+        module.__file__ = None
+        module.__path__ = []  # empty list still a list instance
+        loader = self._run_loader_with_module(module)
+        # No migrations will be loaded (no files), but app should be marked migrated.
+        self.assertEqual(
+            [name for app, name in loader.disk_migrations if app == 'fakeapp'],
+            []
+        )
+        self.assertIn('fakeapp', loader.migrated_apps)
+        self.assertNotIn('fakeapp', loader.unmigrated_apps)
+
+    @override_settings(MIGRATION_MODULES={'fakeapp': 'fakeapp.migrations'})
+    def test_custom_path_object_that_is_list_subclass_loads(self):
+        """A custom object that subclasses list should be treated as list and load."""
+        class CustomList(list):
+            pass
+        pl = CustomList(['/some/path'])
+        module = ModuleType('fakeapp.migrations')
+        module.__file__ = None
+        module.__path__ = pl
+        loader = self._run_loader_with_module(module)
+        self.assertIn(('fakeapp', '0001_initial'), loader.disk_migrations)
+        self.assertIn('fakeapp', loader.migrated_apps)
+
+    @override_settings(MIGRATION_MODULES={'fakeapp': 'fakeapp.migrations'})
+    def test_no_file_no_path_attribute_ignored(self):
+        """Module with no __file__ attribute and no __path__ should be ignored."""
+        module = ModuleType('fakeapp.migrations')
+        # remove __file__ attribute entirely to simulate absence
+        if hasattr(module, '__file__'):
+            delattr(module, '__file__')
+        # ensure no __path__
+        if hasattr(module, '__path__'):
+            delattr(module, '__path__')
+        loader = self._run_loader_with_module(module)
+        self.assertNotIn(('fakeapp', '0001_initial'), loader.disk_migrations)
+        self.assertIn('fakeapp', loader.unmigrated_apps)

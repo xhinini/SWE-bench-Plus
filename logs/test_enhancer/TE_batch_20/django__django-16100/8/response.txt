@@ -1,0 +1,261 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These tests verify that the changelist bulk-edit path in ModelAdmin uses
+  transaction.atomic(...) with the correct 'using' argument (the database alias
+  returned by router.db_for_write(self.model)). They patch the atomic context
+  manager in django.contrib.admin.options and router.db_for_write to record the
+  'using' value passed to atomic. The gold patch calls transaction.atomic with
+  using=router.db_for_write(self.model), so the recorded value should match the
+  router return value. The candidate patch calls transaction.atomic() without
+  the using argument, which will result in recorded value None and cause the
+  tests to fail. The tests exercise several permutations (single change,
+  multiple changes, no changes, and when log_change raises) and different router
+  return values to ensure the fix is enforced.
+test_code: |
+  @override_settings(ROOT_URLCONF="admin_changelist.urls")
+  class ChangelistAtomicUsingTests(TestCase):
+      """
+      Tests that ensure django.contrib.admin.options.changelist_view uses
+      transaction.atomic(using=router.db_for_write(self.model)) when processing
+      list_editable POSTs.
+      """
+
+      def setUp(self):
+          # create a superuser for the tests
+          self.superuser = User.objects.create_superuser(
+              username="atomic_super", email="a@b.com", password="xxx"
+          )
+          self.client.force_login(self.superuser)
+          self.changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+
+      def _post_swallow_changelist(self, data, router_return, expect_exception=None):
+          """
+          Helper that patches transaction.atomic and router.db_for_write.
+          Returns the list of 'using' values passed to atomic.
+          If expect_exception is provided, asserts that posting raises it.
+          """
+          atomic_calls = []
+
+          def atomic_side_effect(*args, **kwargs):
+              # Record the 'using' kwarg value (may be None if not provided).
+              atomic_calls.append(kwargs.get("using"))
+              class CM:
+                  def __enter__(self_inner):
+                      return None
+
+                  def __exit__(self_inner, exc_type, exc, tb):
+                      # Don't swallow exceptions.
+                      return False
+
+              return CM()
+
+          with mock.patch("django.contrib.admin.options.transaction.atomic", side_effect=atomic_side_effect):
+              with mock.patch("django.contrib.admin.options.router.db_for_write", return_value=router_return):
+                  if expect_exception:
+                      with self.assertRaises(expect_exception):
+                          self.client.post(self.changelist_url, data)
+                  else:
+                      response = self.client.post(self.changelist_url, data)
+                      # ensure the view processed (redirect on success)
+                      self.assertIn(response.status_code, (200, 302))
+          return atomic_calls
+
+      def test_atomic_called_with_using_single_change(self):
+          # Two swallows, change one row's fields.
+          a = Swallow.objects.create(origin="A", load=1, speed=1)
+          b = Swallow.objects.create(origin="B", load=2, speed=2)
+          data = {
+              "form-TOTAL_FORMS": "2",
+              "form-INITIAL_FORMS": "2",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(a.pk),
+              "form-1-uuid": str(b.pk),
+              "form-0-load": "9.0",
+              "form-0-speed": "3.0",
+              "form-1-load": "2.0",
+              "form-1-speed": "2.0",
+              "_save": "Save",
+          }
+          atomic_calls = self._post_swallow_changelist(data, router_return="other_db")
+          # atomic must be called once with using equal to router return.
+          self.assertEqual(atomic_calls, ["other_db"])
+
+      def test_atomic_called_with_using_when_log_change_raises(self):
+          # Ensure atomic is still used (with the router return) when log_change
+          # raises DatabaseError, triggering a rollback.
+          a = Swallow.objects.create(origin="A", load=4, speed=1)
+          b = Swallow.objects.create(origin="B", load=2, speed=2)
+          data = {
+              "form-TOTAL_FORMS": "2",
+              "form-INITIAL_FORMS": "2",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(a.pk),
+              "form-1-uuid": str(b.pk),
+              "form-0-load": "9.0",
+              "form-0-speed": "3.0",
+              "form-1-load": "2.0",
+              "form-1-speed": "2.0",
+              "_save": "Save",
+          }
+          # Patch ModelAdmin.log_change to raise DatabaseError on call.
+          with mock.patch("django.contrib.admin.ModelAdmin.log_change", side_effect=DatabaseError):
+              atomic_calls = []
+              def atomic_side_effect(*args, **kwargs):
+                  atomic_calls.append(kwargs.get("using"))
+                  class CM:
+                      def __enter__(self_inner):
+                          return None
+                      def __exit__(self_inner, exc_type, exc, tb):
+                          return False
+                  return CM()
+              with mock.patch("django.contrib.admin.options.transaction.atomic", side_effect=atomic_side_effect):
+                  with mock.patch("django.contrib.admin.options.router.db_for_write", return_value="DB_X"):
+                      with self.assertRaises(DatabaseError):
+                          self.client.post(self.changelist_url, data)
+              self.assertEqual(atomic_calls, ["DB_X"])
+
+      def test_atomic_called_with_using_multiple_changed_forms(self):
+          # Multiple changed forms in the formset should still be wrapped with single atomic
+          a = Swallow.objects.create(origin="A", load=1, speed=1)
+          b = Swallow.objects.create(origin="B", load=2, speed=2)
+          c = Swallow.objects.create(origin="C", load=3, speed=3)
+          data = {
+              "form-TOTAL_FORMS": "3",
+              "form-INITIAL_FORMS": "3",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(a.pk),
+              "form-1-uuid": str(b.pk),
+              "form-2-uuid": str(c.pk),
+              "form-0-load": "10.0",
+              "form-0-speed": "10.0",
+              "form-1-load": "20.0",
+              "form-1-speed": "20.0",
+              "form-2-load": "3.0",
+              "form-2-speed": "3.0",
+              "_save": "Save",
+          }
+          atomic_calls = self._post_swallow_changelist(data, router_return="multi_db")
+          self.assertEqual(atomic_calls, ["multi_db"])
+
+      def test_atomic_called_with_using_when_no_forms_changed(self):
+          # If no forms have changed (all POSTed values equal initial), atomic should still be used.
+          a = Swallow.objects.create(origin="A", load=4, speed=1)
+          b = Swallow.objects.create(origin="B", load=2, speed=2)
+          data = {
+              "form-TOTAL_FORMS": "2",
+              "form-INITIAL_FORMS": "2",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(a.pk),
+              "form-1-uuid": str(b.pk),
+              # Post same values as current so forms have not changed.
+              "form-0-load": str(a.load),
+              "form-0-speed": str(a.speed),
+              "form-1-load": str(b.load),
+              "form-1-speed": str(b.speed),
+              "_save": "Save",
+          }
+          atomic_calls = self._post_swallow_changelist(data, router_return="some_db")
+          self.assertEqual(atomic_calls, ["some_db"])
+
+      def test_atomic_called_with_using_when_router_returns_default(self):
+          # When router returns 'default', atomic should be called with 'default'
+          a = Swallow.objects.create(origin="A", load=1, speed=1)
+          b = Swallow.objects.create(origin="B", load=2, speed=2)
+          data = {
+              "form-TOTAL_FORMS": "2",
+              "form-INITIAL_FORMS": "2",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(a.pk),
+              "form-1-uuid": str(b.pk),
+              "form-0-load": "11.0",
+              "form-0-speed": "6.0",
+              "form-1-load": "2.0",
+              "form-1-speed": "2.0",
+              "_save": "Save",
+          }
+          atomic_calls = self._post_swallow_changelist(data, router_return="default")
+          self.assertEqual(atomic_calls, ["default"])
+
+      def test_atomic_called_with_using_different_router_aliases_1(self):
+          # Another alias case
+          a = Swallow.objects.create(origin="A", load=7, speed=7)
+          b = Swallow.objects.create(origin="B", load=8, speed=8)
+          data = {
+              "form-TOTAL_FORMS": "2",
+              "form-INITIAL_FORMS": "2",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(a.pk),
+              "form-1-uuid": str(b.pk),
+              "form-0-load": "77.0",
+              "form-0-speed": "77.0",
+              "form-1-load": "88.0",
+              "form-1-speed": "88.0",
+              "_save": "Save",
+          }
+          atomic_calls = self._post_swallow_changelist(data, router_return="custom_db_1")
+          self.assertEqual(atomic_calls, ["custom_db_1"])
+
+      def test_atomic_called_with_using_different_router_aliases_2(self):
+          # Yet another alias case
+          a = Swallow.objects.create(origin="A", load=21, speed=21)
+          b = Swallow.objects.create(origin="B", load=22, speed=22)
+          data = {
+              "form-TOTAL_FORMS": "2",
+              "form-INITIAL_FORMS": "2",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(a.pk),
+              "form-1-uuid": str(b.pk),
+              "form-0-load": "121.0",
+              "form-0-speed": "121.0",
+              "form-1-load": "222.0",
+              "form-1-speed": "222.0",
+              "_save": "Save",
+          }
+          atomic_calls = self._post_swallow_changelist(data, router_return="tenant_db")
+          self.assertEqual(atomic_calls, ["tenant_db"])
+
+      def test_atomic_called_with_using_after_partial_failure(self):
+          # Simulate first log_change succeeds, second raises. atomic must be used and called with router return.
+          a = Swallow.objects.create(origin="A", load=1, speed=1)
+          b = Swallow.objects.create(origin="B", load=2, speed=2)
+          data = {
+              "form-TOTAL_FORMS": "2",
+              "form-INITIAL_FORMS": "2",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(a.pk),
+              "form-1-uuid": str(b.pk),
+              "form-0-load": "9.0",
+              "form-0-speed": "3.0",
+              "form-1-load": "5.0",
+              "form-1-speed": "1.0",
+              "_save": "Save",
+          }
+          # First call returns None (normal), second raises DatabaseError
+          with mock.patch(
+              "django.contrib.admin.ModelAdmin.log_change", side_effect=[None, DatabaseError]
+          ):
+              atomic_calls = []
+              def atomic_side_effect(*args, **kwargs):
+                  atomic_calls.append(kwargs.get("using"))
+                  class CM:
+                      def __enter__(self_inner):
+                          return None
+                      def __exit__(self_inner, exc_type, exc, tb):
+                          return False
+                  return CM()
+              with mock.patch("django.contrib.admin.options.transaction.atomic", side_effect=atomic_side_effect):
+                  with mock.patch("django.contrib.admin.options.router.db_for_write", return_value="failover_db"):
+                      with self.assertRaises(DatabaseError):
+                          self.client.post(self.changelist_url, data)
+              self.assertEqual(atomic_calls, ["failover_db"])
+new_imports_code: |
+  # No new imports required; tests reuse existing imports at the top of the file.

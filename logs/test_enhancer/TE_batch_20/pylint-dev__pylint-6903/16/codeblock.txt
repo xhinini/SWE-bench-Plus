@@ -1,0 +1,193 @@
+# No additional imports beyond those already present at top of this test module.
+# Licensed under the GPL: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+# For details: https://github.com/PyCQA/pylint/blob/main/LICENSE
+# Copyright (c) https://github.com/PyCQA/pylint/blob/main/CONTRIBUTORS.txt
+# pylint: disable=missing-module-docstring, missing-function-docstring
+
+from __future__ import annotations
+
+import os
+import pathlib
+import sys
+from collections.abc import Callable
+from unittest.mock import MagicMock, mock_open, patch
+
+import pytest
+from py._path.local import LocalPath  # type: ignore[import]
+
+from pylint.lint import Run
+from pylint.lint.run import _query_cpu, _cpu_count
+from pylint.testutils import GenericTestReporter as Reporter
+
+# Helper to create a mock open and Path for specific cgroup files
+def _make_file_mocks(file_contents: dict):
+    """
+    file_contents: mapping of file path -> string content to be returned by open(...).read()
+    """
+    builtin_open = open
+
+    def _mock_open(path, *args, **kwargs):
+        # path may be passed as Path object sometimes; coerce to str
+        p = path if isinstance(path, str) else str(path)
+        if p in file_contents:
+            return mock_open(read_data=file_contents[p])()
+        return builtin_open(path, *args, **kwargs)
+
+    real_pathlib_Path = pathlib.Path
+
+    def _mock_path(*args, **kwargs):
+        p = args[0] if args else ""
+        # If the path is one we are mocking, return an object with is_file=True
+        if p in file_contents:
+            return MagicMock(is_file=lambda: True)
+        # Otherwise behave like the real pathlib.Path
+        return real_pathlib_Path(*args, **kwargs)
+
+    return _mock_open, _mock_path
+
+@pytest.mark.parametrize(
+    "quota,period",
+    [
+        # quota smaller than period -> int(quota/period) == 0 (fractional)
+        ("50000\n", "100000\n"),
+        # whitespace/newline handling
+        (" 50000 \n", "100000\n"),
+    ],
+)
+def test_jobs_zero_quota_fraction_small_exit_ok(tmpdir: LocalPath, quota: str, period: str) -> None:
+    """When cfs_quota < cfs_period producing 0 CPUs, Run should still exit 0 (normalize to 1)."""
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": quota,
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": period,
+    }
+    _mock_open, _mock_path = _make_file_mocks(file_contents)
+
+    # Ensure multiprocessing is present so we test the normal codepath (no fallback)
+    with tmpdir.as_cwd():
+        with pytest.raises(SystemExit) as err:
+            with patch("builtins.open", _mock_open):
+                with patch("pylint.lint.run.Path", _mock_path):
+                    Run([str(__file__), "--jobs=0"], reporter=Reporter())
+        assert err.value.code == 0
+
+def test_query_cpu_normalizes_quota_fraction_to_one(tmpdir: LocalPath) -> None:
+    """Direct call to _query_cpu should return 1 when quota < period (fractional)."""
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "50000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    _mock_open, _mock_path = _make_file_mocks(file_contents)
+
+    with tmpdir.as_cwd():
+        with patch("builtins.open", _mock_open):
+            with patch("pylint.lint.run.Path", _mock_path):
+                assert _query_cpu() == 1
+
+def test_jobs_zero_quota_precedence_over_shares(tmpdir: LocalPath) -> None:
+    """
+    When both quota/period and cpu.shares are present, quota/period takes precedence.
+    If quota produces a fractional cpu (0) it must be normalized to 1.
+    """
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "50000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+        "/sys/fs/cgroup/cpu/cpu.shares": "2048\n",  # would give 2 if used
+    }
+    _mock_open, _mock_path = _make_file_mocks(file_contents)
+
+    with tmpdir.as_cwd():
+        with pytest.raises(SystemExit) as err:
+            with patch("builtins.open", _mock_open):
+                with patch("pylint.lint.run.Path", _mock_path):
+                    Run([str(__file__), "--jobs=0"], reporter=Reporter())
+        assert err.value.code == 0
+
+@pytest.mark.parametrize("quota,period,expected", [
+    ("100000\n", "100000\n", 1),  # exact one
+    ("300000\n", "100000\n", 3),  # multiple CPUs
+])
+def test_jobs_zero_quota_non_fractional(tmpdir: LocalPath, quota: str, period: str, expected: int) -> None:
+    """Sanity check: non-fractional quota/period values return expected CPU counts and Run succeeds."""
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": quota,
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": period,
+    }
+    _mock_open, _mock_path = _make_file_mocks(file_contents)
+
+    with tmpdir.as_cwd():
+        with pytest.raises(SystemExit) as err:
+            with patch("builtins.open", _mock_open):
+                with patch("pylint.lint.run.Path", _mock_path):
+                    Run([str(__file__), "--jobs=0"], reporter=Reporter())
+        assert err.value.code == 0
+        # Also check that _query_cpu reflects the expected value (>=1)
+        with patch("builtins.open", _mock_open):
+            with patch("pylint.lint.run.Path", _mock_path):
+                assert _query_cpu() == expected
+
+def test_query_cpu_quota_fraction_with_sched_affinity(tmpdir: LocalPath) -> None:
+    """
+    If sched_getaffinity reports multiple CPUs but quota/period would yield 0,
+    the final cpu count should still be normalized to 1 (min(cpu_share, cpu_count) where cpu_share is treated as >=1).
+    """
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "50000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    _mock_open, _mock_path = _make_file_mocks(file_contents)
+
+    # Mock sched_getaffinity to return a set of two CPUs
+    def fake_sched(pid):
+        return {0, 1}
+
+    with tmpdir.as_cwd():
+        with pytest.raises(SystemExit) as err:
+            with patch("builtins.open", _mock_open):
+                with patch("pylint.lint.run.Path", _mock_path):
+                    with patch("pylint.lint.run.os.sched_getaffinity", fake_sched):
+                        # call Run: should normalize fractional quota to 1 and exit 0
+                        Run([str(__file__), "--jobs=0"], reporter=Reporter())
+        assert err.value.code == 0
+
+def test_query_cpu_quota_fraction_with_multiprocessing_cpu_count(tmpdir: LocalPath) -> None:
+    """
+    Ensure that even when multiprocessing.cpu_count() is available, a fractional quota
+    (quota < period) yields a minimum of 1 CPU rather than 0.
+    """
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "50000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    _mock_open, _mock_path = _make_file_mocks(file_contents)
+
+    with tmpdir.as_cwd():
+        with pytest.raises(SystemExit) as err:
+            with patch("builtins.open", _mock_open):
+                with patch("pylint.lint.run.Path", _mock_path):
+                    # Ensure sched_getaffinity is not used in this scenario
+                    with patch("pylint.lint.run.os.sched_getaffinity", None):
+                        # Ensure multiprocessing.cpu_count returns a positive value
+                        with patch("pylint.lint.run.multiprocessing.cpu_count", lambda: 4):
+                            Run([str(__file__), "--jobs=0"], reporter=Reporter())
+        assert err.value.code == 0
+
+def test_query_cpu_shares_fraction_normalized(tmpdir: LocalPath) -> None:
+    """
+    cpu.shares small enough to produce 0 when divided by 1024 should be normalized to 1.
+    This is also covered by the model patch, but we include it to ensure consistent behavior.
+    """
+    file_contents = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",  # indicates quota unusable
+        "/sys/fs/cgroup/cpu/cpu.shares": "512\n",  # 512/1024 -> 0
+    }
+    _mock_open, _mock_path = _make_file_mocks(file_contents)
+
+    with tmpdir.as_cwd():
+        with pytest.raises(SystemExit) as err:
+            with patch("builtins.open", _mock_open):
+                with patch("pylint.lint.run.Path", _mock_path):
+                    Run([str(__file__), "--jobs=0"], reporter=Reporter())
+        assert err.value.code == 0
+        with patch("builtins.open", _mock_open):
+            with patch("pylint.lint.run.Path", _mock_path):
+                assert _query_cpu() == 1

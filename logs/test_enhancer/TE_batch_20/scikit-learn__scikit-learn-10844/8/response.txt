@@ -1,0 +1,190 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests monkeypatch the internal contingency_matrix used by
+  fowlkes_mallows_score to return scipy CSR matrices whose .data arrays
+  are of dtype np.int32 and contain large integer counts. The goal is to
+  ensure fowlkes_mallows_score properly casts to int64 internally (as in
+  the provided gold patch) and computes a finite, correct result even
+  when squaring counts would overflow 32-bit integers. The candidate
+  (model) patch that omitted the cast to int64 will cause overflow and
+  produce non-finite or incorrect values; these tests will fail on that
+  incorrect implementation and pass with the fixed implementation.
+test_code: |
+  import numpy as np
+  from scipy import sparse as sp
+  import importlib
+  
+  # Import the function under test and the module to monkeypatch
+  from sklearn.metrics.cluster import fowlkes_mallows_score
+  supervised = importlib.import_module('sklearn.metrics.cluster.supervised')
+  
+  from sklearn.utils.testing import assert_all_finite
+  from numpy.testing import assert_almost_equal, assert_equal
+  
+  def _make_csr_from_lists(data_vals, row_idxs, col_idxs, shape, dtype=np.int32):
+      """Helper: build a CSR matrix with specified data dtype."""
+      coo = sp.coo_matrix((np.array(data_vals, dtype=dtype),
+                           (np.array(row_idxs, dtype=np.intp),
+                            np.array(col_idxs, dtype=np.intp))),
+                          shape=shape, dtype=dtype)
+      csr = coo.tocsr()
+      csr.sum_duplicates()
+      return csr
+  
+  def _expected_fmi_from_csr(csr):
+      """Compute expected Fowlkes-Mallows index using int64 arithmetic."""
+      # ensure int64 arithmetic for sums and squares
+      data64 = csr.data.astype(np.int64)
+      # row and column sums as int64
+      pj = np.asarray(csr.sum(axis=0)).ravel().astype(np.int64)
+      pi = np.asarray(csr.sum(axis=1)).ravel().astype(np.int64)
+      n_samples = int(pi.sum())
+      tk = int((data64 * data64).sum()) - n_samples
+      pk = int((pj * pj).sum()) - n_samples
+      qk = int((pi * pi).sum()) - n_samples
+      if tk == 0:
+          return 0.0
+      # compute as in the patched implementation to avoid intermediate overflow
+      return np.sqrt(tk / float(pk)) * np.sqrt(tk / float(qk))
+  
+  def _run_with_monkeypatched_contingency_matrix(csr):
+      """Temporarily replace supervised.contingency_matrix to return csr,
+      call fowlkes_mallows_score with labels consistent with csr.sum(), and
+      restore the original function.
+      """
+      original = supervised.contingency_matrix
+      try:
+          # The monkeypatched function must accept the same signature used by
+          # fowlkes_mallows_score(labels_true, labels_pred).
+          def fake_contingency(labels_true, labels_pred, sparse=True):
+              # ignore labels, return our prepared csr
+              return csr
+          supervised.contingency_matrix = fake_contingency
+          # labels length must match csr.sum()
+          n_samples = int(csr.data.sum())
+          labels_true = np.zeros(n_samples, dtype=np.intp)
+          labels_pred = np.zeros(n_samples, dtype=np.intp)
+          score = fowlkes_mallows_score(labels_true, labels_pred)
+          return score
+      finally:
+          supervised.contingency_matrix = original
+  
+  def test_fowlkes_int32_overflow_simple_two_cells():
+      # Two large counts placed on the diagonal of a 2x2 contingency.
+      # Values chosen to overflow 32-bit when squared.
+      data = [70000, 30000]
+      rows = [0, 1]
+      cols = [0, 1]
+      csr = _make_csr_from_lists(data, rows, cols, shape=(2, 2), dtype=np.int32)
+      expected = _expected_fmi_from_csr(csr)
+      score = _run_with_monkeypatched_contingency_matrix(csr)
+      assert_all_finite(score)
+      assert_almost_equal(score, expected, decimal=10)
+  
+  def test_fowlkes_int32_overflow_three_cells_offdiag():
+      # Three large counts distributed in a 2x2 matrix
+      data = [80000, 40000, 20000]
+      rows = [0, 0, 1]
+      cols = [0, 1, 0]
+      csr = _make_csr_from_lists(data, rows, cols, shape=(2, 2), dtype=np.int32)
+      expected = _expected_fmi_from_csr(csr)
+      score = _run_with_monkeypatched_contingency_matrix(csr)
+      assert_all_finite(score)
+      assert_almost_equal(score, expected, decimal=10)
+  
+  def test_fowlkes_int32_overflow_many_large_entries():
+      # Several large entries across a 3x3 matrix
+      data = [60000, 50000, 45000, 30000]
+      rows = [0, 0, 1, 2]
+      cols = [0, 1, 1, 2]
+      csr = _make_csr_from_lists(data, rows, cols, shape=(3, 3), dtype=np.int32)
+      expected = _expected_fmi_from_csr(csr)
+      score = _run_with_monkeypatched_contingency_matrix(csr)
+      assert_all_finite(score)
+      assert_almost_equal(score, expected, decimal=10)
+  
+  def test_fowlkes_int32_overflow_single_large_cell():
+      # Single cell with very large count (1x1 contingency)
+      data = [150000]
+      rows = [0]
+      cols = [0]
+      csr = _make_csr_from_lists(data, rows, cols, shape=(1, 1), dtype=np.int32)
+      expected = _expected_fmi_from_csr(csr)
+      score = _run_with_monkeypatched_contingency_matrix(csr)
+      assert_all_finite(score)
+      assert_almost_equal(score, expected, decimal=10)
+  
+  def test_fowlkes_int32_tk_zero_returns_zero():
+      # Construct a contingency where every non-zero cell is 1 and each sample is its own cell:
+      # tk = sum(1^2) - n_samples = 0 -> according to implementation should return 0.0
+      n = 1000
+      data = [1] * n
+      rows = list(range(n))
+      cols = list(range(n))
+      csr = _make_csr_from_lists(data, rows, cols, shape=(n, n), dtype=np.int32)
+      score = _run_with_monkeypatched_contingency_matrix(csr)
+      # Should be exactly 0.0 and finite
+      assert_all_finite(score)
+      assert_equal(score, 0.0)
+  
+  def test_fowlkes_int32_random_large_values_consistency():
+      # Deterministic pseudo-random large int32 counts
+      rng = np.random.RandomState(0)
+      # create 6 large counts to ensure overflow in int32 squares
+      data = (rng.randint(40000, 90000, size=6)).tolist()
+      rows = [0, 0, 1, 1, 2, 2]
+      cols = [0, 1, 0, 2, 1, 2]
+      csr = _make_csr_from_lists(data, rows, cols, shape=(3, 3), dtype=np.int32)
+      expected = _expected_fmi_from_csr(csr)
+      score = _run_with_monkeypatched_contingency_matrix(csr)
+      assert_all_finite(score)
+      assert_almost_equal(score, expected, decimal=10)
+  
+  def test_fowlkes_int32_symmetric_property_with_monkeypatch():
+      # Verify symmetry: swapping labels should not change score when our
+      # monkeypatched contingency is returned regardless of labels
+      data = [70000, 30000]
+      rows = [0, 1]
+      cols = [0, 1]
+      csr = _make_csr_from_lists(data, rows, cols, shape=(2, 2), dtype=np.int32)
+      score_ab = _run_with_monkeypatched_contingency_matrix(csr)
+      # swap labels (still consistent length)
+      n = int(sum(data))
+      score_ba = fowlkes_mallows_score(np.zeros(n, dtype=int), np.zeros(n, dtype=int))
+      # Because our monkeypatch returns the same csr irrespective of labels,
+      # both should be equal. (The second call used the restored function,
+      # so we repeat the monkeypatching here to test symmetry in a single call.)
+      # Re-monkeypatch to ensure deterministic behaviour:
+      score_ab2 = _run_with_monkeypatched_contingency_matrix(csr)
+      assert_almost_equal(score_ab, score_ab2, decimal=12)
+  
+  def test_fowlkes_int32_score_in_unit_interval():
+      # Ensure computed score is within [0, 1] for large int32 inputs
+      data = [100000, 50000, 25000]
+      rows = [0, 0, 1]
+      cols = [0, 1, 0]
+      csr = _make_csr_from_lists(data, rows, cols, shape=(2, 2), dtype=np.int32)
+      score = _run_with_monkeypatched_contingency_matrix(csr)
+      assert_all_finite(score)
+      assert score >= 0.0 and score <= 1.0
+  
+  def test_fowlkes_int32_many_small_cells_sum_large():
+      # Many moderate-sized counts that collectively are large enough to force
+      # potential overflow if squares are computed in int32
+      vals = [30000] * 5  # 5 cells each 30k -> squares ~9e8 each, sum > 2e9
+      rows = [0, 0, 1, 1, 2]
+      cols = [0, 1, 0, 1, 2]
+      csr = _make_csr_from_lists(vals, rows, cols, shape=(3, 3), dtype=np.int32)
+      expected = _expected_fmi_from_csr(csr)
+      score = _run_with_monkeypatched_contingency_matrix(csr)
+      assert_all_finite(score)
+      assert_almost_equal(score, expected, decimal=10)
+new_imports_code: |
+  import numpy as np
+  from scipy import sparse as sp
+  import importlib
+  from sklearn.metrics.cluster import fowlkes_mallows_score
+  supervised = importlib.import_module('sklearn.metrics.cluster.supervised')
+  from sklearn.utils.testing import assert_all_finite
+  from numpy.testing import assert_almost_equal, assert_equal

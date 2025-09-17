@@ -1,0 +1,175 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise bulk_update() with objects whose attribute values are "expression-like" objects that implement resolve_expression but are not necessarily instances of Django's Expression classes. They ensure bulk_update() treats such objects as expressions (i.e., does not wrap them in Value) and that the expressions are evaluated by the DB update. They cover text and numeric fields, combinations of expressions, use with existing expressions (F, Lower), batch sizes and duplicate objects. The tests should fail if bulk_update() incorrectly treats expression-like instances as plain Python values (for example, by wrapping them in Value) and thus write their Python repr to the DB instead of evaluating the expression.
+new_imports_code: |
+  from django.db.models import F, Value
+  from django.db.models.functions import Lower
+test_code: |
+  from django.test import TestCase
+
+  from django.db import transaction
+  from django.db.models import F, Value
+  from django.db.models.functions import Lower
+
+  from .models import Note, Number, CustomDbColumn, Order, CustomPk
+
+  class DummyExprReturningF:
+      """
+      A custom expression-like object that is NOT a Django Expression subclass
+      but exposes resolve_expression and should therefore be treated like an
+      expression by bulk_update().
+      """
+      def __init__(self, target_field):
+          self.target_field = target_field
+
+      def resolve_expression(self, *args, **kwargs):
+          # Return an actual F() expression for the compiler to use.
+          return F(self.target_field)
+
+      def __repr__(self):
+          return "<DummyExprReturningF(%r)>" % (self.target_field,)
+
+  class DummyExprReturningAdd:
+      """
+      A custom expression-like object that resolves to a real expression
+      combining an F() and Value() so we can test arithmetic-like expressions.
+      """
+      def __init__(self, target_field, addend):
+          self.target_field = target_field
+          self.addend = addend
+
+      def resolve_expression(self, *args, **kwargs):
+          return F(self.target_field) + Value(self.addend)
+
+      def __repr__(self):
+          return "<DummyExprReturningAdd(%r, %r)>" % (self.target_field, self.addend)
+
+  class BulkUpdateExpressionLikeTests(TestCase):
+      def setUp(self):
+          # Create several Note instances for text-expression tests.
+          self.notes = [
+              Note.objects.create(note='note-%s' % i, misc='misc-%s' % i)
+              for i in range(5)
+          ]
+          # Create Number instances for numeric-expression tests.
+          self.numbers = [Number.objects.create(num=0) for _ in range(5)]
+          # CustomDbColumn model has an ip_address and custom_column fields in
+          # the main test suite; create one for testing custom column handling.
+          self.custom = CustomDbColumn.objects.create(custom_column=1)
+
+      def test_bulk_update_with_custom_expr_returning_f_on_text_field(self):
+          # Assign a DummyExprReturningF which resolves to F('note')
+          for note in self.notes:
+              note.misc = DummyExprReturningF('note')
+          Note.objects.bulk_update(self.notes, ['misc'])
+          # misc should equal the value of the note field for each object
+          self.assertCountEqual(
+              Note.objects.values_list('misc', flat=True),
+              [n.note for n in self.notes]
+          )
+
+      def test_bulk_update_with_custom_expr_returning_add_on_integer_field(self):
+          for i, number in enumerate(self.numbers):
+              # Make each number become its index + 5 via resolving expression
+              number.num = DummyExprReturningAdd('num', i + 5)
+          Number.objects.bulk_update(self.numbers, ['num'])
+          # Verify that all values match expected (original num=0 + addend)
+          self.assertCountEqual(Number.objects.values_list('num', flat=True), [i + 5 for i in range(5)])
+
+      def test_bulk_update_with_combined_real_and_dummy_expressions(self):
+          # Mix real expressions (F) and dummy expression-likes to ensure both work
+          for i, note in enumerate(self.notes):
+              if i % 2 == 0:
+                  note.misc = F('note')
+              else:
+                  note.misc = DummyExprReturningF('note')
+          Note.objects.bulk_update(self.notes, ['misc'])
+          self.assertCountEqual(
+              Note.objects.values_list('misc', flat=True),
+              [n.note for n in self.notes]
+          )
+
+      def test_bulk_update_with_function_wrapping_via_dummy_expression(self):
+          # Dummy resolves to F('note') + Value('X'), then wrap with Lower in db side
+          for note in self.notes:
+              # Ensure some are uppercase to validate Lower works in combination
+              note.note = note.note.upper()
+              note.misc = DummyExprReturningAdd('note', '_SUFFIX')
+          Note.objects.bulk_update(self.notes, ['note'])  # apply the uppercase note
+          # Now bulk_update with Lower in the expression-like path by assigning
+          # a Dummy that resolves to Lower(F('note')) via resolve_expression.
+          class DummyLower:
+              def resolve_expression(self, *args, **kwargs):
+                  # Lower(F('note')) is an expression the compiler understands
+                  return Lower(F('note'))
+          for note in self.notes:
+              note.misc = DummyLower()
+          Note.objects.bulk_update(self.notes, ['misc'])
+          # All misc values should be lowercase versions of note
+          self.assertCountEqual(
+              Note.objects.values_list('misc', flat=True),
+              [n.note.lower() for n in self.notes]
+          )
+
+      def test_bulk_update_with_expression_like_on_custom_db_column(self):
+          # Assign DummyExprReturningAdd to custom_column which is an integer-like column
+          self.custom.custom_column = DummyExprReturningAdd('custom_column', 7)
+          CustomDbColumn.objects.bulk_update([self.custom], ['custom_column'])
+          self.custom.refresh_from_db()
+          self.assertEqual(self.custom.custom_column, 1 + 7)
+
+      def test_bulk_update_with_duplicates_and_expression_like_batching(self):
+          # Duplicate entries in list should count as separate updates when they fall into different batches
+          n = Note.objects.create(note='dup-note', misc='x')
+          n.misc = DummyExprReturningF('note')
+          # Pass the same object twice; when using batch_size=1, it should be applied twice
+          rows = Note.objects.bulk_update([n, n], ['misc'], batch_size=1)
+          self.assertEqual(rows, 2)
+          # Value in DB must reflect the expression applied (note field)
+          n.refresh_from_db()
+          self.assertEqual(n.misc, n.note)
+
+      def test_bulk_update_preserves_falsey_pk_and_expression_like(self):
+          # Order model supports pk=0 case; ensure expression-like updates also work
+          order = Order.objects.create(pk=0, name='initial')
+          order.name = DummyExprReturningAdd('name', '_X')
+          Order.objects.bulk_update([order], ['name'])
+          order.refresh_from_db()
+          # Name should be original 'initial' plus suffix
+          self.assertEqual(order.name, 'initial_X')
+
+      def test_bulk_update_custom_pk_and_expression_like_field(self):
+          # Ensure models with custom primary keys work with expression-like updates
+          custom = CustomPk.objects.create(name='pk1', extra='e1')
+          custom.extra = DummyExprReturningAdd('extra', '_updated')
+          CustomPk.objects.bulk_update([custom], ['extra'])
+          custom.refresh_from_db()
+          self.assertEqual(custom.extra, 'e1_updated')
+
+      def test_bulk_update_with_transaction_and_expression_like_values(self):
+          # Ensure bulk_update inside atomic transaction still evaluates expression-like values
+          for number in self.numbers:
+              number.num = DummyExprReturningAdd('num', 2)
+          with transaction.atomic():
+              Number.objects.bulk_update(self.numbers, ['num'])
+          self.assertCountEqual(Number.objects.values_list('num', flat=True), [2] * len(self.numbers))
+
+      def test_bulk_update_with_mixture_of_expression_like_and_none(self):
+          # If some instances use None (set to null) and some use expression-like,
+          # ensure both are handled properly.
+          # Make some notes have None misc, others expression-like mapping from note
+          for i, note in enumerate(self.notes):
+              if i % 2 == 0:
+                  note.misc = None
+              else:
+                  note.misc = DummyExprReturningF('note')
+          Note.objects.bulk_update(self.notes, ['misc'])
+          # Check that the None entries are saved as NULL and the others mirror note
+          db_values = list(Note.objects.order_by('id').values_list('misc', flat=True))
+          expected = []
+          for i, note in enumerate(self.notes):
+              if i % 2 == 0:
+                  expected.append(None)
+              else:
+                  expected.append(note.note)
+          self.assertEqual(db_values, expected)

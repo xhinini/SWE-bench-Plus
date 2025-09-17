@@ -1,0 +1,236 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests create fake migration modules with various combinations of __file__ and __path__ attributes
+  to assert that MigrationLoader.load_disk() makes the correct decision about whether an app is migrated
+  (a regular package with migrations) or unmigrated (a module file or a namespace package). They cover:
+  - regular packages with no __file__ (frozen env support)
+  - namespace packages (custom non-list __path__) with no __file__
+  - module files (no __path__)
+  - packages with __file__ present but non-list __path__
+  - tuple __path__ and list-subclass __path__
+  - attribute-access raising __path__ scenarios
+  - multiple apps in one call
+  These are intended to surface the incorrect behavior introduced by the candidate model patch
+  (incorrect handling or ordering of the __file__/__path__ checks), while passing with the gold patch.
+test_code: |
+  import sys
+  import types
+
+  from django.test import TestCase, override_settings
+  from django.db.migrations.loader import MigrationLoader
+  from django.apps import apps
+
+  class MockAppConfig:
+      def __init__(self, label, name=None):
+          self.label = label
+          self.name = name or label
+
+  class EmptyIterable:
+      def __iter__(self):
+          return iter(())
+
+  class ListSubclass(list):
+      pass
+
+  class AttrErrorModule(types.ModuleType):
+      # simulate attribute access raising AttributeError for __path__
+      def __getattribute__(self, name):
+          if name == '__path__':
+              raise AttributeError("__path__ access not allowed")
+          return super().__getattribute__(name)
+
+  class AdditionalLoaderTests(TestCase):
+      def setUp(self):
+          # Save originals
+          self._orig_get_app_configs = apps.get_app_configs
+          self._orig_get_app_config = apps.get_app_config
+          self._orig_sys_modules = dict(sys.modules)
+
+      def tearDown(self):
+          # Restore apps helpers
+          apps.get_app_configs = self._orig_get_app_configs
+          apps.get_app_config = self._orig_get_app_config
+          # Clean injected modules
+          to_remove = [k for k in sys.modules.keys() if k not in self._orig_sys_modules]
+          for k in to_remove:
+              sys.modules.pop(k, None)
+
+      def _setup_and_load(self, module_name, module_obj, app_label):
+          # Put module into sys.modules
+          sys.modules[module_name] = module_obj
+
+          app_config = MockAppConfig(app_label, name=app_label + "_package")
+          apps.get_app_configs = lambda: [app_config]
+          apps.get_app_config = lambda label: app_config
+
+          # Ensure MIGRATION_MODULES points to our module name
+          loader = MigrationLoader(connection=None, load=False)
+          # Use explicit mapping via MIGRATION_MODULES by directly providing the module name
+          # to migrations_module through settings is simpler via overriding settings at decorator,
+          # but here we directly monkeypatch MigrationLoader.migrations_module for the single call.
+          # However, to keep behavior stable, set the module mapping on the instance by temporarily
+          # setting settings.MIGRATION_MODULES via override_settings in individual tests where needed.
+          return loader
+
+      @override_settings(MIGRATION_MODULES={'app_reg_nofile': 'app_reg_nofile.migrations'})
+      def test_regular_package_no_file(self):
+          """
+          Regular package with no __file__ and a list __path__ should be treated as migrated.
+          """
+          module_name = 'app_reg_nofile.migrations'
+          mod = types.ModuleType(module_name)
+          mod.__path__ = []  # list -> regular package
+          # Ensure __file__ missing to simulate frozen env
+          if hasattr(mod, '__file__'):
+              delattr(mod, '__file__')
+          loader = self._setup_and_load(module_name, mod, 'app_reg_nofile')
+          loader.load_disk()
+          self.assertIn('app_reg_nofile', loader.migrated_apps)
+          self.assertNotIn('app_reg_nofile', loader.unmigrated_apps)
+
+      @override_settings(MIGRATION_MODULES={'app_ns_nofile': 'app_ns_nofile.migrations'})
+      def test_namespace_package_no_file(self):
+          """
+          Namespace package (non-list __path__) and no __file__ must be treated as unmigrated.
+          """
+          module_name = 'app_ns_nofile.migrations'
+          mod = types.ModuleType(module_name)
+          mod.__path__ = EmptyIterable()  # not a list -> namespace
+          if hasattr(mod, '__file__'):
+              delattr(mod, '__file__')
+          loader = self._setup_and_load(module_name, mod, 'app_ns_nofile')
+          loader.load_disk()
+          self.assertIn('app_ns_nofile', loader.unmigrated_apps)
+          self.assertNotIn('app_ns_nofile', loader.migrated_apps)
+
+      @override_settings(MIGRATION_MODULES={'app_module_file': 'app_module_file.migrations'})
+      def test_module_file_no_path(self):
+          """
+          A migrations module that is a plain file (no __path__) should be considered unmigrated.
+          """
+          module_name = 'app_module_file.migrations'
+          mod = types.ModuleType(module_name)
+          # simulate module file by NOT setting __path__ and having __file__
+          mod.__file__ = '/some/path/migrations.py'
+          loader = self._setup_and_load(module_name, mod, 'app_module_file')
+          loader.load_disk()
+          self.assertIn('app_module_file', loader.unmigrated_apps)
+          self.assertNotIn('app_module_file', loader.migrated_apps)
+
+      @override_settings(MIGRATION_MODULES={'app_custompath_with_file': 'app_custompath_with_file.migrations'})
+      def test_custom_path_with_file(self):
+          """
+          If __file__ is present, even a non-list __path__ should be considered migrated.
+          """
+          module_name = 'app_custompath_with_file.migrations'
+          mod = types.ModuleType(module_name)
+          mod.__path__ = EmptyIterable()  # non-list
+          mod.__file__ = '/some/path/__init__.py'
+          loader = self._setup_and_load(module_name, mod, 'app_custompath_with_file')
+          loader.load_disk()
+          # Because __file__ is not None, this should be treated as migrated (regular package)
+          self.assertIn('app_custompath_with_file', loader.migrated_apps)
+          self.assertNotIn('app_custompath_with_file', loader.unmigrated_apps)
+
+      @override_settings(MIGRATION_MODULES={'app_tuple_path': 'app_tuple_path.migrations'})
+      def test_tuple_path_no_file(self):
+          """
+          A tuple __path__ with no __file__ is not a regular package (should be unmigrated).
+          """
+          module_name = 'app_tuple_path.migrations'
+          mod = types.ModuleType(module_name)
+          mod.__path__ = tuple()  # tuple, not list
+          if hasattr(mod, '__file__'):
+              delattr(mod, '__file__')
+          loader = self._setup_and_load(module_name, mod, 'app_tuple_path')
+          loader.load_disk()
+          self.assertIn('app_tuple_path', loader.unmigrated_apps)
+          self.assertNotIn('app_tuple_path', loader.migrated_apps)
+
+      @override_settings(MIGRATION_MODULES={'app_listsubclass': 'app_listsubclass.migrations'})
+      def test_list_subclass_no_file(self):
+          """
+          A list subclass used as __path__ with no __file__ should still be accepted as a regular package.
+          """
+          module_name = 'app_listsubclass.migrations'
+          mod = types.ModuleType(module_name)
+          mod.__path__ = ListSubclass()  # subclass of list
+          if hasattr(mod, '__file__'):
+              delattr(mod, '__file__')
+          loader = self._setup_and_load(module_name, mod, 'app_listsubclass')
+          loader.load_disk()
+          self.assertIn('app_listsubclass', loader.migrated_apps)
+          self.assertNotIn('app_listsubclass', loader.unmigrated_apps)
+
+      @override_settings(MIGRATION_MODULES={'app_iterable_path': 'app_iterable_path.migrations'})
+      def test_custom_iterable_path_no_file(self):
+          """
+          Custom iterable __path__ (not a list) and no __file__ must be treated as unmigrated.
+          """
+          module_name = 'app_iterable_path.migrations'
+          mod = types.ModuleType(module_name)
+          class CustomIter:
+              def __iter__(self):
+                  return iter(())
+          mod.__path__ = CustomIter()
+          if hasattr(mod, '__file__'):
+              delattr(mod, '__file__')
+          loader = self._setup_and_load(module_name, mod, 'app_iterable_path')
+          loader.load_disk()
+          self.assertIn('app_iterable_path', loader.unmigrated_apps)
+          self.assertNotIn('app_iterable_path', loader.migrated_apps)
+
+      @override_settings(MIGRATION_MODULES={'app_attrerror': 'app_attrerror.migrations'})
+      def test_path_attribute_raises_attributeerror(self):
+          """
+          If accessing __path__ raises AttributeError, it should be treated as missing and thus unmigrated.
+          This verifies hasattr/getattr uses are safe and don't raise unexpected exceptions.
+          """
+          module_name = 'app_attrerror.migrations'
+          mod = AttrErrorModule(module_name)
+          # No __file__
+          if hasattr(mod, '__file__'):
+              delattr(mod, '__file__')
+          loader = self._setup_and_load(module_name, mod, 'app_attrerror')
+          # This should not raise; just classify as unmigrated
+          loader.load_disk()
+          self.assertIn('app_attrerror', loader.unmigrated_apps)
+
+      @override_settings(MIGRATION_MODULES={'app_multi_a': 'app_multi_a.migrations', 'app_multi_b': 'app_multi_b.migrations'})
+      def test_multiple_apps_mixed(self):
+          """
+          Multiple apps in a single load: one regular package without __file__ (migrated)
+          and one namespace-like without __file__ (unmigrated).
+          """
+          # app_multi_a -> regular package list __path__ no __file__
+          mod_a_name = 'app_multi_a.migrations'
+          mod_a = types.ModuleType(mod_a_name)
+          mod_a.__path__ = []
+          if hasattr(mod_a, '__file__'):
+              delattr(mod_a, '__file__')
+
+          # app_multi_b -> namespace-style non-list __path__ no __file__
+          mod_b_name = 'app_multi_b.migrations'
+          mod_b = types.ModuleType(mod_b_name)
+          mod_b.__path__ = EmptyIterable()
+          if hasattr(mod_b, '__file__'):
+              delattr(mod_b, '__file__')
+
+          # Put both in sys.modules
+          sys.modules[mod_a_name] = mod_a
+          sys.modules[mod_b_name] = mod_b
+
+          # Provide app configs list
+          app_a = MockAppConfig('app_multi_a', name='app_multi_a_package')
+          app_b = MockAppConfig('app_multi_b', name='app_multi_b_package')
+          apps.get_app_configs = lambda: [app_a, app_b]
+          apps.get_app_config = lambda label: app_a if label == 'app_multi_a' else app_b
+
+          loader = MigrationLoader(connection=None, load=False)
+          loader.load_disk()
+          self.assertIn('app_multi_a', loader.migrated_apps)
+          self.assertIn('app_multi_b', loader.unmigrated_apps)
+new_imports_code: |
+  import sys
+  import types

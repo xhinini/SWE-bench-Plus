@@ -1,0 +1,181 @@
+from types import SimpleNamespace
+from types import SimpleNamespace
+from unittest import mock
+
+from django.test import SimpleTestCase
+from django.db import models
+from django.db.migrations.autodetector import MigrationAutodetector
+from django.db.migrations.state import ProjectState
+
+class OnlyRelationAgnosticFieldsTests(SimpleTestCase):
+    def setUp(self):
+        self.autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+
+    def test_custom_fk_deconstruct_omits_to_does_not_raise_and_removes_to(self):
+        # Similar to existing HardcodedForeignKey: deconstruct omits 'to'
+        class HardcodedForeignKey(models.ForeignKey):
+            def __init__(self, *args, **kwargs):
+                # Hardcode a target and then call super()
+                kwargs['to'] = 'testapp.Author'
+                super().__init__(*args, **kwargs)
+
+            def deconstruct(self):
+                name, path, args, kwargs = super().deconstruct()
+                # Simulate a custom FK that removes 'to' from its deconstruction
+                kwargs.pop('to', None)
+                return name, path, args, kwargs
+
+        field = HardcodedForeignKey(on_delete=models.CASCADE)
+        defs = self.autodetector.only_relation_agnostic_fields({'f': field})
+        # Should not raise and 'to' should not be present in the kwargs of the returned deconstruction
+        self.assertEqual(len(defs), 1)
+        self.assertNotIn('to', defs[0][2])
+
+    def test_standard_foreignkey_to_is_removed(self):
+        fk = models.ForeignKey('otherapp.Book', models.CASCADE)
+        defs = self.autodetector.only_relation_agnostic_fields({'fk': fk})
+        self.assertEqual(len(defs), 1)
+        # For a normal ForeignKey deconstruct, 'to' should be removed by only_relation_agnostic_fields
+        self.assertNotIn('to', defs[0][2])
+
+    def test_many_to_many_deconstruct_to_is_removed(self):
+        m2m = models.ManyToManyField('otherapp.Book')
+        defs = self.autodetector.only_relation_agnostic_fields({'m2m': m2m})
+        self.assertEqual(len(defs), 1)
+        # 'to' should be removed for M2M fields as well
+        self.assertNotIn('to', defs[0][2])
+
+    def test_custom_field_with_remote_field_and_deconstruct_omits_to(self):
+        # A custom Field subclass whose deconstruct omits 'to' but has remote_field.model
+        class CustomRelField(models.Field):
+            description = "Custom field that pretends to be relational"
+
+            def __init__(self, *args, **kwargs):
+                # Fake a remote_field attribute with a model so only_relation_agnostic_fields
+                # will try to remove 'to' if present.
+                self.remote_field = SimpleNamespace(model='app.SomeModel')
+                super().__init__(*args, **kwargs)
+
+            def deconstruct(self):
+                # Return a 4-tuple as Field.deconstruct is expected to do
+                name = 'customrelfield'
+                path = self.__module__ + '.' + self.__class__.__name__
+                args = []
+                kwargs = {'custom': 'value'}  # note: no 'to' key
+                return name, path, args, kwargs
+
+        f = CustomRelField()
+        defs = self.autodetector.only_relation_agnostic_fields({'c': f})
+        self.assertEqual(len(defs), 1)
+        # Should not raise and 'to' is not present (because it was never there)
+        self.assertNotIn('to', defs[0][2])
+        # Other kwargs should be preserved
+        self.assertEqual(defs[0][2].get('custom'), 'value')
+
+    def test_custom_field_with_remote_field_and_deconstruct_with_to_removed(self):
+        # Custom field whose deconstruct includes 'to' explicitly
+        class CustomRelFieldWithTo(models.Field):
+            def __init__(self, *args, **kwargs):
+                self.remote_field = SimpleNamespace(model='app.SomeModel')
+                super().__init__(*args, **kwargs)
+
+            def deconstruct(self):
+                name = 'customrelwithto'
+                path = self.__module__ + '.' + self.__class__.__name__
+                args = []
+                kwargs = {'to': 'app.somemodel', 'other': 1}
+                return name, path, args, kwargs
+
+        f = CustomRelFieldWithTo()
+        defs = self.autodetector.only_relation_agnostic_fields({'c2': f})
+        self.assertEqual(len(defs), 1)
+        # 'to' should be removed by only_relation_agnostic_fields
+        self.assertNotIn('to', defs[0][2])
+        # Ensure other kwargs remain
+        self.assertEqual(defs[0][2].get('other'), 1)
+
+    def test_remote_field_present_but_model_falsy_keeps_to(self):
+        # If remote_field exists but .model is falsy, only_relation_agnostic_fields
+        # should not remove 'to'
+        class CustomRelFieldKeepTo(models.Field):
+            def __init__(self, *args, **kwargs):
+                # model is falsy (None), so it should not trigger removal
+                self.remote_field = SimpleNamespace(model=None)
+                super().__init__(*args, **kwargs)
+
+            def deconstruct(self):
+                name = 'keepto'
+                path = self.__module__ + '.' + self.__class__.__name__
+                args = []
+                kwargs = {'to': 'app.other', 'flag': True}
+                return name, path, args, kwargs
+
+        f = CustomRelFieldKeepTo()
+        defs = self.autodetector.only_relation_agnostic_fields({'k': f})
+        self.assertEqual(len(defs), 1)
+        # Because remote_field.model is falsy, 'to' should still be present
+        self.assertIn('to', defs[0][2])
+        self.assertEqual(defs[0][2]['to'], 'app.other')
+
+    def test_multiple_fields_mixed_to_handling(self):
+        # Mix of fields where some have 'to' removed and some keep it
+        fk = models.ForeignKey('app.X', models.CASCADE)
+        class KeepTo(models.Field):
+            def __init__(self):
+                self.remote_field = SimpleNamespace(model=None)
+                super().__init__()
+
+            def deconstruct(self):
+                return 'n', 'p', [], {'to': 'some.where'}
+
+        keep = KeepTo()
+        defs = self.autodetector.only_relation_agnostic_fields({'a_fk': fk, 'b_keep': keep})
+        # Two fields processed
+        self.assertEqual(len(defs), 2)
+        # Find each kwargs dict and assert behavior
+        kwargs_list = [d[2] for d in defs]
+        # One should not contain 'to' (the FK)
+        self.assertTrue(any('to' not in k for k in kwargs_list))
+        # One should still contain 'to' (the KeepTo)
+        self.assertTrue(any('to' in k for k in kwargs_list))
+
+    def test_only_relation_agnostic_fields_does_not_modify_field_object_state(self):
+        # Ensure calling only_relation_agnostic_fields does not mutate the field's own deconstruct output
+        class FieldWithTo(models.Field):
+            def __init__(self):
+                self.remote_field = SimpleNamespace(model='app.X')
+                super().__init__()
+
+            def deconstruct(self):
+                return 'n', 'p', [], {'to': 'app.x', 'keep': 5}
+
+        f = FieldWithTo()
+        # Obtain a deep deconstruction first
+        before = self.autodetector.deep_deconstruct(f)
+        # Now call only_relation_agnostic_fields
+        _ = self.autodetector.only_relation_agnostic_fields({'fld': f})
+        after = self.autodetector.deep_deconstruct(f)
+        # The deep_deconstruct of the field itself should still include 'to' (we didn't mutate the field)
+        # Note: deep_deconstruct returns (path, args, kwargs) for Field instances
+        self.assertIn('to', before[2])
+        self.assertIn('to', after[2])
+        self.assertEqual(before[2]['to'], after[2]['to'])
+
+    def test_custom_many_to_many_deconstruct_omits_to_safe(self):
+        # Custom M2M that omits 'to' in deconstruct (simulate buggy third-party field)
+        class HardM2M(models.ManyToManyField):
+            def __init__(self, *args, **kwargs):
+                kwargs['to'] = 'app.Some'
+                super().__init__(*args, **kwargs)
+
+            def deconstruct(self):
+                name, path, args, kwargs = super().deconstruct()
+                # Remove 'to' from kwargs to simulate the edge case
+                kwargs.pop('to', None)
+                return name, path, args, kwargs
+
+        m2m = HardM2M('app.Some')
+        defs = self.autodetector.only_relation_agnostic_fields({'m': m2m})
+        # Should not raise and should return a kwargs dict without 'to'
+        self.assertEqual(len(defs), 1)
+        self.assertNotIn('to', defs[0][2])

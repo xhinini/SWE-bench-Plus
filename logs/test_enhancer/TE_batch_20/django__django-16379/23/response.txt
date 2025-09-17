@@ -1,0 +1,177 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests exercise race conditions and edge cases in the FileBasedCache backend,
+  especially around file-not-found races that can occur between checking for a
+  file's existence and opening it. They verify that FileBasedCache methods
+  (has_key, get, touch, delete, and _list_cache_files) handle FileNotFoundError
+  gracefully (returning False or the default value) while letting other OSError
+  subclasses propagate. There are also tests to ensure only files with the cache
+  suffix are listed and that versioned keys are treated independently.
+test_code: |
+  from pathlib import Path
+  import os
+  import shutil
+  import tempfile
+  from unittest import mock
+
+  from django.test import TestCase, override_settings
+  from django.test.signals import setting_changed
+  from django.conf import settings
+  from django.core import caches
+
+  @override_settings(
+      CACHES={
+          "default": {
+              "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
+              # LOCATION is replaced in setUp to a temp dir for isolation.
+              "LOCATION": "/does/not/matter",
+          }
+      }
+  )
+  class FileBasedCacheRegressionTests(TestCase):
+      def setUp(self):
+          self.dirname = tempfile.mkdtemp()
+          # Ensure the cache backend uses our temp dir.
+          settings.CACHES["default"]["LOCATION"] = self.dirname
+          # Notify the cache system that settings changed.
+          setting_changed.send(self.__class__, setting="CACHES", enter=False)
+          self.cache = caches["default"]
+
+      def tearDown(self):
+          try:
+              self.cache.clear()
+          finally:
+              shutil.rmtree(self.dirname)
+
+      def test_has_key_handles_race_when_exists_true_but_open_fails(self):
+          # Simulate os.path.exists returning True but open() raising FileNotFoundError
+          key = "racekey1"
+          self.cache.set(key, "value")
+          fname = self.cache._key_to_file(key)
+          # Ensure file exists prior to the simulated race.
+          self.assertTrue(os.path.exists(fname))
+
+          with mock.patch("os.path.exists", return_value=True), mock.patch(
+              "builtins.open", side_effect=FileNotFoundError
+          ) as mocked_open:
+              # has_key should handle the race and return False rather than raising
+              self.assertIs(self.cache.has_key(key), False)
+              mocked_open.assert_called_once()
+
+      def test_has_key_with_version_handles_race(self):
+          # Versioned keys should also handle the race condition.
+          key = "racekey2"
+          self.cache.set(key, "v1", version=1)
+          self.cache.set(key, "v2", version=2)
+          fname_v1 = self.cache._key_to_file(key, version=1)
+          self.assertTrue(os.path.exists(fname_v1))
+
+          with mock.patch("os.path.exists", return_value=True), mock.patch(
+              "builtins.open", side_effect=FileNotFoundError
+          ):
+              self.assertIs(self.cache.has_key(key, version=1), False)
+              # Ensure other version still reports correctly (not affected by the mocked open)
+              # Drop the mock and check version=2.
+          self.assertIs(self.cache.has_key(key, version=2), True)
+
+      def test_pathlib_based_location_handles_open_race(self):
+          # Re-configure the cache location to be a pathlib.Path instance directory.
+          p = Path(self.dirname)
+          settings.CACHES["default"]["LOCATION"] = p
+          setting_changed.send(self.__class__, setting="CACHES", enter=False)
+          cache = caches["default"]
+          key = "pathlibkey"
+          cache.set(key, "value")
+          with mock.patch("os.path.exists", return_value=True), mock.patch(
+              "builtins.open", side_effect=FileNotFoundError
+          ):
+              self.assertIs(cache.has_key(key), False)
+
+      def test_get_handles_race_when_exists_true_but_open_fails(self):
+          key = "get_race"
+          self.cache.set(key, "val")
+          fname = self.cache._key_to_file(key)
+          self.assertTrue(os.path.exists(fname))
+          with mock.patch("os.path.exists", return_value=True), mock.patch(
+              "builtins.open", side_effect=FileNotFoundError
+          ) as mocked_open:
+              # get() should return the provided default and not raise.
+              self.assertEqual(self.cache.get(key, default="DEF"), "DEF")
+              mocked_open.assert_called_once()
+
+      def test_touch_handles_race_when_exists_true_but_open_fails(self):
+          key = "touch_race"
+          self.cache.set(key, "val", timeout=10)
+          fname = self.cache._key_to_file(key)
+          self.assertTrue(os.path.exists(fname))
+          with mock.patch("os.path.exists", return_value=True), mock.patch(
+              "builtins.open", side_effect=FileNotFoundError
+          ):
+              # touch should return False if the file vanishes between exists and open.
+              self.assertIs(self.cache.touch(key), False)
+
+      def test_delete_handles_file_removed_after_exists(self):
+          # Simulate os.path.exists returning True but os.remove raising FileNotFoundError.
+          key = "delete_race"
+          self.cache.set(key, "to_delete")
+          fname = self.cache._key_to_file(key)
+          self.assertTrue(os.path.exists(fname))
+          with mock.patch("os.path.exists", return_value=True), mock.patch(
+              "os.remove", side_effect=FileNotFoundError
+          ) as mocked_remove:
+              # delete should return False when the file was removed by another process.
+              self.assertIs(self.cache.delete(key), False)
+              mocked_remove.assert_called_once_with(fname)
+
+      def test_has_key_propagates_non_filenotfound_errors(self):
+          # If open() raises a non-FileNotFoundError (e.g. OSError), it should propagate.
+          key = "oserror_key"
+          self.cache.set(key, "value")
+          with mock.patch("os.path.exists", return_value=True), mock.patch(
+              "builtins.open", side_effect=OSError("boom")
+          ):
+              with self.assertRaises(OSError):
+                  self.cache.has_key(key)
+
+      def test_get_reports_default_and_open_called_even_if_exists_true(self):
+          # Ensure get returns default and open() is attempted when os.path.exists returns True.
+          key = "get_race_2"
+          self.cache.set(key, "value")
+          with mock.patch("os.path.exists", return_value=True), mock.patch(
+              "builtins.open", side_effect=FileNotFoundError
+          ) as mocked_open:
+              self.assertEqual(self.cache.get(key, default=None), None)
+              mocked_open.assert_called_once()
+
+      def test_list_cache_files_only_includes_cache_suffix(self):
+          # Create files with and without the cache suffix and verify only cache files are listed.
+          cache_fname = os.path.join(self.dirname, "foo" + self.cache.cache_suffix)
+          other_fname = os.path.join(self.dirname, "not_cache.txt")
+          with open(cache_fname, "wb") as fh:
+              fh.write(b"")
+          with open(other_fname, "wb") as fh:
+              fh.write(b"")
+          filelist = self.cache._list_cache_files()
+          self.assertIn(cache_fname, filelist)
+          self.assertNotIn(other_fname, filelist)
+
+      def test_versioned_keys_produce_different_files(self):
+          key = "versioned"
+          self.cache.set(key, "one", version=1)
+          self.cache.set(key, "two", version=2)
+          f1 = self.cache._key_to_file(key, version=1)
+          f2 = self.cache._key_to_file(key, version=2)
+          self.assertNotEqual(f1, f2)
+          self.assertTrue(os.path.exists(f1))
+          self.assertTrue(os.path.exists(f2))
+new_imports_code: |
+  from pathlib import Path
+  import os
+  import shutil
+  import tempfile
+  from unittest import mock
+  from django.test import TestCase, override_settings
+  from django.test.signals import setting_changed
+  from django.conf import settings
+  from django.core import caches

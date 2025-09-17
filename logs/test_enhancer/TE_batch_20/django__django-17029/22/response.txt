@@ -1,0 +1,213 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These tests assert the ordering semantics of Apps.clear_cache():
+  - get_swappable_settings_name.cache_clear() must be called before get_models.cache_clear().
+  - Both cache clears must happen before any model _meta._expire_cache() calls.
+  The tests also assert behavior when one of the cache_clear methods or model _expire_cache raises:
+  - If get_models.cache_clear() raises, get_swappable_settings_name.cache_clear() must have been called already.
+  - If get_swappable_settings_name.cache_clear() raises, get_models.cache_clear() must NOT be called.
+  - If model._meta._expire_cache() raises, both cache clears must have been executed before the exception is propagated.
+test_code: |
+  from types import SimpleNamespace
+  from unittest import mock
+
+  from django.test import SimpleTestCase
+  from django.apps.registry import Apps
+
+  class DummyAppConfig:
+      def __init__(self, models_list):
+          # models_list: list of (name, model-like-object)
+          self._models = models_list
+
+      def get_models(self, include_auto_created=False):
+          return self._models
+
+  class DummyModel:
+      def __init__(self, name, calls, raise_in_expire=False):
+          # model-like object with _meta._expire_cache()
+          self._name = name
+          self._calls = calls
+          self._raise = raise_in_expire
+          def _expire():
+              self._calls.append(f"expire:{self._name}")
+              if self._raise:
+                  raise RuntimeError("expire-error")
+          self._meta = SimpleNamespace(_expire_cache=_expire, app_label="app", model_name=name)
+
+  class ClearCacheOrderTests(SimpleTestCase):
+      def setUp(self):
+          # Create a fresh Apps registry with no installed apps.
+          self.apps = Apps([])
+
+      def _patch_clears(self, calls, sw_side_effect=None, gm_side_effect=None):
+          """
+          Patch the cache_clear methods for get_swappable_settings_name and get_models.
+          sw_side_effect / gm_side_effect can be callables or exceptions.
+          """
+          original_sw = Apps.get_swappable_settings_name.cache_clear
+          original_gm = Apps.get_models.cache_clear
+
+          def sw_clear():
+              calls.append("swappable")
+              if callable(sw_side_effect):
+                  sw_side_effect()
+              elif isinstance(sw_side_effect, BaseException):
+                  raise sw_side_effect
+              else:
+                  # call original to keep internal state sane
+                  try:
+                      original_sw()
+                  except Exception:
+                      pass
+
+          def gm_clear():
+              calls.append("get_models")
+              if callable(gm_side_effect):
+                  gm_side_effect()
+              elif isinstance(gm_side_effect, BaseException):
+                  raise gm_side_effect
+              else:
+                  try:
+                      original_gm()
+                  except Exception:
+                      pass
+
+          sw_patcher = mock.patch.object(Apps.get_swappable_settings_name, "cache_clear", new=sw_clear)
+          gm_patcher = mock.patch.object(Apps.get_models, "cache_clear", new=gm_clear)
+          return sw_patcher, gm_patcher
+
+      def test_swappable_before_get_models_ready_false(self):
+          calls = []
+          sw_patcher, gm_patcher = self._patch_clears(calls)
+          with sw_patcher, gm_patcher:
+              # Ensure ready=False to avoid expire loop
+              self.apps.ready = False
+              self.apps.clear_cache()
+          self.assertEqual(calls, ["swappable", "get_models"])
+
+      def test_swappable_before_get_models_ready_true_no_apps(self):
+          calls = []
+          sw_patcher, gm_patcher = self._patch_clears(calls)
+          with sw_patcher, gm_patcher:
+              self.apps.ready = True
+              # No app_configs => no expire loop
+              self.apps.clear_cache()
+          self.assertEqual(calls, ["swappable", "get_models"])
+
+      def test_order_with_one_app_one_model(self):
+          calls = []
+          model_calls = []
+          m = DummyModel("m1", model_calls)
+          dummy_ac = DummyAppConfig([m])
+          self.apps.app_configs = {"app": dummy_ac}
+          self.apps.ready = True
+          sw_patcher, gm_patcher = self._patch_clears(calls)
+          with sw_patcher, gm_patcher:
+              self.apps.clear_cache()
+          # swappable and get_models must happen before expire
+          self.assertEqual(calls, ["swappable", "get_models"])
+          self.assertEqual(model_calls, ["expire:m1"])
+
+      def test_order_with_multiple_apps_models(self):
+          calls = []
+          model_calls = []
+          m1 = DummyModel("m1", model_calls)
+          m2 = DummyModel("m2", model_calls)
+          m3 = DummyModel("m3", model_calls)
+          ac1 = DummyAppConfig([m1, m2])
+          ac2 = DummyAppConfig([m3])
+          # order of app_configs.values() is insertion order of dict
+          self.apps.app_configs = {"a1": ac1, "a2": ac2}
+          self.apps.ready = True
+          sw_patcher, gm_patcher = self._patch_clears(calls)
+          with sw_patcher, gm_patcher:
+              self.apps.clear_cache()
+          self.assertEqual(calls, ["swappable", "get_models"])
+          # All expire calls should have occurred and be after the two clears
+          self.assertEqual(model_calls, ["expire:m1", "expire:m2", "expire:m3"])
+
+      def test_get_models_exception_swappable_cleared_first(self):
+          calls = []
+          # Make get_models.cache_clear raise; ensure swappable cleared before exception.
+          sw_patcher, gm_patcher = self._patch_clears(calls, sw_side_effect=None, gm_side_effect=RuntimeError("boom"))
+          with sw_patcher, gm_patcher:
+              with self.assertRaisesMessage(RuntimeError, "boom"):
+                  self.apps.clear_cache()
+          # In the correct implementation, swappable is cleared before get_models raises.
+          self.assertIn("swappable", calls)
+          # get_models should have been attempted and raised
+          self.assertIn("get_models", calls)
+          # swappable must appear before get_models
+          self.assertLess(calls.index("swappable"), calls.index("get_models"))
+
+      def test_swappable_exception_prevents_get_models_called(self):
+          calls = []
+          # Make swappable.cache_clear raise; get_models must NOT be called.
+          sw_error = RuntimeError("sw-err")
+          sw_patcher, gm_patcher = self._patch_clears(calls, sw_side_effect=sw_error, gm_side_effect=None)
+          with sw_patcher, gm_patcher:
+              with self.assertRaisesMessage(RuntimeError, "sw-err"):
+                  self.apps.clear_cache()
+          # get_models must not have been called because swappable raised first.
+          self.assertNotIn("get_models", calls)
+
+      def test_expire_exception_propagated_after_clears(self):
+          calls = []
+          model_calls = []
+          # Model expire raises; caches must be cleared first, then exception propagated.
+          m = DummyModel("bad", model_calls, raise_in_expire=True)
+          ac = DummyAppConfig([m])
+          self.apps.app_configs = {"app": ac}
+          self.apps.ready = True
+          sw_patcher, gm_patcher = self._patch_clears(calls)
+          with sw_patcher, gm_patcher:
+              with self.assertRaisesMessage(RuntimeError, "expire-error"):
+                  self.apps.clear_cache()
+          # Both cache clears must have been executed before the expire exception.
+          self.assertEqual(calls, ["swappable", "get_models"])
+          self.assertEqual(model_calls, ["expire:bad"])
+
+      def test_clear_cache_multiple_models_ordering(self):
+          calls = []
+          model_calls = []
+          m1 = DummyModel("m1", model_calls)
+          m2 = DummyModel("m2", model_calls)
+          ac = DummyAppConfig([m1, m2])
+          self.apps.app_configs = {"app": ac}
+          self.apps.ready = True
+          sw_patcher, gm_patcher = self._patch_clears(calls)
+          with sw_patcher, gm_patcher:
+              self.apps.clear_cache()
+          self.assertEqual(calls, ["swappable", "get_models"])
+          self.assertEqual(model_calls, ["expire:m1", "expire:m2"])
+
+      def test_clear_cache_no_app_configs_does_not_expire(self):
+          calls = []
+          model_calls = []
+          self.apps.app_configs = {}
+          self.apps.ready = True
+          sw_patcher, gm_patcher = self._patch_clears(calls)
+          with sw_patcher, gm_patcher:
+              # No models to expire
+              self.apps.clear_cache()
+          self.assertEqual(calls, ["swappable", "get_models"])
+          self.assertEqual(model_calls, [])
+
+      def test_clear_cache_called_when_ready_false_and_apps_present(self):
+          # If ready is False, the expire loop must be skipped, but the two clears still occur in order.
+          calls = []
+          model_calls = []
+          m = DummyModel("m1", model_calls)
+          ac = DummyAppConfig([m])
+          self.apps.app_configs = {"app": ac}
+          self.apps.ready = False
+          sw_patcher, gm_patcher = self._patch_clears(calls)
+          with sw_patcher, gm_patcher:
+              self.apps.clear_cache()
+          # Even though app_configs is non-empty, expire loop is skipped when ready is False.
+          self.assertEqual(calls, ["swappable", "get_models"])
+          self.assertEqual(model_calls, [])
+new_imports_code: |
+  from types import SimpleNamespace
+  from unittest import mock

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.StartAppPathNormalization._prepare_app_dir admin_scripts.tests_llm.StartAppPathNormalization.test_absolute_target_ending_with_dot admin_scripts.tests_llm.StartAppPathNormalization.test_complex_relative_with_parent_and_current_segments admin_scripts.tests_llm.StartAppPathNormalization.test_mixed_segments_requiring_normalization admin_scripts.tests_llm.StartAppPathNormalization.test_multiple_current_dir_segments admin_scripts.tests_llm.StartAppPathNormalization.test_target_ends_with_dot admin_scripts.tests_llm.StartAppPathNormalization.test_target_ends_with_dot_and_trailing_sep admin_scripts.tests_llm.StartAppPathNormalization.test_target_ends_with_parent_dir admin_scripts.tests_llm.StartAppPathNormalization.test_target_ends_with_parent_dir_and_trailing_sep admin_scripts.tests_llm.StartAppPathNormalization.test_target_with_embedded_current_dir_segment admin_scripts.tests_llm.StartAppPathNormalization.test_target_with_leading_dot_and_trailing_dot
+coverage json -o coverage.json
+: '>>>>> End Test Output'

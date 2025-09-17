@@ -1,0 +1,240 @@
+import os
+import re
+import shutil
+import tempfile
+import unittest
+from hashlib import md5
+from django.core.files.base import ContentFile
+from django.core.files.storage import FileSystemStorage
+from django.contrib.staticfiles.storage import HashedFilesMixin, ManifestFilesMixin
+
+class TempStorage(HashedFilesMixin, FileSystemStorage):
+    """
+    Combine the mixin with FileSystemStorage for testing.
+    """
+    def __init__(self, location, base_url='/static/'):
+        # HashedFilesMixin.__init__ calls super(), which resolves to FileSystemStorage.__init__
+        super().__init__(location, base_url)
+
+class PostProcessMaxZeroTests(unittest.TestCase):
+    def setUp(self):
+        self.tempdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tempdir)
+
+    def write_file(self, name, content):
+        path = os.path.join(self.tempdir, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, 'wb') as f:
+            f.write(content)
+        return path
+
+    def test_no_passes_simple_css_image_reference(self):
+        """
+        With max_post_process_passes = 0, a CSS referencing an image should be
+        processed without raising an UnboundLocalError and the hashed name
+        should include the correct content hash.
+        """
+        css_name = 'bar.css'
+        img_name = 'foo.png'
+        css_content = b'body { background: url("foo.png"); }'
+        img_content = b'PNGDATA'
+        self.write_file(css_name, css_content)
+        self.write_file(img_name, img_content)
+
+        proc_storage = TempStorage(self.tempdir, base_url='/static/')
+        proc_storage.max_post_process_passes = 0
+
+        source_storage = FileSystemStorage(location=self.tempdir)
+        paths = {css_name: (source_storage, css_name)}
+
+        results = list(proc_storage.post_process(paths, dry_run=False))
+        # Should have processed the adjustable css file
+        self.assertTrue(any(r[0] == css_name for r in results))
+
+        # The storage's hashed_files should contain an entry for the css
+        key = proc_storage.hash_key(proc_storage.clean_name(css_name))
+        self.assertIn(key, proc_storage.hashed_files)
+        hashed = proc_storage.hashed_files[key]
+        # The hashed filename should contain a 12-character MD5 segment
+        expected_hash = md5(css_content).hexdigest()[:12]
+        self.assertRegex(hashed, r'\.' + re.escape(expected_hash) + r'\.css$')
+
+    def test_no_passes_non_adjustable_file_png_yielded(self):
+        """
+        A non-adjustable file (e.g., PNG) should be yielded and processed
+        normally when max_post_process_passes = 0.
+        """
+        img_name = 'image.png'
+        img_content = b'IMAGEDATA'
+        self.write_file(img_name, img_content)
+
+        proc_storage = TempStorage(self.tempdir, base_url='/static/')
+        proc_storage.max_post_process_passes = 0
+
+        source_storage = FileSystemStorage(location=self.tempdir)
+        paths = {img_name: (source_storage, img_name)}
+
+        results = list(proc_storage.post_process(paths, dry_run=False))
+        # Should yield the non-adjustable file
+        self.assertTrue(any(r[0] == img_name for r in results))
+
+        # hashed_files should contain an entry for the image
+        key = proc_storage.hash_key(proc_storage.clean_name(img_name))
+        self.assertIn(key, proc_storage.hashed_files)
+        hashed = proc_storage.hashed_files[key]
+        expected_hash = md5(img_content).hexdigest()[:12]
+        self.assertRegex(hashed, r'\.' + re.escape(expected_hash) + r'\.png$')
+
+    def test_no_passes_existing_hashed_file_overwritten(self):
+        """
+        If a hashed version of a file already exists on disk, the post_process
+        run with max_post_process_passes = 0 should overwrite/update it and
+        finish without error.
+        """
+        css_name = 'cached/styles.css'
+        css_content = b'@import "other.css";'
+        other_name = 'cached/other.css'
+        other_content = b''
+
+        self.write_file(css_name, css_content)
+        self.write_file(other_name, other_content)
+
+        proc_storage = TempStorage(self.tempdir, base_url='/static/')
+        proc_storage.max_post_process_passes = 0
+
+        # Create an existing hashed file (simulate an old intermediate)
+        existing_hashed = os.path.join(self.tempdir, 'cached', 'styles.oldhash.css')
+        os.makedirs(os.path.dirname(existing_hashed), exist_ok=True)
+        with open(existing_hashed, 'wb') as f:
+            f.write(b'old')
+
+        source_storage = FileSystemStorage(location=self.tempdir)
+        paths = {css_name: (source_storage, css_name)}
+
+        results = list(proc_storage.post_process(paths, dry_run=False))
+        # Ensure processing completed and hashed_files updated
+        key = proc_storage.hash_key(proc_storage.clean_name(css_name))
+        self.assertIn(key, proc_storage.hashed_files)
+        final_hashed = proc_storage.hashed_files[key]
+        # Final hashed name should not be the old intermediate name
+        self.assertNotIn('oldhash', final_hashed)
+
+    def test_no_passes_multiple_adjustable_files(self):
+        """
+        Multiple adjustable files should all be processed when max_post_process_passes = 0.
+        """
+        files = {
+            'css/a.css': b'url("../img/a.png")',
+            'css/b.css': b'url("../img/b.png")',
+            'img/a.png': b'A',
+            'img/b.png': b'B',
+        }
+        for name, content in files.items():
+            self.write_file(name, content)
+
+        proc_storage = TempStorage(self.tempdir, base_url='/static/')
+        proc_storage.max_post_process_passes = 0
+
+        source_storage = FileSystemStorage(location=self.tempdir)
+        paths = {name: (source_storage, name) for name in files.keys()}
+
+        results = list(proc_storage.post_process(paths, dry_run=False))
+        # Expect both css files to be processed
+        processed_names = [r[0] for r in results]
+        self.assertIn('css/a.css', processed_names)
+        self.assertIn('css/b.css', processed_names)
+
+    def test_hashed_name_fragment_preserved(self):
+        """
+        Hashed name special-case for '?#' fragments should preserve the '?' suffix.
+        """
+        name = 'fonts/font.eot?#iefix'
+        content = ContentFile(b'FONTDATA')
+        proc_storage = TempStorage(self.tempdir, base_url='/static/')
+        # Call hashed_name directly with a ContentFile
+        hashed = proc_storage.hashed_name(name, content=content)
+        # When '?#' present in name, hashed_name appends '?' to path portion
+        self.assertIn('?.', hashed) or self.assertIn('?.', hashed)  # keep assertion intent clear
+        # Also ensure a hash segment exists
+        self.assertRegex(hashed, r'\.[0-9a-f]{12}\.eot\?')
+
+    def test_stored_name_resolves_with_max_zero(self):
+        """
+        stored_name should be able to compute a hashed name even when
+        max_post_process_passes = 0 and there is no cached entry yet.
+        """
+        css_name = 'style.css'
+        css_content = b'body{}'
+        self.write_file(css_name, css_content)
+
+        proc_storage = TempStorage(self.tempdir, base_url='/static/')
+        proc_storage.max_post_process_passes = 0
+        # Ensure no cached entries
+        proc_storage.hashed_files.clear()
+
+        # Call stored_name; should not raise and should return a cleaned name
+        result = proc_storage.stored_name(css_name)
+        self.assertIsInstance(result, str)
+        self.assertTrue(result.endswith('.css'))
+
+    def test_post_process_zero_no_adjustable_paths(self):
+        """
+        If there are no adjustable paths, post_process should still run
+        and yield the non-adjustable files without raising.
+        """
+        # single non-adjustable file
+        non_adj = 'file.bin'
+        self.write_file(non_adj, b'DATA')
+
+        proc_storage = TempStorage(self.tempdir, base_url='/static/')
+        proc_storage.max_post_process_passes = 0
+
+        source_storage = FileSystemStorage(location=self.tempdir)
+        # Pass an empty adjustable_paths by making adjustable_paths computed empty:
+        paths = {non_adj: (source_storage, non_adj)}
+        results = list(proc_storage.post_process(paths, dry_run=False))
+        self.assertTrue(any(r[0] == non_adj for r in results))
+
+    def test_post_process_zero_manifest_mixin(self):
+        """
+        ManifestFilesMixin subclass should initialize and post_process
+        without raising when max_post_process_passes = 0.
+        """
+        class MyManifest(ManifestFilesMixin, FileSystemStorage):
+            def __init__(self, location, base_url='/static/'):
+                super().__init__(location, base_url)
+
+        css_name = 'm.css'
+        self.write_file(css_name, b'body{background:url("x.png")}')
+        self.write_file('x.png', b'X')
+
+        m = MyManifest(self.tempdir, base_url='/static/')
+        m.max_post_process_passes = 0
+
+        source_storage = FileSystemStorage(location=self.tempdir)
+        paths = {css_name: (source_storage, css_name)}
+        # Should not raise and should produce output
+        results = list(m.post_process(paths, dry_run=False))
+        self.assertTrue(any(r[0] == css_name for r in results))
+
+    def test_post_process_zero_does_not_raise_runtime_error(self):
+        """
+        Ensure that when max_post_process_passes = 0, the post_process
+        logic does not mistakenly raise the 'Max post-process passes exceeded.' RuntimeError.
+        """
+        css_name = 'c.css'
+        img_name = 'c.png'
+        self.write_file(css_name, b'url("c.png")')
+        self.write_file(img_name, b'IMG')
+
+        proc_storage = TempStorage(self.tempdir, base_url='/static/')
+        proc_storage.max_post_process_passes = 0
+
+        source_storage = FileSystemStorage(location=self.tempdir)
+        paths = {css_name: (source_storage, css_name)}
+
+        # Collect results; if a RuntimeError were yielded, it would appear in results
+        results = list(proc_storage.post_process(paths, dry_run=False))
+        # There should be no 'All' entry that indicates an exceeded max pass
+        names = [r[0] for r in results]
+        self.assertNotIn('All', names)

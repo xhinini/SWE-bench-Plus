@@ -1,0 +1,207 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that SlicedLowLevelWCS.world_to_pixel_values correctly inserts the fixed world coordinate values for dropped world dimensions (computed from pixel zeros) and returns pixel coordinates adjusted for pixel slicing. They exercise scalar, array, broadcasting and Quantity inputs and several slicing configurations. The tests will fail for the candidate (incorrect) patch and pass with the gold patch.
+test_code: |
+  import warnings
+  import numpy as np
+  import pytest
+  from numpy.testing import assert_allclose
+  from astropy.io.fits import Header
+  from astropy.wcs.wcs import WCS
+  from astropy.wcs.wcsapi.wrappers.sliced_wcs import SlicedLowLevelWCS
+  import astropy.units as u
+  
+  # Reuse the spectral cube header used by the upstream tests to construct a 3-axis WCS
+  HEADER_SPECTRAL_CUBE = """
+  NAXIS   = 3
+  NAXIS1  = 10
+  NAXIS2  = 20
+  NAXIS3  = 30
+  CTYPE1  = GLAT-CAR
+  CTYPE2  = FREQ
+  CTYPE3  = GLON-CAR
+  CNAME1  = Latitude
+  CNAME2  = Frequency
+  CNAME3  = Longitude
+  CRVAL1  = 10
+  CRVAL2  = 20
+  CRVAL3  = 25
+  CRPIX1  = 30
+  CRPIX2  = 40
+  CRPIX3  = 45
+  CDELT1  = -0.1
+  CDELT2  =  0.5
+  CDELT3  =  0.1
+  CUNIT1  = deg
+  CUNIT2  = Hz
+  CUNIT3  = deg
+  """
+  
+  @pytest.fixture
+  def spectral_wcs():
+      with warnings.catch_warnings():
+          warnings.simplefilter('ignore')
+          wcs = WCS(Header.fromstring(HEADER_SPECTRAL_CUBE, sep='\n'))
+      # give pixel_bounds to avoid None cases; not necessary for world->pixel logic here
+      wcs.pixel_bounds = [(-1, 11), (-2, 18), (5, 15)]
+      return wcs
+  
+  def _expected_world_to_pixel_for_sliced(sll, provided_worlds):
+      """
+      Compute the expected pixel result by calling the underlying WCS.world_to_pixel_values
+      with dropped world dimensions filled by the values obtained from
+      sll._pixel_to_world_values_all(*[0]*len(sll._pixel_keep)), then applying the
+      same pixel-slice adjustments and keeping only the pixel_keep indices.
+      """
+      # Ensure provided_worlds is a tuple/list
+      if not isinstance(provided_worlds, (list, tuple)):
+          provided_worlds = (provided_worlds,)
+  
+      # Compute the fixed world coords for dropped dims (as the implementation does)
+      sliced_out_world_coords = sll._pixel_to_world_values_all(*[0] * len(sll._pixel_keep))
+      # Ensure it is indexable (could be np.ndarray or tuple)
+      # Build full world list matching underlying WCS world_n_dim
+      full_worlds = []
+      iworld_curr = 0
+      for iworld in range(sll._wcs.world_n_dim):
+          if iworld in sll._world_keep:
+              full_worlds.append(provided_worlds[iworld_curr])
+              iworld_curr += 1
+          else:
+              full_worlds.append(sliced_out_world_coords[iworld])
+  
+      # Convert to numpy arrays / units as needed and broadcast
+      full_worlds = tuple(full_worlds)
+      full_worlds = tuple(np.asanyarray(w) if not hasattr(w, 'unit') else w for w in full_worlds)
+      full_worlds_b = np.broadcast_arrays(*full_worlds)
+  
+      # Call underlying wcs
+      pixel_full = list(sll._wcs.world_to_pixel_values(*full_worlds_b))
+  
+      # Apply pixel slice starts: subtract start where slice has a start
+      # Note: sll._slices_pixel is in original WCS pixel order
+      for ipixel in range(sll._wcs.pixel_n_dim):
+          sl = sll._slices_pixel[ipixel]
+          if isinstance(sl, slice) and sl.start is not None:
+              pixel_full[ipixel] = np.asanyarray(pixel_full[ipixel]) - sl.start
+  
+      # Keep only pixel_keep indices and return in same shape/type as wrapper
+      pixel_kept = tuple(pixel_full[ip] for ip in sll._pixel_keep)
+      if sll.pixel_n_dim == 1 and sll._wcs.pixel_n_dim > 1:
+          return pixel_kept[0]
+      return pixel_kept
+  
+  def assert_pixel_equal(actual, expected):
+      # actual/expected may be scalars or tuples/arrays; use assert_allclose on all components
+      if isinstance(expected, tuple):
+          assert isinstance(actual, tuple)
+          assert len(actual) == len(expected)
+          for a, e in zip(actual, expected):
+              assert_allclose(np.asanyarray(a), np.asanyarray(e))
+      else:
+          # scalar/array
+          assert_allclose(np.asanyarray(actual), np.asanyarray(expected))
+  
+  # 1) Spectral slice (drop spectral world axis) - scalar inputs
+  def test_spectral_slice_fixed_value_scalar(spectral_wcs):
+      wcs = spectral_wcs
+      sll = SlicedLowLevelWCS(wcs, [slice(None), 10])  # drops the spectral axis in world output
+      # provide the two kept world coords (Latitude, Longitude) order is as wrapper defines
+      provided = (10.0, 25.0)
+      actual = sll.world_to_pixel_values(*provided)
+      expected = _expected_world_to_pixel_for_sliced(sll, provided)
+      assert_pixel_equal(actual, expected)
+  
+  # 2) Spectral slice - array inputs (broadcasted)
+  def test_spectral_slice_fixed_value_array(spectral_wcs):
+      wcs = spectral_wcs
+      sll = SlicedLowLevelWCS(wcs, [slice(None), 10])
+      provided = (np.array([10.0, 10.0]), np.array([25.0, 25.0]))
+      actual = sll.world_to_pixel_values(*provided)
+      expected = _expected_world_to_pixel_for_sliced(sll, provided)
+      assert_pixel_equal(actual, expected)
+  
+  # 3) Spectral slice - Quantity inputs with units
+  def test_spectral_slice_with_quantity_units(spectral_wcs):
+      wcs = spectral_wcs
+      sll = SlicedLowLevelWCS(wcs, [slice(None), 10])
+      provided = (10.0 * u.deg, 25.0 * u.deg)
+      actual = sll.world_to_pixel_values(*provided)
+      expected = _expected_world_to_pixel_for_sliced(sll, provided)
+      assert_pixel_equal(actual, expected)
+  
+  # 4) Spectral slice - broadcasting with mismatched shapes
+  def test_spectral_slice_broadcasting_mixed_shapes(spectral_wcs):
+      wcs = spectral_wcs
+      sll = SlicedLowLevelWCS(wcs, [slice(None), 10])
+      provided = (np.array([10.0, 11.0]), 25.0)  # second will be broadcast
+      actual = sll.world_to_pixel_values(*provided)
+      expected = _expected_world_to_pixel_for_sliced(sll, provided)
+      assert_pixel_equal(actual, expected)
+  
+  # 5) Middle axis integer slice (drop second pixel dimension -> drop corresponding world axis)
+  def test_mid_axis_integer_slice_scalar(spectral_wcs):
+      wcs = spectral_wcs
+      # slice middle pixel axis to fixed integer -> np.s_[:, 0, :]
+      sll = SlicedLowLevelWCS(wcs, (slice(None), 0, slice(None)))
+      # After dropping the middle pixel, one world axis (frequency) will be dropped; provide kept world coords
+      # sll.world_n_dim should be 2 in this configuration
+      assert sll.world_n_dim == 2
+      provided = (10.0, 25.0)
+      actual = sll.world_to_pixel_values(*provided)
+      expected = _expected_world_to_pixel_for_sliced(sll, provided)
+      assert_pixel_equal(actual, expected)
+  
+  # 6) Middle axis negative index integer slice
+  def test_mid_axis_negative_index_slice_scalar(spectral_wcs):
+      wcs = spectral_wcs
+      sll = SlicedLowLevelWCS(wcs, (slice(None), -1, slice(None)))
+      assert sll.world_n_dim == 2
+      provided = (12.0, 24.0)
+      actual = sll.world_to_pixel_values(*provided)
+      expected = _expected_world_to_pixel_for_sliced(sll, provided)
+      assert_pixel_equal(actual, expected)
+  
+  # 7) Nested slicing: slice twice should combine correctly
+  def test_nested_slicing_behavior(spectral_wcs):
+      wcs = spectral_wcs
+      first = SlicedLowLevelWCS(wcs, (slice(None), slice(2, 5), slice(None)))
+      nested = SlicedLowLevelWCS(first, (slice(None), 1))  # further slice second pixel axis to int
+      # Now nested should have dropped one world axis; ensure mapping matches expected full insertion
+      provided = (10.0, 25.0)
+      actual = nested.world_to_pixel_values(*provided)
+      expected = _expected_world_to_pixel_for_sliced(nested, provided)
+      assert_pixel_equal(actual, expected)
+  
+  # 8) Spectral slice with zero-length arrays (empty)
+  def test_spectral_slice_empty_arrays(spectral_wcs):
+      wcs = spectral_wcs
+      sll = SlicedLowLevelWCS(wcs, [slice(None), 10])
+      provided = (np.array([]), np.array([]))
+      actual = sll.world_to_pixel_values(*provided)
+      expected = _expected_world_to_pixel_for_sliced(sll, provided)
+      # both should be empty arrays broadcasted; compare shapes and content
+      assert_pixel_equal(actual, expected)
+  
+  # 9) Spectral slice with integer-like numpy dtypes (e.g., np.int64) for kept world coords
+  def test_spectral_slice_with_integer_like_inputs(spectral_wcs):
+      wcs = spectral_wcs
+      sll = SlicedLowLevelWCS(wcs, [slice(None), 10])
+      provided = (np.int64(10), np.int64(25))
+      actual = sll.world_to_pixel_values(*provided)
+      expected = _expected_world_to_pixel_for_sliced(sll, provided)
+      assert_pixel_equal(actual, expected)
+  
+  # 10) Spectral slice where pixel_n_dim == 1 (ensure scalar pixel result returned when expected)
+  def test_spectral_slice_single_pixel_dimension_return_scalar(spectral_wcs):
+      wcs = spectral_wcs
+      # Make two pixel axes fixed so only 1 pixel dim remains
+      sll = SlicedLowLevelWCS(wcs, (0, slice(None), 10))  # fix first and last pixel axes
+      assert sll.pixel_n_dim == 1
+      # Provide the single kept world coordinate(s) corresponding to world_n_dim
+      provided = (20.0,) if sll.world_n_dim == 1 else (10.0, 20.0)  # handle either case defensively
+      actual = sll.world_to_pixel_values(*provided)
+      expected = _expected_world_to_pixel_for_sliced(sll, provided)
+      assert_pixel_equal(actual, expected)
+new_imports_code: |
+  # No package-level imports required beyond what is in the test file.

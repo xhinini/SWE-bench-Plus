@@ -1,0 +1,2817 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `sphinx/domains/python.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 """
+2     sphinx.domains.python
+3     ~~~~~~~~~~~~~~~~~~~~~
+4 
+5     The Python domain.
+6 
+7     :copyright: Copyright 2007-2021 by the Sphinx team, see AUTHORS.
+8     :license: BSD, see LICENSE for details.
+9 """
+10 
+11 import builtins
+12 import inspect
+13 import re
+14 import sys
+15 import typing
+16 import warnings
+17 from inspect import Parameter
+18 from typing import Any, Dict, Iterable, Iterator, List, NamedTuple, Optional, Tuple, Type, cast
+19 
+20 from docutils import nodes
+21 from docutils.nodes import Element, Node
+22 from docutils.parsers.rst import directives
+23 from docutils.parsers.rst.states import Inliner
+24 
+25 from sphinx import addnodes
+26 from sphinx.addnodes import desc_signature, pending_xref, pending_xref_condition
+27 from sphinx.application import Sphinx
+28 from sphinx.builders import Builder
+29 from sphinx.deprecation import RemovedInSphinx50Warning
+30 from sphinx.directives import ObjectDescription
+31 from sphinx.domains import Domain, Index, IndexEntry, ObjType
+32 from sphinx.environment import BuildEnvironment
+33 from sphinx.locale import _, __
+34 from sphinx.pycode.ast import ast
+35 from sphinx.pycode.ast import parse as ast_parse
+36 from sphinx.roles import XRefRole
+37 from sphinx.util import logging
+38 from sphinx.util.docfields import Field, GroupedField, TypedField
+39 from sphinx.util.docutils import SphinxDirective
+40 from sphinx.util.inspect import signature_from_str
+41 from sphinx.util.nodes import find_pending_xref_condition, make_id, make_refnode
+42 from sphinx.util.typing import OptionSpec, TextlikeNode
+43 
+44 logger = logging.getLogger(__name__)
+45 
+46 
+47 # REs for Python signatures
+48 py_sig_re = re.compile(
+49     r'''^ ([\w.]*\.)?            # class name(s)
+50           (\w+)  \s*             # thing name
+51           (?: \(\s*(.*)\s*\)     # optional: arguments
+52            (?:\s* -> \s* (.*))?  #           return annotation
+53           )? $                   # and nothing more
+54           ''', re.VERBOSE)
+55 
+56 
+57 pairindextypes = {
+58     'module':    _('module'),
+59     'keyword':   _('keyword'),
+60     'operator':  _('operator'),
+61     'object':    _('object'),
+62     'exception': _('exception'),
+63     'statement': _('statement'),
+64     'builtin':   _('built-in function'),
+65 }
+66 
+67 
+68 class ObjectEntry(NamedTuple):
+69     docname: str
+70     node_id: str
+71     objtype: str
+72     aliased: bool
+73 
+74 
+75 class ModuleEntry(NamedTuple):
+76     docname: str
+77     node_id: str
+78     synopsis: str
+79     platform: str
+80     deprecated: bool
+81 
+82 
+83 def type_to_xref(text: str, env: BuildEnvironment = None) -> addnodes.pending_xref:
+84     """Convert a type string to a cross reference node."""
+85     if text == 'None':
+86         reftype = 'obj'
+87     else:
+88         reftype = 'class'
+89 
+90     if env:
+91         kwargs = {'py:module': env.ref_context.get('py:module'),
+92                   'py:class': env.ref_context.get('py:class')}
+93     else:
+94         kwargs = {}
+95 
+96     if env.config.python_use_unqualified_type_names:
+97         # Note: It would be better to use qualname to describe the object to support support
+98         # nested classes.  But python domain can't access the real python object because this
+99         # module should work not-dynamically.
+100         shortname = text.split('.')[-1]
+101         contnodes: List[Node] = [pending_xref_condition('', shortname, condition='resolved'),
+102                                  pending_xref_condition('', text, condition='*')]
+103     else:
+104         contnodes = [nodes.Text(text)]
+105 
+106     return pending_xref('', *contnodes,
+107                         refdomain='py', reftype=reftype, reftarget=text, **kwargs)
+108 
+109 
+110 def _parse_annotation(annotation: str, env: BuildEnvironment = None) -> List[Node]:
+111     """Parse type annotation."""
+112     def unparse(node: ast.AST) -> List[Node]:
+113         if isinstance(node, ast.Attribute):
+114             return [nodes.Text("%s.%s" % (unparse(node.value)[0], node.attr))]
+115         elif isinstance(node, ast.BinOp):
+116             result: List[Node] = unparse(node.left)
+117             result.extend(unparse(node.op))
+118             result.extend(unparse(node.right))
+119             return result
+120         elif isinstance(node, ast.BitOr):
+121             return [addnodes.desc_sig_space(),
+122                     addnodes.desc_sig_punctuation('', '|'),
+123                     addnodes.desc_sig_space()]
+124         elif isinstance(node, ast.Constant):  # type: ignore
+125             if node.value is Ellipsis:
+126                 return [addnodes.desc_sig_punctuation('', "...")]
+127             elif isinstance(node.value, bool):
+128                 return [addnodes.desc_sig_keyword('', repr(node.value))]
+129             elif isinstance(node.value, int):
+130                 return [addnodes.desc_sig_literal_number('', repr(node.value))]
+131             elif isinstance(node.value, str):
+132                 return [addnodes.desc_sig_literal_string('', repr(node.value))]
+133             else:
+134                 # handles None, which is further handled by type_to_xref later
+135                 # and fallback for other types that should be converted
+136                 return [nodes.Text(repr(node.value))]
+137         elif isinstance(node, ast.Expr):
+138             return unparse(node.value)
+139         elif isinstance(node, ast.Index):
+140             return unparse(node.value)
+141         elif isinstance(node, ast.List):
+142             result = [addnodes.desc_sig_punctuation('', '[')]
+143             if node.elts:
+144                 # check if there are elements in node.elts to only pop the
+145                 # last element of result if the for-loop was run at least
+146                 # once
+147                 for elem in node.elts:
+148                     result.extend(unparse(elem))
+149                     result.append(addnodes.desc_sig_punctuation('', ','))
+150                     result.append(addnodes.desc_sig_space())
+151                 result.pop()
+152                 result.pop()
+153             result.append(addnodes.desc_sig_punctuation('', ']'))
+154             return result
+155         elif isinstance(node, ast.Module):
+156             return sum((unparse(e) for e in node.body), [])
+157         elif isinstance(node, ast.Name):
+158             return [nodes.Text(node.id)]
+159         elif isinstance(node, ast.Subscript):
+160             result = unparse(node.value)
+161             result.append(addnodes.desc_sig_punctuation('', '['))
+162             result.extend(unparse(node.slice))
+163             result.append(addnodes.desc_sig_punctuation('', ']'))
+164 
+165             # Wrap the Text nodes inside brackets by literal node if the subscript is a Literal
+166             if result[0] in ('Literal', 'typing.Literal'):
+167                 for i, subnode in enumerate(result[1:], start=1):
+168                     if isinstance(subnode, nodes.Text):
+169                         result[i] = nodes.literal('', '', subnode)
+170             return result
+171         elif isinstance(node, ast.Tuple):
+172             if node.elts:
+173                 result = []
+174                 for elem in node.elts:
+175                     result.extend(unparse(elem))
+176                     result.append(addnodes.desc_sig_punctuation('', ','))
+177                     result.append(addnodes.desc_sig_space())
+178                 result.pop()
+179                 result.pop()
+180             else:
+181                 result = [addnodes.desc_sig_punctuation('', '('),
+182                           addnodes.desc_sig_punctuation('', ')')]
+183 
+184             return result
+185         else:
+186             if sys.version_info < (3, 8):
+187                 if isinstance(node, ast.Ellipsis):
+188                     return [addnodes.desc_sig_punctuation('', "...")]
+189                 elif isinstance(node, ast.NameConstant):
+190                     return [nodes.Text(node.value)]
+191 
+192             raise SyntaxError  # unsupported syntax
+193 
+194     if env is None:
+195         warnings.warn("The env parameter for _parse_annotation becomes required now.",
+196                       RemovedInSphinx50Warning, stacklevel=2)
+197 
+198     try:
+199         tree = ast_parse(annotation)
+200         result = unparse(tree)
+201         for i, node in enumerate(result):
+202             if isinstance(node, nodes.literal):
+203                 result[i] = node[0]
+204             elif isinstance(node, nodes.Text) and node.strip():
+205                 result[i] = type_to_xref(str(node), env)
+206         return result
+207     except SyntaxError:
+208         return [type_to_xref(annotation, env)]
+209 
+210 
+211 def _parse_arglist(arglist: str, env: BuildEnvironment = None) -> addnodes.desc_parameterlist:
+212     """Parse a list of arguments using AST parser"""
+213     params = addnodes.desc_parameterlist(arglist)
+214     sig = signature_from_str('(%s)' % arglist)
+215     last_kind = None
+216     for param in sig.parameters.values():
+217         if param.kind != param.POSITIONAL_ONLY and last_kind == param.POSITIONAL_ONLY:
+218             # PEP-570: Separator for Positional Only Parameter: /
+219             params += addnodes.desc_parameter('', '', addnodes.desc_sig_operator('', '/'))
+220         if param.kind == param.KEYWORD_ONLY and last_kind in (param.POSITIONAL_OR_KEYWORD,
+221                                                               param.POSITIONAL_ONLY,
+222                                                               None):
+223             # PEP-3102: Separator for Keyword Only Parameter: *
+224             params += addnodes.desc_parameter('', '', addnodes.desc_sig_operator('', '*'))
+225 
+226         node = addnodes.desc_parameter()
+227         if param.kind == param.VAR_POSITIONAL:
+228             node += addnodes.desc_sig_operator('', '*')
+229             node += addnodes.desc_sig_name('', param.name)
+230         elif param.kind == param.VAR_KEYWORD:
+231             node += addnodes.desc_sig_operator('', '**')
+232             node += addnodes.desc_sig_name('', param.name)
+233         else:
+234             node += addnodes.desc_sig_name('', param.name)
+235 
+236         if param.annotation is not param.empty:
+237             children = _parse_annotation(param.annotation, env)
+238             node += addnodes.desc_sig_punctuation('', ':')
+239             node += addnodes.desc_sig_space()
+240             node += addnodes.desc_sig_name('', '', *children)  # type: ignore
+241         if param.default is not param.empty:
+242             if param.annotation is not param.empty:
+243                 node += addnodes.desc_sig_space()
+244                 node += addnodes.desc_sig_operator('', '=')
+245                 node += addnodes.desc_sig_space()
+246             else:
+247                 node += addnodes.desc_sig_operator('', '=')
+248             node += nodes.inline('', param.default, classes=['default_value'],
+249                                  support_smartquotes=False)
+250 
+251         params += node
+252         last_kind = param.kind
+253 
+254     if last_kind == Parameter.POSITIONAL_ONLY:
+255         # PEP-570: Separator for Positional Only Parameter: /
+256         params += addnodes.desc_parameter('', '', addnodes.desc_sig_operator('', '/'))
+257 
+258     return params
+259 
+260 
+261 def _pseudo_parse_arglist(signode: desc_signature, arglist: str) -> None:
+262     """"Parse" a list of arguments separated by commas.
+263 
+264     Arguments can have "optional" annotations given by enclosing them in
+265     brackets.  Currently, this will split at any comma, even if it's inside a
+266     string literal (e.g. default argument value).
+267     """
+268     paramlist = addnodes.desc_parameterlist()
+269     stack: List[Element] = [paramlist]
+270     try:
+271         for argument in arglist.split(','):
+272             argument = argument.strip()
+273             ends_open = ends_close = 0
+274             while argument.startswith('['):
+275                 stack.append(addnodes.desc_optional())
+276                 stack[-2] += stack[-1]
+277                 argument = argument[1:].strip()
+278             while argument.startswith(']'):
+279                 stack.pop()
+280                 argument = argument[1:].strip()
+281             while argument.endswith(']') and not argument.endswith('[]'):
+282                 ends_close += 1
+283                 argument = argument[:-1].strip()
+284             while argument.endswith('['):
+285                 ends_open += 1
+286                 argument = argument[:-1].strip()
+287             if argument:
+288                 stack[-1] += addnodes.desc_parameter(
+289                     '', '', addnodes.desc_sig_name(argument, argument))
+290             while ends_open:
+291                 stack.append(addnodes.desc_optional())
+292                 stack[-2] += stack[-1]
+293                 ends_open -= 1
+294             while ends_close:
+295                 stack.pop()
+296                 ends_close -= 1
+297         if len(stack) != 1:
+298             raise IndexError
+299     except IndexError:
+300         # if there are too few or too many elements on the stack, just give up
+301         # and treat the whole argument list as one argument, discarding the
+302         # already partially populated paramlist node
+303         paramlist = addnodes.desc_parameterlist()
+304         paramlist += addnodes.desc_parameter(arglist, arglist)
+305         signode += paramlist
+306     else:
+307         signode += paramlist
+308 
+309 
+310 # This override allows our inline type specifiers to behave like :class: link
+311 # when it comes to handling "." and "~" prefixes.
+312 class PyXrefMixin:
+313     def make_xref(self, rolename: str, domain: str, target: str,
+314                   innernode: Type[TextlikeNode] = nodes.emphasis,
+315                   contnode: Node = None, env: BuildEnvironment = None,
+316                   inliner: Inliner = None, location: Node = None) -> Node:
+317         # we use inliner=None to make sure we get the old behaviour with a single
+318         # pending_xref node
+319         result = super().make_xref(rolename, domain, target,  # type: ignore
+320                                    innernode, contnode,
+321                                    env, inliner=None, location=None)
+322         result['refspecific'] = True
+323         result['py:module'] = env.ref_context.get('py:module')
+324         result['py:class'] = env.ref_context.get('py:class')
+325         if target.startswith(('.', '~')):
+326             prefix, result['reftarget'] = target[0], target[1:]
+327             if prefix == '.':
+328                 text = target[1:]
+329             elif prefix == '~':
+330                 text = target.split('.')[-1]
+331             for node in result.traverse(nodes.Text):
+332                 node.parent[node.parent.index(node)] = nodes.Text(text)
+333                 break
+334         elif isinstance(result, pending_xref) and env.config.python_use_unqualified_type_names:
+335             children = result.children
+336             result.clear()
+337 
+338             shortname = target.split('.')[-1]
+339             textnode = innernode('', shortname)
+340             contnodes = [pending_xref_condition('', '', textnode, condition='resolved'),
+341                          pending_xref_condition('', '', *children, condition='*')]
+342             result.extend(contnodes)
+343 
+344         return result
+345 
+346     def make_xrefs(self, rolename: str, domain: str, target: str,
+347                    innernode: Type[TextlikeNode] = nodes.emphasis,
+348                    contnode: Node = None, env: BuildEnvironment = None,
+349                    inliner: Inliner = None, location: Node = None) -> List[Node]:
+350         delims = r'(\s*[\[\]\(\),](?:\s*or\s)?\s*|\s+or\s+|\s*\|\s*|\.\.\.)'
+351         delims_re = re.compile(delims)
+352         sub_targets = re.split(delims, target)
+353 
+354         split_contnode = bool(contnode and contnode.astext() == target)
+355 
+356         results = []
+357         for sub_target in filter(None, sub_targets):
+358             if split_contnode:
+359                 contnode = nodes.Text(sub_target)
+360 
+361             if delims_re.match(sub_target):
+362                 results.append(contnode or innernode(sub_target, sub_target))
+363             else:
+364                 results.append(self.make_xref(rolename, domain, sub_target,
+365                                               innernode, contnode, env, inliner, location))
+366 
+367         return results
+368 
+369 
+370 class PyField(PyXrefMixin, Field):
+371     def make_xref(self, rolename: str, domain: str, target: str,
+372                   innernode: Type[TextlikeNode] = nodes.emphasis,
+373                   contnode: Node = None, env: BuildEnvironment = None,
+374                   inliner: Inliner = None, location: Node = None) -> Node:
+375         if rolename == 'class' and target == 'None':
+376             # None is not a type, so use obj role instead.
+377             rolename = 'obj'
+378 
+379         return super().make_xref(rolename, domain, target, innernode, contnode,
+380                                  env, inliner, location)
+381 
+382 
+383 class PyGroupedField(PyXrefMixin, GroupedField):
+384     pass
+385 
+386 
+387 class PyTypedField(PyXrefMixin, TypedField):
+388     def make_xref(self, rolename: str, domain: str, target: str,
+389                   innernode: Type[TextlikeNode] = nodes.emphasis,
+390                   contnode: Node = None, env: BuildEnvironment = None,
+391                   inliner: Inliner = None, location: Node = None) -> Node:
+392         if rolename == 'class' and target == 'None':
+393             # None is not a type, so use obj role instead.
+394             rolename = 'obj'
+395 
+396         return super().make_xref(rolename, domain, target, innernode, contnode,
+397                                  env, inliner, location)
+398 
+399 
+400 class PyObject(ObjectDescription[Tuple[str, str]]):
+401     """
+402     Description of a general Python object.
+403 
+404     :cvar allow_nesting: Class is an object that allows for nested namespaces
+405     :vartype allow_nesting: bool
+406     """
+407     option_spec: OptionSpec = {
+408         'noindex': directives.flag,
+409         'noindexentry': directives.flag,
+410         'module': directives.unchanged,
+411         'canonical': directives.unchanged,
+412         'annotation': directives.unchanged,
+413     }
+414 
+415     doc_field_types = [
+416         PyTypedField('parameter', label=_('Parameters'),
+417                      names=('param', 'parameter', 'arg', 'argument',
+418                             'keyword', 'kwarg', 'kwparam'),
+419                      typerolename='class', typenames=('paramtype', 'type'),
+420                      can_collapse=True),
+421         PyTypedField('variable', label=_('Variables'),
+422                      names=('var', 'ivar', 'cvar'),
+423                      typerolename='class', typenames=('vartype',),
+424                      can_collapse=True),
+425         PyGroupedField('exceptions', label=_('Raises'), rolename='exc',
+426                        names=('raises', 'raise', 'exception', 'except'),
+427                        can_collapse=True),
+428         Field('returnvalue', label=_('Returns'), has_arg=False,
+429               names=('returns', 'return')),
+430         PyField('returntype', label=_('Return type'), has_arg=False,
+431                 names=('rtype',), bodyrolename='class'),
+432     ]
+433 
+434     allow_nesting = False
+435 
+436     def get_signature_prefix(self, sig: str) -> List[nodes.Node]:
+437         """May return a prefix to put before the object name in the
+438         signature.
+439         """
+440         return []
+441 
+442     def needs_arglist(self) -> bool:
+443         """May return true if an empty argument list is to be generated even if
+444         the document contains none.
+445         """
+446         return False
+447 
+448     def handle_signature(self, sig: str, signode: desc_signature) -> Tuple[str, str]:
+449         """Transform a Python signature into RST nodes.
+450 
+451         Return (fully qualified name of the thing, classname if any).
+452 
+453         If inside a class, the current class name is handled intelligently:
+454         * it is stripped from the displayed name if present
+455         * it is added to the full name (return value) if not present
+456         """
+457         m = py_sig_re.match(sig)
+458         if m is None:
+459             raise ValueError
+460         prefix, name, arglist, retann = m.groups()
+461 
+462         # determine module and class name (if applicable), as well as full name
+463         modname = self.options.get('module', self.env.ref_context.get('py:module'))
+464         classname = self.env.ref_context.get('py:class')
+465         if classname:
+466             add_module = False
+467             if prefix and (prefix == classname or
+468                            prefix.startswith(classname + ".")):
+469                 fullname = prefix + name
+470                 # class name is given again in the signature
+471                 prefix = prefix[len(classname):].lstrip('.')
+472             elif prefix:
+473                 # class name is given in the signature, but different
+474                 # (shouldn't happen)
+475                 fullname = classname + '.' + prefix + name
+476             else:
+477                 # class name is not given in the signature
+478                 fullname = classname + '.' + name
+479         else:
+480             add_module = True
+481             if prefix:
+482                 classname = prefix.rstrip('.')
+483                 fullname = prefix + name
+484             else:
+485                 classname = ''
+486                 fullname = name
+487 
+488         signode['module'] = modname
+489         signode['class'] = classname
+490         signode['fullname'] = fullname
+491 
+492         sig_prefix = self.get_signature_prefix(sig)
+493         if sig_prefix:
+494             signode += addnodes.desc_annotation(str(sig_prefix), '', *sig_prefix)
+495 
+496         if prefix:
+497             signode += addnodes.desc_addname(prefix, prefix)
+498         elif modname and add_module and self.env.config.add_module_names:
+499             nodetext = modname + '.'
+500             signode += addnodes.desc_addname(nodetext, nodetext)
+501 
+502         signode += addnodes.desc_name(name, name)
+503         if arglist:
+504             try:
+505                 signode += _parse_arglist(arglist, self.env)
+506             except SyntaxError:
+507                 # fallback to parse arglist original parser.
+508                 # it supports to represent optional arguments (ex. "func(foo [, bar])")
+509                 _pseudo_parse_arglist(signode, arglist)
+510             except NotImplementedError as exc:
+511                 logger.warning("could not parse arglist (%r): %s", arglist, exc,
+512                                location=signode)
+513                 _pseudo_parse_arglist(signode, arglist)
+514         else:
+515             if self.needs_arglist():
+516                 # for callables, add an empty parameter list
+517                 signode += addnodes.desc_parameterlist()
+518 
+519         if retann:
+520             children = _parse_annotation(retann, self.env)
+521             signode += addnodes.desc_returns(retann, '', *children)
+522 
+523         anno = self.options.get('annotation')
+524         if anno:
+525             signode += addnodes.desc_annotation(' ' + anno, '',
+526                                                 addnodes.desc_sig_space(),
+527                                                 nodes.Text(anno))
+528 
+529         return fullname, prefix
+530 
+531     def get_index_text(self, modname: str, name: Tuple[str, str]) -> str:
+532         """Return the text for the index entry of the object."""
+533         raise NotImplementedError('must be implemented in subclasses')
+534 
+535     def add_target_and_index(self, name_cls: Tuple[str, str], sig: str,
+536                              signode: desc_signature) -> None:
+537         modname = self.options.get('module', self.env.ref_context.get('py:module'))
+538         fullname = (modname + '.' if modname else '') + name_cls[0]
+539         node_id = make_id(self.env, self.state.document, '', fullname)
+540         signode['ids'].append(node_id)
+541 
+542         # Assign old styled node_id(fullname) not to break old hyperlinks (if possible)
+543         # Note: Will removed in Sphinx-5.0  (RemovedInSphinx50Warning)
+544         if node_id != fullname and fullname not in self.state.document.ids:
+545             signode['ids'].append(fullname)
+546 
+547         self.state.document.note_explicit_target(signode)
+548 
+549         domain = cast(PythonDomain, self.env.get_domain('py'))
+550         domain.note_object(fullname, self.objtype, node_id, location=signode)
+551 
+552         canonical_name = self.options.get('canonical')
+553         if canonical_name:
+554             domain.note_object(canonical_name, self.objtype, node_id, aliased=True,
+555                                location=signode)
+556 
+557         if 'noindexentry' not in self.options:
+558             indextext = self.get_index_text(modname, name_cls)
+559             if indextext:
+560                 self.indexnode['entries'].append(('single', indextext, node_id, '', None))
+561 
+562     def before_content(self) -> None:
+563         """Handle object nesting before content
+564 
+565         :py:class:`PyObject` represents Python language constructs. For
+566         constructs that are nestable, such as a Python classes, this method will
+567         build up a stack of the nesting hierarchy so that it can be later
+568         de-nested correctly, in :py:meth:`after_content`.
+569 
+570         For constructs that aren't nestable, the stack is bypassed, and instead
+571         only the most recent object is tracked. This object prefix name will be
+572         removed with :py:meth:`after_content`.
+573         """
+574         prefix = None
+575         if self.names:
+576             # fullname and name_prefix come from the `handle_signature` method.
+577             # fullname represents the full object name that is constructed using
+578             # object nesting and explicit prefixes. `name_prefix` is the
+579             # explicit prefix given in a signature
+580             (fullname, name_prefix) = self.names[-1]
+581             if self.allow_nesting:
+582                 prefix = fullname
+583             elif name_prefix:
+584                 prefix = name_prefix.strip('.')
+585         if prefix:
+586             self.env.ref_context['py:class'] = prefix
+587             if self.allow_nesting:
+588                 classes = self.env.ref_context.setdefault('py:classes', [])
+589                 classes.append(prefix)
+590         if 'module' in self.options:
+591             modules = self.env.ref_context.setdefault('py:modules', [])
+592             modules.append(self.env.ref_context.get('py:module'))
+593             self.env.ref_context['py:module'] = self.options['module']
+594 
+595     def after_content(self) -> None:
+596         """Handle object de-nesting after content
+597 
+598         If this class is a nestable object, removing the last nested class prefix
+599         ends further nesting in the object.
+600 
+601         If this class is not a nestable object, the list of classes should not
+602         be altered as we didn't affect the nesting levels in
+603         :py:meth:`before_content`.
+604         """
+605         classes = self.env.ref_context.setdefault('py:classes', [])
+606         if self.allow_nesting:
+607             try:
+608                 classes.pop()
+609             except IndexError:
+610                 pass
+611         self.env.ref_context['py:class'] = (classes[-1] if len(classes) > 0
+612                                             else None)
+613         if 'module' in self.options:
+614             modules = self.env.ref_context.setdefault('py:modules', [])
+615             if modules:
+616                 self.env.ref_context['py:module'] = modules.pop()
+617             else:
+618                 self.env.ref_context.pop('py:module')
+619 
+620 
+621 class PyFunction(PyObject):
+622     """Description of a function."""
+623 
+624     option_spec: OptionSpec = PyObject.option_spec.copy()
+625     option_spec.update({
+626         'async': directives.flag,
+627     })
+628 
+629     def get_signature_prefix(self, sig: str) -> List[nodes.Node]:
+630         if 'async' in self.options:
+631             return [addnodes.desc_sig_keyword('', 'async'),
+632                     addnodes.desc_sig_space()]
+633         else:
+634             return []
+635 
+636     def needs_arglist(self) -> bool:
+637         return True
+638 
+639     def add_target_and_index(self, name_cls: Tuple[str, str], sig: str,
+640                              signode: desc_signature) -> None:
+641         super().add_target_and_index(name_cls, sig, signode)
+642         if 'noindexentry' not in self.options:
+643             modname = self.options.get('module', self.env.ref_context.get('py:module'))
+644             node_id = signode['ids'][0]
+645 
+646             name, cls = name_cls
+647             if modname:
+648                 text = _('%s() (in module %s)') % (name, modname)
+649                 self.indexnode['entries'].append(('single', text, node_id, '', None))
+650             else:
+651                 text = '%s; %s()' % (pairindextypes['builtin'], name)
+652                 self.indexnode['entries'].append(('pair', text, node_id, '', None))
+653 
+654     def get_index_text(self, modname: str, name_cls: Tuple[str, str]) -> str:
+655         # add index in own add_target_and_index() instead.
+656         return None
+657 
+658 
+659 class PyDecoratorFunction(PyFunction):
+660     """Description of a decorator."""
+661 
+662     def run(self) -> List[Node]:
+663         # a decorator function is a function after all
+664         self.name = 'py:function'
+665         return super().run()
+666 
+667     def handle_signature(self, sig: str, signode: desc_signature) -> Tuple[str, str]:
+668         ret = super().handle_signature(sig, signode)
+669         signode.insert(0, addnodes.desc_addname('@', '@'))
+670         return ret
+671 
+672     def needs_arglist(self) -> bool:
+673         return False
+674 
+675 
+676 class PyVariable(PyObject):
+677     """Description of a variable."""
+678 
+679     option_spec: OptionSpec = PyObject.option_spec.copy()
+680     option_spec.update({
+681         'type': directives.unchanged,
+682         'value': directives.unchanged,
+683     })
+684 
+685     def handle_signature(self, sig: str, signode: desc_signature) -> Tuple[str, str]:
+686         fullname, prefix = super().handle_signature(sig, signode)
+687 
+688         typ = self.options.get('type')
+689         if typ:
+690             annotations = _parse_annotation(typ, self.env)
+691             signode += addnodes.desc_annotation(typ, '',
+692                                                 addnodes.desc_sig_punctuation('', ':'),
+693                                                 addnodes.desc_sig_space(), *annotations)
+694 
+695         value = self.options.get('value')
+696         if value:
+697             signode += addnodes.desc_annotation(value, '',
+698                                                 addnodes.desc_sig_space(),
+699                                                 addnodes.desc_sig_punctuation('', '='),
+700                                                 addnodes.desc_sig_space(),
+701                                                 nodes.Text(value))
+702 
+703         return fullname, prefix
+704 
+705     def get_index_text(self, modname: str, name_cls: Tuple[str, str]) -> str:
+706         name, cls = name_cls
+707         if modname:
+708             return _('%s (in module %s)') % (name, modname)
+709         else:
+710             return _('%s (built-in variable)') % name
+711 
+712 
+713 class PyClasslike(PyObject):
+714     """
+715     Description of a class-like object (classes, interfaces, exceptions).
+716     """
+717 
+718     option_spec: OptionSpec = PyObject.option_spec.copy()
+719     option_spec.update({
+720         'final': directives.flag,
+721     })
+722 
+723     allow_nesting = True
+724 
+725     def get_signature_prefix(self, sig: str) -> List[nodes.Node]:
+726         if 'final' in self.options:
+727             return [nodes.Text('final'), addnodes.desc_sig_space(),
+728                     nodes.Text(self.objtype), addnodes.desc_sig_space()]
+729         else:
+730             return [nodes.Text(self.objtype), addnodes.desc_sig_space()]
+731 
+732     def get_index_text(self, modname: str, name_cls: Tuple[str, str]) -> str:
+733         if self.objtype == 'class':
+734             if not modname:
+735                 return _('%s (built-in class)') % name_cls[0]
+736             return _('%s (class in %s)') % (name_cls[0], modname)
+737         elif self.objtype == 'exception':
+738             return name_cls[0]
+739         else:
+740             return ''
+741 
+742 
+743 class PyMethod(PyObject):
+744     """Description of a method."""
+745 
+746     option_spec: OptionSpec = PyObject.option_spec.copy()
+747     option_spec.update({
+748         'abstractmethod': directives.flag,
+749         'async': directives.flag,
+750         'classmethod': directives.flag,
+751         'final': directives.flag,
+752         'property': directives.flag,
+753         'staticmethod': directives.flag,
+754     })
+755 
+756     def needs_arglist(self) -> bool:
+757         if 'property' in self.options:
+758             return False
+759         else:
+760             return True
+761 
+762     def get_signature_prefix(self, sig: str) -> List[nodes.Node]:
+763         prefix: List[nodes.Node] = []
+764         if 'final' in self.options:
+765             prefix.append(nodes.Text('final'))
+766             prefix.append(addnodes.desc_sig_space())
+767         if 'abstractmethod' in self.options:
+768             prefix.append(nodes.Text('abstract'))
+769             prefix.append(addnodes.desc_sig_space())
+770         if 'async' in self.options:
+771             prefix.append(nodes.Text('async'))
+772             prefix.append(addnodes.desc_sig_space())
+773         if 'classmethod' in self.options:
+774             prefix.append(nodes.Text('classmethod'))
+775             prefix.append(addnodes.desc_sig_space())
+776         if 'property' in self.options:
+777             prefix.append(nodes.Text('property'))
+778             prefix.append(addnodes.desc_sig_space())
+779         if 'staticmethod' in self.options:
+780             prefix.append(nodes.Text('static'))
+781             prefix.append(addnodes.desc_sig_space())
+782         return prefix
+783 
+784     def get_index_text(self, modname: str, name_cls: Tuple[str, str]) -> str:
+785         name, cls = name_cls
+786         try:
+787             clsname, methname = name.rsplit('.', 1)
+788             if modname and self.env.config.add_module_names:
+789                 clsname = '.'.join([modname, clsname])
+790         except ValueError:
+791             if modname:
+792                 return _('%s() (in module %s)') % (name, modname)
+793             else:
+794                 return '%s()' % name
+795 
+796         if 'classmethod' in self.options:
+797             return _('%s() (%s class method)') % (methname, clsname)
+798         elif 'property' in self.options:
+799             return _('%s (%s property)') % (methname, clsname)
+800         elif 'staticmethod' in self.options:
+801             return _('%s() (%s static method)') % (methname, clsname)
+802         else:
+803             return _('%s() (%s method)') % (methname, clsname)
+804 
+805 
+806 class PyClassMethod(PyMethod):
+807     """Description of a classmethod."""
+808 
+809     option_spec: OptionSpec = PyObject.option_spec.copy()
+810 
+811     def run(self) -> List[Node]:
+812         self.name = 'py:method'
+813         self.options['classmethod'] = True
+814 
+815         return super().run()
+816 
+817 
+818 class PyStaticMethod(PyMethod):
+819     """Description of a staticmethod."""
+820 
+821     option_spec: OptionSpec = PyObject.option_spec.copy()
+822 
+823     def run(self) -> List[Node]:
+824         self.name = 'py:method'
+825         self.options['staticmethod'] = True
+826 
+827         return super().run()
+828 
+829 
+830 class PyDecoratorMethod(PyMethod):
+831     """Description of a decoratormethod."""
+832 
+833     def run(self) -> List[Node]:
+834         self.name = 'py:method'
+835         return super().run()
+836 
+837     def handle_signature(self, sig: str, signode: desc_signature) -> Tuple[str, str]:
+838         ret = super().handle_signature(sig, signode)
+839         signode.insert(0, addnodes.desc_addname('@', '@'))
+840         return ret
+841 
+842     def needs_arglist(self) -> bool:
+843         return False
+844 
+845 
+846 class PyAttribute(PyObject):
+847     """Description of an attribute."""
+848 
+849     option_spec: OptionSpec = PyObject.option_spec.copy()
+850     option_spec.update({
+851         'type': directives.unchanged,
+852         'value': directives.unchanged,
+853     })
+854 
+855     def handle_signature(self, sig: str, signode: desc_signature) -> Tuple[str, str]:
+856         fullname, prefix = super().handle_signature(sig, signode)
+857 
+858         typ = self.options.get('type')
+859         if typ:
+860             annotations = _parse_annotation(typ, self.env)
+861             signode += addnodes.desc_annotation(typ, '',
+862                                                 addnodes.desc_sig_punctuation('', ':'),
+863                                                 addnodes.desc_sig_space(),
+864                                                 *annotations)
+865 
+866         value = self.options.get('value')
+867         if value:
+868             signode += addnodes.desc_annotation(value, '',
+869                                                 addnodes.desc_sig_space(),
+870                                                 addnodes.desc_sig_punctuation('', '='),
+871                                                 addnodes.desc_sig_space(),
+872                                                 nodes.Text(value))
+873 
+874         return fullname, prefix
+875 
+876     def get_index_text(self, modname: str, name_cls: Tuple[str, str]) -> str:
+877         name, cls = name_cls
+878         try:
+879             clsname, attrname = name.rsplit('.', 1)
+880             if modname and self.env.config.add_module_names:
+881                 clsname = '.'.join([modname, clsname])
+882         except ValueError:
+883             if modname:
+884                 return _('%s (in module %s)') % (name, modname)
+885             else:
+886                 return name
+887 
+888         return _('%s (%s attribute)') % (attrname, clsname)
+889 
+890 
+891 class PyProperty(PyObject):
+892     """Description of an attribute."""
+893 
+894     option_spec = PyObject.option_spec.copy()
+895     option_spec.update({
+896         'abstractmethod': directives.flag,
+897         'classmethod': directives.flag,
+898         'type': directives.unchanged,
+899     })
+900 
+901     def handle_signature(self, sig: str, signode: desc_signature) -> Tuple[str, str]:
+902         fullname, prefix = super().handle_signature(sig, signode)
+903 
+904         typ = self.options.get('type')
+905         if typ:
+906             annotations = _parse_annotation(typ, self.env)
+907             signode += addnodes.desc_annotation(typ, '',
+908                                                 addnodes.desc_sig_punctuation('', ':'),
+909                                                 addnodes.desc_sig_space(),
+910                                                 *annotations)
+911 
+912         return fullname, prefix
+913 
+914     def get_signature_prefix(self, sig: str) -> List[nodes.Node]:
+915         prefix: List[nodes.Node] = []
+916         if 'abstractmethod' in self.options:
+917             prefix.append(nodes.Text('abstract'))
+918             prefix.append(addnodes.desc_sig_space())
+919         if 'classmethod' in self.options:
+920             prefix.append(nodes.Text('class'))
+921             prefix.append(addnodes.desc_sig_space())
+922 
+923         prefix.append(nodes.Text('property'))
+924         prefix.append(addnodes.desc_sig_space())
+925         return prefix
+926 
+927     def get_index_text(self, modname: str, name_cls: Tuple[str, str]) -> str:
+928         name, cls = name_cls
+929         try:
+930             clsname, attrname = name.rsplit('.', 1)
+931             if modname and self.env.config.add_module_names:
+932                 clsname = '.'.join([modname, clsname])
+933         except ValueError:
+934             if modname:
+935                 return _('%s (in module %s)') % (name, modname)
+936             else:
+937                 return name
+938 
+939         return _('%s (%s property)') % (attrname, clsname)
+940 
+941 
+942 class PyDecoratorMixin:
+943     """
+944     Mixin for decorator directives.
+945     """
+946     def handle_signature(self, sig: str, signode: desc_signature) -> Tuple[str, str]:
+947         for cls in self.__class__.__mro__:
+948             if cls.__name__ != 'DirectiveAdapter':
+949                 warnings.warn('PyDecoratorMixin is deprecated. '
+950                               'Please check the implementation of %s' % cls,
+951                               RemovedInSphinx50Warning, stacklevel=2)
+952                 break
+953         else:
+954             warnings.warn('PyDecoratorMixin is deprecated',
+955                           RemovedInSphinx50Warning, stacklevel=2)
+956 
+957         ret = super().handle_signature(sig, signode)  # type: ignore
+958         signode.insert(0, addnodes.desc_addname('@', '@'))
+959         return ret
+960 
+961     def needs_arglist(self) -> bool:
+962         return False
+963 
+964 
+965 class PyModule(SphinxDirective):
+966     """
+967     Directive to mark description of a new module.
+968     """
+969 
+970     has_content = False
+971     required_arguments = 1
+972     optional_arguments = 0
+973     final_argument_whitespace = False
+974     option_spec: OptionSpec = {
+975         'platform': lambda x: x,
+976         'synopsis': lambda x: x,
+977         'noindex': directives.flag,
+978         'deprecated': directives.flag,
+979     }
+980 
+981     def run(self) -> List[Node]:
+982         domain = cast(PythonDomain, self.env.get_domain('py'))
+983 
+984         modname = self.arguments[0].strip()
+985         noindex = 'noindex' in self.options
+986         self.env.ref_context['py:module'] = modname
+987         ret: List[Node] = []
+988         if not noindex:
+989             # note module to the domain
+990             node_id = make_id(self.env, self.state.document, 'module', modname)
+991             target = nodes.target('', '', ids=[node_id], ismod=True)
+992             self.set_source_info(target)
+993 
+994             # Assign old styled node_id not to break old hyperlinks (if possible)
+995             # Note: Will removed in Sphinx-5.0  (RemovedInSphinx50Warning)
+996             old_node_id = self.make_old_id(modname)
+997             if node_id != old_node_id and old_node_id not in self.state.document.ids:
+998                 target['ids'].append(old_node_id)
+999 
+1000             self.state.document.note_explicit_target(target)
+1001 
+1002             domain.note_module(modname,
+1003                                node_id,
+1004                                self.options.get('synopsis', ''),
+1005                                self.options.get('platform', ''),
+1006                                'deprecated' in self.options)
+1007             domain.note_object(modname, 'module', node_id, location=target)
+1008 
+1009             # the platform and synopsis aren't printed; in fact, they are only
+1010             # used in the modindex currently
+1011             ret.append(target)
+1012             indextext = '%s; %s' % (pairindextypes['module'], modname)
+1013             inode = addnodes.index(entries=[('pair', indextext, node_id, '', None)])
+1014             ret.append(inode)
+1015         return ret
+1016 
+1017     def make_old_id(self, name: str) -> str:
+1018         """Generate old styled node_id.
+1019 
+1020         Old styled node_id is incompatible with docutils' node_id.
+1021         It can contain dots and hyphens.
+1022 
+1023         .. note:: Old styled node_id was mainly used until Sphinx-3.0.
+1024         """
+1025         return 'module-%s' % name
+1026 
+1027 
+1028 class PyCurrentModule(SphinxDirective):
+1029     """
+1030     This directive is just to tell Sphinx that we're documenting
+1031     stuff in module foo, but links to module foo won't lead here.
+1032     """
+1033 
+1034     has_content = False
+1035     required_arguments = 1
+1036     optional_arguments = 0
+1037     final_argument_whitespace = False
+1038     option_spec: OptionSpec = {}
+1039 
+1040     def run(self) -> List[Node]:
+1041         modname = self.arguments[0].strip()
+1042         if modname == 'None':
+1043             self.env.ref_context.pop('py:module', None)
+1044         else:
+1045             self.env.ref_context['py:module'] = modname
+1046         return []
+1047 
+1048 
+1049 class PyXRefRole(XRefRole):
+1050     def process_link(self, env: BuildEnvironment, refnode: Element,
+1051                      has_explicit_title: bool, title: str, target: str) -> Tuple[str, str]:
+1052         refnode['py:module'] = env.ref_context.get('py:module')
+1053         refnode['py:class'] = env.ref_context.get('py:class')
+1054         if not has_explicit_title:
+1055             title = title.lstrip('.')    # only has a meaning for the target
+1056             target = target.lstrip('~')  # only has a meaning for the title
+1057             # if the first character is a tilde, don't display the module/class
+1058             # parts of the contents
+1059             if title[0:1] == '~':
+1060                 title = title[1:]
+1061                 dot = title.rfind('.')
+1062                 if dot != -1:
+1063                     title = title[dot + 1:]
+1064         # if the first character is a dot, search more specific namespaces first
+1065         # else search builtins first
+1066         if target[0:1] == '.':
+1067             target = target[1:]
+1068             refnode['refspecific'] = True
+1069         return title, target
+1070 
+1071 
+1072 def filter_meta_fields(app: Sphinx, domain: str, objtype: str, content: Element) -> None:
+1073     """Filter ``:meta:`` field from its docstring."""
+1074     if domain != 'py':
+1075         return
+1076 
+1077     for node in content:
+1078         if isinstance(node, nodes.field_list):
+1079             fields = cast(List[nodes.field], node)
+1080             for field in fields:
+1081                 field_name = cast(nodes.field_body, field[0]).astext().strip()
+1082                 if field_name == 'meta' or field_name.startswith('meta '):
+1083                     node.remove(field)
+1084                     break
+1085 
+1086 
+1087 class PythonModuleIndex(Index):
+1088     """
+1089     Index subclass to provide the Python module index.
+1090     """
+1091 
+1092     name = 'modindex'
+1093     localname = _('Python Module Index')
+1094     shortname = _('modules')
+1095 
+1096     def generate(self, docnames: Iterable[str] = None
+1097                  ) -> Tuple[List[Tuple[str, List[IndexEntry]]], bool]:
+1098         content: Dict[str, List[IndexEntry]] = {}
+1099         # list of prefixes to ignore
+1100         ignores: List[str] = self.domain.env.config['modindex_common_prefix']
+1101         ignores = sorted(ignores, key=len, reverse=True)
+1102         # list of all modules, sorted by module name
+1103         modules = sorted(self.domain.data['modules'].items(),
+1104                          key=lambda x: x[0].lower())
+1105         # sort out collapsible modules
+1106         prev_modname = ''
+1107         num_toplevels = 0
+1108         for modname, (docname, node_id, synopsis, platforms, deprecated) in modules:
+1109             if docnames and docname not in docnames:
+1110                 continue
+1111 
+1112             for ignore in ignores:
+1113                 if modname.startswith(ignore):
+1114                     modname = modname[len(ignore):]
+1115                     stripped = ignore
+1116                     break
+1117             else:
+1118                 stripped = ''
+1119 
+1120             # we stripped the whole module name?
+1121             if not modname:
+1122                 modname, stripped = stripped, ''
+1123 
+1124             entries = content.setdefault(modname[0].lower(), [])
+1125 
+1126             package = modname.split('.')[0]
+1127             if package != modname:
+1128                 # it's a submodule
+1129                 if prev_modname == package:
+1130                     # first submodule - make parent a group head
+1131                     if entries:
+1132                         last = entries[-1]
+1133                         entries[-1] = IndexEntry(last[0], 1, last[2], last[3],
+1134                                                  last[4], last[5], last[6])
+1135                 elif not prev_modname.startswith(package):
+1136                     # submodule without parent in list, add dummy entry
+1137                     entries.append(IndexEntry(stripped + package, 1, '', '', '', '', ''))
+1138                 subtype = 2
+1139             else:
+1140                 num_toplevels += 1
+1141                 subtype = 0
+1142 
+1143             qualifier = _('Deprecated') if deprecated else ''
+1144             entries.append(IndexEntry(stripped + modname, subtype, docname,
+1145                                       node_id, platforms, qualifier, synopsis))
+1146             prev_modname = modname
+1147 
+1148         # apply heuristics when to collapse modindex at page load:
+1149         # only collapse if number of toplevel modules is larger than
+1150         # number of submodules
+1151         collapse = len(modules) - num_toplevels < num_toplevels
+1152 
+1153         # sort by first letter
+1154         sorted_content = sorted(content.items())
+1155 
+1156         return sorted_content, collapse
+1157 
+1158 
+1159 class PythonDomain(Domain):
+1160     """Python language domain."""
+1161     name = 'py'
+1162     label = 'Python'
+1163     object_types: Dict[str, ObjType] = {
+1164         'function':     ObjType(_('function'),      'func', 'obj'),
+1165         'data':         ObjType(_('data'),          'data', 'obj'),
+1166         'class':        ObjType(_('class'),         'class', 'exc', 'obj'),
+1167         'exception':    ObjType(_('exception'),     'exc', 'class', 'obj'),
+1168         'method':       ObjType(_('method'),        'meth', 'obj'),
+1169         'classmethod':  ObjType(_('class method'),  'meth', 'obj'),
+1170         'staticmethod': ObjType(_('static method'), 'meth', 'obj'),
+1171         'attribute':    ObjType(_('attribute'),     'attr', 'obj'),
+1172         'property':     ObjType(_('property'),      'attr', '_prop', 'obj'),
+1173         'module':       ObjType(_('module'),        'mod', 'obj'),
+1174     }
+1175 
+1176     directives = {
+1177         'function':        PyFunction,
+1178         'data':            PyVariable,
+1179         'class':           PyClasslike,
+1180         'exception':       PyClasslike,
+1181         'method':          PyMethod,
+1182         'classmethod':     PyClassMethod,
+1183         'staticmethod':    PyStaticMethod,
+1184         'attribute':       PyAttribute,
+1185         'property':        PyProperty,
+1186         'module':          PyModule,
+1187         'currentmodule':   PyCurrentModule,
+1188         'decorator':       PyDecoratorFunction,
+1189         'decoratormethod': PyDecoratorMethod,
+1190     }
+1191     roles = {
+1192         'data':  PyXRefRole(),
+1193         'exc':   PyXRefRole(),
+1194         'func':  PyXRefRole(fix_parens=True),
+1195         'class': PyXRefRole(),
+1196         'const': PyXRefRole(),
+1197         'attr':  PyXRefRole(),
+1198         'meth':  PyXRefRole(fix_parens=True),
+1199         'mod':   PyXRefRole(),
+1200         'obj':   PyXRefRole(),
+1201     }
+1202     initial_data: Dict[str, Dict[str, Tuple[Any]]] = {
+1203         'objects': {},  # fullname -> docname, objtype
+1204         'modules': {},  # modname -> docname, synopsis, platform, deprecated
+1205     }
+1206     indices = [
+1207         PythonModuleIndex,
+1208     ]
+1209 
+1210     @property
+1211     def objects(self) -> Dict[str, ObjectEntry]:
+1212         return self.data.setdefault('objects', {})  # fullname -> ObjectEntry
+1213 
+1214     def note_object(self, name: str, objtype: str, node_id: str,
+1215                     aliased: bool = False, location: Any = None) -> None:
+1216         """Note a python object for cross reference.
+1217 
+1218         .. versionadded:: 2.1
+1219         """
+1220         if name in self.objects:
+1221             other = self.objects[name]
+1222             if other.aliased and aliased is False:
+1223                 # The original definition found. Override it!
+1224                 pass
+1225             elif other.aliased is False and aliased:
+1226                 # The original definition is already registered.
+1227                 return
+1228             else:
+1229                 # duplicated
+1230                 logger.warning(__('duplicate object description of %s, '
+1231                                   'other instance in %s, use :noindex: for one of them'),
+1232                                name, other.docname, location=location)
+1233         self.objects[name] = ObjectEntry(self.env.docname, node_id, objtype, aliased)
+1234 
+1235     @property
+1236     def modules(self) -> Dict[str, ModuleEntry]:
+1237         return self.data.setdefault('modules', {})  # modname -> ModuleEntry
+1238 
+1239     def note_module(self, name: str, node_id: str, synopsis: str,
+1240                     platform: str, deprecated: bool) -> None:
+1241         """Note a python module for cross reference.
+1242 
+1243         .. versionadded:: 2.1
+1244         """
+1245         self.modules[name] = ModuleEntry(self.env.docname, node_id,
+1246                                          synopsis, platform, deprecated)
+1247 
+1248     def clear_doc(self, docname: str) -> None:
+1249         for fullname, obj in list(self.objects.items()):
+1250             if obj.docname == docname:
+1251                 del self.objects[fullname]
+1252         for modname, mod in list(self.modules.items()):
+1253             if mod.docname == docname:
+1254                 del self.modules[modname]
+1255 
+1256     def merge_domaindata(self, docnames: List[str], otherdata: Dict) -> None:
+1257         # XXX check duplicates?
+1258         for fullname, obj in otherdata['objects'].items():
+1259             if obj.docname in docnames:
+1260                 self.objects[fullname] = obj
+1261         for modname, mod in otherdata['modules'].items():
+1262             if mod.docname in docnames:
+1263                 self.modules[modname] = mod
+1264 
+1265     def find_obj(self, env: BuildEnvironment, modname: str, classname: str,
+1266                  name: str, type: str, searchmode: int = 0
+1267                  ) -> List[Tuple[str, ObjectEntry]]:
+1268         """Find a Python object for "name", perhaps using the given module
+1269         and/or classname.  Returns a list of (name, object entry) tuples.
+1270         """
+1271         # skip parens
+1272         if name[-2:] == '()':
+1273             name = name[:-2]
+1274 
+1275         if not name:
+1276             return []
+1277 
+1278         matches: List[Tuple[str, ObjectEntry]] = []
+1279 
+1280         newname = None
+1281         if searchmode == 1:
+1282             if type is None:
+1283                 objtypes = list(self.object_types)
+1284             else:
+1285                 objtypes = self.objtypes_for_role(type)
+1286             if objtypes is not None:
+1287                 if modname and classname:
+1288                     fullname = modname + '.' + classname + '.' + name
+1289                     if fullname in self.objects and self.objects[fullname].objtype in objtypes:
+1290                         newname = fullname
+1291                 if not newname:
+1292                     if modname and modname + '.' + name in self.objects and \
+1293                        self.objects[modname + '.' + name].objtype in objtypes:
+1294                         newname = modname + '.' + name
+1295                     elif name in self.objects and self.objects[name].objtype in objtypes:
+1296                         newname = name
+1297                     else:
+1298                         # "fuzzy" searching mode
+1299                         searchname = '.' + name
+1300                         matches = [(oname, self.objects[oname]) for oname in self.objects
+1301                                    if oname.endswith(searchname) and
+1302                                    self.objects[oname].objtype in objtypes]
+1303         else:
+1304             # NOTE: searching for exact match, object type is not considered
+1305             if name in self.objects:
+1306                 newname = name
+1307             elif type == 'mod':
+1308                 # only exact matches allowed for modules
+1309                 return []
+1310             elif classname and classname + '.' + name in self.objects:
+1311                 newname = classname + '.' + name
+1312             elif modname and modname + '.' + name in self.objects:
+1313                 newname = modname + '.' + name
+1314             elif modname and classname and \
+1315                     modname + '.' + classname + '.' + name in self.objects:
+1316                 newname = modname + '.' + classname + '.' + name
+1317         if newname is not None:
+1318             matches.append((newname, self.objects[newname]))
+1319         return matches
+1320 
+1321     def resolve_xref(self, env: BuildEnvironment, fromdocname: str, builder: Builder,
+1322                      type: str, target: str, node: pending_xref, contnode: Element
+1323                      ) -> Optional[Element]:
+1324         modname = node.get('py:module')
+1325         clsname = node.get('py:class')
+1326         searchmode = 1 if node.hasattr('refspecific') else 0
+1327         matches = self.find_obj(env, modname, clsname, target,
+1328                                 type, searchmode)
+1329 
+1330         if not matches and type == 'attr':
+1331             # fallback to meth (for property; Sphinx-2.4.x)
+1332             # this ensures that `:attr:` role continues to refer to the old property entry
+1333             # that defined by ``method`` directive in old reST files.
+1334             matches = self.find_obj(env, modname, clsname, target, 'meth', searchmode)
+1335         if not matches and type == 'meth':
+1336             # fallback to attr (for property)
+1337             # this ensures that `:meth:` in the old reST files can refer to the property
+1338             # entry that defined by ``property`` directive.
+1339             #
+1340             # Note: _prop is a secret role only for internal look-up.
+1341             matches = self.find_obj(env, modname, clsname, target, '_prop', searchmode)
+1342 
+1343         if not matches:
+1344             return None
+1345         elif len(matches) > 1:
+1346             canonicals = [m for m in matches if not m[1].aliased]
+1347             if len(canonicals) == 1:
+1348                 matches = canonicals
+1349             else:
+1350                 logger.warning(__('more than one target found for cross-reference %r: %s'),
+1351                                target, ', '.join(match[0] for match in matches),
+1352                                type='ref', subtype='python', location=node)
+1353         name, obj = matches[0]
+1354 
+1355         if obj[2] == 'module':
+1356             return self._make_module_refnode(builder, fromdocname, name, contnode)
+1357         else:
+1358             # determine the content of the reference by conditions
+1359             content = find_pending_xref_condition(node, 'resolved')
+1360             if content:
+1361                 children = content.children
+1362             else:
+1363                 # if not found, use contnode
+1364                 children = [contnode]
+1365 
+1366             return make_refnode(builder, fromdocname, obj[0], obj[1], children, name)
+1367 
+1368     def resolve_any_xref(self, env: BuildEnvironment, fromdocname: str, builder: Builder,
+1369                          target: str, node: pending_xref, contnode: Element
+1370                          ) -> List[Tuple[str, Element]]:
+1371         modname = node.get('py:module')
+1372         clsname = node.get('py:class')
+1373         results: List[Tuple[str, Element]] = []
+1374 
+1375         # always search in "refspecific" mode with the :any: role
+1376         matches = self.find_obj(env, modname, clsname, target, None, 1)
+1377         for name, obj in matches:
+1378             if obj[2] == 'module':
+1379                 results.append(('py:mod',
+1380                                 self._make_module_refnode(builder, fromdocname,
+1381                                                           name, contnode)))
+1382             else:
+1383                 # determine the content of the reference by conditions
+1384                 content = find_pending_xref_condition(node, 'resolved')
+1385                 if content:
+1386                     children = content.children
+1387                 else:
+1388                     # if not found, use contnode
+1389                     children = [contnode]
+1390 
+1391                 results.append(('py:' + self.role_for_objtype(obj[2]),
+1392                                 make_refnode(builder, fromdocname, obj[0], obj[1],
+1393                                              children, name)))
+1394         return results
+1395 
+1396     def _make_module_refnode(self, builder: Builder, fromdocname: str, name: str,
+1397                              contnode: Node) -> Element:
+1398         # get additional info for modules
+1399         module = self.modules[name]
+1400         title = name
+1401         if module.synopsis:
+1402             title += ': ' + module.synopsis
+1403         if module.deprecated:
+1404             title += _(' (deprecated)')
+1405         if module.platform:
+1406             title += ' (' + module.platform + ')'
+1407         return make_refnode(builder, fromdocname, module.docname, module.node_id,
+1408                             contnode, title)
+1409 
+1410     def get_objects(self) -> Iterator[Tuple[str, str, str, str, str, int]]:
+1411         for modname, mod in self.modules.items():
+1412             yield (modname, modname, 'module', mod.docname, mod.node_id, 0)
+1413         for refname, obj in self.objects.items():
+1414             if obj.objtype != 'module':  # modules are already handled
+1415                 if obj.aliased:
+1416                     # aliased names are not full-text searchable.
+1417                     yield (refname, refname, obj.objtype, obj.docname, obj.node_id, -1)
+1418                 else:
+1419                     yield (refname, refname, obj.objtype, obj.docname, obj.node_id, 1)
+1420 
+1421     def get_full_qualified_name(self, node: Element) -> Optional[str]:
+1422         modname = node.get('py:module')
+1423         clsname = node.get('py:class')
+1424         target = node.get('reftarget')
+1425         if target is None:
+1426             return None
+1427         else:
+1428             return '.'.join(filter(None, [modname, clsname, target]))
+1429 
+1430 
+1431 def builtin_resolver(app: Sphinx, env: BuildEnvironment,
+1432                      node: pending_xref, contnode: Element) -> Element:
+1433     """Do not emit nitpicky warnings for built-in types."""
+1434     def istyping(s: str) -> bool:
+1435         if s.startswith('typing.'):
+1436             s = s.split('.', 1)[1]
+1437 
+1438         return s in typing.__all__  # type: ignore
+1439 
+1440     if node.get('refdomain') != 'py':
+1441         return None
+1442     elif node.get('reftype') in ('class', 'obj') and node.get('reftarget') == 'None':
+1443         return contnode
+1444     elif node.get('reftype') in ('class', 'exc'):
+1445         reftarget = node.get('reftarget')
+1446         if inspect.isclass(getattr(builtins, reftarget, None)):
+1447             # built-in class
+1448             return contnode
+1449         elif istyping(reftarget):
+1450             # typing class
+1451             return contnode
+1452 
+1453     return None
+1454 
+1455 
+1456 def setup(app: Sphinx) -> Dict[str, Any]:
+1457     app.setup_extension('sphinx.directives')
+1458 
+1459     app.add_domain(PythonDomain)
+1460     app.add_config_value('python_use_unqualified_type_names', False, 'env')
+1461     app.connect('object-description-transform', filter_meta_fields)
+1462     app.connect('missing-reference', builtin_resolver, priority=900)
+1463 
+1464     return {
+1465         'version': 'builtin',
+1466         'env_version': 3,
+1467         'parallel_read_safe': True,
+1468         'parallel_write_safe': True,
+1469     }
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `sphinx/domains/python.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/sphinx/domains/python.py b/sphinx/domains/python.py
+--- a/sphinx/domains/python.py
++++ b/sphinx/domains/python.py
+@@ -796,7 +796,7 @@ def get_index_text(self, modname: str, name_cls: Tuple[str, str]) -> str:
+         if 'classmethod' in self.options:
+             return _('%s() (%s class method)') % (methname, clsname)
+         elif 'property' in self.options:
+-            return _('%s() (%s property)') % (methname, clsname)
++            return _('%s (%s property)') % (methname, clsname)
+         elif 'staticmethod' in self.options:
+             return _('%s() (%s static method)') % (methname, clsname)
+         else:
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/sphinx/domains/python.py b/sphinx/domains/python.py
+index cd02eaad5..1a3bd60c7 100644
+--- a/sphinx/domains/python.py
++++ b/sphinx/domains/python.py
+@@ -796,7 +796,7 @@ class PyMethod(PyObject):
+         if 'classmethod' in self.options:
+             return _('%s() (%s class method)') % (methname, clsname)
+         elif 'property' in self.options:
+-            return _('%s() (%s property)') % (methname, clsname)
++            return _('%s (%s property)') % (methname, clsname)
+         elif 'staticmethod' in self.options:
+             return _('%s() (%s static method)') % (methname, clsname)
+         else:
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `tests/test_domain_py.py` that contains the existing tests.
+-----------------------------------------------------------
+"""
+    test_domain_py
+    ~~~~~~~~~~~~~~
+
+    Tests the Python Domain
+
+    :copyright: Copyright 2007-2021 by the Sphinx team, see AUTHORS.
+    :license: BSD, see LICENSE for details.
+"""
+
+import re
+import sys
+from unittest.mock import Mock
+
+import pytest
+from docutils import nodes
+
+from sphinx import addnodes
+from sphinx.addnodes import (desc, desc_addname, desc_annotation, desc_content, desc_name,
+                             desc_optional, desc_parameter, desc_parameterlist, desc_returns,
+                             desc_sig_keyword, desc_sig_literal_number,
+                             desc_sig_literal_string, desc_sig_name, desc_sig_operator,
+                             desc_sig_punctuation, desc_sig_space, desc_signature,
+                             pending_xref)
+from sphinx.domains import IndexEntry
+from sphinx.domains.python import (PythonDomain, PythonModuleIndex, _parse_annotation,
+                                   _pseudo_parse_arglist, py_sig_re)
+from sphinx.testing import restructuredtext
+from sphinx.testing.util import assert_node
+
+
+def parse(sig):
+    m = py_sig_re.match(sig)
+    if m is None:
+        raise ValueError
+    name_prefix, name, arglist, retann = m.groups()
+    signode = addnodes.desc_signature(sig, '')
+    _pseudo_parse_arglist(signode, arglist)
+    return signode.astext()
+
+
+def test_function_signatures():
+    rv = parse('func(a=1) -> int object')
+    assert rv == '(a=1)'
+
+    rv = parse('func(a=1, [b=None])')
+    assert rv == '(a=1, [b=None])'
+
+    rv = parse('func(a=1[, b=None])')
+    assert rv == '(a=1, [b=None])'
+
+    rv = parse("compile(source : string, filename, symbol='file')")
+    assert rv == "(source : string, filename, symbol='file')"
+
+    rv = parse('func(a=[], [b=None])')
+    assert rv == '(a=[], [b=None])'
+
+    rv = parse('func(a=[][, b=None])')
+    assert rv == '(a=[], [b=None])'
+
+
+@pytest.mark.sphinx('dummy', testroot='domain-py')
+def test_domain_py_xrefs(app, status, warning):
+    """Domain objects have correct prefixes when looking up xrefs"""
+    app.builder.build_all()
+
+    def assert_refnode(node, module_name, class_name, target, reftype=None,
+                       domain='py'):
+        attributes = {
+            'refdomain': domain,
+            'reftarget': target,
+        }
+        if reftype is not None:
+            attributes['reftype'] = reftype
+        if module_name is not False:
+            attributes['py:module'] = module_name
+        if class_name is not False:
+            attributes['py:class'] = class_name
+        assert_node(node, **attributes)
+
+    doctree = app.env.get_doctree('roles')
+    refnodes = list(doctree.traverse(pending_xref))
+    assert_refnode(refnodes[0], None, None, 'TopLevel', 'class')
+    assert_refnode(refnodes[1], None, None, 'top_level', 'meth')
+    assert_refnode(refnodes[2], None, 'NestedParentA', 'child_1', 'meth')
+    assert_refnode(refnodes[3], None, 'NestedParentA', 'NestedChildA.subchild_2', 'meth')
+    assert_refnode(refnodes[4], None, 'NestedParentA', 'child_2', 'meth')
+    assert_refnode(refnodes[5], False, 'NestedParentA', 'any_child', domain='')
+    assert_refnode(refnodes[6], None, 'NestedParentA', 'NestedChildA', 'class')
+    assert_refnode(refnodes[7], None, 'NestedParentA.NestedChildA', 'subchild_2', 'meth')
+    assert_refnode(refnodes[8], None, 'NestedParentA.NestedChildA',
+                   'NestedParentA.child_1', 'meth')
+    assert_refnode(refnodes[9], None, 'NestedParentA', 'NestedChildA.subchild_1', 'meth')
+    assert_refnode(refnodes[10], None, 'NestedParentB', 'child_1', 'meth')
+    assert_refnode(refnodes[11], None, 'NestedParentB', 'NestedParentB', 'class')
+    assert_refnode(refnodes[12], None, None, 'NestedParentA.NestedChildA', 'class')
+    assert len(refnodes) == 13
+
+    doctree = app.env.get_doctree('module')
+    refnodes = list(doctree.traverse(pending_xref))
+    assert_refnode(refnodes[0], 'module_a.submodule', None,
+                   'ModTopLevel', 'class')
+    assert_refnode(refnodes[1], 'module_a.submodule', 'ModTopLevel',
+                   'mod_child_1', 'meth')
+    assert_refnode(refnodes[2], 'module_a.submodule', 'ModTopLevel',
+                   'ModTopLevel.mod_child_1', 'meth')
+    assert_refnode(refnodes[3], 'module_a.submodule', 'ModTopLevel',
+                   'mod_child_2', 'meth')
+    assert_refnode(refnodes[4], 'module_a.submodule', 'ModTopLevel',
+                   'module_a.submodule.ModTopLevel.mod_child_1', 'meth')
+    assert_refnode(refnodes[5], 'module_a.submodule', 'ModTopLevel',
+                   'prop', 'attr')
+    assert_refnode(refnodes[6], 'module_a.submodule', 'ModTopLevel',
+                   'prop', 'meth')
+    assert_refnode(refnodes[7], 'module_b.submodule', None,
+                   'ModTopLevel', 'class')
+    assert_refnode(refnodes[8], 'module_b.submodule', 'ModTopLevel',
+                   'ModNoModule', 'class')
+    assert_refnode(refnodes[9], False, False, 'int', 'class')
+    assert_refnode(refnodes[10], False, False, 'tuple', 'class')
+    assert_refnode(refnodes[11], False, False, 'str', 'class')
+    assert_refnode(refnodes[12], False, False, 'float', 'class')
+    assert_refnode(refnodes[13], False, False, 'list', 'class')
+    assert_refnode(refnodes[14], False, False, 'ModTopLevel', 'class')
+    assert_refnode(refnodes[15], False, False, 'index', 'doc', domain='std')
+    assert len(refnodes) == 16
+
+    doctree = app.env.get_doctree('module_option')
+    refnodes = list(doctree.traverse(pending_xref))
+    print(refnodes)
+    print(refnodes[0])
+    print(refnodes[1])
+    assert_refnode(refnodes[0], 'test.extra', 'B', 'foo', 'meth')
+    assert_refnode(refnodes[1], 'test.extra', 'B', 'foo', 'meth')
+    assert len(refnodes) == 2
+
+
+@pytest.mark.sphinx('html', testroot='domain-py')
+def test_domain_py_xrefs_abbreviations(app, status, warning):
+    app.builder.build_all()
+
+    content = (app.outdir / 'abbr.html').read_text()
+    assert re.search(r'normal: <a .* href="module.html#module_a.submodule.ModTopLevel.'
+                     r'mod_child_1" .*><.*>module_a.submodule.ModTopLevel.mod_child_1\(\)'
+                     r'<.*></a>',
+                     content)
+    assert re.search(r'relative: <a .* href="module.html#module_a.submodule.ModTopLevel.'
+                     r'mod_child_1" .*><.*>ModTopLevel.mod_child_1\(\)<.*></a>',
+                     content)
+    assert re.search(r'short name: <a .* href="module.html#module_a.submodule.ModTopLevel.'
+                     r'mod_child_1" .*><.*>mod_child_1\(\)<.*></a>',
+                     content)
+    assert re.search(r'relative \+ short name: <a .* href="module.html#module_a.submodule.'
+                     r'ModTopLevel.mod_child_1" .*><.*>mod_child_1\(\)<.*></a>',
+                     content)
+    assert re.search(r'short name \+ relative: <a .* href="module.html#module_a.submodule.'
+                     r'ModTopLevel.mod_child_1" .*><.*>mod_child_1\(\)<.*></a>',
+                     content)
+
+
+@pytest.mark.sphinx('dummy', testroot='domain-py')
+def test_domain_py_objects(app, status, warning):
+    app.builder.build_all()
+
+    modules = app.env.domains['py'].data['modules']
+    objects = app.env.domains['py'].data['objects']
+
+    assert 'module_a.submodule' in modules
+    assert 'module_a.submodule' in objects
+    assert 'module_b.submodule' in modules
+    assert 'module_b.submodule' in objects
+
+    assert objects['module_a.submodule.ModTopLevel'][2] == 'class'
+    assert objects['module_a.submodule.ModTopLevel.mod_child_1'][2] == 'method'
+    assert objects['module_a.submodule.ModTopLevel.mod_child_2'][2] == 'method'
+    assert 'ModTopLevel.ModNoModule' not in objects
+    assert objects['ModNoModule'][2] == 'class'
+    assert objects['module_b.submodule.ModTopLevel'][2] == 'class'
+
+    assert objects['TopLevel'][2] == 'class'
+    assert objects['top_level'][2] == 'method'
+    assert objects['NestedParentA'][2] == 'class'
+    assert objects['NestedParentA.child_1'][2] == 'method'
+    assert objects['NestedParentA.any_child'][2] == 'method'
+    assert objects['NestedParentA.NestedChildA'][2] == 'class'
+    assert objects['NestedParentA.NestedChildA.subchild_1'][2] == 'method'
+    assert objects['NestedParentA.NestedChildA.subchild_2'][2] == 'method'
+    assert objects['NestedParentA.child_2'][2] == 'method'
+    assert objects['NestedParentB'][2] == 'class'
+    assert objects['NestedParentB.child_1'][2] == 'method'
+
+
+@pytest.mark.sphinx('html', testroot='domain-py')
+def test_resolve_xref_for_properties(app, status, warning):
+    app.builder.build_all()
+
+    content = (app.outdir / 'module.html').read_text()
+    assert ('Link to <a class="reference internal" href="#module_a.submodule.ModTopLevel.prop"'
+            ' title="module_a.submodule.ModTopLevel.prop">'
+            '<code class="xref py py-attr docutils literal notranslate"><span class="pre">'
+            'prop</span> <span class="pre">attribute</span></code></a>' in content)
+    assert ('Link to <a class="reference internal" href="#module_a.submodule.ModTopLevel.prop"'
+            ' title="module_a.submodule.ModTopLevel.prop">'
+            '<code class="xref py py-meth docutils literal notranslate"><span class="pre">'
+            'prop</span> <span class="pre">method</span></code></a>' in content)
+    assert ('Link to <a class="reference internal" href="#module_a.submodule.ModTopLevel.prop"'
+            ' title="module_a.submodule.ModTopLevel.prop">'
+            '<code class="xref py py-attr docutils literal notranslate"><span class="pre">'
+            'prop</span> <span class="pre">attribute</span></code></a>' in content)
+
+
+@pytest.mark.sphinx('dummy', testroot='domain-py')
+def test_domain_py_find_obj(app, status, warning):
+
+    def find_obj(modname, prefix, obj_name, obj_type, searchmode=0):
+        return app.env.domains['py'].find_obj(
+            app.env, modname, prefix, obj_name, obj_type, searchmode)
+
+    app.builder.build_all()
+
+    assert (find_obj(None, None, 'NONEXISTANT', 'class') == [])
+    assert (find_obj(None, None, 'NestedParentA', 'class') ==
+            [('NestedParentA', ('roles', 'NestedParentA', 'class', False))])
+    assert (find_obj(None, None, 'NestedParentA.NestedChildA', 'class') ==
+            [('NestedParentA.NestedChildA',
+              ('roles', 'NestedParentA.NestedChildA', 'class', False))])
+    assert (find_obj(None, 'NestedParentA', 'NestedChildA', 'class') ==
+            [('NestedParentA.NestedChildA',
+              ('roles', 'NestedParentA.NestedChildA', 'class', False))])
+    assert (find_obj(None, None, 'NestedParentA.NestedChildA.subchild_1', 'meth') ==
+            [('NestedParentA.NestedChildA.subchild_1',
+              ('roles', 'NestedParentA.NestedChildA.subchild_1', 'method', False))])
+    assert (find_obj(None, 'NestedParentA', 'NestedChildA.subchild_1', 'meth') ==
+            [('NestedParentA.NestedChildA.subchild_1',
+              ('roles', 'NestedParentA.NestedChildA.subchild_1', 'method', False))])
+    assert (find_obj(None, 'NestedParentA.NestedChildA', 'subchild_1', 'meth') ==
+            [('NestedParentA.NestedChildA.subchild_1',
+              ('roles', 'NestedParentA.NestedChildA.subchild_1', 'method', False))])
+
+
+@pytest.mark.sphinx('html', testroot='domain-py', freshenv=True)
+def test_domain_py_canonical(app, status, warning):
+    app.builder.build_all()
+
+    content = (app.outdir / 'canonical.html').read_text()
+    assert ('<a class="reference internal" href="#canonical.Foo" title="canonical.Foo">'
+            '<code class="xref py py-class docutils literal notranslate">'
+            '<span class="pre">Foo</span></code></a>' in content)
+    assert warning.getvalue() == ''
+
+
+def test_get_full_qualified_name():
+    env = Mock(domaindata={})
+    domain = PythonDomain(env)
+
+    # non-python references
+    node = nodes.reference()
+    assert domain.get_full_qualified_name(node) is None
+
+    # simple reference
+    node = nodes.reference(reftarget='func')
+    assert domain.get_full_qualified_name(node) == 'func'
+
+    # with py:module context
+    kwargs = {'py:module': 'module1'}
+    node = nodes.reference(reftarget='func', **kwargs)
+    assert domain.get_full_qualified_name(node) == 'module1.func'
+
+    # with py:class context
+    kwargs = {'py:class': 'Class'}
+    node = nodes.reference(reftarget='func', **kwargs)
+    assert domain.get_full_qualified_name(node) == 'Class.func'
+
+    # with both py:module and py:class context
+    kwargs = {'py:module': 'module1', 'py:class': 'Class'}
+    node = nodes.reference(reftarget='func', **kwargs)
+    assert domain.get_full_qualified_name(node) == 'module1.Class.func'
+
+
+def test_parse_annotation(app):
+    doctree = _parse_annotation("int", app.env)
+    assert_node(doctree, ([pending_xref, "int"],))
+    assert_node(doctree[0], pending_xref, refdomain="py", reftype="class", reftarget="int")
+
+    doctree = _parse_annotation("List[int]", app.env)
+    assert_node(doctree, ([pending_xref, "List"],
+                          [desc_sig_punctuation, "["],
+                          [pending_xref, "int"],
+                          [desc_sig_punctuation, "]"]))
+
+    doctree = _parse_annotation("Tuple[int, int]", app.env)
+    assert_node(doctree, ([pending_xref, "Tuple"],
+                          [desc_sig_punctuation, "["],
+                          [pending_xref, "int"],
+                          [desc_sig_punctuation, ","],
+                          desc_sig_space,
+                          [pending_xref, "int"],
+                          [desc_sig_punctuation, "]"]))
+
+    doctree = _parse_annotation("Tuple[()]", app.env)
+    assert_node(doctree, ([pending_xref, "Tuple"],
+                          [desc_sig_punctuation, "["],
+                          [desc_sig_punctuation, "("],
+                          [desc_sig_punctuation, ")"],
+                          [desc_sig_punctuation, "]"]))
+
+    doctree = _parse_annotation("Tuple[int, ...]", app.env)
+    assert_node(doctree, ([pending_xref, "Tuple"],
+                          [desc_sig_punctuation, "["],
+                          [pending_xref, "int"],
+                          [desc_sig_punctuation, ","],
+                          desc_sig_space,
+                          [desc_sig_punctuation, "..."],
+                          [desc_sig_punctuation, "]"]))
+
+    doctree = _parse_annotation("Callable[[int, int], int]", app.env)
+    print(doctree)
+    assert_node(doctree, ([pending_xref, "Callable"],
+                          [desc_sig_punctuation, "["],
+                          [desc_sig_punctuation, "["],
+                          [pending_xref, "int"],
+                          [desc_sig_punctuation, ","],
+                          desc_sig_space,
+                          [pending_xref, "int"],
+                          [desc_sig_punctuation, "]"],
+                          [desc_sig_punctuation, ","],
+                          desc_sig_space,
+                          [pending_xref, "int"],
+                          [desc_sig_punctuation, "]"]))
+
+    doctree = _parse_annotation("Callable[[], int]", app.env)
+    assert_node(doctree, ([pending_xref, "Callable"],
+                          [desc_sig_punctuation, "["],
+                          [desc_sig_punctuation, "["],
+                          [desc_sig_punctuation, "]"],
+                          [desc_sig_punctuation, ","],
+                          desc_sig_space,
+                          [pending_xref, "int"],
+                          [desc_sig_punctuation, "]"]))
+
+    doctree = _parse_annotation("List[None]", app.env)
+    assert_node(doctree, ([pending_xref, "List"],
+                          [desc_sig_punctuation, "["],
+                          [pending_xref, "None"],
+                          [desc_sig_punctuation, "]"]))
+
+    # None type makes an object-reference (not a class reference)
+    doctree = _parse_annotation("None", app.env)
+    assert_node(doctree, ([pending_xref, "None"],))
+    assert_node(doctree[0], pending_xref, refdomain="py", reftype="obj", reftarget="None")
+
+
+@pytest.mark.skipif(sys.version_info < (3, 8), reason='python 3.8+ is required.')
+def test_parse_annotation_Literal(app):
+    doctree = _parse_annotation("Literal[True, False]", app.env)
+    assert_node(doctree, ([pending_xref, "Literal"],
+                          [desc_sig_punctuation, "["],
+                          [desc_sig_keyword, "True"],
+                          [desc_sig_punctuation, ","],
+                          desc_sig_space,
+                          [desc_sig_keyword, "False"],
+                          [desc_sig_punctuation, "]"]))
+
+    doctree = _parse_annotation("typing.Literal[0, 1, 'abc']", app.env)
+    assert_node(doctree, ([pending_xref, "typing.Literal"],
+                          [desc_sig_punctuation, "["],
+                          [desc_sig_literal_number, "0"],
+                          [desc_sig_punctuation, ","],
+                          desc_sig_space,
+                          [desc_sig_literal_number, "1"],
+                          [desc_sig_punctuation, ","],
+                          desc_sig_space,
+                          [desc_sig_literal_string, "'abc'"],
+                          [desc_sig_punctuation, "]"]))
+
+
+def test_pyfunction_signature(app):
+    text = ".. py:function:: hello(name: str) -> str"
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_name, "hello"],
+                                                    desc_parameterlist,
+                                                    [desc_returns, pending_xref, "str"])],
+                                  desc_content)]))
+    assert_node(doctree[1], addnodes.desc, desctype="function",
+                domain="py", objtype="function", noindex=False)
+    assert_node(doctree[1][0][1],
+                [desc_parameterlist, desc_parameter, ([desc_sig_name, "name"],
+                                                      [desc_sig_punctuation, ":"],
+                                                      desc_sig_space,
+                                                      [nodes.inline, pending_xref, "str"])])
+
+
+def test_pyfunction_signature_full(app):
+    text = (".. py:function:: hello(a: str, b = 1, *args: str, "
+            "c: bool = True, d: tuple = (1, 2), **kwargs: str) -> str")
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_name, "hello"],
+                                                    desc_parameterlist,
+                                                    [desc_returns, pending_xref, "str"])],
+                                  desc_content)]))
+    assert_node(doctree[1], addnodes.desc, desctype="function",
+                domain="py", objtype="function", noindex=False)
+    assert_node(doctree[1][0][1],
+                [desc_parameterlist, ([desc_parameter, ([desc_sig_name, "a"],
+                                                        [desc_sig_punctuation, ":"],
+                                                        desc_sig_space,
+                                                        [desc_sig_name, pending_xref, "str"])],
+                                      [desc_parameter, ([desc_sig_name, "b"],
+                                                        [desc_sig_operator, "="],
+                                                        [nodes.inline, "1"])],
+                                      [desc_parameter, ([desc_sig_operator, "*"],
+                                                        [desc_sig_name, "args"],
+                                                        [desc_sig_punctuation, ":"],
+                                                        desc_sig_space,
+                                                        [desc_sig_name, pending_xref, "str"])],
+                                      [desc_parameter, ([desc_sig_name, "c"],
+                                                        [desc_sig_punctuation, ":"],
+                                                        desc_sig_space,
+                                                        [desc_sig_name, pending_xref, "bool"],
+                                                        desc_sig_space,
+                                                        [desc_sig_operator, "="],
+                                                        desc_sig_space,
+                                                        [nodes.inline, "True"])],
+                                      [desc_parameter, ([desc_sig_name, "d"],
+                                                        [desc_sig_punctuation, ":"],
+                                                        desc_sig_space,
+                                                        [desc_sig_name, pending_xref, "tuple"],
+                                                        desc_sig_space,
+                                                        [desc_sig_operator, "="],
+                                                        desc_sig_space,
+                                                        [nodes.inline, "(1, 2)"])],
+                                      [desc_parameter, ([desc_sig_operator, "**"],
+                                                        [desc_sig_name, "kwargs"],
+                                                        [desc_sig_punctuation, ":"],
+                                                        desc_sig_space,
+                                                        [desc_sig_name, pending_xref, "str"])])])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 8), reason='python 3.8+ is required.')
+def test_pyfunction_signature_full_py38(app):
+    # case: separator at head
+    text = ".. py:function:: hello(*, a)"
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree[1][0][1],
+                [desc_parameterlist, ([desc_parameter, nodes.inline, "*"],
+                                      [desc_parameter, desc_sig_name, "a"])])
+
+    # case: separator in the middle
+    text = ".. py:function:: hello(a, /, b, *, c)"
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree[1][0][1],
+                [desc_parameterlist, ([desc_parameter, desc_sig_name, "a"],
+                                      [desc_parameter, desc_sig_operator, "/"],
+                                      [desc_parameter, desc_sig_name, "b"],
+                                      [desc_parameter, desc_sig_operator, "*"],
+                                      [desc_parameter, desc_sig_name, "c"])])
+
+    # case: separator in the middle (2)
+    text = ".. py:function:: hello(a, /, *, b)"
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree[1][0][1],
+                [desc_parameterlist, ([desc_parameter, desc_sig_name, "a"],
+                                      [desc_parameter, desc_sig_operator, "/"],
+                                      [desc_parameter, desc_sig_operator, "*"],
+                                      [desc_parameter, desc_sig_name, "b"])])
+
+    # case: separator at tail
+    text = ".. py:function:: hello(a, /)"
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree[1][0][1],
+                [desc_parameterlist, ([desc_parameter, desc_sig_name, "a"],
+                                      [desc_parameter, desc_sig_operator, "/"])])
+
+
+@pytest.mark.skipif(sys.version_info < (3, 8), reason='python 3.8+ is required.')
+def test_pyfunction_with_number_literals(app):
+    text = ".. py:function:: hello(age=0x10, height=1_6_0)"
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree[1][0][1],
+                [desc_parameterlist, ([desc_parameter, ([desc_sig_name, "age"],
+                                                        [desc_sig_operator, "="],
+                                                        [nodes.inline, "0x10"])],
+                                      [desc_parameter, ([desc_sig_name, "height"],
+                                                        [desc_sig_operator, "="],
+                                                        [nodes.inline, "1_6_0"])])])
+
+
+def test_pyfunction_with_union_type_operator(app):
+    text = ".. py:function:: hello(age: int | None)"
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree[1][0][1],
+                [desc_parameterlist, ([desc_parameter, ([desc_sig_name, "age"],
+                                                        [desc_sig_punctuation, ":"],
+                                                        desc_sig_space,
+                                                        [desc_sig_name, ([pending_xref, "int"],
+                                                                         desc_sig_space,
+                                                                         [desc_sig_punctuation, "|"],
+                                                                         desc_sig_space,
+                                                                         [pending_xref, "None"])])])])
+
+
+def test_optional_pyfunction_signature(app):
+    text = ".. py:function:: compile(source [, filename [, symbol]]) -> ast object"
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_name, "compile"],
+                                                    desc_parameterlist,
+                                                    [desc_returns, pending_xref, "ast object"])],
+                                  desc_content)]))
+    assert_node(doctree[1], addnodes.desc, desctype="function",
+                domain="py", objtype="function", noindex=False)
+    assert_node(doctree[1][0][1],
+                ([desc_parameter, ([desc_sig_name, "source"])],
+                 [desc_optional, ([desc_parameter, ([desc_sig_name, "filename"])],
+                                  [desc_optional, desc_parameter, ([desc_sig_name, "symbol"])])]))
+
+
+def test_pyexception_signature(app):
+    text = ".. py:exception:: builtins.IOError"
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_annotation, ('exception', desc_sig_space)],
+                                                    [desc_addname, "builtins."],
+                                                    [desc_name, "IOError"])],
+                                  desc_content)]))
+    assert_node(doctree[1], desc, desctype="exception",
+                domain="py", objtype="exception", noindex=False)
+
+
+def test_pydata_signature(app):
+    text = (".. py:data:: version\n"
+            "   :type: int\n"
+            "   :value: 1\n")
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_name, "version"],
+                                                    [desc_annotation, ([desc_sig_punctuation, ':'],
+                                                                       desc_sig_space,
+                                                                       [pending_xref, "int"])],
+                                                    [desc_annotation, (
+                                                        desc_sig_space,
+                                                        [desc_sig_punctuation, '='],
+                                                        desc_sig_space,
+                                                        "1")]
+                                                    )],
+                                  desc_content)]))
+    assert_node(doctree[1], addnodes.desc, desctype="data",
+                domain="py", objtype="data", noindex=False)
+
+
+def test_pydata_signature_old(app):
+    text = (".. py:data:: version\n"
+            "   :annotation: = 1\n")
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_name, "version"],
+                                                    [desc_annotation, (desc_sig_space,
+                                                                       "= 1")])],
+                                  desc_content)]))
+    assert_node(doctree[1], addnodes.desc, desctype="data",
+                domain="py", objtype="data", noindex=False)
+
+
+def test_pydata_with_union_type_operator(app):
+    text = (".. py:data:: version\n"
+            "   :type: int | str")
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree[1][0],
+                ([desc_name, "version"],
+                 [desc_annotation, ([desc_sig_punctuation, ':'],
+                                    desc_sig_space,
+                                    [pending_xref, "int"],
+                                    desc_sig_space,
+                                    [desc_sig_punctuation, "|"],
+                                    desc_sig_space,
+                                    [pending_xref, "str"])]))
+
+
+def test_pyobject_prefix(app):
+    text = (".. py:class:: Foo\n"
+            "\n"
+            "   .. py:method:: Foo.say\n"
+            "   .. py:method:: FooBar.say")
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_annotation, ('class', desc_sig_space)],
+                                                    [desc_name, "Foo"])],
+                                  [desc_content, (addnodes.index,
+                                                  desc,
+                                                  addnodes.index,
+                                                  desc)])]))
+    assert doctree[1][1][1].astext().strip() == 'say()'           # prefix is stripped
+    assert doctree[1][1][3].astext().strip() == 'FooBar.say()'    # not stripped
+
+
+def test_pydata(app):
+    text = (".. py:module:: example\n"
+            ".. py:data:: var\n"
+            "   :type: int\n")
+    domain = app.env.get_domain('py')
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (nodes.target,
+                          addnodes.index,
+                          addnodes.index,
+                          [desc, ([desc_signature, ([desc_addname, "example."],
+                                                    [desc_name, "var"],
+                                                    [desc_annotation, ([desc_sig_punctuation, ':'],
+                                                                       desc_sig_space,
+                                                                       [pending_xref, "int"])])],
+                                  [desc_content, ()])]))
+    assert_node(doctree[3][0][2][2], pending_xref, **{"py:module": "example"})
+    assert 'example.var' in domain.objects
+    assert domain.objects['example.var'] == ('index', 'example.var', 'data', False)
+
+
+def test_pyfunction(app):
+    text = (".. py:function:: func1\n"
+            ".. py:module:: example\n"
+            ".. py:function:: func2\n"
+            "   :async:\n")
+    domain = app.env.get_domain('py')
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_name, "func1"],
+                                                    [desc_parameterlist, ()])],
+                                  [desc_content, ()])],
+                          nodes.target,
+                          addnodes.index,
+                          addnodes.index,
+                          [desc, ([desc_signature, ([desc_annotation, ([desc_sig_keyword, 'async'],
+                                                                       desc_sig_space)],
+                                                    [desc_addname, "example."],
+                                                    [desc_name, "func2"],
+                                                    [desc_parameterlist, ()])],
+                                  [desc_content, ()])]))
+    assert_node(doctree[0], addnodes.index,
+                entries=[('pair', 'built-in function; func1()', 'func1', '', None)])
+    assert_node(doctree[3], addnodes.index,
+                entries=[('pair', 'module; example', 'module-example', '', None)])
+    assert_node(doctree[4], addnodes.index,
+                entries=[('single', 'func2() (in module example)', 'example.func2', '', None)])
+
+    assert 'func1' in domain.objects
+    assert domain.objects['func1'] == ('index', 'func1', 'function', False)
+    assert 'example.func2' in domain.objects
+    assert domain.objects['example.func2'] == ('index', 'example.func2', 'function', False)
+
+
+def test_pyclass_options(app):
+    text = (".. py:class:: Class1\n"
+            ".. py:class:: Class2\n"
+            "   :final:\n")
+    domain = app.env.get_domain('py')
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_annotation, ("class", desc_sig_space)],
+                                                    [desc_name, "Class1"])],
+                                  [desc_content, ()])],
+                          addnodes.index,
+                          [desc, ([desc_signature, ([desc_annotation, ("final",
+                                                                       desc_sig_space,
+                                                                       "class",
+                                                                       desc_sig_space)],
+                                                    [desc_name, "Class2"])],
+                                  [desc_content, ()])]))
+
+    # class
+    assert_node(doctree[0], addnodes.index,
+                entries=[('single', 'Class1 (built-in class)', 'Class1', '', None)])
+    assert 'Class1' in domain.objects
+    assert domain.objects['Class1'] == ('index', 'Class1', 'class', False)
+
+    # :final:
+    assert_node(doctree[2], addnodes.index,
+                entries=[('single', 'Class2 (built-in class)', 'Class2', '', None)])
+    assert 'Class2' in domain.objects
+    assert domain.objects['Class2'] == ('index', 'Class2', 'class', False)
+
+
+def test_pymethod_options(app):
+    text = (".. py:class:: Class\n"
+            "\n"
+            "   .. py:method:: meth1\n"
+            "   .. py:method:: meth2\n"
+            "      :classmethod:\n"
+            "   .. py:method:: meth3\n"
+            "      :staticmethod:\n"
+            "   .. py:method:: meth4\n"
+            "      :async:\n"
+            "   .. py:method:: meth5\n"
+            "      :property:\n"
+            "   .. py:method:: meth6\n"
+            "      :abstractmethod:\n"
+            "   .. py:method:: meth7\n"
+            "      :final:\n")
+    domain = app.env.get_domain('py')
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_annotation, ("class", desc_sig_space)],
+                                                    [desc_name, "Class"])],
+                                  [desc_content, (addnodes.index,
+                                                  desc,
+                                                  addnodes.index,
+                                                  desc,
+                                                  addnodes.index,
+                                                  desc,
+                                                  addnodes.index,
+                                                  desc,
+                                                  addnodes.index,
+                                                  desc,
+                                                  addnodes.index,
+                                                  desc,
+                                                  addnodes.index,
+                                                  desc)])]))
+
+    # method
+    assert_node(doctree[1][1][0], addnodes.index,
+                entries=[('single', 'meth1() (Class method)', 'Class.meth1', '', None)])
+    assert_node(doctree[1][1][1], ([desc_signature, ([desc_name, "meth1"],
+                                                     [desc_parameterlist, ()])],
+                                   [desc_content, ()]))
+    assert 'Class.meth1' in domain.objects
+    assert domain.objects['Class.meth1'] == ('index', 'Class.meth1', 'method', False)
+
+    # :classmethod:
+    assert_node(doctree[1][1][2], addnodes.index,
+                entries=[('single', 'meth2() (Class class method)', 'Class.meth2', '', None)])
+    assert_node(doctree[1][1][3], ([desc_signature, ([desc_annotation, ("classmethod", desc_sig_space)],
+                                                     [desc_name, "meth2"],
+                                                     [desc_parameterlist, ()])],
+                                   [desc_content, ()]))
+    assert 'Class.meth2' in domain.objects
+    assert domain.objects['Class.meth2'] == ('index', 'Class.meth2', 'method', False)
+
+    # :staticmethod:
+    assert_node(doctree[1][1][4], addnodes.index,
+                entries=[('single', 'meth3() (Class static method)', 'Class.meth3', '', None)])
+    assert_node(doctree[1][1][5], ([desc_signature, ([desc_annotation, ("static", desc_sig_space)],
+                                                     [desc_name, "meth3"],
+                                                     [desc_parameterlist, ()])],
+                                   [desc_content, ()]))
+    assert 'Class.meth3' in domain.objects
+    assert domain.objects['Class.meth3'] == ('index', 'Class.meth3', 'method', False)
+
+    # :async:
+    assert_node(doctree[1][1][6], addnodes.index,
+                entries=[('single', 'meth4() (Class method)', 'Class.meth4', '', None)])
+    assert_node(doctree[1][1][7], ([desc_signature, ([desc_annotation, ("async", desc_sig_space)],
+                                                     [desc_name, "meth4"],
+                                                     [desc_parameterlist, ()])],
+                                   [desc_content, ()]))
+    assert 'Class.meth4' in domain.objects
+    assert domain.objects['Class.meth4'] == ('index', 'Class.meth4', 'method', False)
+
+    # :property:
+    assert_node(doctree[1][1][8], addnodes.index,
+                entries=[('single', 'meth5 (Class property)', 'Class.meth5', '', None)])
+    assert_node(doctree[1][1][9], ([desc_signature, ([desc_annotation, ("property", desc_sig_space)],
+                                                     [desc_name, "meth5"])],
+                                   [desc_content, ()]))
+    assert 'Class.meth5' in domain.objects
+    assert domain.objects['Class.meth5'] == ('index', 'Class.meth5', 'method', False)
+
+    # :abstractmethod:
+    assert_node(doctree[1][1][10], addnodes.index,
+                entries=[('single', 'meth6() (Class method)', 'Class.meth6', '', None)])
+    assert_node(doctree[1][1][11], ([desc_signature, ([desc_annotation, ("abstract", desc_sig_space)],
+                                                      [desc_name, "meth6"],
+                                                      [desc_parameterlist, ()])],
+                                    [desc_content, ()]))
+    assert 'Class.meth6' in domain.objects
+    assert domain.objects['Class.meth6'] == ('index', 'Class.meth6', 'method', False)
+
+    # :final:
+    assert_node(doctree[1][1][12], addnodes.index,
+                entries=[('single', 'meth7() (Class method)', 'Class.meth7', '', None)])
+    assert_node(doctree[1][1][13], ([desc_signature, ([desc_annotation, ("final", desc_sig_space)],
+                                                      [desc_name, "meth7"],
+                                                      [desc_parameterlist, ()])],
+                                    [desc_content, ()]))
+    assert 'Class.meth7' in domain.objects
+    assert domain.objects['Class.meth7'] == ('index', 'Class.meth7', 'method', False)
+
+
+def test_pyclassmethod(app):
+    text = (".. py:class:: Class\n"
+            "\n"
+            "   .. py:classmethod:: meth\n")
+    domain = app.env.get_domain('py')
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_annotation, ("class", desc_sig_space)],
+                                                    [desc_name, "Class"])],
+                                  [desc_content, (addnodes.index,
+                                                  desc)])]))
+    assert_node(doctree[1][1][0], addnodes.index,
+                entries=[('single', 'meth() (Class class method)', 'Class.meth', '', None)])
+    assert_node(doctree[1][1][1], ([desc_signature, ([desc_annotation, ("classmethod", desc_sig_space)],
+                                                     [desc_name, "meth"],
+                                                     [desc_parameterlist, ()])],
+                                   [desc_content, ()]))
+    assert 'Class.meth' in domain.objects
+    assert domain.objects['Class.meth'] == ('index', 'Class.meth', 'method', False)
+
+
+def test_pystaticmethod(app):
+    text = (".. py:class:: Class\n"
+            "\n"
+            "   .. py:staticmethod:: meth\n")
+    domain = app.env.get_domain('py')
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_annotation, ("class", desc_sig_space)],
+                                                    [desc_name, "Class"])],
+                                  [desc_content, (addnodes.index,
+                                                  desc)])]))
+    assert_node(doctree[1][1][0], addnodes.index,
+                entries=[('single', 'meth() (Class static method)', 'Class.meth', '', None)])
+    assert_node(doctree[1][1][1], ([desc_signature, ([desc_annotation, ("static", desc_sig_space)],
+                                                     [desc_name, "meth"],
+                                                     [desc_parameterlist, ()])],
+                                   [desc_content, ()]))
+    assert 'Class.meth' in domain.objects
+    assert domain.objects['Class.meth'] == ('index', 'Class.meth', 'method', False)
+
+
+def test_pyattribute(app):
+    text = (".. py:class:: Class\n"
+            "\n"
+            "   .. py:attribute:: attr\n"
+            "      :type: Optional[str]\n"
+            "      :value: ''\n")
+    domain = app.env.get_domain('py')
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_annotation, ("class", desc_sig_space)],
+                                                    [desc_name, "Class"])],
+                                  [desc_content, (addnodes.index,
+                                                  desc)])]))
+    assert_node(doctree[1][1][0], addnodes.index,
+                entries=[('single', 'attr (Class attribute)', 'Class.attr', '', None)])
+    assert_node(doctree[1][1][1], ([desc_signature, ([desc_name, "attr"],
+                                                     [desc_annotation, ([desc_sig_punctuation, ':'],
+                                                                        desc_sig_space,
+                                                                        [pending_xref, "Optional"],
+                                                                        [desc_sig_punctuation, "["],
+                                                                        [pending_xref, "str"],
+                                                                        [desc_sig_punctuation, "]"])],
+                                                     [desc_annotation, (desc_sig_space,
+                                                                        [desc_sig_punctuation, '='],
+                                                                        desc_sig_space,
+                                                                        "''")]
+                                                     )],
+                                   [desc_content, ()]))
+    assert_node(doctree[1][1][1][0][1][2], pending_xref, **{"py:class": "Class"})
+    assert_node(doctree[1][1][1][0][1][4], pending_xref, **{"py:class": "Class"})
+    assert 'Class.attr' in domain.objects
+    assert domain.objects['Class.attr'] == ('index', 'Class.attr', 'attribute', False)
+
+
+def test_pyproperty(app):
+    text = (".. py:class:: Class\n"
+            "\n"
+            "   .. py:property:: prop1\n"
+            "      :abstractmethod:\n"
+            "      :type: str\n"
+            "\n"
+            "   .. py:property:: prop2\n"
+            "      :classmethod:\n"
+            "      :type: str\n")
+    domain = app.env.get_domain('py')
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_annotation, ("class", desc_sig_space)],
+                                                    [desc_name, "Class"])],
+                                  [desc_content, (addnodes.index,
+                                                  desc,
+                                                  addnodes.index,
+                                                  desc)])]))
+    assert_node(doctree[1][1][0], addnodes.index,
+                entries=[('single', 'prop1 (Class property)', 'Class.prop1', '', None)])
+    assert_node(doctree[1][1][1], ([desc_signature, ([desc_annotation, ("abstract", desc_sig_space,
+                                                                        "property", desc_sig_space)],
+                                                     [desc_name, "prop1"],
+                                                     [desc_annotation, ([desc_sig_punctuation, ':'],
+                                                                        desc_sig_space,
+                                                                        [pending_xref, "str"])])],
+                                   [desc_content, ()]))
+    assert_node(doctree[1][1][2], addnodes.index,
+                entries=[('single', 'prop2 (Class property)', 'Class.prop2', '', None)])
+    assert_node(doctree[1][1][3], ([desc_signature, ([desc_annotation, ("class", desc_sig_space,
+                                                                        "property", desc_sig_space)],
+                                                     [desc_name, "prop2"],
+                                                     [desc_annotation, ([desc_sig_punctuation, ':'],
+                                                                        desc_sig_space,
+                                                                        [pending_xref, "str"])])],
+                                   [desc_content, ()]))
+    assert 'Class.prop1' in domain.objects
+    assert domain.objects['Class.prop1'] == ('index', 'Class.prop1', 'property', False)
+    assert 'Class.prop2' in domain.objects
+    assert domain.objects['Class.prop2'] == ('index', 'Class.prop2', 'property', False)
+
+
+def test_pydecorator_signature(app):
+    text = ".. py:decorator:: deco"
+    domain = app.env.get_domain('py')
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_addname, "@"],
+                                                    [desc_name, "deco"])],
+                                  desc_content)]))
+    assert_node(doctree[1], addnodes.desc, desctype="function",
+                domain="py", objtype="function", noindex=False)
+
+    assert 'deco' in domain.objects
+    assert domain.objects['deco'] == ('index', 'deco', 'function', False)
+
+
+def test_pydecoratormethod_signature(app):
+    text = ".. py:decoratormethod:: deco"
+    domain = app.env.get_domain('py')
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_addname, "@"],
+                                                    [desc_name, "deco"])],
+                                  desc_content)]))
+    assert_node(doctree[1], addnodes.desc, desctype="method",
+                domain="py", objtype="method", noindex=False)
+
+    assert 'deco' in domain.objects
+    assert domain.objects['deco'] == ('index', 'deco', 'method', False)
+
+
+def test_canonical(app):
+    text = (".. py:class:: io.StringIO\n"
+            "   :canonical: _io.StringIO")
+    domain = app.env.get_domain('py')
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index,
+                          [desc, ([desc_signature, ([desc_annotation, ("class", desc_sig_space)],
+                                                    [desc_addname, "io."],
+                                                    [desc_name, "StringIO"])],
+                                  desc_content)]))
+    assert 'io.StringIO' in domain.objects
+    assert domain.objects['io.StringIO'] == ('index', 'io.StringIO', 'class', False)
+    assert domain.objects['_io.StringIO'] == ('index', 'io.StringIO', 'class', True)
+
+
+def test_canonical_definition_overrides(app, warning):
+    text = (".. py:class:: io.StringIO\n"
+            "   :canonical: _io.StringIO\n"
+            ".. py:class:: _io.StringIO\n")
+    restructuredtext.parse(app, text)
+    assert warning.getvalue() == ""
+
+    domain = app.env.get_domain('py')
+    assert domain.objects['_io.StringIO'] == ('index', 'id0', 'class', False)
+
+
+def test_canonical_definition_skip(app, warning):
+    text = (".. py:class:: _io.StringIO\n"
+            ".. py:class:: io.StringIO\n"
+            "   :canonical: _io.StringIO\n")
+
+    restructuredtext.parse(app, text)
+    assert warning.getvalue() == ""
+
+    domain = app.env.get_domain('py')
+    assert domain.objects['_io.StringIO'] == ('index', 'io.StringIO', 'class', False)
+
+
+def test_canonical_duplicated(app, warning):
+    text = (".. py:class:: mypackage.StringIO\n"
+            "   :canonical: _io.StringIO\n"
+            ".. py:class:: io.StringIO\n"
+            "   :canonical: _io.StringIO\n")
+
+    restructuredtext.parse(app, text)
+    assert warning.getvalue() != ""
+
+
+def test_info_field_list(app):
+    text = (".. py:module:: example\n"
+            ".. py:class:: Class\n"
+            "\n"
+            "   :param str name: blah blah\n"
+            "   :param age: blah blah\n"
+            "   :type age: int\n"
+            "   :param items: blah blah\n"
+            "   :type items: Tuple[str, ...]\n"
+            "   :param Dict[str, str] params: blah blah\n")
+    doctree = restructuredtext.parse(app, text)
+    print(doctree)
+
+    assert_node(doctree, (nodes.target,
+                          addnodes.index,
+                          addnodes.index,
+                          [desc, ([desc_signature, ([desc_annotation, ("class", desc_sig_space)],
+                                                    [desc_addname, "example."],
+                                                    [desc_name, "Class"])],
+                                  [desc_content, nodes.field_list, nodes.field])]))
+    assert_node(doctree[3][1][0][0],
+                ([nodes.field_name, "Parameters"],
+                 [nodes.field_body, nodes.bullet_list, ([nodes.list_item, nodes.paragraph],
+                                                        [nodes.list_item, nodes.paragraph],
+                                                        [nodes.list_item, nodes.paragraph],
+                                                        [nodes.list_item, nodes.paragraph])]))
+
+    # :param str name:
+    assert_node(doctree[3][1][0][0][1][0][0][0],
+                ([addnodes.literal_strong, "name"],
+                 " (",
+                 [pending_xref, addnodes.literal_emphasis, "str"],
+                 ")",
+                 " -- ",
+                 "blah blah"))
+    assert_node(doctree[3][1][0][0][1][0][0][0][2], pending_xref,
+                refdomain="py", reftype="class", reftarget="str",
+                **{"py:module": "example", "py:class": "Class"})
+
+    # :param age: + :type age:
+    assert_node(doctree[3][1][0][0][1][0][1][0],
+                ([addnodes.literal_strong, "age"],
+                 " (",
+                 [pending_xref, addnodes.literal_emphasis, "int"],
+                 ")",
+                 " -- ",
+                 "blah blah"))
+    assert_node(doctree[3][1][0][0][1][0][1][0][2], pending_xref,
+                refdomain="py", reftype="class", reftarget="int",
+                **{"py:module": "example", "py:class": "Class"})
+
+    # :param items: + :type items:
+    assert_node(doctree[3][1][0][0][1][0][2][0],
+                ([addnodes.literal_strong, "items"],
+                 " (",
+                 [pending_xref, addnodes.literal_emphasis, "Tuple"],
+                 [addnodes.literal_emphasis, "["],
+                 [pending_xref, addnodes.literal_emphasis, "str"],
+                 [addnodes.literal_emphasis, ", "],
+                 [addnodes.literal_emphasis, "..."],
+                 [addnodes.literal_emphasis, "]"],
+                 ")",
+                 " -- ",
+                 "blah blah"))
+    assert_node(doctree[3][1][0][0][1][0][2][0][2], pending_xref,
+                refdomain="py", reftype="class", reftarget="Tuple",
+                **{"py:module": "example", "py:class": "Class"})
+    assert_node(doctree[3][1][0][0][1][0][2][0][4], pending_xref,
+                refdomain="py", reftype="class", reftarget="str",
+                **{"py:module": "example", "py:class": "Class"})
+
+    # :param Dict[str, str] params:
+    assert_node(doctree[3][1][0][0][1][0][3][0],
+                ([addnodes.literal_strong, "params"],
+                 " (",
+                 [pending_xref, addnodes.literal_emphasis, "Dict"],
+                 [addnodes.literal_emphasis, "["],
+                 [pending_xref, addnodes.literal_emphasis, "str"],
+                 [addnodes.literal_emphasis, ", "],
+                 [pending_xref, addnodes.literal_emphasis, "str"],
+                 [addnodes.literal_emphasis, "]"],
+                 ")",
+                 " -- ",
+                 "blah blah"))
+    assert_node(doctree[3][1][0][0][1][0][3][0][2], pending_xref,
+                refdomain="py", reftype="class", reftarget="Dict",
+                **{"py:module": "example", "py:class": "Class"})
+    assert_node(doctree[3][1][0][0][1][0][3][0][4], pending_xref,
+                refdomain="py", reftype="class", reftarget="str",
+                **{"py:module": "example", "py:class": "Class"})
+    assert_node(doctree[3][1][0][0][1][0][3][0][6], pending_xref,
+                refdomain="py", reftype="class", reftarget="str",
+                **{"py:module": "example", "py:class": "Class"})
+
+
+def test_info_field_list_piped_type(app):
+    text = (".. py:module:: example\n"
+            ".. py:class:: Class\n"
+            "\n"
+            "   :param age: blah blah\n"
+            "   :type age: int | str\n")
+    doctree = restructuredtext.parse(app, text)
+
+    assert_node(doctree,
+                (nodes.target,
+                 addnodes.index,
+                 addnodes.index,
+                 [desc, ([desc_signature, ([desc_annotation, ("class", desc_sig_space)],
+                                           [desc_addname, "example."],
+                                           [desc_name, "Class"])],
+                         [desc_content, nodes.field_list, nodes.field, (nodes.field_name,
+                                                                        nodes.field_body)])]))
+    assert_node(doctree[3][1][0][0][1],
+                ([nodes.paragraph, ([addnodes.literal_strong, "age"],
+                                    " (",
+                                    [pending_xref, addnodes.literal_emphasis, "int"],
+                                    [addnodes.literal_emphasis, " | "],
+                                    [pending_xref, addnodes.literal_emphasis, "str"],
+                                    ")",
+                                    " -- ",
+                                    "blah blah")],))
+    assert_node(doctree[3][1][0][0][1][0][2], pending_xref,
+                refdomain="py", reftype="class", reftarget="int",
+                **{"py:module": "example", "py:class": "Class"})
+    assert_node(doctree[3][1][0][0][1][0][4], pending_xref,
+                refdomain="py", reftype="class", reftarget="str",
+                **{"py:module": "example", "py:class": "Class"})
+
+
+def test_info_field_list_var(app):
+    text = (".. py:class:: Class\n"
+            "\n"
+            "   :var int attr: blah blah\n")
+    doctree = restructuredtext.parse(app, text)
+
+    assert_node(doctree, (addnodes.index,
+                          [desc, (desc_signature,
+                                  [desc_content, nodes.field_list, nodes.field])]))
+    assert_node(doctree[1][1][0][0], ([nodes.field_name, "Variables"],
+                                      [nodes.field_body, nodes.paragraph]))
+
+    # :var int attr:
+    assert_node(doctree[1][1][0][0][1][0],
+                ([addnodes.literal_strong, "attr"],
+                 " (",
+                 [pending_xref, addnodes.literal_emphasis, "int"],
+                 ")",
+                 " -- ",
+                 "blah blah"))
+    assert_node(doctree[1][1][0][0][1][0][2], pending_xref,
+                refdomain="py", reftype="class", reftarget="int", **{"py:class": "Class"})
+
+
+@pytest.mark.sphinx(freshenv=True)
+def test_module_index(app):
+    text = (".. py:module:: docutils\n"
+            ".. py:module:: sphinx\n"
+            ".. py:module:: sphinx.config\n"
+            ".. py:module:: sphinx.builders\n"
+            ".. py:module:: sphinx.builders.html\n"
+            ".. py:module:: sphinx_intl\n")
+    restructuredtext.parse(app, text)
+    index = PythonModuleIndex(app.env.get_domain('py'))
+    assert index.generate() == (
+        [('d', [IndexEntry('docutils', 0, 'index', 'module-docutils', '', '', '')]),
+         ('s', [IndexEntry('sphinx', 1, 'index', 'module-sphinx', '', '', ''),
+                IndexEntry('sphinx.builders', 2, 'index', 'module-sphinx.builders', '', '', ''),  # NOQA
+                IndexEntry('sphinx.builders.html', 2, 'index', 'module-sphinx.builders.html', '', '', ''),  # NOQA
+                IndexEntry('sphinx.config', 2, 'index', 'module-sphinx.config', '', '', ''),
+                IndexEntry('sphinx_intl', 0, 'index', 'module-sphinx_intl', '', '', '')])],
+        False
+    )
+
+
+@pytest.mark.sphinx(freshenv=True)
+def test_module_index_submodule(app):
+    text = ".. py:module:: sphinx.config\n"
+    restructuredtext.parse(app, text)
+    index = PythonModuleIndex(app.env.get_domain('py'))
+    assert index.generate() == (
+        [('s', [IndexEntry('sphinx', 1, '', '', '', '', ''),
+                IndexEntry('sphinx.config', 2, 'index', 'module-sphinx.config', '', '', '')])],
+        False
+    )
+
+
+@pytest.mark.sphinx(freshenv=True)
+def test_module_index_not_collapsed(app):
+    text = (".. py:module:: docutils\n"
+            ".. py:module:: sphinx\n")
+    restructuredtext.parse(app, text)
+    index = PythonModuleIndex(app.env.get_domain('py'))
+    assert index.generate() == (
+        [('d', [IndexEntry('docutils', 0, 'index', 'module-docutils', '', '', '')]),
+         ('s', [IndexEntry('sphinx', 0, 'index', 'module-sphinx', '', '', '')])],
+        True
+    )
+
+
+@pytest.mark.sphinx(freshenv=True, confoverrides={'modindex_common_prefix': ['sphinx.']})
+def test_modindex_common_prefix(app):
+    text = (".. py:module:: docutils\n"
+            ".. py:module:: sphinx\n"
+            ".. py:module:: sphinx.config\n"
+            ".. py:module:: sphinx.builders\n"
+            ".. py:module:: sphinx.builders.html\n"
+            ".. py:module:: sphinx_intl\n")
+    restructuredtext.parse(app, text)
+    index = PythonModuleIndex(app.env.get_domain('py'))
+    assert index.generate() == (
+        [('b', [IndexEntry('sphinx.builders', 1, 'index', 'module-sphinx.builders', '', '', ''),  # NOQA
+                IndexEntry('sphinx.builders.html', 2, 'index', 'module-sphinx.builders.html', '', '', '')]),  # NOQA
+         ('c', [IndexEntry('sphinx.config', 0, 'index', 'module-sphinx.config', '', '', '')]),
+         ('d', [IndexEntry('docutils', 0, 'index', 'module-docutils', '', '', '')]),
+         ('s', [IndexEntry('sphinx', 0, 'index', 'module-sphinx', '', '', ''),
+                IndexEntry('sphinx_intl', 0, 'index', 'module-sphinx_intl', '', '', '')])],
+        True
+    )
+
+
+def test_noindexentry(app):
+    text = (".. py:function:: f()\n"
+            ".. py:function:: g()\n"
+            "   :noindexentry:\n")
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index, desc, addnodes.index, desc))
+    assert_node(doctree[0], addnodes.index, entries=[('pair', 'built-in function; f()', 'f', '', None)])
+    assert_node(doctree[2], addnodes.index, entries=[])
+
+    text = (".. py:class:: f\n"
+            ".. py:class:: g\n"
+            "   :noindexentry:\n")
+    doctree = restructuredtext.parse(app, text)
+    assert_node(doctree, (addnodes.index, desc, addnodes.index, desc))
+    assert_node(doctree[0], addnodes.index, entries=[('single', 'f (built-in class)', 'f', '', None)])
+    assert_node(doctree[2], addnodes.index, entries=[])
+
+
+@pytest.mark.sphinx('html', testroot='domain-py-python_use_unqualified_type_names')
+def test_python_python_use_unqualified_type_names(app, status, warning):
+    app.build()
+    content = (app.outdir / 'index.html').read_text()
+    assert ('<span class="n"><a class="reference internal" href="#foo.Name" title="foo.Name">'
+            '<span class="pre">Name</span></a></span>' in content)
+    assert '<span class="n"><span class="pre">foo.Age</span></span>' in content
+    assert ('<p><strong>name</strong> (<a class="reference internal" href="#foo.Name" '
+            'title="foo.Name"><em>Name</em></a>) – blah blah</p>' in content)
+    assert '<p><strong>age</strong> (<em>foo.Age</em>) – blah blah</p>' in content
+
+
+@pytest.mark.sphinx('html', testroot='domain-py-python_use_unqualified_type_names',
+                    confoverrides={'python_use_unqualified_type_names': False})
+def test_python_python_use_unqualified_type_names_disabled(app, status, warning):
+    app.build()
+    content = (app.outdir / 'index.html').read_text()
+    assert ('<span class="n"><a class="reference internal" href="#foo.Name" title="foo.Name">'
+            '<span class="pre">foo.Name</span></a></span>' in content)
+    assert '<span class="n"><span class="pre">foo.Age</span></span>' in content
+    assert ('<p><strong>name</strong> (<a class="reference internal" href="#foo.Name" '
+            'title="foo.Name"><em>foo.Name</em></a>) – blah blah</p>' in content)
+    assert '<p><strong>age</strong> (<em>foo.Age</em>) – blah blah</p>' in content
+
+
+@pytest.mark.sphinx('dummy', testroot='domain-py-xref-warning')
+def test_warn_missing_reference(app, status, warning):
+    app.build()
+    assert 'index.rst:6: WARNING: undefined label: no-label' in warning.getvalue()
+    assert ('index.rst:6: WARNING: Failed to create a cross reference. A title or caption not found: existing-label'
+            in warning.getvalue())
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""

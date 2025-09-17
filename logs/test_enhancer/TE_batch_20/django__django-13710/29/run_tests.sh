@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_inlines.tests_llm.InlineVerboseNamePluralLazyTests.test_both_none_uses_model_meta_plural_as_string admin_inlines.tests_llm.InlineVerboseNamePluralLazyTests.test_format_lazy_verbose_name_generates_lazy_plural admin_inlines.tests_llm.InlineVerboseNamePluralLazyTests.test_gettext_lazy_verbose_name_generates_lazy_plural admin_inlines.tests_llm.InlineVerboseNamePluralLazyTests.test_mark_safe_verbose_name_generates_lazy_plural admin_inlines.tests_llm.InlineVerboseNamePluralLazyTests.test_multiple_inlines_all_generate_lazy_plurals_when_needed admin_inlines.tests_llm.InlineVerboseNamePluralLazyTests.test_plain_string_verbose_name_generates_lazy_plural_stacked admin_inlines.tests_llm.InlineVerboseNamePluralLazyTests.test_plain_string_verbose_name_generates_lazy_plural_tabular admin_inlines.tests_llm.InlineVerboseNamePluralLazyTests.test_verbose_name_lazy_and_explicit_plural_none_concat_behaviour
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_join_custom_iterator_autoescape_off_direct template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_join_empty_list_autoescape_off_direct template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_join_generator_autoescape_off_template template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_join_generator_autoescape_on_template template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_join_integers_autoescape_off_direct template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_join_map_autoescape_off_direct template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_join_safe_elements_autoescape_off_direct template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_join_tuple_autoescape_off_direct template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_arg_autoescape_off_direct template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_arg_autoescape_on_direct
+coverage json -o coverage.json
+: '>>>>> End Test Output'

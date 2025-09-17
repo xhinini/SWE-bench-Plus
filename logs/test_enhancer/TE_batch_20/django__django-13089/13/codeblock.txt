@@ -1,0 +1,237 @@
+from contextlib import contextmanager
+from django.core import management
+from django.db import connections, router
+from django.test import TransactionTestCase, override_settings
+from contextlib import contextmanager
+import time
+from datetime import datetime, timedelta
+from django.core import management
+from django.conf import settings
+from django.core.cache import cache, caches
+from django.db import connections, router
+from django.test import TransactionTestCase, override_settings
+from django.utils import timezone
+from django.core.cache.backends.db import DatabaseCache
+
+CACHE_TABLE_NAME = 'test cache table'
+
+CACHES_OVERRIDE = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
+        'LOCATION': CACHE_TABLE_NAME,
+    }
+}
+
+@override_settings(CACHES=CACHES_OVERRIDE)
+class CullRegressionTests(TransactionTestCase):
+    available_apps = ['cache']
+
+    def setUp(self):
+        super().setUp()
+        # Create the cache table used by DatabaseCache
+        management.call_command('createcachetable', verbosity=0)
+        # Ensure a fresh cache instance
+        self.cache = caches['default']
+
+    def tearDown(self):
+        # Drop the cache table to clean up
+        conn = connections[router.db_for_write(self.cache.cache_model_class)]
+        with conn.cursor() as cursor:
+            table_name = conn.ops.quote_name(CACHE_TABLE_NAME)
+            cursor.execute('DROP TABLE %s' % table_name)
+        super().tearDown()
+
+    def _count_table_rows(self):
+        db = router.db_for_read(self.cache.cache_model_class)
+        conn = connections[db]
+        with conn.cursor() as cursor:
+            cursor.execute('SELECT COUNT(*) FROM %s' % conn.ops.quote_name(CACHE_TABLE_NAME))
+            return cursor.fetchone()[0]
+
+    def test_cull_handles_no_last_cache_key_single_row(self):
+        # Insert a single row
+        self.cache.set('k1', 'v1', timeout=1000)
+        self.assertEqual(self._count_table_rows(), 1)
+
+        # Force cull condition: set _max_entries to 0 so num > _max_entries
+        self.cache._max_entries = 0
+        db = router.db_for_write(self.cache.cache_model_class)
+        conn = connections[db]
+        # Patch cursor.fetchone so that the first fetchone (COUNT) returns (1,)
+        # and the second fetchone (last_cache_key) returns None.
+        with conn.cursor() as cursor:
+            responses = [(1,), None]
+            original_fetchone = cursor.fetchone
+            def fetchone():
+                return responses.pop(0)
+            cursor.fetchone = fetchone
+            now = timezone.now().replace(microsecond=0)
+            # Call _cull directly; should not raise and should not delete the single row
+            self.cache._cull(db, cursor, now)
+        self.assertEqual(self._count_table_rows(), 1)
+
+    def test_cull_handles_no_last_cache_key_multiple_rows(self):
+        # Insert multiple rows
+        for i in range(3):
+            self.cache.set(f'k{i}', f'v{i}', timeout=1000)
+        self.assertGreaterEqual(self._count_table_rows(), 3)
+
+        self.cache._max_entries = 1
+        db = router.db_for_write(self.cache.cache_model_class)
+        conn = connections[db]
+        with conn.cursor() as cursor:
+            # First fetchone -> return current count
+            # Second fetchone -> None (no last_cache_key)
+            responses = [(self._count_table_rows(),), None]
+            cursor.fetchone = lambda: responses.pop(0)
+            now = timezone.now().replace(microsecond=0)
+            # Should not raise
+            self.cache._cull(db, cursor, now)
+        # No deletion happened because last cache key was None
+        self.assertGreaterEqual(self._count_table_rows(), 3)
+
+    def test_cull_handles_no_last_cache_key_with_expired_rows(self):
+        # Insert an expired row and a valid row
+        self.cache.set('expired', 'old', timeout=0)  # expires immediately
+        # small sleep to ensure the DB expiry time is earlier than "now"
+        time.sleep(0.01)
+        self.cache.set('valid', 'fresh', timeout=1000)
+        # Confirm two rows at insertion time (expired row still present until _cull runs)
+        self.assertGreaterEqual(self._count_table_rows(), 2)
+
+        self.cache._max_entries = 0
+        db = router.db_for_write(self.cache.cache_model_class)
+        conn = connections[db]
+        with conn.cursor() as cursor:
+            # First fetchone for COUNT -> return current count
+            # Second fetchone for last_cache_key -> None
+            responses = [(self._count_table_rows(),), None]
+            cursor.fetchone = lambda: responses.pop(0)
+            now = timezone.now().replace(microsecond=0)
+            # _cull should delete expired rows (the DELETE ... WHERE expires < now)
+            # but should not raise when last_cache_key is None, and should not remove the valid row.
+            self.cache._cull(db, cursor, now)
+        # The valid row should still be present
+        rows_after = self._count_table_rows()
+        self.assertGreaterEqual(rows_after, 1)
+
+    def test_cull_with_cull_frequency_one_and_no_last_cache_key(self):
+        # Insert 2 rows
+        self.cache.set('a', 1, timeout=1000)
+        self.cache.set('b', 2, timeout=1000)
+        self.assertGreaterEqual(self._count_table_rows(), 2)
+
+        self.cache._max_entries = 1
+        self.cache._cull_frequency = 1
+        db = router.db_for_write(self.cache.cache_model_class)
+        conn = connections[db]
+        with conn.cursor() as cursor:
+            responses = [(self._count_table_rows(),), None]
+            cursor.fetchone = lambda: responses.pop(0)
+            now = timezone.now().replace(microsecond=0)
+            # Should not raise when last_cache_key is None
+            self.cache._cull(db, cursor, now)
+        # Both rows should still be present
+        self.assertGreaterEqual(self._count_table_rows(), 2)
+
+    def test_cull_no_last_cache_key_does_not_clear_when_frequency_nonzero(self):
+        # Insert a few keys
+        for i in range(4):
+            self.cache.set(f'k{i}', f'v{i}', timeout=1000)
+        self.assertGreaterEqual(self._count_table_rows(), 4)
+
+        # Set cull frequency non-zero so clear() is not called
+        self.cache._max_entries = 1
+        self.cache._cull_frequency = 3
+        db = router.db_for_write(self.cache.cache_model_class)
+        conn = connections[db]
+        with conn.cursor() as cursor:
+            responses = [(self._count_table_rows(),), None]
+            cursor.fetchone = lambda: responses.pop(0)
+            now = timezone.now().replace(microsecond=0)
+            self.cache._cull(db, cursor, now)
+        # Rows remain since last_cache_key was None
+        self.assertGreaterEqual(self._count_table_rows(), 4)
+
+    @override_settings(USE_TZ=True)
+    def test_cull_no_last_cache_key_timezone_aware(self):
+        # Ensure behavior is OK when USE_TZ=True
+        self.cache.set('tz_a', 'v', timeout=1000)
+        self.assertGreaterEqual(self._count_table_rows(), 1)
+
+        self.cache._max_entries = 0
+        db = router.db_for_write(self.cache.cache_model_class)
+        conn = connections[db]
+        with conn.cursor() as cursor:
+            responses = [(self._count_table_rows(),), None]
+            cursor.fetchone = lambda: responses.pop(0)
+            now = timezone.now().replace(microsecond=0)
+            self.cache._cull(db, cursor, now)
+        self.assertGreaterEqual(self._count_table_rows(), 1)
+
+    @override_settings(USE_TZ=False)
+    def test_cull_no_last_cache_key_timezone_naive(self):
+        # Ensure behavior is OK when USE_TZ=False
+        self.cache.set('tz_b', 'v', timeout=1000)
+        self.assertGreaterEqual(self._count_table_rows(), 1)
+
+        self.cache._max_entries = 0
+        db = router.db_for_write(self.cache.cache_model_class)
+        conn = connections[db]
+        with conn.cursor() as cursor:
+            responses = [(self._count_table_rows(),), None]
+            cursor.fetchone = lambda: responses.pop(0)
+            now = datetime.now().replace(microsecond=0)
+            self.cache._cull(db, cursor, now)
+        self.assertGreaterEqual(self._count_table_rows(), 1)
+
+    def test_base_set_triggers_cull_and_handles_no_last_cache_key(self):
+        # Insert several rows so that a subsequent set would trigger cull in _base_set.
+        for i in range(3):
+            self.cache.set(f'pre{i}', f'v{i}', timeout=1000)
+        self.assertGreaterEqual(self._count_table_rows(), 3)
+
+        # Force max entries low to trigger cull inside _base_set
+        self.cache._max_entries = 1
+        db = router.db_for_write(self.cache.cache_model_class)
+        conn = connections[db]
+        orig_cursor = conn.cursor
+        @contextmanager
+        def patched_cursor():
+            # Use the real cursor but override fetchone for the culling SQL
+            with orig_cursor() as cursor:
+                responses = [(self._count_table_rows(),), None]
+                original_fetchone = cursor.fetchone
+                def fetchone():
+                    return responses.pop(0)
+                cursor.fetchone = fetchone
+                yield cursor
+        # Patch connection.cursor to use our patched context manager so that
+        # DatabaseCache._base_set will receive a cursor with the desired behavior.
+        conn.cursor = patched_cursor
+        try:
+            # This set would normally call _cull internally and must not raise.
+            self.cache.set('trigger', 'value', timeout=1000)
+        finally:
+            # Restore original cursor callable
+            conn.cursor = orig_cursor
+        # Ensure the set succeeded (trigger key present)
+        self.assertIsNotNone(self.cache.get('trigger'))
+
+    def test_cull_with_many_rows_and_no_last_cache_key_preserves_rows(self):
+        # Insert many rows to ensure cull path is exercised with larger numbers.
+        for i in range(10):
+            self.cache.set(f'many{i}', f'v{i}', timeout=1000)
+        initial = self._count_table_rows()
+        self.assertGreaterEqual(initial, 10)
+
+        self.cache._max_entries = 5
+        db = router.db_for_write(self.cache.cache_model_class)
+        conn = connections[db]
+        with conn.cursor() as cursor:
+            responses = [(initial,), None]
+            cursor.fetchone = lambda: responses.pop(0)
+            now = timezone.now().replace(microsecond=0)
+            # No exception should be raised and rows should remain since last_cache_key is None.
+            self.cache._cull(db, cursor, now)
+        self.assertEqual(self._count_table_rows(), initial)

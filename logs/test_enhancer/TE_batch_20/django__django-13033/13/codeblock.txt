@@ -1,0 +1,164 @@
+from types import MethodType, SimpleNamespace
+from django.db.models.expressions import RawSQL
+from types import MethodType, SimpleNamespace
+import unittest
+from django.db.models.sql.compiler import SQLCompiler
+from django.db.models.expressions import RawSQL
+
+def _make_compiler(field_attname, targets, joins=('TJOIN',)):
+    """
+    Build an SQLCompiler instance with a monkeypatched _setup_joins that
+    returns a relation Field (is_relation=True) when the last piece matches
+    field_attname, and a non-relation Field otherwise. The transform_function
+    returns RawSQL nodes constructed from the targets.
+    """
+    # Minimal fake query object used by SQLCompiler
+    fake_query = SimpleNamespace()
+    # alias_map entries used when the "relation" branch computes join_tuple
+    fake_query.alias_map = {j: SimpleNamespace(join_cols=('jc',)) for j in joins}
+    # trim_joins should return the targets and alias and an ignored value
+    fake_query.trim_joins = lambda t, j, p: (t, 'ALIA', None)
+    compiler = SQLCompiler(fake_query, SimpleNamespace(vendor='sqlite'), using='default')
+
+    # The dynamic _setup_joins looks at the pieces passed in and returns either
+    # a relation-like field (is_relation=True) or a non-relation field.
+    def _setup_joins(self, pieces, opts, alias):
+        last = pieces[-1]
+        if last == field_attname:
+            # relation field
+            field = SimpleNamespace(is_relation=True, attname=field_attname)
+            # targets are nodes; we'll use simple strings that transform_function will map
+            opts_for_return = SimpleNamespace()
+            joins_out = list(joins)
+            path = None
+            # transform_function returns a RawSQL node wrapping the target string
+            def transform_function(t, alias_inner):
+                return RawSQL(str(t), [])
+            return field, list(targets), 'ALIA', joins_out, path, transform_function
+        else:
+            # non-relation field - return single simple "target"
+            field = SimpleNamespace(is_relation=False, attname='nonrel')
+            opts_for_return = SimpleNamespace()
+            joins_out = list(joins)
+            path = None
+            def transform_function(t, alias_inner):
+                return RawSQL(str(t), [])
+            return field, list(targets), 'ALIA', joins_out, path, transform_function
+    # Bind the method to the compiler instance
+    compiler._setup_joins = MethodType(_setup_joins, compiler)
+    return compiler
+
+def compile_orderings(compiler, results):
+    """
+    Compile the OrderBy expressions returned by find_ordering_name into SQL
+    strings so we can assert on them. Each result is a tuple (OrderBy, False).
+    """
+    sqls = []
+    for expr, _is_ref in results:
+        sql, params = compiler.compile(expr)
+        sqls.append(sql)
+    return sqls
+
+class FindOrderingNameTests(unittest.TestCase):
+    def test_skip_relation_when_last_piece_matches_attname(self):
+        # Field attname is 'root_id' and the ordering is 'record__root_id'
+        compiler = _make_compiler(field_attname='root_id', targets=['t1', 't2'])
+        opts = SimpleNamespace(ordering=['some_default'])  # non-empty -> would trigger relation branch on bug
+        result = compiler.find_ordering_name('record__root_id', opts)
+        sqls = compile_orderings(compiler, result)
+        # Expect two order expressions corresponding to our two targets
+        self.assertEqual(len(sqls), 2)
+        self.assertIn('t1', sqls[0])
+        self.assertIn('t2', sqls[1])
+
+    def test_descending_skip_relation_when_last_piece_matches_attname(self):
+        compiler = _make_compiler(field_attname='root_id', targets=['t1'])
+        opts = SimpleNamespace(ordering=['some_default'])
+        result = compiler.find_ordering_name('-record__root_id', opts)
+        sqls = compile_orderings(compiler, result)
+        self.assertEqual(len(sqls), 1)
+        # Should include target and DESC direction
+        self.assertIn('t1', sqls[0])
+        self.assertIn('DESC', sqls[0].upper())
+
+    def test_multiple_level_field_last_piece_matches_attname(self):
+        compiler = _make_compiler(field_attname='c_id', targets=['x'])
+        opts = SimpleNamespace(ordering=['other'])
+        # pieces has three parts, last is 'c_id' -> should skip relation expansion
+        result = compiler.find_ordering_name('a__b__c_id', opts)
+        sqls = compile_orderings(compiler, result)
+        self.assertEqual(len(sqls), 1)
+        self.assertIn('x', sqls[0])
+
+    def test_negative_multiple_level_field_last_piece_matches_attname(self):
+        compiler = _make_compiler(field_attname='c_id', targets=['x'])
+        opts = SimpleNamespace(ordering=['other'])
+        result = compiler.find_ordering_name('-a__b__c_id', opts)
+        sqls = compile_orderings(compiler, result)
+        self.assertEqual(len(sqls), 1)
+        self.assertIn('x', sqls[0])
+        self.assertIn('DESC', sqls[0].upper())
+
+    def test_with_empty_opts_ordering_still_returns_targets(self):
+        # When opts.ordering is empty, the default-ordering branch isn't used.
+        compiler = _make_compiler(field_attname='root_id', targets=['t1'])
+        opts = SimpleNamespace(ordering=[])
+        result = compiler.find_ordering_name('record__root_id', opts)
+        sqls = compile_orderings(compiler, result)
+        self.assertEqual(len(sqls), 1)
+        self.assertIn('t1', sqls[0])
+
+    def test_alias_argument_ignored_for_matching_attname(self):
+        compiler = _make_compiler(field_attname='root_id', targets=['a'])
+        opts = SimpleNamespace(ordering=['d'])
+        # Providing alias argument (should be passed through to _setup_joins)
+        result = compiler.find_ordering_name('record__root_id', opts, alias='SOME_ALIAS')
+        sqls = compile_orderings(compiler, result)
+        self.assertEqual(len(sqls), 1)
+        self.assertIn('a', sqls[0])
+
+    def test_default_order_desc_passed_to_orderby_on_match(self):
+        compiler = _make_compiler(field_attname='root_id', targets=['t'])
+        opts = SimpleNamespace(ordering=['z'])
+        result = compiler.find_ordering_name('record__root_id', opts, default_order='DESC')
+        sqls = compile_orderings(compiler, result)
+        self.assertEqual(len(sqls), 1)
+        # When default_order is DESC and no explicit -, the OrderBy should be descending.
+        self.assertIn('DESC', sqls[0].upper())
+
+    def test_default_order_asc_passed_to_orderby_on_match(self):
+        compiler = _make_compiler(field_attname='root_id', targets=['t'])
+        opts = SimpleNamespace(ordering=['z'])
+        result = compiler.find_ordering_name('record__root_id', opts, default_order='ASC')
+        sqls = compile_orderings(compiler, result)
+        self.assertEqual(len(sqls), 1)
+        self.assertIn('ASC', sqls[0].upper())
+
+    def test_single_target_returns_single_orderby(self):
+        compiler = _make_compiler(field_attname='root_id', targets=['only'])
+        opts = SimpleNamespace(ordering=['whatever'])
+        result = compiler.find_ordering_name('record__root_id', opts)
+        sqls = compile_orderings(compiler, result)
+        self.assertEqual(sqls, [sqls[0]])
+        self.assertIn('only', sqls[0])
+
+    def test_no_false_positive_when_attname_matches_but_full_name_differs(self):
+        """
+        This is the core regression test: if the last piece matches the field's
+        attname (root_id == root_id) but the full dotted name differs
+        (record__root_id != root_id), the compiler MUST NOT expand to the
+        related model's default ordering. The fixed code compares against the
+        last piece; the buggy one compared against the full name and would
+        incorrectly expand.
+        """
+        compiler = _make_compiler(field_attname='root_id', targets=['a', 'b', 'c'])
+        opts = SimpleNamespace(ordering=['default1', 'default2'])
+        result = compiler.find_ordering_name('record__root_id', opts)
+        sqls = compile_orderings(compiler, result)
+        self.assertEqual(len(sqls), 3)
+        self.assertIn('a', sqls[0])
+        self.assertIn('b', sqls[1])
+        self.assertIn('c', sqls[2])
+
+if __name__ == '__main__':
+    unittest.main()

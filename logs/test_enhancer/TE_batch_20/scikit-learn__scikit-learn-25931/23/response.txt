@@ -1,0 +1,156 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests add regression checks around (1) ensuring that IsolationForest.fit does not call the public score_samples method when computing the offset for a user-specified contamination (which would re-run input validation and may remove feature names); (2) ensuring that the offset computed at fit time equals the percentile of the private scores; (3) preserving feature names when fitting with a pandas DataFrame and contamination != "auto"; (4) consistent behavior between CSR and CSC sparse formats for train vs. test; (5) chunking behavior consistency; (6) that score_samples/decision_function relation holds after fit on DataFrame; (7) that calling fit with CSR sparse input works (regression for sparse acceptance); (8) that score array shapes and ranges are correct; (9) that compute of offset does not call the public score_samples (explicit patch-guard); (10) that model warm_start behavior remains. Tests use monkeypatch/patch where appropriate and follow existing test conventions in the file.
+test_code: |
+  import numpy as np
+  import pytest
+  import warnings
+  from unittest.mock import Mock, patch
+  
+  from scipy.sparse import csc_matrix, csr_matrix
+  
+  from sklearn.ensemble import IsolationForest
+  from sklearn.utils import check_random_state
+  from sklearn.utils._testing import assert_allclose, assert_array_equal, assert_array_almost_equal
+  from sklearn.model_selection import train_test_split
+  
+  pd = pytest.importorskip("pandas")
+  
+  # 1) Ensure fit does not call public score_samples when contamination is a float.
+  def test_fit_does_not_call_public_score_samples(global_random_seed):
+      X = pd.DataFrame(data=np.random.RandomState(global_random_seed).randn(50, 3),
+                       columns=["a", "b", "c"])
+  
+      clf = IsolationForest(contamination=0.1, random_state=global_random_seed)
+  
+      # Monkeypatch the public score_samples to raise if called. The algorithm
+      # should use the private scoring method during fit to avoid re-validating
+      # and dropping feature names.
+      def bad_score_samples(*args, **kwargs):
+          raise AssertionError("score_samples should not be called during fit")
+  
+      clf.score_samples = bad_score_samples
+      # Should not raise
+      clf.fit(X)
+  
+  # 2) The offset_ computed at fit time equals the percentile of the private scores
+  def test_offset_equals_percentile_of__score_samples(global_random_seed):
+      rng = check_random_state(global_random_seed)
+      X = rng.randn(200, 5)
+      contamination = 0.1
+      clf = IsolationForest(contamination=contamination, random_state=global_random_seed)
+      clf.fit(X)
+  
+      # compute private scores directly and compare percentile to stored offset_
+      private_scores = clf._score_samples(X)
+      expected = np.percentile(private_scores, 100.0 * contamination)
+      assert_allclose(clf.offset_, expected)
+  
+  # 3) Preserve feature names for DataFrame when contamination != "auto"
+  def test_feature_names_preserved_dataframe_contamination(global_random_seed):
+      rng = np.random.RandomState(global_random_seed)
+      X = pd.DataFrame(data=rng.randn(20, 2), columns=["feature1", "feature2"])
+      clf = IsolationForest(random_state=global_random_seed, contamination=0.05)
+      # should not warn about feature name removal
+      with warnings.catch_warnings():
+          warnings.simplefilter("error", UserWarning)
+          clf.fit(X)
+      # feature names must be available and match
+      assert_array_equal(clf.feature_names_in_, np.array(["feature1", "feature2"]))
+  
+  # 4) Training on CSC and predicting on CSR (and vice versa) yields same predictions
+  def test_sparse_format_train_vs_test_consistency(global_random_seed):
+      rng = check_random_state(global_random_seed)
+      X = rng.randn(100, 10)
+      X_train, X_test = train_test_split(X, random_state=rng)
+  
+      # Train on CSC and predict on CSR
+      clf_csc = IsolationForest(n_estimators=10, random_state=global_random_seed).fit(csc_matrix(X_train))
+      preds_csc_train_csr_test = clf_csc.predict(csr_matrix(X_test))
+  
+      # Train on CSR and predict on CSC
+      clf_csr = IsolationForest(n_estimators=10, random_state=global_random_seed).fit(csr_matrix(X_train))
+      preds_csr_train_csc_test = clf_csr.predict(csc_matrix(X_test))
+  
+      assert_array_equal(preds_csc_train_csr_test, preds_csr_train_csc_test)
+  
+  # 5) Chunking produces same results as no-chunking (small chunk size)
+  @patch("sklearn.ensemble._iforest.get_chunk_n_rows", side_effect=Mock(**{"return_value": 3}))
+  def test_chunking_small_chunk(mock_get_chunk, global_random_seed):
+      rng = check_random_state(global_random_seed)
+      X = rng.randn(50, 4)
+      clf = IsolationForest(n_estimators=20, random_state=global_random_seed).fit(X)
+      # With patched small chunk size, score_samples should still equal original
+      scores_small = clf.score_samples(X)
+  
+      # now unpatch by calling with original chunking (call underlying method directly)
+      # Compute expected by using the private compute function on full array (no chunking)
+      expected = clf._score_samples(X)
+      assert_allclose(scores_small, expected)
+  
+  # 6) decision_function equals score_samples - offset after fit on DataFrame
+  def test_decision_function_relation_after_dataframe_fit(global_random_seed):
+      rng = np.random.RandomState(global_random_seed)
+      X = pd.DataFrame(data=rng.randn(30, 3), columns=["a", "b", "c"])
+      clf = IsolationForest(random_state=global_random_seed, contamination=0.2)
+      clf.fit(X)
+      # relation: decision_function = score_samples - offset_
+      s = clf.score_samples(X)
+      d = clf.decision_function(X)
+      assert_allclose(d, s - clf.offset_)
+  
+  # 7) fit accepts CSR input (regression for sparse acceptance)
+  def test_fit_accepts_csr_input(global_random_seed):
+      rng = check_random_state(global_random_seed)
+      X = rng.randn(60, 6)
+      X_csr = csr_matrix(X)
+      clf = IsolationForest(random_state=global_random_seed)
+      # Should not raise
+      clf.fit(X_csr)
+      # predictions should be produced
+      preds = clf.predict(X_csr)
+      assert preds.shape[0] == X_csr.shape[0]
+  
+  # 8) score_samples returns expected shape and values in (0, 1] when computed
+  def test_score_samples_shape_and_range(global_random_seed):
+      rng = check_random_state(global_random_seed)
+      X = rng.randn(40, 3)
+      clf = IsolationForest(n_estimators=15, random_state=global_random_seed).fit(X)
+      scores = clf.score_samples(X)
+      assert scores.shape == (X.shape[0],)
+      # scores are returned as 2 ** (-depth / denom) so should be > 0
+      assert np.all(scores > 0.0)
+  
+  # 9) Ensure that fit does not call the public score_samples by patching it to record calls
+  def test_fit_does_not_invoke_score_samples_call_count(global_random_seed):
+      rng = check_random_state(global_random_seed)
+      X = pd.DataFrame(data=rng.randn(50, 3), columns=["a", "b", "c"])
+      contamination = 0.1
+      clf = IsolationForest(contamination=contamination, random_state=global_random_seed)
+  
+      calls = {"count": 0}
+  
+      original_score_samples = IsolationForest.score_samples
+      def counting_score_samples(self, *args, **kwargs):
+          calls["count"] += 1
+          return original_score_samples(self, *args, **kwargs)
+  
+      # Patch instance method
+      clf.score_samples = counting_score_samples.__get__(clf, IsolationForest)
+      # Should not increment count during fit
+      clf.fit(X)
+      assert calls["count"] == 0
+  
+  # 10) Warm start keeps previously fitted trees and increases estimator count
+  def test_warm_start_keeps_existing_estimators(global_random_seed):
+      rng = check_random_state(global_random_seed)
+      X = rng.randn(30, 2)
+      clf = IsolationForest(n_estimators=5, max_samples=30, random_state=rng, warm_start=True)
+      clf.fit(X)
+      first_tree = clf.estimators_[0]
+      clf.set_params(n_estimators=10)
+      clf.fit(X)
+      assert len(clf.estimators_) == 10
+      assert clf.estimators_[0] is first_tree
+new_imports_code: |
+  import pandas as pd

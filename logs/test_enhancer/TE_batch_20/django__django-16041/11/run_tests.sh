@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.EmptyFormKwargsTests.test_auto_id_in_form_kwargs_does_not_override_and_no_error forms_tests.tests.test_formsets_llm.EmptyFormKwargsTests.test_combined_conflicting_form_kwargs_no_error_and_correct_values forms_tests.tests.test_formsets_llm.EmptyFormKwargsTests.test_custom_kwarg_passed_through_to_empty_form forms_tests.tests.test_formsets_llm.EmptyFormKwargsTests.test_empty_permitted_true_even_if_form_kwargs_sets_false forms_tests.tests.test_formsets_llm.EmptyFormKwargsTests.test_overridden_get_form_kwargs_auto_id_conflict forms_tests.tests.test_formsets_llm.EmptyFormKwargsTests.test_overridden_get_form_kwargs_prefix_conflict forms_tests.tests.test_formsets_llm.EmptyFormKwargsTests.test_overridden_get_form_kwargs_renderer_conflict forms_tests.tests.test_formsets_llm.EmptyFormKwargsTests.test_prefix_in_form_kwargs_does_not_override_and_no_error forms_tests.tests.test_formsets_llm.EmptyFormKwargsTests.test_renderer_in_form_kwargs_uses_formset_renderer_and_no_error forms_tests.tests.test_formsets_llm.EmptyFormKwargsTests.test_use_required_attribute_in_form_kwargs_does_not_override_and_no_error forms_tests.tests.test_formsets_llm.TestCustomForm.__init__
+coverage json -o coverage.json
+: '>>>>> End Test Output'

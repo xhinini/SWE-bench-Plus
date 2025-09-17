@@ -1,0 +1,164 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests validate the behavior of pylint.lint.run._query_cpu under various
+  cgroup file contents. They specifically ensure that when available CPU
+  calculations yield zero (e.g. when cpu.cfs_quota_us < cpu.cfs_period_us or
+  cpu.shares < 1024), the function returns at least 1 (to avoid returning 0).
+  This catches the candidate model patch which fails to normalize zero quota
+  results to 1 in the cpu_quota branch.
+test_code: |
+  # Licensed under the GPL: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+  # For details: https://github.com/PyCQA/pylint/blob/main/LICENSE
+  # Copyright (c) https://github.com/PyCQA/pylint/blob/main/CONTRIBUTORS.txt
+  # pylint: disable=missing-module-docstring, missing-function-docstring
+  
+  from __future__ import annotations
+  
+  import builtins
+  from unittest.mock import MagicMock, mock_open, patch
+  
+  import pytest
+  
+  from pylint.lint.run import _query_cpu
+  
+  
+  def _make_path_mock(existing_files: set[str]):
+      """
+      Return a Path-like callable that yields objects with is_file() according
+      to whether their str path is present in existing_files.
+      """
+      def _mock_path(path_str, *args, **kwargs):
+          # Emulate pathlib.Path(path_str)
+          return MagicMock(is_file=lambda: str(path_str) in existing_files)
+      return _mock_path
+  
+  
+  def _make_open_mock(mapping: dict[str, str]):
+      """
+      Return a builtins.open replacement that yields mapping[path] as file content.
+      """
+      real_open = builtins.open
+  
+      def _mock_open(path, *args, **kwargs):
+          key = str(path)
+          if key in mapping:
+              # Use mock_open so .read() works as expected
+              return mock_open(read_data=mapping[key])()
+          return real_open(path, *args, **kwargs)
+  
+      return _mock_open
+  
+  
+  @pytest.mark.parametrize(
+      "quota,period",
+      [
+          ("50000\n", "100000\n"),   # 0.5 -> int() == 0 -> should be normalized to 1
+          ("1\n", "100000\n"),       # tiny quota -> 0
+          ("0\n", "100000\n"),       # zero quota -> 0
+          ("  42  \n", "100000\n"),  # whitespace handling -> 0
+      ],
+  )
+  def test_query_cpu_quota_fraction_returns_one(quota, period):
+      """
+      When cpu.cfs_quota_us < cpu.cfs_period_us the integer division yields 0.
+      The function must return 1 instead of 0.
+      """
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
+      }
+      open_map = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": quota,
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": period,
+      }
+  
+      with patch("builtins.open", _make_open_mock(open_map)):
+          with patch("pylint.lint.run.Path", _make_path_mock(files)):
+              assert _query_cpu() == 1
+  
+  
+  def test_query_cpu_quota_large_returns_expected_value():
+      """A quota significantly larger than period returns the floored value."""
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
+      }
+      # quota 200000 / period 100000 => 2
+      open_map = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "200000\n",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+      }
+  
+      with patch("builtins.open", _make_open_mock(open_map)):
+          with patch("pylint.lint.run.Path", _make_path_mock(files)):
+              assert _query_cpu() == 2
+  
+  
+  @pytest.mark.parametrize(
+      "shares",
+      [
+          ("2\n"),    # 2/1024 == 0 -> should be normalized to 1
+          ("512\n"),  # 512/1024 == 0 -> normalized to 1
+      ],
+  )
+  def test_query_cpu_shares_fraction_returns_one(shares):
+      """When cpu.shares / 1024 yields 0 the function must return 1."""
+      files = {"/sys/fs/cgroup/cpu/cpu.shares"}
+      open_map = {"/sys/fs/cgroup/cpu/cpu.shares": shares}
+  
+      with patch("builtins.open", _make_open_mock(open_map)):
+          with patch("pylint.lint.run.Path", _make_path_mock(files)):
+              assert _query_cpu() == 1
+  
+  
+  def test_query_cpu_prefers_quota_over_shares_when_quota_valid():
+      """
+      If cpu.cfs_quota_us is present and not -1, it should be used even if
+      cpu.shares is also present.
+      """
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us",
+          "/sys/fs/cgroup/cpu/cpu.shares",
+      }
+      # quota yields 3, shares would yield 0 if used (1023/1024 -> 0)
+      open_map = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "300000\n",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+          "/sys/fs/cgroup/cpu/cpu.shares": "1023\n",
+      }
+  
+      with patch("builtins.open", _make_open_mock(open_map)):
+          with patch("pylint.lint.run.Path", _make_path_mock(files)):
+              assert _query_cpu() == 3
+  
+  
+  def test_query_cpu_uses_shares_when_quota_is_negative_but_normalizes_zero():
+      """
+      If cpu.cfs_quota_us == -1 the shares file should be used, and small shares
+      must normalize to 1.
+      """
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us",
+          "/sys/fs/cgroup/cpu/cpu.shares",
+      }
+      open_map = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",
+          "/sys/fs/cgroup/cpu/cpu.shares": "2\n",
+      }
+  
+      with patch("builtins.open", _make_open_mock(open_map)):
+          with patch("pylint.lint.run.Path", _make_path_mock(files)):
+              assert _query_cpu() == 1
+  
+  
+  def test_query_cpu_no_cgroup_files_returns_none():
+      """If no relevant cgroup files exist, _query_cpu should return None."""
+      files: set[str] = set()
+      open_map: dict[str, str] = {}
+      with patch("builtins.open", _make_open_mock(open_map)):
+          with patch("pylint.lint.run.Path", _make_path_mock(files)):
+              assert _query_cpu() is None
+new_imports_code: |
+  from __future__ import annotations

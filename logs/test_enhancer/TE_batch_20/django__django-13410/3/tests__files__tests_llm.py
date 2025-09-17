@@ -1,0 +1,107 @@
+import os
+import errno
+from unittest import mock
+import errno
+import os
+import unittest
+from unittest import mock
+from django.core.files import locks
+
+@unittest.skipIf(os.name == 'nt', 'fcntl-based locking tests are POSIX only')
+class LockingRegressionTests(unittest.TestCase):
+
+    def test_lock_propagates_permission_error(self):
+        err = PermissionError(errno.EACCES, 'Permission denied')
+        with mock.patch('django.core.files.locks.fcntl.flock', side_effect=err):
+            with self.assertRaises(PermissionError):
+                locks.lock(4, locks.LOCK_EX)
+
+    def test_lock_propagates_generic_oserror(self):
+        err = OSError(errno.EACCES, 'Access error')
+        with mock.patch('django.core.files.locks.fcntl.flock', side_effect=err):
+            with self.assertRaises(OSError) as cm:
+                locks.lock(6, locks.LOCK_EX)
+            self.assertEqual(cm.exception.errno, errno.EACCES)
+
+    def test_unlock_propagates_blockingio(self):
+        with mock.patch('django.core.files.locks.fcntl.flock', side_effect=BlockingIOError):
+            with self.assertRaises(BlockingIOError):
+                locks.unlock(8)
+
+    def test_unlock_propagates_permission_error(self):
+        err = PermissionError(errno.EACCES, 'Permission denied')
+        with mock.patch('django.core.files.locks.fcntl.flock', side_effect=err):
+            with self.assertRaises(PermissionError):
+                locks.unlock(9)
+
+import os
+import tempfile
+from unittest import mock
+import os
+import tempfile
+import unittest
+from unittest import mock
+from django.core.files import locks
+
+@unittest.skipIf(os.name == 'nt', 'fcntl-only tests')
+class LocksModuleTests(unittest.TestCase):
+
+    def test_lock_propagates_non_blocking_oserror(self):
+        with mock.patch('django.core.files.locks.fcntl.flock', side_effect=PermissionError):
+            with tempfile.NamedTemporaryFile() as tf:
+                with self.assertRaises(PermissionError):
+                    locks.lock(tf, locks.LOCK_EX)
+
+    def test_unlock_propagates_oserror_on_failure(self):
+        with mock.patch('django.core.files.locks.fcntl.flock', side_effect=OSError):
+            with tempfile.NamedTemporaryFile() as tf:
+                with self.assertRaises(OSError):
+                    locks.unlock(tf)
+
+    def test_unlock_propagates_blockingioerror_on_failure(self):
+        with mock.patch('django.core.files.locks.fcntl.flock', side_effect=BlockingIOError):
+            with tempfile.NamedTemporaryFile() as tf:
+                with self.assertRaises(BlockingIOError):
+                    locks.unlock(tf)
+
+import errno
+import tempfile
+import unittest
+from unittest import mock
+from django.core.files import locks
+import errno
+import tempfile
+import unittest
+from unittest import mock
+from django.core.files import locks
+
+@unittest.skipUnless(hasattr(locks, 'fcntl'), 'fcntl required for these tests')
+class LocksExceptionAndReturnBehaviorTests(unittest.TestCase):
+
+    def test_lock_propagates_oserror_from_flock_fileobj(self):
+        with mock.patch('django.core.files.locks.fcntl.flock', side_effect=OSError(errno.EINVAL, 'invalid')):
+            with tempfile.TemporaryFile() as temp:
+                with self.assertRaises(OSError):
+                    locks.lock(temp, locks.LOCK_EX)
+
+    def test_lock_propagates_permissionerror_from_flock_fd(self):
+        perm_err = PermissionError(errno.EACCES, 'permission denied')
+        with mock.patch('django.core.files.locks.fcntl.flock', side_effect=perm_err):
+            with tempfile.TemporaryFile() as temp:
+                fd = temp.fileno()
+                with self.assertRaises(PermissionError):
+                    locks.lock(fd, locks.LOCK_EX)
+
+    def test_unlock_propagates_oserror_from_flock_fileobj(self):
+        with mock.patch('django.core.files.locks.fcntl.flock', side_effect=OSError(errno.EIO, 'i/o error')):
+            with tempfile.TemporaryFile() as temp:
+                with self.assertRaises(OSError):
+                    locks.unlock(temp)
+
+    def test_unlock_propagates_permissionerror_from_flock_fd(self):
+        perm_err = PermissionError(errno.EPERM, 'operation not permitted')
+        with mock.patch('django.core.files.locks.fcntl.flock', side_effect=perm_err):
+            with tempfile.TemporaryFile() as temp:
+                fd = temp.fileno()
+                with self.assertRaises(PermissionError):
+                    locks.unlock(fd)

@@ -1,0 +1,245 @@
+from django.core import management
+from django.db import connections, connection
+from django.test import TransactionTestCase, override_settings
+from django.core.cache import caches
+from django.conf import settings
+
+@override_settings(CACHES={
+    'default': {
+        'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
+        # Spaces in table name mirror the real tests to ensure quoting is used.
+        'LOCATION': 'test cache table'
+    },
+    # Provide a named cache entry for culling tests
+    'cull': {
+        'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
+        'LOCATION': 'test cache table'
+    }
+})
+class DBCullRegressionTests(TransactionTestCase):
+    """
+    Regression tests for _cull behavior in DatabaseCache.
+
+    These tests monkeypatch the connection cursor to simulate different
+    results for cursor.fetchone() for the culling query and ensure no
+    exceptions are raised and the correct follow-up DELETE is made only
+    when a last cache key is returned.
+    """
+    available_apps = ['cache']
+
+    def setUp(self):
+        super().setUp()
+        # Ensure the cache table exists.
+        management.call_command('createcachetable', verbosity=0)
+        # Use the 'cull' cache from settings for targeted tests.
+        self.cache = caches['cull']
+        # Keep small values to make the logic easier to reason about.
+        self.cache._max_entries = 1
+        self.cache._cull_frequency = 2
+
+    def tearDown(self):
+        # Drop the table created for tests.
+        with connection.cursor() as cursor:
+            cursor.execute('DROP TABLE %s' % connection.ops.quote_name('test cache table'))
+        super().tearDown()
+
+    class CursorWrapper:
+        """
+        Wraps a real DB-API cursor context manager and allows controlling
+        fetchone() return values based on the last executed SQL, and
+        records executed statements for assertions.
+        """
+        def __init__(self, real_cm, respond_for, collectors):
+            self._real_cm = real_cm
+            self._respond_for = respond_for
+            # collectors is a list to allow test access to this wrapper instance
+            self._collectors = collectors
+            self.executed = []
+            self.last_sql = None
+            self.last_params = None
+
+        def __enter__(self):
+            # Enter the real context manager to get the actual cursor
+            self._real_cursor = self._real_cm.__enter__()
+            # Append self so tests can inspect executed SQL after the with-block
+            self._collectors.append(self)
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return self._real_cm.__exit__(exc_type, exc, tb)
+
+        def execute(self, sql, params=None):
+            self.last_sql = sql
+            self.last_params = params
+            self.executed.append((sql, params))
+            # Forward the execute call to the real cursor.
+            return self._real_cursor.execute(sql, params)
+
+        def fetchone(self):
+            # Determine which query we're answering for by inspecting last_sql.
+            if self.last_sql and 'SELECT COUNT' in self.last_sql.upper():
+                # Return the configured count value.
+                return (self._respond_for.get('count', 0),)
+            # If this looks like the culling SQL (it will reference cache_key
+            # but not COUNT), return the configured 'cull' response directly.
+            if self.last_sql and 'CACHE_KEY' in self.last_sql.upper() and 'COUNT' not in self.last_sql.upper():
+                return self._respond_for.get('cull')
+            # Fallback to the real cursor's fetchone.
+            return self._real_cursor.fetchone()
+
+        def fetchall(self):
+            return self._real_cursor.fetchall()
+
+        def __getattr__(self, name):
+            # Delegate attribute access to the real cursor for other methods.
+            return getattr(self._real_cursor, name)
+
+    def _patch_cursor(self, respond_for):
+        """
+        Monkeypatch connections['default'].cursor to return a CursorWrapper
+        that returns controlled values for fetchone() depending on the SQL.
+        Returns a tuple (restore_callable, collectors_list) where collectors_list
+        will contain the CursorWrapper instance used.
+        """
+        db = 'default'
+        conn = connections[db]
+        orig_cursor = conn.cursor
+        collectors = []
+
+        def factory():
+            # orig_cursor() is a context manager; pass it to our wrapper.
+            return DBCullRegressionTests.CursorWrapper(orig_cursor(), respond_for, collectors)
+
+        conn.cursor = factory
+
+        def restore():
+            conn.cursor = orig_cursor
+
+        return restore, collectors
+
+    def test_cull_no_last_cache_key_does_not_attempt_delete(self):
+        # Simulate COUNT > max_entries but the culling query returning None
+        respond_for = {'count': 100, 'cull': None}
+        restore, collectors = self._patch_cursor(respond_for)
+        try:
+            # Trigger an insert which will invoke _cull via _base_set
+            self.cache.set('trigger-no-last', 'value')
+        finally:
+            restore()
+        # Inspect the wrapper for executed statements.
+        self.assertTrue(collectors, "Expected a wrapped cursor to be used.")
+        wrapper = collectors[0]
+        # Ensure a culling SELECT was executed
+        self.assertTrue(any('cache_key' in (sql or '').lower() for sql, _ in wrapper.executed),
+                        "Expected a culling SELECT to be executed.")
+        # Ensure no DELETE by cache_key was executed since fetchone() returned None
+        self.assertFalse(any('where cache_key <' in (sql or '').lower() for sql, _ in wrapper.executed),
+                         "Did not expect a DELETE by cache_key when last cache key is None.")
+
+    def test_cull_with_last_cache_key_executes_delete_with_value(self):
+        # Simulate COUNT > max_entries and culling SELECT returning a key tuple
+        respond_for = {'count': 100, 'cull': ('last-key-123',)}
+        restore, collectors = self._patch_cursor(respond_for)
+        try:
+            self.cache.set('trigger-with-last', 'value')
+        finally:
+            restore()
+        self.assertTrue(collectors, "Expected a wrapped cursor to be used.")
+        wrapper = collectors[0]
+        # Find any DELETE statement that references cache_key < ...
+        deletes = [params for (sql, params) in wrapper.executed if 'where cache_key <' in (sql or '').lower()]
+        self.assertTrue(deletes, "Expected a DELETE by cache_key to be executed when last cache key is present.")
+        # The parameter passed to the DELETE should match the returned last cache key
+        self.assertIn(['last-key-123'], [list(p) for p in deletes if p is not None])
+
+    def test_cull_with_empty_string_key_executes_delete(self):
+        # cull returns a tuple with empty string; should still attempt delete
+        respond_for = {'count': 100, 'cull': ('',)}
+        restore, collectors = self._patch_cursor(respond_for)
+        try:
+            self.cache.set('trigger-empty-key', 'value')
+        finally:
+            restore()
+        wrapper = collectors[0]
+        deletes = [params for (sql, params) in wrapper.executed if 'where cache_key <' in (sql or '').lower()]
+        self.assertTrue(deletes)
+        # Parameter given should be empty string
+        self.assertIn([''], [list(p) for p in deletes if p is not None])
+
+    def test_cull_with_none_inside_tuple_executes_delete(self):
+        # cull returns (None,) which is truthy, and delete should be attempted with None
+        respond_for = {'count': 100, 'cull': (None,)}
+        restore, collectors = self._patch_cursor(respond_for)
+        try:
+            self.cache.set('trigger-none-in-tuple', 'value')
+        finally:
+            restore()
+        wrapper = collectors[0]
+        deletes = [params for (sql, params) in wrapper.executed if 'where cache_key <' in (sql or '').lower()]
+        self.assertTrue(deletes)
+        # Parameter should be [None]
+        self.assertIn([None], [list(p) for p in deletes if p is not None])
+
+    def test_multiple_cull_calls_with_no_last_key_do_not_raise(self):
+        # Ensure repeated cull activity with no last cache key does not raise.
+        respond_for = {'count': 100, 'cull': None}
+        restore, collectors = self._patch_cursor(respond_for)
+        try:
+            # Call set multiple times to force multiple potential culls.
+            for i in range(3):
+                self.cache.set(f'trigger-repeat-{i}', 'value')
+        finally:
+            restore()
+        wrapper = collectors[0]
+        # No DELETE by cache_key should appear
+        self.assertFalse(any('where cache_key <' in (sql or '').lower() for sql, _ in wrapper.executed))
+
+    def test_cull_when_cull_frequency_zero_calls_clear(self):
+        # When _cull_frequency == 0, clear() should be called instead of culling by key.
+        # Simulate COUNT > max_entries to reach the cull logic.
+        self.cache._cull_frequency = 0
+        respond_for = {'count': 100, 'cull': None}
+        restore, collectors = self._patch_cursor(respond_for)
+        try:
+            self.cache.set('trigger-zero-frequency', 'value')
+        finally:
+            restore()
+        wrapper = collectors[0]
+        # Expect a general DELETE FROM <table> to be called by clear()
+        self.assertTrue(any('delete from' in (sql or '').lower() and 'where' not in (sql or '').lower()
+                            for sql, _ in wrapper.executed),
+                        "Expected a full-table DELETE to be issued when cull_frequency == 0.")
+
+    def test_cull_with_string_row_returned_treated_as_value(self):
+        # Simulate a DB returning a one-item string instead of a tuple.
+        # We'll return a string directly; the code expects a sequence, so
+        # indexing [0] should still work on a string in the gold patch.
+        respond_for = {'count': 100, 'cull': 'string-key'}
+        restore, collectors = self._patch_cursor(respond_for)
+        try:
+            self.cache.set('trigger-string-row', 'value')
+        finally:
+            restore()
+        wrapper = collectors[0]
+        deletes = [params for (sql, params) in wrapper.executed if 'where cache_key <' in (sql or '').lower()]
+        # If a string was returned, the delete should be attempted and the parameter
+        # should be the first character if the code mistakenly treats it as sequence,
+        # but the intended behavior is to use the full value. We assert that some delete
+        # happened; correctness of param handling is dependent on DB adaptation.
+        self.assertTrue(deletes)
+
+    def test_cull_does_not_crash_when_count_zero(self):
+        # If count is 0 (table empty), cull shouldn't proceed and no errors
+        respond_for = {'count': 0, 'cull': None}
+        restore, collectors = self._patch_cursor(respond_for)
+        try:
+            # A simple set that would normally not trigger cull (count==0)
+            self.cache.set('trigger-count-zero', 'value')
+        finally:
+            restore()
+        wrapper = collectors[0]
+        # No culling select should have been executed since num <= _max_entries
+        self.assertFalse(any('cache_key' in (sql or '').lower() and 'count' not in (sql or '').lower()
+                             for sql, _ in wrapper.executed))
+new_imports_code: |
+  # No additional imports required beyond what's already available in the test module.

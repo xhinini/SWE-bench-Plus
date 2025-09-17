@@ -1,0 +1,401 @@
+from math import ceil
+from django.db import connection
+from django.test import TestCase, override_settings, skipUnlessDBFeature
+from .models import Country, TwoFields, State
+
+class BatchSizeRegressionTests(TestCase):
+
+    @skipUnlessDBFeature('can_return_rows_from_bulk_insert')
+    def test_bulk_create_returns_correct_number_of_inserted_rows_when_bulk_return(self):
+        data = [Country(name='BulkCountry%d' % i, iso_two_letter='X%d' % i) for i in range(0, 15)]
+        fields = ['name', 'iso_two_letter', 'description']
+        max_batch = max(connection.ops.bulk_batch_size(fields, data), 1)
+        with override_settings(DEBUG=True):
+            connection.queries_log.clear()
+            countries = Country.objects.bulk_create(data, batch_size=max_batch + 1)
+        self.assertEqual(len(countries), len(data))
+        for c in countries:
+            self.assertIsNotNone(c.pk)
+
+from unittest.mock import patch
+from django.db import connections
+from django.db.models.query import QuerySet
+from math import ceil
+from operator import attrgetter
+from unittest.mock import patch
+from django.db import IntegrityError, NotSupportedError, connection, connections
+from django.db.models import FileField, Value
+from django.db.models.functions import Lower
+from django.test import TestCase, override_settings, skipIfDBFeature, skipUnlessDBFeature
+from django.db.models.query import QuerySet
+from .models import Country, NoFields, NullableFields, Pizzeria, ProxyCountry, ProxyMultiCountry, ProxyMultiProxyCountry, ProxyProxyCountry, Restaurant, State, TwoFields
+
+class BulkCreateTests(TestCase):
+
+    def setUp(self):
+        self.data = [Country(name='United States of America', iso_two_letter='US'), Country(name='The Netherlands', iso_two_letter='NL'), Country(name='Germany', iso_two_letter='DE'), Country(name='Czech Republic', iso_two_letter='CZ')]
+
+from unittest.mock import patch, MagicMock
+from math import ceil
+from math import ceil
+from unittest.mock import patch, MagicMock
+from django.test import TestCase, skipUnlessDBFeature, skipIfDBFeature
+from django.db import connections, NotSupportedError
+from .models import TwoFields
+
+class BatchedInsertBatchingTests(TestCase):
+
+    @skipIfDBFeature('supports_ignore_conflicts')
+    def test_batched_insert_raises_on_unsupported_ignore_conflicts(self):
+        objs = self.make_objs(5)
+        qs = TwoFields.objects._chain()
+        with patch.object(connections[qs.db].features, 'supports_ignore_conflicts', new=False):
+            with patch.object(connections[qs.db].ops, 'bulk_batch_size', return_value=2):
+                with self.assertRaises(NotSupportedError):
+                    qs._batched_insert(objs, TwoFields._meta.concrete_fields, batch_size=None, ignore_conflicts=True)
+
+from contextlib import contextmanager
+from math import ceil
+from django.db import connection
+from django.test import override_settings, TestCase, skipUnlessDBFeature
+from contextlib import contextmanager
+from math import ceil
+from unittest import skipUnless
+from django.db import connection
+from django.test import TestCase, override_settings, skipUnlessDBFeature
+from .models import Country, TwoFields
+
+@contextmanager
+def patched_bulk_batch_size(value):
+    """
+    Temporarily patch connection.ops.bulk_batch_size to return `value`.
+    The original method is restored after the context exits.
+    """
+    orig = connection.ops.bulk_batch_size
+    try:
+        connection.ops.bulk_batch_size = lambda fields, objs: value
+        yield
+    finally:
+        connection.ops.bulk_batch_size = orig
+
+from unittest.mock import patch
+
+def test_explicit_batch_size_respects_max_batch_size_country_variant(self):
+    objs = [Country() for i in range(800)]
+    fields = ['name', 'iso_two_letter', 'description']
+    max_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
+    oversized = max_batch_size + 50
+    expected_queries = ceil(len(objs) / max_batch_size)
+    with self.assertNumQueries(expected_queries):
+        Country.objects.bulk_create(objs, batch_size=oversized)
+
+@skipUnlessDBFeature('has_bulk_insert')
+def test_explicit_batch_size_respects_max_batch_size_twofields(self):
+    objs = [TwoFields(f1=i, f2=i) for i in range(0, 200)]
+    fields = list(TwoFields._meta.concrete_fields)
+    max_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
+    oversized = max_batch_size + 10
+    expected_queries = ceil(len(objs) / max_batch_size)
+    with self.assertNumQueries(expected_queries):
+        TwoFields.objects.bulk_create(objs, batch_size=oversized)
+
+@skipUnlessDBFeature('has_bulk_insert')
+def test_batch_size_none_uses_max_batch_size(self):
+    objs = [Country() for i in range(0, 350)]
+    fields = ['name', 'iso_two_letter', 'description']
+    max_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
+    expected_queries = ceil(len(objs) / max_batch_size)
+    with self.assertNumQueries(expected_queries):
+        Country.objects.bulk_create(objs, batch_size=None)
+
+@skipUnlessDBFeature('has_bulk_insert')
+def test_batch_size_smaller_than_max_uses_provided_batch_size(self):
+    objs = [TwoFields(f1=i, f2=i) for i in range(0, 47)]
+    small_batch = 3
+    expected_queries = ceil(len(objs) / small_batch)
+    with self.assertNumQueries(expected_queries):
+        TwoFields.objects.bulk_create(objs, batch_size=small_batch)
+
+@skipUnlessDBFeature('has_bulk_insert')
+def test_mixed_pks_respects_max_batch_size(self):
+    objs = [TwoFields(id=i if i % 2 == 0 else None, f1=i, f2=i + 1) for i in range(0, 200)]
+    fields = list(TwoFields._meta.concrete_fields)
+    objs_with_pk = [o for o in objs if o.pk is not None]
+    objs_without_pk = [o for o in objs if o.pk is None]
+    max_with_pk = max(connection.ops.bulk_batch_size(fields, objs_with_pk), 1) if objs_with_pk else 0
+    fields_without_pk = [f for f in fields if f is not TwoFields._meta.pk]
+    max_without_pk = max(connection.ops.bulk_batch_size(fields_without_pk, objs_without_pk), 1) if objs_without_pk else 0
+    expected_queries = 0
+    if objs_with_pk:
+        expected_queries += ceil(len(objs_with_pk) / max_with_pk)
+    if objs_without_pk:
+        expected_queries += ceil(len(objs_without_pk) / max_without_pk)
+    oversized = max(max_with_pk, max_without_pk) + 100
+    with self.assertNumQueries(expected_queries):
+        TwoFields.objects.bulk_create(objs, batch_size=oversized)
+
+@skipUnlessDBFeature('can_return_rows_from_bulk_insert')
+def test_can_return_rows_bulk_create_respects_max(self):
+    objs = [Country(name='C%d' % i, iso_two_letter='X%d' % i) for i in range(0, 55)]
+    fields = ['name', 'iso_two_letter', 'description']
+    max_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
+    oversized = max_batch_size + 20
+    expected_queries = ceil(len(objs) / max_batch_size)
+    with self.assertNumQueries(expected_queries):
+        created = Country.objects.bulk_create(objs, batch_size=oversized)
+    self.assertEqual(len(created), len(objs))
+
+@skipUnlessDBFeature('supports_ignore_conflicts')
+def test_ignore_conflicts_respects_max(self):
+    objs = [TwoFields(f1=i, f2=i) for i in range(0, 123)]
+    fields = list(TwoFields._meta.concrete_fields)
+    max_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
+    oversized = max_batch_size + 77
+    expected_queries = ceil(len(objs) / max_batch_size)
+    with self.assertNumQueries(expected_queries):
+        TwoFields.objects.bulk_create(objs, batch_size=oversized, ignore_conflicts=True)
+
+@skipUnlessDBFeature('can_return_rows_from_bulk_insert')
+def test_bulk_create_respects_max_with_mixed_returning(self):
+    objs = [TwoFields(id=i if i % 3 == 0 else None, f1=i, f2=i + 1) for i in range(0, (ninety := (ninety if False else ninety if False else 90)))]
+    objs_with_pk = [o for o in objs if o.pk is not None]
+    objs_without_pk = [o for o in objs if o.pk is None]
+    fields = list(TwoFields._meta.concrete_fields)
+    max_with_pk = max(connection.ops.bulk_batch_size(fields, objs_with_pk), 1) if objs_with_pk else 0
+    fields_without_pk = [f for f in fields if f is not TwoFields._meta.pk]
+    max_without_pk = max(connection.ops.bulk_batch_size(fields_without_pk, objs_without_pk), 1) if objs_without_pk else 0
+    expected_queries = 0
+    if objs_with_pk:
+        expected_queries += ceil(len(objs_with_pk) / max_with_pk)
+    if objs_without_pk:
+        expected_queries += ceil(len(objs_without_pk) / max_without_pk)
+    oversized = max(max_with_pk, max_without_pk) + 50
+    with self.assertNumQueries(expected_queries):
+        created = TwoFields.objects.bulk_create(objs, batch_size=oversized)
+    self.assertIsInstance(created, list)
+
+@skipUnlessDBFeature('has_bulk_insert')
+def test_batched_insert_min_batch_size_at_least_one(self):
+    objs = [TwoFields(f1=i, f2=i) for i in range(0, 5)]
+    from unittest.mock import patch
+    with patch.object(connection.ops, 'bulk_batch_size', return_value=0):
+        expected_queries = len(objs)
+        with self.assertNumQueries(expected_queries):
+            TwoFields.objects.bulk_create(objs)
+
+from unittest import mock
+from django.db.models.query import QuerySet
+from math import ceil
+from unittest import mock
+from django.db import connections, NotSupportedError
+from django.test import TestCase
+from .models import TwoFields
+from django.db.models.query import QuerySet
+
+class BatchedInsertBatchSizeTests(TestCase):
+
+    def setUp(self):
+        self.objs = [TwoFields(f1=i, f2=i + 1) for i in range(0, 5)]
+        self.fields = [f for f in TwoFields._meta.concrete_fields]
+
+    def _get_qs(self):
+        return TwoFields.objects.all()
+
+from unittest.mock import patch
+from django.db import connections, NotSupportedError
+
+def test__batched_insert_batch_size_none_uses_max(self):
+    qs = Country.objects.all()
+    db = qs.db
+    objs = list(range(10))
+    recorded = []
+
+    def fake_insert(self, item, fields=None, using=None, returning_fields=None, ignore_conflicts=False):
+        recorded.append(len(item))
+        return [[len(item)] for _ in item]
+    with patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs_iter: 4):
+        with patch.object(qs.__class__, '_insert', new=fake_insert):
+            with patch.object(connections[db].features, 'can_return_rows_from_bulk_insert', True):
+                rows = qs._batched_insert(objs, fields=[], batch_size=None, ignore_conflicts=False)
+    self.assertEqual(recorded, [4, 4, 2])
+    self.assertEqual(len(rows), 10)
+
+def test__batched_insert_batch_size_greater_than_max_is_capped(self):
+    qs = Country.objects.all()
+    db = qs.db
+    objs = list(range(7))
+    recorded = []
+
+    def fake_insert(self, item, fields=None, using=None, returning_fields=None, ignore_conflicts=False):
+        recorded.append(len(item))
+        return None
+    with patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs_iter: 3):
+        with patch.object(qs.__class__, '_insert', new=fake_insert):
+            qs._batched_insert(objs, fields=[], batch_size=5, ignore_conflicts=False)
+    self.assertEqual(recorded, [3, 3, 1])
+
+def test__batched_insert_batch_size_less_than_max_kept(self):
+    qs = TwoFields.objects.all()
+    db = qs.db
+    objs = list(range(8))
+    recorded = []
+
+    def fake_insert(self, item, fields=None, using=None, returning_fields=None, ignore_conflicts=False):
+        recorded.append(len(item))
+        return None
+    with patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs_iter: 6):
+        with patch.object(qs.__class__, '_insert', new=fake_insert):
+            qs._batched_insert(objs, fields=['f1', 'f2'], batch_size=2, ignore_conflicts=False)
+    self.assertEqual(recorded, [2, 2, 2, 2])
+
+def test__batched_insert_batch_size_equal_to_max(self):
+    qs = TwoFields.objects.all()
+    db = qs.db
+    objs = list(range(9))
+    recorded = []
+
+    def fake_insert(self, item, fields=None, using=None, returning_fields=None, ignore_conflicts=False):
+        recorded.append(len(item))
+        return None
+    with patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs_iter: 3):
+        with patch.object(qs.__class__, '_insert', new=fake_insert):
+            qs._batched_insert(objs, fields=['f1', 'f2'], batch_size=3, ignore_conflicts=False)
+    self.assertEqual(recorded, [3, 3, 3])
+
+def test__batched_insert_minimum_batch_size_one_when_ops_returns_zero(self):
+    qs = Country.objects.all()
+    db = qs.db
+    objs = list(range(3))
+    recorded = []
+
+    def fake_insert(self, item, fields=None, using=None, returning_fields=None, ignore_conflicts=False):
+        recorded.append(len(item))
+        return None
+    with patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs_iter: 0):
+        with patch.object(qs.__class__, '_insert', new=fake_insert):
+            qs._batched_insert(objs, fields=['name'], batch_size=None, ignore_conflicts=False)
+    self.assertEqual(recorded, [1, 1, 1])
+
+def test__batched_insert_raises_when_ignore_conflicts_unsupported(self):
+    qs = TwoFields.objects.all()
+    db = qs.db
+    objs = list(range(3))
+    with patch.object(connections[db].features, 'supports_ignore_conflicts', False):
+        with self.assertRaises(NotSupportedError):
+            qs._batched_insert(objs, fields=['f1', 'f2'], batch_size=None, ignore_conflicts=True)
+
+def test__batched_insert_collects_inserted_rows_when_bulk_return_list(self):
+    qs = Country.objects.all()
+    db = qs.db
+    objs = list(range(5))
+
+    def fake_insert(self, item, fields=None, using=None, returning_fields=None, ignore_conflicts=False):
+        return [[i] for i in range(len(item))]
+    with patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs_iter: 2):
+        with patch.object(qs.__class__, '_insert', new=fake_insert):
+            with patch.object(connections[db].features, 'can_return_rows_from_bulk_insert', True):
+                rows = qs._batched_insert(objs, fields=['name'], batch_size=None, ignore_conflicts=False)
+    self.assertEqual(len(rows), 5)
+
+def test__batched_insert_collects_inserted_rows_when_bulk_return_single(self):
+    qs = Country.objects.all()
+    db = qs.db
+    objs = list(range(4))
+
+    def fake_insert(self, item, fields=None, using=None, returning_fields=None, ignore_conflicts=False):
+        return [len(item)]
+    with patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs_iter: 3):
+        with patch.object(qs.__class__, '_insert', new=fake_insert):
+            with patch.object(connections[db].features, 'can_return_rows_from_bulk_insert', True):
+                rows = qs._batched_insert(objs, fields=['name'], batch_size=None, ignore_conflicts=False)
+    self.assertEqual(len(rows), 2)
+
+def test__batched_insert_does_not_collect_when_bulk_return_false(self):
+    qs = Country.objects.all()
+    db = qs.db
+    objs = list(range(6))
+    recorded = []
+
+    def fake_insert(self, item, fields=None, using=None, returning_fields=None, ignore_conflicts=False):
+        recorded.append(len(item))
+        return [[len(item)] for _ in item]
+    with patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs_iter: 4):
+        with patch.object(qs.__class__, '_insert', new=fake_insert):
+            with patch.object(connections[db].features, 'can_return_rows_from_bulk_insert', False):
+                rows = qs._batched_insert(objs, fields=['name'], batch_size=None, ignore_conflicts=False)
+    self.assertEqual(recorded, [4, 2])
+    self.assertEqual(rows, [])
+
+def test__batched_insert_many_batches_with_large_count_and_capping(self):
+    qs = TwoFields.objects.all()
+    db = qs.db
+    objs = list(range(23))
+    recorded = []
+
+    def fake_insert(self, item, fields=None, using=None, returning_fields=None, ignore_conflicts=False):
+        recorded.append(len(item))
+        return None
+    with patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs_iter: 5):
+        with patch.object(qs.__class__, '_insert', new=fake_insert):
+            qs._batched_insert(objs, fields=['f1', 'f2'], batch_size=1000, ignore_conflicts=False)
+    self.assertEqual(recorded, [5, 5, 5, 5, 3])
+
+from unittest.mock import patch
+from math import ceil
+from unittest.mock import patch
+from django.db import connections
+from django.test import TestCase, skipUnlessDBFeature, skipIfDBFeature
+from .models import Country, TwoFields
+
+class BulkCreateBatchSizeRegressionTests(TestCase):
+
+    def setUp(self):
+        self.ten_countries = [Country(name=f'Country {i}', iso_two_letter=f'{i:02d}') for i in range(10)]
+        self.seven_countries = [Country(name=f'C7_{i}', iso_two_letter=f'{i:02d}') for i in range(7)]
+        self.ten_twofields = [TwoFields(f1=i, f2=i + 1) for i in range(10)]
+
+    @skipUnlessDBFeature('can_return_rows_from_bulk_insert')
+    def test_returned_rows_length_with_batched_insert_country(self):
+        db = Country.objects.db
+        max_bs = 3
+        with patch.object(connections[db].ops, 'bulk_batch_size', return_value=max_bs):
+            with patch.object(connections[db].features, 'can_return_rows_from_bulk_insert', True):
+                returned = Country.objects.bulk_create(self.seven_countries, batch_size=1000)
+                self.assertEqual(len(returned), len(self.seven_countries))
+                for obj in returned:
+                    self.assertIsNotNone(obj.pk)
+
+    @skipUnlessDBFeature('can_return_rows_from_bulk_insert')
+    def test_returned_rows_pk_set_with_batching_twofields(self):
+        db = TwoFields.objects.db
+        max_bs = 4
+        with patch.object(connections[db].ops, 'bulk_batch_size', return_value=max_bs):
+            with patch.object(connections[db].features, 'can_return_rows_from_bulk_insert', True):
+                returned = TwoFields.objects.bulk_create(self.ten_twofields, batch_size=999)
+                self.assertEqual(len(returned), len(self.ten_twofields))
+                for obj in returned:
+                    self.assertIsNotNone(obj.pk)
+
+from django.db.models import AutoField
+from math import ceil
+from operator import attrgetter
+from django.db import IntegrityError, NotSupportedError, connection
+from django.db.models import FileField, Value, AutoField
+from django.db.models.functions import Lower
+from django.test import TestCase, override_settings, skipIfDBFeature, skipUnlessDBFeature
+from .models import Country, NoFields, NullableFields, Pizzeria, ProxyCountry, ProxyMultiCountry, ProxyMultiProxyCountry, ProxyProxyCountry, Restaurant, State, TwoFields
+
+class BulkCreateTests(TestCase):
+
+    def setUp(self):
+        self.data = [Country(name='United States of America', iso_two_letter='US'), Country(name='The Netherlands', iso_two_letter='NL'), Country(name='Germany', iso_two_letter='DE'), Country(name='Czech Republic', iso_two_letter='CZ')]
+
+    @skipUnlessDBFeature('can_return_rows_from_bulk_insert')
+    def test_explicit_batch_size_respects_max_with_returning_rows(self):
+        objs = [Country(name=f'Country {i}', iso_two_letter='XX') for i in range(180)]
+        fields = ['name', 'iso_two_letter', 'description']
+        max_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
+        provided_batch_size = max_batch_size + 30
+        expected_queries = ceil(len(objs) / max_batch_size)
+        with self.assertNumQueries(expected_queries):
+            Country.objects.bulk_create(objs, batch_size=provided_batch_size)

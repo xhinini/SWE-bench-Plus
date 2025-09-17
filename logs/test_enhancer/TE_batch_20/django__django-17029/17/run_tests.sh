@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 apps.tests_llm.ClearSwappableCacheTests.test_clear_cache_after_repopulating_in_set_available_apps apps.tests_llm.ClearSwappableCacheTests.test_clear_cache_direct_clears_swappable_cache apps.tests_llm.ClearSwappableCacheTests.test_clear_cache_during_expire_loop_does_not_leave_swappable_cache_populated apps.tests_llm.ClearSwappableCacheTests.test_clear_cache_for_different_model_strings apps.tests_llm.ClearSwappableCacheTests.test_clear_cache_multiple_times_idempotent apps.tests_llm.ClearSwappableCacheTests.test_clear_cache_on_non_main_apps_instance apps.tests_llm.ClearSwappableCacheTests.test_clear_cache_via_set_available_apps_clears_swappable_cache apps.tests_llm.ClearSwappableCacheTests.test_clear_cache_via_unset_available_apps_clears_swappable_cache apps.tests_llm.ClearSwappableCacheTests.test_clear_cache_when_ready_false_clears_swappable_cache apps.tests_llm.ClearSwappableCacheTests.test_clear_cache_with_different_case_model_string
+coverage json -o coverage.json
+: '>>>>> End Test Output'

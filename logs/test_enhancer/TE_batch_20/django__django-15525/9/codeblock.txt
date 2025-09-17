@@ -1,0 +1,204 @@
+# No additional imports required beyond build_instance imported in test_code.
+from unittest import TestCase
+
+from django.core.serializers.base import build_instance
+
+
+class DummyPK:
+    def __init__(self, attname="id", to_python=lambda x: int(x)):
+        self.attname = attname
+        self.to_python = to_python
+
+
+class DummyState:
+    def __init__(self, db=None):
+        self.db = db
+
+
+class DummyManager:
+    def __init__(self, result_pk=None, raise_dne=False):
+        self._called_with = None
+        self.result_pk = result_pk
+        self.raise_dne = raise_dne
+        self.last_db = None
+
+    def db_manager(self, db):
+        # return self but remember which DB was asked for
+        self.last_db = db
+        return self
+
+    def get_by_natural_key(self, *args):
+        self._called_with = args
+        if self.raise_dne:
+            # Simulate Django's DoesNotExist by raising the indicated exception
+            raise self.model_class.DoesNotExist()
+        class Obj:
+            def __init__(self, pk):
+                self.pk = pk
+        return Obj(self.result_pk)
+
+
+class FieldDoesNotExist(Exception):
+    pass
+
+
+class DummyMeta:
+    def __init__(self, pk_attname="id", raise_on_get_field_for=None, pk_to_python=int):
+        self.pk = DummyPK(attname=pk_attname, to_python=pk_to_python)
+        # if provided, get_field will raise FieldDoesNotExist for those names
+        self._raise_on = set(raise_on_get_field_for or [])
+        self.default_manager = None
+        self.model_name = "dummy"
+        self.app_label = "app"
+
+    def get_field(self, name):
+        if name in self._raise_on:
+            raise FieldDoesNotExist("no such field: %s" % name)
+        # Return a simple object that has to_python if needed by callers
+        class F:
+            def to_python(self, value):
+                return value
+        return F()
+
+
+class DummyModelBase:
+    # Provide a DoesNotExist exception class for tests that expect it
+    class DoesNotExist(Exception):
+        pass
+
+    def __init__(self, **data):
+        # Accept arbitrary data keys (attnames like 'author_id' included)
+        for k, v in data.items():
+            setattr(self, k, v)
+        # default pk attribute name may vary
+        self._state = DummyState()
+
+    def __repr__(self):
+        return "<DummyModel %r>" % getattr(self, self._meta.pk.attname, None)
+
+
+class DummyModelFactory:
+    """
+    Utility to produce dummy model classes with controlled behavior.
+    """
+
+    @staticmethod
+    def create(
+        *,
+        pk_attname="id",
+        manager_result_pk="1",
+        manager_raises=False,
+        natural_key_func=None,
+        get_field_raises_for=None,
+        pk_to_python=int,
+    ):
+        manager = DummyManager(result_pk=manager_result_pk, raise_dne=manager_raises)
+
+        class M(DummyModelBase):
+            pass
+
+        # Attach metadata objects
+        M._meta = DummyMeta(pk_attname=pk_attname, raise_on_get_field_for=get_field_raises_for, pk_to_python=pk_to_python)
+        manager.model_class = M
+        M._meta.default_manager = manager
+        M._meta.pk = M._meta.pk
+        # natural_key implementation
+        if natural_key_func is None:
+            # default natural key simply returns a tuple containing the instance state's db
+            def natural_key(self):
+                return (self._state.db,)
+            M.natural_key = natural_key
+        else:
+            M.natural_key = natural_key_func
+        return M
+
+
+class BuildInstanceTests(TestCase):
+    def test_sets_pk_using_natural_key_and_db_on_instance(self):
+        # natural_key uses self._state.db; build_instance must set _state.db before calling it
+        M = DummyModelFactory.create(pk_attname="id", manager_result_pk="42", pk_to_python=int)
+        # No pk provided in input data -> triggers natural_key path
+        instance = build_instance(M, {}, "other_db")
+        # The manager returns pk "42" and pk.to_python converts to int(42)
+        self.assertEqual(getattr(instance, "id"), 42)
+        # manager should have been called with the natural key equal to ('other_db',)
+        self.assertEqual(M._meta.default_manager._called_with, ("other_db",))
+        self.assertEqual(M._meta.default_manager.last_db, "other_db")
+
+    def test_handles_does_not_exist_from_get_by_natural_key(self):
+        # When get_by_natural_key raises DoesNotExist, build_instance must not raise and should return Model(**data)
+        M = DummyModelFactory.create(manager_raises=True)
+        # No pk provided -> natural_key path, but manager will raise DoesNotExist -> build_instance should swallow it
+        instance = build_instance(M, {}, "db")
+        # No pk attribute set because lookup failed
+        self.assertFalse(hasattr(instance, M._meta.pk.attname))
+
+    def test_with_foreignkey_attname_in_data_does_not_call_meta_get_field(self):
+        # Data contains an attname like 'author_id' which is not a real field name.
+        # Candidate buggy patch attempts to call _meta.get_field('author_id') and would raise.
+        M = DummyModelFactory.create(get_field_raises_for=["author_id"])
+        data = {"author_id": 5}
+        # Even though pk is None (so natural key code path runs), providing unrelated attname must not cause introspection failures
+        instance = build_instance(M, data, "db")
+        # The returned instance should have the author_id attribute set from data
+        self.assertEqual(getattr(instance, "author_id"), 5)
+
+    def test_calls_pk_to_python(self):
+        # Ensure pk.to_python is used on the value returned by get_by_natural_key
+        def to_python_str(x):
+            return "converted-%s" % x
+        M = DummyModelFactory.create(pk_attname="pk", manager_result_pk="99", pk_to_python=to_python_str)
+        instance = build_instance(M, {}, "db")
+        self.assertEqual(getattr(instance, "pk"), "converted-99")
+
+    def test_nonstandard_db_name_is_used(self):
+        M = DummyModelFactory.create(manager_result_pk="7")
+        instance = build_instance(M, {}, "custom_db_name")
+        self.assertEqual(getattr(instance, "id"), 7)
+        self.assertEqual(M._meta.default_manager.last_db, "custom_db_name")
+
+    def test_no_get_by_natural_key_manager(self):
+        # If manager doesn't implement get_by_natural_key, nothing special should happen.
+        class SimpleManager:
+            def __init__(self):
+                self._called = False
+        M = DummyModelFactory.create()
+        # Replace the manager with one lacking get_by_natural_key
+        M._meta.default_manager = SimpleManager()
+        # build_instance should just return Model(**data) without error
+        instance = build_instance(M, {}, "db")
+        self.assertIsInstance(instance, M)
+
+    def test_existing_pk_skips_natural_key_lookup(self):
+        # If pk present, build_instance should not attempt natural_key resolution.
+        M = DummyModelFactory.create(manager_result_pk="100")  # manager would return something else if called
+        data = {M._meta.pk.attname: 123, "other_field": "x"}
+        instance = build_instance(M, data, "db")
+        # The provided pk must be kept (no overwrite)
+        self.assertEqual(getattr(instance, M._meta.pk.attname), 123)
+
+    def test_propagates_exception_from_natural_key(self):
+        # If natural_key raises an exception other than DoesNotExist, it should propagate
+        def bad_natural_key(self):
+            raise ValueError("bad")
+        M = DummyModelFactory.create(natural_key_func=bad_natural_key)
+        with self.assertRaises(ValueError):
+            build_instance(M, {}, "db")
+
+    def test_natural_key_returning_iterable_tuple(self):
+        # natural_key returns multiple values; ensure they're passed through to manager
+        def nk(self):
+            return (self._state.db, "extra")
+        M = DummyModelFactory.create(natural_key_func=nk, manager_result_pk="5")
+        instance = build_instance(M, {}, "db")
+        # Manager should have been called with both values
+        self.assertEqual(M._meta.default_manager._called_with, ("db", "extra"))
+        self.assertEqual(getattr(instance, "id"), 5)
+
+    def test_does_not_modify_unrelated_data_keys(self):
+        # Keys not related to pk or natural key must be preserved
+        M = DummyModelFactory.create()
+        data = {"some_field": "value", "author_id": 77}
+        instance = build_instance(M, data, "db")
+        self.assertEqual(getattr(instance, "some_field"), "value")
+        self.assertEqual(getattr(instance, "author_id"), 77)

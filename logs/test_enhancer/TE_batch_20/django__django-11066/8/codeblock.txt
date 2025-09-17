@@ -1,0 +1,189 @@
+from django.db import connections
+
+from django.apps.registry import apps
+from django.conf import settings
+from django.contrib.contenttypes import management as contenttypes_management
+from django.contrib.contenttypes.models import ContentType
+from django.db import migrations, models, IntegrityError
+from django.test import TransactionTestCase, override_settings
+
+
+class AllowOtherRouter:
+    """
+    Router that only allows migrations on the 'other' database.
+    """
+    def allow_migrate(self, db, app_label, model_name=None, **hints):
+        return db == 'other'
+
+    # For older router APIs, ensure allow_migrate_model works as well.
+    def allow_migrate_model(self, db, model):
+        return self.allow_migrate(db, model._meta.app_label, model._meta.model_name)
+
+
+@override_settings(
+    MIGRATION_MODULES=dict(
+        settings.MIGRATION_MODULES,
+        contenttypes_tests='contenttypes_tests.operations_migrations',
+    ),
+)
+class AdditionalRenameTests(TransactionTestCase):
+    databases = {'default', 'other'}
+    available_apps = [
+        'contenttypes_tests',
+        'django.contrib.contenttypes',
+    ]
+
+    def setUp(self):
+        # Ensure clean state for content types in both DBs used by tests.
+        ContentType.objects.using('default').filter(app_label='additivetest').delete()
+        ContentType.objects.using('other').filter(app_label='additivetest').delete()
+
+    @override_settings(DATABASE_ROUTERS=[AllowOtherRouter()])
+    def test_rename_uses_target_db(self):
+        # Create a content type in the 'other' DB and ensure rename happens there.
+        ContentType.objects.using('other').create(app_label='additivetest', model='oldmodel')
+        rename = contenttypes_management.RenameContentType('additivetest', 'oldmodel', 'newmodel')
+        connection = connections['other']
+        with connection.schema_editor() as schema_editor:
+            # Directly call the helper to ensure it picks up the schema_editor's DB.
+            rename._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+        # Assert operation affected 'other' DB only.
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='additivetest', model='newmodel').exists())
+        self.assertFalse(ContentType.objects.using('other').filter(app_label='additivetest', model='oldmodel').exists())
+        # Default DB should be unchanged.
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='additivetest').exists())
+
+    @override_settings(DATABASE_ROUTERS=[AllowOtherRouter()])
+    def test_rename_does_not_run_if_router_disallows(self):
+        # Router disallows migrations on 'default', create content type in default and ensure rename is skipped.
+        # Use a router that disallows any DB (override to a lambda router).
+        class DisallowAll:
+            def allow_migrate(self, db, app_label, model_name=None, **hints):
+                return False
+        with override_settings(DATABASE_ROUTERS=[DisallowAll()]):
+            ContentType.objects.using('default').create(app_label='additivetest', model='nomove')
+            rename = contenttypes_management.RenameContentType('additivetest', 'nomove', 'nomovenew')
+            connection = connections['default']
+            with connection.schema_editor() as schema_editor:
+                # Should be a no-op because router disallows migrations on the ContentType model.
+                rename._rename(apps, schema_editor, 'nomove', 'nomovenew')
+            self.assertTrue(ContentType.objects.using('default').filter(app_label='additivetest', model='nomove').exists())
+            self.assertFalse(ContentType.objects.using('default').filter(app_label='additivetest', model='nomovenew').exists())
+
+    @override_settings(DATABASE_ROUTERS=[AllowOtherRouter()])
+    def test_backward_rename_uses_target_db(self):
+        # Create a content type in 'other' DB with the new name and run rename_backward to restore the old name.
+        ContentType.objects.using('other').create(app_label='additivetest', model='afterrename')
+        rename = contenttypes_management.RenameContentType('additivetest', 'before', 'afterrename')
+        connection = connections['other']
+        with connection.schema_editor() as schema_editor:
+            # rename_backward will swap new->old
+            rename.rename_backward(apps, schema_editor)
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='additivetest', model='before').exists())
+        self.assertFalse(ContentType.objects.using('other').filter(app_label='additivetest', model='afterrename').exists())
+
+    @override_settings(DATABASE_ROUTERS=[AllowOtherRouter()])
+    def test_missing_content_type_is_ignored(self):
+        # Non-existing content type should be ignored (no exception).
+        rename = contenttypes_management.RenameContentType('additivetest', 'doesnotexist', 'stilldoesnt')
+        connection = connections['other']
+        with connection.schema_editor() as schema_editor:
+            # Should not raise
+            rename._rename(apps, schema_editor, 'doesnotexist', 'stilldoesnt')
+        self.assertFalse(ContentType.objects.using('other').filter(app_label='additivetest').exists())
+
+    @override_settings(DATABASE_ROUTERS=[AllowOtherRouter()])
+    def test_integrity_error_reverts_model_value(self):
+        # Create a conflicting content type in 'other' DB so that renaming will cause IntegrityError.
+        ContentType.objects.using('other').create(app_label='additivetest', model='conflict')
+        original = ContentType.objects.using('other').create(app_label='additivetest', model='toberenamed')
+        rename = contenttypes_management.RenameContentType('additivetest', 'toberenamed', 'conflict')
+        connection = connections['other']
+        with connection.schema_editor() as schema_editor:
+            # Running the rename should catch IntegrityError and leave the original model name intact.
+            rename._rename(apps, schema_editor, 'toberenamed', 'conflict')
+        # Reload from DB and confirm still has original name.
+        self.assertTrue(ContentType.objects.using('other').filter(pk=original.pk, model='toberenamed').exists())
+
+    @override_settings(DATABASE_ROUTERS=[AllowOtherRouter()])
+    def test_clear_cache_called_on_success(self):
+        # Ensure ContentType.objects.clear_cache is called on successful rename.
+        ContentType.objects.using('other').create(app_label='additivetest', model='cacheold')
+        rename = contenttypes_management.RenameContentType('additivetest', 'cacheold', 'cachenew')
+        connection = connections['other']
+        called = []
+        manager = ContentType.objects
+        original_clear = getattr(manager, 'clear_cache', None)
+        try:
+            # Patch the manager method to record calls.
+            setattr(manager, 'clear_cache', lambda: called.append(True))
+            with connection.schema_editor() as schema_editor:
+                rename._rename(apps, schema_editor, 'cacheold', 'cachenew')
+            self.assertTrue(called)  # clear_cache should have been called exactly once (at least called).
+        finally:
+            # Restore original method.
+            if original_clear is not None:
+                setattr(manager, 'clear_cache', original_clear)
+
+    @override_settings(DATABASE_ROUTERS=[AllowOtherRouter()])
+    def test_cache_not_cleared_on_integrity_error(self):
+        # Ensure clear_cache is NOT called when an IntegrityError occurs.
+        ContentType.objects.using('other').create(app_label='additivetest', model='cacheconflict')
+        ContentType.objects.using('other').create(app_label='additivetest', model='cacheconflict_target')
+        # Make an entry that will conflict with the rename target to trigger IntegrityError.
+        ContentType.objects.using('other').create(app_label='additivetest', model='cacheconflict_new')
+        rename = contenttypes_management.RenameContentType('additivetest', 'cacheconflict', 'cacheconflict_new')
+        connection = connections['other']
+        called = []
+        manager = ContentType.objects
+        original_clear = getattr(manager, 'clear_cache', None)
+        try:
+            setattr(manager, 'clear_cache', lambda: called.append(True))
+            with connection.schema_editor() as schema_editor:
+                rename._rename(apps, schema_editor, 'cacheconflict', 'cacheconflict_new')
+            self.assertFalse(called)  # clear_cache should not have been called on IntegrityError
+        finally:
+            if original_clear is not None:
+                setattr(manager, 'clear_cache', original_clear)
+
+    def test_inject_rename_contenttypes_operations_respects_initial_contenttypes_unapplied(self):
+        # If ('contenttypes', '0001_initial') is in the plan as unapplied (backward=True), subsequent RenameModel ops should not get injected RenameContentType.
+        plan = []
+        # First migration is contenttypes initial unapplied (backward True).
+        contenttypes_initial = migrations.Migration('0001_initial', 'contenttypes')
+        plan.append((contenttypes_initial, True))
+        # Second migration in another app that would normally get a RenameContentType injected.
+        other_migration = migrations.Migration('0001_something', 'someapp')
+        # Add a RenameModel operation into other_migration.operations so injection would normally add an operation.
+        other_migration.operations = [migrations.RenameModel('OldName', 'NewName')]
+        plan.append((other_migration, False))
+        # Run injection: because initial is unapplied and backward is True, it should break early and not inject into other_migration.
+        contenttypes_management.inject_rename_contenttypes_operations(plan=plan, apps=apps, using='default')
+        # The other_migration should remain with a single RenameModel operation.
+        self.assertEqual(len(other_migration.operations), 1)
+        self.assertIsInstance(other_migration.operations[0], migrations.RenameModel)
+
+    def test_get_contenttypes_and_models_router_disallows(self):
+        # If router disallows migration, get_contenttypes_and_models returns (None, None).
+        class DisallowAll:
+            def allow_migrate(self, db, app_label, model_name=None, **hints):
+                return False
+        app_config = apps.get_app_config('contenttypes_tests')
+        ContentTypeModel = apps.get_model('contenttypes', 'ContentType')
+        # Use the disallow router for this call via override_settings context manager.
+        with override_settings(DATABASE_ROUTERS=[DisallowAll()]):
+            cts, models_map = contenttypes_management.get_contenttypes_and_models(app_config, 'default', ContentTypeModel)
+            self.assertEqual((cts, models_map), (None, None))
+
+    def test_get_contenttypes_and_models_returns_expected_mappings(self):
+        # Ensure the function returns dictionaries mapping model names to model classes and content types.
+        app_config = apps.get_app_config('contenttypes_tests')
+        ContentTypeModel = apps.get_model('contenttypes', 'ContentType')
+        # Create a content type for a model that will be returned by app_config.get_models().
+        # Use a distinct app_label to avoid colliding with other tests.
+        ContentTypeModel.objects.using('default').create(app_label=app_config.label, model='foo')
+        cts, models_map = contenttypes_management.get_contenttypes_and_models(app_config, 'default', ContentTypeModel)
+        # models_map should contain model names from the app_config; content types should include 'foo'.
+        self.assertIsInstance(cts, dict)
+        self.assertIsInstance(models_map, dict)
+        self.assertIn('foo', cts)

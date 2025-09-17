@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.AdditionalNonFormErrorsTests.test_appending_to_returned_non_form_errors_affects_internal_storage forms_tests.tests.test_formsets_llm.AdditionalNonFormErrorsTests.test_mutation_reflects_in_str forms_tests.tests.test_formsets_llm.AdditionalNonFormErrorsTests.test_non_form_errors_error_class_preserved_no_errors forms_tests.tests.test_formsets_llm.AdditionalNonFormErrorsTests.test_non_form_errors_error_class_preserved_with_errors forms_tests.tests.test_formsets_llm.AdditionalNonFormErrorsTests.test_non_form_errors_identity_for_unbound_formset forms_tests.tests.test_formsets_llm.AdditionalNonFormErrorsTests.test_non_form_errors_identity_for_valid_bound_formset forms_tests.tests.test_formsets_llm.AdditionalNonFormErrorsTests.test_non_form_errors_returns_errorlist_instance_various_states forms_tests.tests.test_formsets_llm.AdditionalNonFormErrorsTests.test_non_form_errors_singleton_across_calls_bound forms_tests.tests.test_formsets_llm.AdditionalNonFormErrorsTests.test_non_form_errors_singleton_across_calls_unbound forms_tests.tests.test_formsets_llm.AdditionalNonFormErrorsTests.test_non_form_errors_triggers_full_clean_and_populates_internal_storage forms_tests.tests.test_formsets_llm.BaseFavoriteDrinksFormSet.clean
+coverage json -o coverage.json
+: '>>>>> End Test Output'

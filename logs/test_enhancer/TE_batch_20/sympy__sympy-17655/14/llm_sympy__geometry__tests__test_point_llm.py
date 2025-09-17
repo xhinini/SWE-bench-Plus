@@ -1,0 +1,1 @@
+from sympy.geometry.exceptions import GeometryError

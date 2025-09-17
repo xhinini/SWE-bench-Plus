@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 view_tests.tests.test_static_llm.SemicolonHeaderRegressionTests.test_serve_handles_leading_semicolon_length view_tests.tests.test_static_llm.SemicolonHeaderRegressionTests.test_serve_handles_leading_semicolon_no_space_length view_tests.tests.test_static_llm.SemicolonHeaderRegressionTests.test_serve_handles_semicolon_and_date view_tests.tests.test_static_llm.SemicolonHeaderRegressionTests.test_serve_handles_semicolon_only_header view_tests.tests.test_static_llm.SemicolonHeaderRegressionTests.test_was_modified_since_leading_semicolon_and_size_zero view_tests.tests.test_static_llm.SemicolonHeaderRegressionTests.test_was_modified_since_leading_semicolon_garbage view_tests.tests.test_static_llm.SemicolonHeaderRegressionTests.test_was_modified_since_leading_semicolon_no_space_before_length view_tests.tests.test_static_llm.SemicolonHeaderRegressionTests.test_was_modified_since_leading_semicolon_unexpected_key view_tests.tests.test_static_llm.SemicolonHeaderRegressionTests.test_was_modified_since_leading_semicolon_with_length view_tests.tests.test_static_llm.SemicolonHeaderRegressionTests.test_was_modified_since_semicolon_only
+coverage json -o coverage.json
+: '>>>>> End Test Output'

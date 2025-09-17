@@ -1,0 +1,153 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests verify that the sqlmigrate command only enables transactional
+  output wrappers (BEGIN/COMMIT) when both the migration is atomic and the
+  database connection reports support for transactional DDL
+  (features.can_rollback_ddl). They also check that the command returns the
+  SQL returned by MigrationExecutor.collect_sql and that Command.execute
+  forces no_color=True before delegating to BaseCommand.execute.
+test_code: |
+  from types import SimpleNamespace
+  from unittest import mock
+
+  from django.test import SimpleTestCase
+  from django.core.management.commands import sqlmigrate
+  from django.core.management.base import BaseCommand
+
+  def _make_fake_executor_factory(atomic, sql_statements, app_label='testapp'):
+      """
+      Returns a MigrationExecutor replacement class that returns a migration
+      with the given `atomic` attribute and whose collect_sql returns
+      `sql_statements`.
+      """
+      class FakeExecutor:
+          def __init__(self, connection):
+              # store the passed connection (not used in this fake beyond storage)
+              self.connection = connection
+              # simple loader with the minimal interface required by sqlmigrate
+              migration = SimpleNamespace(name='0001', atomic=atomic)
+              def get_migration_by_prefix(a_label, migration_name):
+                  if a_label == app_label and migration_name.startswith('0001'):
+                      return migration
+                  raise KeyError("migration not found")
+              self.loader = SimpleNamespace(
+                  migrated_apps={app_label},
+                  get_migration_by_prefix=get_migration_by_prefix,
+                  graph=SimpleNamespace(nodes={(app_label, migration.name): 'node'}),
+              )
+          def collect_sql(self, plan):
+              # Return exactly what we were configured with
+              return list(sql_statements)
+      return FakeExecutor
+
+  class SqlMigrateOutputTransactionTests(SimpleTestCase):
+      """
+      Tests for output_transaction logic in sqlmigrate.Command.handle().
+      """
+
+      def _run_handle_with(self, migration_atomic, can_rollback_ddl, backwards=False):
+          """
+          Helper to run Command.handle with a fake environment and return
+          (command_instance, return_value, fake_connection).
+          """
+          app_label = 'testapp'
+          sql_lines = ['-- op1', 'CREATE TABLE example', '-- op2']
+          FakeExecutor = _make_fake_executor_factory(migration_atomic, sql_lines, app_label=app_label)
+          fake_conn = SimpleNamespace(
+              features=SimpleNamespace(can_rollback_ddl=can_rollback_ddl),
+              ops=SimpleNamespace(
+                  start_transaction_sql=lambda: 'BEGIN',
+                  end_transaction_sql=lambda: 'COMMIT',
+              )
+          )
+          # Patch MigrationExecutor used in the sqlmigrate module
+          patch_executor = mock.patch(
+              'django.core.management.commands.sqlmigrate.MigrationExecutor',
+              new=FakeExecutor
+          )
+          # Patch the module-level connections mapping to return our fake connection
+          patch_connections = mock.patch(
+              'django.core.management.commands.sqlmigrate.connections',
+              new={ 'default': fake_conn }
+          )
+          # Prevent apps.get_app_config from raising by returning a dummy config
+          patch_get_app_config = mock.patch(
+              'django.core.management.commands.sqlmigrate.apps.get_app_config',
+              return_value=SimpleNamespace()
+          )
+          with patch_executor, patch_connections, patch_get_app_config:
+              cmd = sqlmigrate.Command()
+              # Call handle directly with kwargs (it accepts **options)
+              result = cmd.handle(app_label=app_label, migration_name='0001', database='default', backwards=backwards)
+              return cmd, result, fake_conn
+
+      def test_atomic_true_and_db_supports_transactions_sets_output_transaction_true(self):
+          cmd, result, fake_conn = self._run_handle_with(migration_atomic=True, can_rollback_ddl=True)
+          self.assertTrue(cmd.output_transaction)
+          self.assertEqual(result, '-- op1\nCREATE TABLE example\n-- op2')
+
+      def test_atomic_true_and_db_does_not_support_transactions_sets_output_transaction_false(self):
+          cmd, result, fake_conn = self._run_handle_with(migration_atomic=True, can_rollback_ddl=False)
+          self.assertFalse(cmd.output_transaction)
+          self.assertEqual(result, '-- op1\nCREATE TABLE example\n-- op2')
+
+      def test_non_atomic_migration_even_if_db_supports_transactions_output_transaction_false(self):
+          cmd, result, fake_conn = self._run_handle_with(migration_atomic=False, can_rollback_ddl=True)
+          self.assertFalse(cmd.output_transaction)
+          self.assertEqual(result, '-- op1\nCREATE TABLE example\n-- op2')
+
+      def test_non_atomic_and_db_no_transactions_output_transaction_false(self):
+          cmd, result, fake_conn = self._run_handle_with(migration_atomic=False, can_rollback_ddl=False)
+          self.assertFalse(cmd.output_transaction)
+          self.assertEqual(result, '-- op1\nCREATE TABLE example\n-- op2')
+
+      def test_backwards_flag_does_not_affect_output_transaction_when_atomic_and_supported(self):
+          cmd, result, fake_conn = self._run_handle_with(migration_atomic=True, can_rollback_ddl=True, backwards=True)
+          self.assertTrue(cmd.output_transaction)
+          self.assertEqual(result, '-- op1\nCREATE TABLE example\n-- op2')
+
+      def test_backwards_flag_does_not_affect_output_transaction_when_atomic_and_not_supported(self):
+          cmd, result, fake_conn = self._run_handle_with(migration_atomic=True, can_rollback_ddl=False, backwards=True)
+          self.assertFalse(cmd.output_transaction)
+          self.assertEqual(result, '-- op1\nCREATE TABLE example\n-- op2')
+
+      def test_backwards_flag_non_atomic_db_supports_transactions(self):
+          cmd, result, fake_conn = self._run_handle_with(migration_atomic=False, can_rollback_ddl=True, backwards=True)
+          self.assertFalse(cmd.output_transaction)
+          self.assertEqual(result, '-- op1\nCREATE TABLE example\n-- op2')
+
+      def test_backwards_flag_non_atomic_db_no_transactions(self):
+          cmd, result, fake_conn = self._run_handle_with(migration_atomic=False, can_rollback_ddl=False, backwards=True)
+          self.assertFalse(cmd.output_transaction)
+          self.assertEqual(result, '-- op1\nCREATE TABLE example\n-- op2')
+
+      def test_execute_forces_no_color_before_delegating_to_base_execute(self):
+          """
+          Ensure Command.execute forces no_color=True before calling the base
+          implementation.
+          """
+          cmd = sqlmigrate.Command()
+          with mock.patch.object(
+              BaseCommand, 'execute', autospec=True, return_value='SENTINEL'
+          ) as mock_base_execute:
+              result = cmd.execute(app_label='irrelevant', migration_name='0001', database='default', backwards=False)
+              # The patched BaseCommand.execute should have been called exactly once
+              self.assertEqual(result, 'SENTINEL')
+              self.assertTrue(mock_base_execute.called)
+              # Inspect the kwargs passed to BaseCommand.execute: should include no_color=True
+              _, kwargs = mock_base_execute.call_args
+              self.assertIn('no_color', kwargs)
+              self.assertTrue(kwargs['no_color'])
+
+      def test_handle_returns_joined_sql_lines(self):
+          """
+          The handle() method should return the joined SQL produced by
+          MigrationExecutor.collect_sql unchanged.
+          """
+          cmd, result, fake_conn = self._run_handle_with(migration_atomic=True, can_rollback_ddl=True)
+          # The fake executor returns three lines; ensure they are joined with newlines
+          self.assertEqual(result, '-- op1\nCREATE TABLE example\n-- op2')
+new_imports_code: |
+  from types import SimpleNamespace
+  from unittest import mock

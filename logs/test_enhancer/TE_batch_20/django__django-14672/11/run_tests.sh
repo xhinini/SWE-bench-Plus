@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.setUp invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_counts_in_list invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_dict_keys_distinct invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_dict_update_keeps_both_keys invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_hash_values_are_different invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_identity_contains_hashable_through_fields_for_empty_list invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_list_indexing_preserves_order invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_relation_not_in_set_of_other invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_relations_are_not_equal invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_set_contains_two_distinct_relations
+coverage json -o coverage.json
+: '>>>>> End Test Output'

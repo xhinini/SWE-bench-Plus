@@ -1,0 +1,153 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests verify that RenameContentType._rename uses the correct database alias when saving,
+  respects router.allow_migrate behavior, handles missing ContentType instances, recovers from
+  IntegrityError without persisting partial state, and calls clear_cache only on successful rename.
+  They will fail if the save() call in _rename does not pass the 'using' argument (which would
+  cause the save to operate on the default database instead of the intended one).
+test_code: |
+  from django.apps import apps
+  from django.conf import settings
+  from django.contrib.contenttypes import management as contenttypes_management
+  from django.contrib.contenttypes.models import ContentType
+  from django.db import IntegrityError, connections
+  from django.test import TransactionTestCase, override_settings
+  
+  
+  @override_settings(
+      MIGRATION_MODULES=dict(
+          settings.MIGRATION_MODULES,
+          contenttypes_tests='contenttypes_tests.operations_migrations',
+      ),
+  )
+  class RenameContentTypeRegressionTests(TransactionTestCase):
+      databases = {'default', 'other'}
+      available_apps = [
+          'contenttypes_tests',
+          'django.contrib.contenttypes',
+      ]
+  
+      def _run_rename(self, using, app_label, old, new):
+          op = contenttypes_management.RenameContentType(app_label, old, new)
+          with connections[using].schema_editor() as schema_editor:
+              # Call the internal helper directly as migrations.RunPython would.
+              op._rename(apps, schema_editor, old, new)
+  
+      def test_rename_uses_correct_db_alias_other(self):
+          # Ensure a content type in 'other' is renamed in 'other', not 'default'.
+          ContentType.objects.using('other').create(app_label='regapp', model='foo')
+          self._run_rename('other', 'regapp', 'foo', 'bar')
+          self.assertTrue(ContentType.objects.using('other').filter(app_label='regapp', model='bar').exists())
+          # Default should remain unaffected.
+          self.assertFalse(ContentType.objects.using('default').filter(app_label='regapp', model='bar').exists())
+  
+      def test_rename_does_not_affect_default_db_when_other_used(self):
+          ContentType.objects.using('other').create(app_label='regapp2', model='alpha')
+          # Ensure default DB has no record
+          self.assertFalse(ContentType.objects.using('default').filter(app_label='regapp2').exists())
+          self._run_rename('other', 'regapp2', 'alpha', 'beta')
+          self.assertTrue(ContentType.objects.using('other').filter(app_label='regapp2', model='beta').exists())
+          self.assertFalse(ContentType.objects.using('default').filter(app_label='regapp2', model='beta').exists())
+  
+      def test_rename_resets_on_integrity_error(self):
+          # Simulate a conflict: target name already exists in the same DB -> IntegrityError
+          ContentType.objects.using('other').create(app_label='confapp', model='old')
+          ContentType.objects.using('other').create(app_label='confapp', model='newname')
+          # Capture the pre-state
+          pre_count_old = ContentType.objects.using('other').filter(app_label='confapp', model='old').count()
+          pre_count_new = ContentType.objects.using('other').filter(app_label='confapp', model='newname').count()
+          # Run rename; it should catch IntegrityError and leave database state unchanged
+          self._run_rename('other', 'confapp', 'old', 'newname')
+          self.assertEqual(ContentType.objects.using('other').filter(app_label='confapp', model='old').count(), pre_count_old)
+          self.assertEqual(ContentType.objects.using('other').filter(app_label='confapp', model='newname').count(), pre_count_new)
+  
+      def test_clear_cache_called_on_success(self):
+          # Monkeypatch clear_cache to detect calls
+          called = []
+          original_clear = ContentType.objects.clear_cache
+          def spy_clear():
+              called.append(True)
+          ContentType.objects.clear_cache = spy_clear
+          try:
+              ContentType.objects.using('other').create(app_label='cacheapp', model='before')
+              self._run_rename('other', 'cacheapp', 'before', 'after')
+              self.assertTrue(called, "clear_cache should be called on successful rename")
+          finally:
+              ContentType.objects.clear_cache = original_clear
+  
+      def test_clear_cache_not_called_on_integrity_error(self):
+          # If rename fails due to IntegrityError, clear_cache should not be called.
+          called = []
+          original_clear = ContentType.objects.clear_cache
+          def spy_clear():
+              called.append(True)
+          ContentType.objects.clear_cache = spy_clear
+          try:
+              ContentType.objects.using('other').create(app_label='cacheapp2', model='before')
+              ContentType.objects.using('other').create(app_label='cacheapp2', model='after')  # causes conflict
+              self._run_rename('other', 'cacheapp2', 'before', 'after')
+              self.assertFalse(called, "clear_cache should NOT be called when rename fails with IntegrityError")
+          finally:
+              ContentType.objects.clear_cache = original_clear
+  
+      @override_settings(DATABASE_ROUTERS=[])
+      def test_no_action_when_router_disallows(self):
+          # Provide a router that disallows migrations for the ContentType model on 'other'.
+          class DisallowRouter:
+              def db_for_read(self, model, **hints):
+                  return None
+              def db_for_write(self, model, **hints):
+                  return None
+              def allow_migrate(self, db, app_label, model_name=None, **hints):
+                  # Disallow migrations for contenttypes on all DBs.
+                  if app_label == 'contenttypes':
+                      return False
+                  return None
+          with override_settings(DATABASE_ROUTERS=[DisallowRouter()]):
+              ContentType.objects.using('other').create(app_label='norename', model='keep')
+              # Attempt to rename; nothing should happen because router disallows migrate for ContentType
+              self._run_rename('other', 'norename', 'keep', 'changed')
+              self.assertTrue(ContentType.objects.using('other').filter(app_label='norename', model='keep').exists())
+              self.assertFalse(ContentType.objects.using('other').filter(app_label='norename', model='changed').exists())
+  
+      def test_missing_contenttype_ignored(self):
+          # If there is no ContentType for the given app_label/model, nothing should happen and no exception raised.
+          # Ensure databases don't have this content type already.
+          self.assertFalse(ContentType.objects.using('other').filter(app_label='missingapp').exists())
+          # Should be a no-op
+          self._run_rename('other', 'missingapp', 'doesnotexist', 'stilldoesnotexist')
+          self.assertFalse(ContentType.objects.using('other').filter(app_label='missingapp').exists())
+  
+      def test_rename_forward_and_backward(self):
+          ContentType.objects.using('other').create(app_label='swapapp', model='one')
+          op = contenttypes_management.RenameContentType('swapapp', 'one', 'two')
+          # Forward
+          with connections['other'].schema_editor() as schema_editor:
+              op.rename_forward(apps, schema_editor)
+          self.assertTrue(ContentType.objects.using('other').filter(app_label='swapapp', model='two').exists())
+          # Backward
+          with connections['other'].schema_editor() as schema_editor:
+              op.rename_backward(apps, schema_editor)
+          self.assertTrue(ContentType.objects.using('other').filter(app_label='swapapp', model='one').exists())
+  
+      def test_save_called_with_using_arg(self):
+          # Spy on the save call to ensure 'using' kwarg is provided by the implementation.
+          original_save = ContentType.save
+          recorded_kwargs = {}
+          def spy_save(self, *args, **kwargs):
+              # Record kwargs for inspection and then call real save.
+              recorded_kwargs.clear()
+              recorded_kwargs.update(kwargs)
+              return original_save(self, *args, **kwargs)
+          ContentType.save = spy_save
+          try:
+              ContentType.objects.using('other').create(app_label='spyapp', model='orig')
+              self._run_rename('other', 'spyapp', 'orig', 'spy')
+              # The spy should have recorded the 'using' kwarg when save was called.
+              self.assertIn('using', recorded_kwargs, "save() must be called with a 'using' keyword argument")
+              self.assertEqual(recorded_kwargs['using'], 'other')
+          finally:
+              ContentType.save = original_save
+new_imports_code: |
+  # No additional imports required; the test file is self-contained.

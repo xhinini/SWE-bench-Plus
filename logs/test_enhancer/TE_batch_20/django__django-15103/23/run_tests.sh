@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 utils_tests.test_html_llm.JsonScriptFalseyIdTests._assert_no_id_emitted utils_tests.test_html_llm.JsonScriptFalseyIdTests.test_json_script_omit_id_empty_bytearray utils_tests.test_html_llm.JsonScriptFalseyIdTests.test_json_script_omit_id_empty_bytes utils_tests.test_html_llm.JsonScriptFalseyIdTests.test_json_script_omit_id_empty_dict utils_tests.test_html_llm.JsonScriptFalseyIdTests.test_json_script_omit_id_empty_frozenset utils_tests.test_html_llm.JsonScriptFalseyIdTests.test_json_script_omit_id_empty_list utils_tests.test_html_llm.JsonScriptFalseyIdTests.test_json_script_omit_id_empty_set utils_tests.test_html_llm.JsonScriptFalseyIdTests.test_json_script_omit_id_empty_string utils_tests.test_html_llm.JsonScriptFalseyIdTests.test_json_script_omit_id_empty_tuple utils_tests.test_html_llm.JsonScriptFalseyIdTests.test_json_script_omit_id_false_boolean utils_tests.test_html_llm.JsonScriptFalseyIdTests.test_json_script_omit_id_zero_integer
+coverage json -o coverage.json
+: '>>>>> End Test Output'

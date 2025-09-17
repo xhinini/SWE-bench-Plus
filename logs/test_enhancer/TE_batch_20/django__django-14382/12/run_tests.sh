@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.StartAppTrailingDot._run_and_check admin_scripts.tests_llm.StartAppTrailingDot.setUp admin_scripts.tests_llm.StartAppTrailingDot.test_absolute_path_ending_with_dot admin_scripts.tests_llm.StartAppTrailingDot.test_absolute_path_ending_with_dot_and_slash admin_scripts.tests_llm.StartAppTrailingDot.test_multiple_dot_segments_in_target admin_scripts.tests_llm.StartAppTrailingDot.test_relative_leading_dot_with_trailing_dot admin_scripts.tests_llm.StartAppTrailingDot.test_relative_leading_dot_with_trailing_dot_slash admin_scripts.tests_llm.StartAppTrailingDot.test_relative_multiple_dot_segments_in_target admin_scripts.tests_llm.StartAppTrailingDot.test_relative_triple_dot_segments_in_target admin_scripts.tests_llm.StartAppTrailingDot.test_trailing_dot_in_target_app_directory_name admin_scripts.tests_llm.StartAppTrailingDot.test_trailing_dot_slash_in_target_app_directory_name admin_scripts.tests_llm.StartAppTrailingDot.test_triple_dot_segments_in_target
+coverage json -o coverage.json
+: '>>>>> End Test Output'

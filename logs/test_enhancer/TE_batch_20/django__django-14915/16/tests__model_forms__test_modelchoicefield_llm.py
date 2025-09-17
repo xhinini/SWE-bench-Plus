@@ -1,0 +1,112 @@
+# No additional imports required beyond those in the test code.
+from django import forms
+from django.forms.models import ModelChoiceIteratorValue
+from django.forms.widgets import CheckboxSelectMultiple, RadioSelect
+from django.test import TestCase
+
+from .models import Category
+
+
+class ModelChoiceIteratorValueHashAndWidgetTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.c1 = Category.objects.create(name='Entertainment', slug='entertainment', url='entertainment')
+        cls.c2 = Category.objects.create(name='A test', slug='test', url='test')
+        cls.c3 = Category.objects.create(name='Third', slug='third-test', url='third')
+
+    def test_set_membership_with_equivalent_value(self):
+        """A ModelChoiceIteratorValue should be usable in a set and found by an equal value."""
+        v1 = ModelChoiceIteratorValue(self.c1.pk, self.c1)
+        s = {v1}
+        # Construct a new object with same underlying value but different instance
+        v1_equiv = ModelChoiceIteratorValue(self.c1.pk, None)
+        self.assertIn(v1_equiv, s)
+
+    def test_dict_key_lookup_with_equivalent_value(self):
+        """Using ModelChoiceIteratorValue as dict keys must work with equivalent values."""
+        v2 = ModelChoiceIteratorValue(self.c2.pk, self.c2)
+        d = {v2: 'category-2'}
+        v2_equiv = ModelChoiceIteratorValue(self.c2.pk, None)
+        self.assertEqual(d[v2_equiv], 'category-2')
+
+    def test_construct_set_from_choice_iterator_values(self):
+        """
+        The values produced by iterating over a ModelChoiceField's choices
+        (ModelChoiceIteratorValue objects) must be hashable so they can be
+        collected into a set without raising.
+        """
+        field = forms.ModelChoiceField(Category.objects.all())
+        values = {val for val, label in field.choices}
+        # Each produced value should be present via an equivalent reconstructed value
+        self.assertIn(ModelChoiceIteratorValue(self.c1.pk, None), values)
+        self.assertIn(ModelChoiceIteratorValue(self.c2.pk, None), values)
+        self.assertIn(ModelChoiceIteratorValue(self.c3.pk, None), values)
+
+    def test_choices_map_lookup_by_value(self):
+        """A dict built from iterator values to labels should be addressable by equivalent values."""
+        field = forms.ModelChoiceField(Category.objects.all())
+        choices_map = {val: label for val, label in field.choices}
+        self.assertEqual(choices_map[ModelChoiceIteratorValue(self.c2.pk, None)], 'A test')
+
+    def test_set_uniqueness_with_different_instances(self):
+        """
+        Different ModelChoiceIteratorValue instances with the same underlying
+        value should behave as a single key in a set (i.e., hashing+equality).
+        """
+        v_a = ModelChoiceIteratorValue(self.c1.pk, self.c1)
+        v_b = ModelChoiceIteratorValue(self.c1.pk, None)
+        s = set()
+        s.add(v_a)
+        s.add(v_b)  # should not increase size
+        self.assertEqual(len(s), 1)
+
+    def test_checkbox_widget_selected_when_given_modelchoiceiteratorvalues(self):
+        """
+        CheckboxSelectMultiple should mark the checkbox as checked when the
+        selected values list contains ModelChoiceIteratorValue instances with
+        matching underlying values.
+        """
+        field = forms.ModelMultipleChoiceField(Category.objects.all(), widget=CheckboxSelectMultiple)
+        # Simulate selected data as a list containing a ModelChoiceIteratorValue
+        selected = [ModelChoiceIteratorValue(self.c1.pk, self.c1)]
+        html = field.widget.render('name', selected)
+        # ensure the c1 checkbox is checked
+        self.assertIn(f'value="{self.c1.pk}"', html)
+        # checked attribute should appear for the selected value
+        self.assertIn('checked', html)
+        # Ensure other options are present but not necessarily checked for c2/c3
+        self.assertIn(f'value="{self.c2.pk}"', html)
+        self.assertIn(f'value="{self.c3.pk}"', html)
+
+    def test_radio_widget_selected_when_given_modelchoiceiteratorvalue(self):
+        """
+        RadioSelect should mark the correct radio input when provided a
+        ModelChoiceIteratorValue as the selected value.
+        """
+        field = forms.ModelChoiceField(Category.objects.all(), widget=RadioSelect)
+        selected = ModelChoiceIteratorValue(self.c2.pk, self.c2)
+        html = field.widget.render('name', selected)
+        # c2 should be present and marked checked
+        self.assertIn(f'value="{self.c2.pk}"', html)
+        self.assertIn('checked', html)
+
+    def test_choices_values_membership_with_reconstructed_values(self):
+        """
+        Values produced by iter(field.choices) should be usable to index into
+        a set/dict via reconstructed ModelChoiceIteratorValue objects.
+        """
+        field = forms.ModelChoiceField(Category.objects.all())
+        values = [val for val, label in field.choices]
+        s = set(values)
+        self.assertIn(ModelChoiceIteratorValue(self.c3.pk, None), s)
+        d = {val: label for val, label in field.choices}
+        self.assertEqual(d[ModelChoiceIteratorValue(self.c3.pk, None)], 'Third')
+
+    def test_equality_against_underlying_primitive(self):
+        """
+        Comparing a ModelChoiceIteratorValue to the underlying primitive value
+        should be True when values are equal (i.e., v == pk).
+        """
+        v = ModelChoiceIteratorValue(self.c1.pk, self.c1)
+        self.assertTrue(v == self.c1.pk)
+        self.assertFalse(v == self.c2.pk)

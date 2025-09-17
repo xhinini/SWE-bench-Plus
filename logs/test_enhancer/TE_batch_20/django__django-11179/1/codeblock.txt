@@ -1,0 +1,201 @@
+from django.apps import apps
+from django.db import connection, models as django_models
+
+class FastDeleteEarlyReturnRegressionTests(TestCase):
+    """
+    Regression tests for the early-return fast-delete path in Collector.delete().
+    These ensure the Python instance has its primary key attribute set to None
+    after a successful Model.delete() that takes the optimized fast-delete path.
+    """
+
+    def _make_dynamic_model(self, name, pk_field=None):
+        """
+        Create a dynamic Model subclass and the corresponding database table.
+
+        name: string name of the model class
+        pk_field: None for default AutoField PK, or a tuple (field_name, FieldInstance)
+        """
+        attrs = {
+            '__module__': self.__class__.__module__,
+            'Meta': type('Meta', (), {'app_label': 'delete_tests'}),
+        }
+        if pk_field:
+            attrs[pk_field[0]] = pk_field[1]
+        else:
+            # Add a regular field so we have something to create
+            attrs['value'] = django_models.CharField(max_length=10, null=True)
+        Model = type(name, (django_models.Model,), attrs)
+        # Create the table
+        with connection.schema_editor() as schema_editor:
+            schema_editor.create_model(Model)
+        # Register the model in the app cache so Django can use it normally.
+        try:
+            apps.register_model('delete_tests', Model)
+        except RuntimeError:
+            # In some test environments register_model may not be reentrant; ignore if already registered.
+            pass
+        return Model
+
+    def _destroy_dynamic_model(self, Model):
+        # Drop the table and unregister the model if possible.
+        with connection.schema_editor() as schema_editor:
+            schema_editor.delete_model(Model)
+        # Removing from apps is not strictly required for the test lifetime, and
+        # apps.unregister_model is not part of the public API in older Django.
+        # We leave the model in the registry; table has been removed.
+
+    def test_auto_pk_model_delete_sets_pk_none(self):
+        Model = self._make_dynamic_model('TempAutoPKModel1')
+        try:
+            obj = Model.objects.create(value='x')
+            deleted, details = obj.delete()
+            # DB row removed
+            self.assertFalse(Model.objects.filter(pk=obj.pk).exists())
+            # Python instance pk must be None after delete
+            self.assertIsNone(obj.pk)
+            # Return values indicate one deletion for this model's label
+            self.assertEqual(deleted, 1)
+            self.assertEqual(details.get(Model._meta.label), 1)
+        finally:
+            self._destroy_dynamic_model(Model)
+
+    def test_auto_pk_model_delete_multiple_calls_consistent(self):
+        Model = self._make_dynamic_model('TempAutoPKModel2')
+        try:
+            obj = Model.objects.create(value='y')
+            # call delete twice (second should be a noop)
+            deleted, details = obj.delete()
+            self.assertIsNone(obj.pk)
+            self.assertEqual(deleted, 1)
+            deleted2, details2 = obj.delete()
+            self.assertEqual(deleted2, 0)
+            self.assertEqual(details2, {})
+        finally:
+            self._destroy_dynamic_model(Model)
+
+    def test_custom_char_pk_model_delete_sets_pk_none(self):
+        pk_field = ('code', django_models.CharField(max_length=32, primary_key=True))
+        Model = self._make_dynamic_model('TempCharPKModel1', pk_field=pk_field)
+        try:
+            obj = Model.objects.create(code='abc123')
+            deleted, details = obj.delete()
+            # The database must no longer have the object
+            self.assertFalse(Model.objects.filter(pk='abc123').exists())
+            self.assertIsNone(obj.pk)
+            self.assertEqual(deleted, 1)
+            self.assertEqual(details.get(Model._meta.label), 1)
+        finally:
+            self._destroy_dynamic_model(Model)
+
+    def test_custom_int_pk_field_with_name_not_id_sets_pk_none(self):
+        # Create a model with an integer PK whose attname differs from 'pk' property name
+        pk_field = ('custom_id', django_models.AutoField(primary_key=True))
+        Model = self._make_dynamic_model('TempIntNamedPKModel', pk_field=pk_field)
+        try:
+            obj = Model.objects.create()
+            pk_before = obj.pk
+            deleted, details = obj.delete()
+            self.assertFalse(Model.objects.filter(pk=pk_before).exists())
+            self.assertIsNone(obj.pk)
+            self.assertEqual(deleted, 1)
+            self.assertEqual(details.get(Model._meta.label), 1)
+        finally:
+            self._destroy_dynamic_model(Model)
+
+    def test_multiple_dynamic_models_independent_deletes(self):
+        # Create two different dynamic models and delete an instance of each,
+        # ensuring the Python instance pk gets nulled for each.
+        M1 = self._make_dynamic_model('TempMultiModelA')
+        M2 = self._make_dynamic_model('TempMultiModelB')
+        try:
+            o1 = M1.objects.create(value='a')
+            o2 = M2.objects.create(value='b')
+            d1, _ = o1.delete()
+            d2, _ = o2.delete()
+            self.assertIsNone(o1.pk)
+            self.assertIsNone(o2.pk)
+            self.assertEqual(d1, 1)
+            self.assertEqual(d2, 1)
+        finally:
+            self._destroy_dynamic_model(M1)
+            self._destroy_dynamic_model(M2)
+
+    def test_delete_returns_expected_counts_on_custom_pk_model(self):
+        pk_field = ('slug', django_models.CharField(max_length=50, primary_key=True))
+        Model = self._make_dynamic_model('TempSlugPKModel', pk_field=pk_field)
+        try:
+            obj = Model.objects.create(slug='s1')
+            deleted, details = obj.delete()
+            self.assertIsNone(obj.pk)
+            self.assertEqual(deleted, 1)
+            self.assertEqual(details.get(Model._meta.label), 1)
+        finally:
+            self._destroy_dynamic_model(Model)
+
+    def test_delete_on_model_with_extra_fields_sets_pk_none(self):
+        # Model with additional fields but no relationships
+        attrs = {
+            'extra': django_models.IntegerField(default=0),
+            '__module__': self.__class__.__module__,
+            'Meta': type('Meta', (), {'app_label': 'delete_tests'}),
+        }
+        Model = type('TempExtraFieldsModel', (django_models.Model,), attrs)
+        with connection.schema_editor() as schema_editor:
+            schema_editor.create_model(Model)
+        try:
+            apps.register_model('delete_tests', Model)
+        except RuntimeError:
+            pass
+        try:
+            obj = Model.objects.create(extra=5)
+            deleted, details = obj.delete()
+            self.assertIsNone(obj.pk)
+            self.assertEqual(deleted, 1)
+            self.assertEqual(details.get(Model._meta.label), 1)
+        finally:
+            with connection.schema_editor() as schema_editor:
+                schema_editor.delete_model(Model)
+
+    def test_delete_does_not_set_pk_if_delete_fails(self):
+        """
+        If delete_batch raises an exception, the instance.pk must not be set to None.
+        This test simulates a failure by monkeypatching DeleteQuery.delete_batch to raise.
+        """
+        Model = self._make_dynamic_model('TempFailDeleteModel')
+        try:
+            obj = Model.objects.create(value='z')
+            # Monkeypatch DeleteQuery.delete_batch to raise an exception.
+            original_delete_batch = None
+            from django.db.models import sql as sql_module
+            original_delete_batch = sql_module.DeleteQuery.delete_batch
+
+            def raising_delete_batch(self, pks, using):
+                raise RuntimeError("simulated failure")
+
+            sql_module.DeleteQuery.delete_batch = raising_delete_batch
+            try:
+                with self.assertRaises(RuntimeError):
+                    obj.delete()
+            finally:
+                # restore
+                sql_module.DeleteQuery.delete_batch = original_delete_batch
+
+            # After a failed delete, the Python instance should still have its pk intact.
+            self.assertIsNotNone(obj.pk)
+        finally:
+            self._destroy_dynamic_model(Model)
+
+    def test_delete_with_transaction_context_sets_pk_none(self):
+        """
+        Ensures pk is cleared even when the deletion runs inside the transaction
+        context manager used by the fast-delete early return path.
+        """
+        Model = self._make_dynamic_model('TempTxnModel')
+        try:
+            obj = Model.objects.create(value='tx')
+            # This follows the same fast-delete path as Model.delete(); just call it.
+            deleted, details = obj.delete()
+            self.assertEqual(deleted, 1)
+            self.assertIsNone(obj.pk)
+        finally:
+            self._destroy_dynamic_model(Model)

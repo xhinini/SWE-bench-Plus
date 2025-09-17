@@ -1,0 +1,468 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `pylint/lint/run.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 # Licensed under the GPL: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+2 # For details: https://github.com/PyCQA/pylint/blob/main/LICENSE
+3 # Copyright (c) https://github.com/PyCQA/pylint/blob/main/CONTRIBUTORS.txt
+4 
+5 from __future__ import annotations
+6 
+7 import os
+8 import sys
+9 import warnings
+10 from collections.abc import Sequence
+11 from pathlib import Path
+12 from typing import Any, ClassVar
+13 
+14 from pylint import config
+15 from pylint.config._pylint_config import (
+16     _handle_pylint_config_commands,
+17     _register_generate_config_options,
+18 )
+19 from pylint.config.config_initialization import _config_initialization
+20 from pylint.config.exceptions import ArgumentPreprocessingError
+21 from pylint.config.utils import _preprocess_options
+22 from pylint.constants import full_version
+23 from pylint.lint.base_options import _make_run_options
+24 from pylint.lint.pylinter import PyLinter
+25 from pylint.reporters.base_reporter import BaseReporter
+26 
+27 try:
+28     import multiprocessing
+29     from multiprocessing import synchronize  # noqa pylint: disable=unused-import
+30 except ImportError:
+31     multiprocessing = None  # type: ignore[assignment]
+32 
+33 
+34 def _query_cpu() -> int | None:
+35     """Try to determine number of CPUs allotted in a docker container.
+36 
+37     This is based on discussion and copied from suggestions in
+38     https://bugs.python.org/issue36054.
+39     """
+40     cpu_quota, avail_cpu = None, None
+41 
+42     if Path("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").is_file():
+43         with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8") as file:
+44             # Not useful for AWS Batch based jobs as result is -1, but works on local linux systems
+45             cpu_quota = int(file.read().rstrip())
+46 
+47     if (
+48         cpu_quota
+49         and cpu_quota != -1
+50         and Path("/sys/fs/cgroup/cpu/cpu.cfs_period_us").is_file()
+51     ):
+52         with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8") as file:
+53             cpu_period = int(file.read().rstrip())
+54         # Divide quota by period and you should get num of allotted CPU to the container, rounded down if fractional.
+55         avail_cpu = int(cpu_quota / cpu_period)
+56     elif Path("/sys/fs/cgroup/cpu/cpu.shares").is_file():
+57         with open("/sys/fs/cgroup/cpu/cpu.shares", encoding="utf-8") as file:
+58             cpu_shares = int(file.read().rstrip())
+59         # For AWS, gives correct value * 1024.
+60         avail_cpu = int(cpu_shares / 1024)
+61 
+62     # In K8s Pods also a fraction of a single core could be available
+63     # As multiprocessing is not able to run only a "fraction" of process
+64     # assume we have 1 CPU available
+65     if avail_cpu == 0:
+66         avail_cpu = 1
+67 
+68     return avail_cpu
+69 
+70 
+71 def _cpu_count() -> int:
+72     """Use sched_affinity if available for virtualized or containerized
+73     environments.
+74     """
+75     cpu_share = _query_cpu()
+76     cpu_count = None
+77     sched_getaffinity = getattr(os, "sched_getaffinity", None)
+78     # pylint: disable=not-callable,using-constant-test,useless-suppression
+79     if sched_getaffinity:
+80         cpu_count = len(sched_getaffinity(0))
+81     elif multiprocessing:
+82         cpu_count = multiprocessing.cpu_count()
+83     else:
+84         cpu_count = 1
+85     if cpu_share is not None:
+86         return min(cpu_share, cpu_count)
+87     return cpu_count
+88 
+89 
+90 UNUSED_PARAM_SENTINEL = object()
+91 
+92 
+93 class Run:
+94     """Helper class to use as main for pylint with 'run(*sys.argv[1:])'."""
+95 
+96     LinterClass = PyLinter
+97     option_groups = (
+98         (
+99             "Commands",
+100             "Options which are actually commands. Options in this \
+101 group are mutually exclusive.",
+102         ),
+103     )
+104     _is_pylint_config: ClassVar[bool] = False
+105     """Boolean whether or not this is a 'pylint-config' run.
+106 
+107     Used by _PylintConfigRun to make the 'pylint-config' command work.
+108     """
+109 
+110     def __init__(
+111         self,
+112         args: Sequence[str],
+113         reporter: BaseReporter | None = None,
+114         exit: bool = True,  # pylint: disable=redefined-builtin
+115         do_exit: Any = UNUSED_PARAM_SENTINEL,
+116     ) -> None:
+117         # Immediately exit if user asks for version
+118         if "--version" in args:
+119             print(full_version)
+120             sys.exit(0)
+121 
+122         self._rcfile: str | None = None
+123         self._output: str | None = None
+124         self._plugins: list[str] = []
+125         self.verbose: bool = False
+126 
+127         # Pre-process certain options and remove them from args list
+128         try:
+129             args = _preprocess_options(self, args)
+130         except ArgumentPreprocessingError as ex:
+131             print(ex, file=sys.stderr)
+132             sys.exit(32)
+133 
+134         # Determine configuration file
+135         if self._rcfile is None:
+136             default_file = next(config.find_default_config_files(), None)
+137             if default_file:
+138                 self._rcfile = str(default_file)
+139 
+140         self.linter = linter = self.LinterClass(
+141             _make_run_options(self),
+142             option_groups=self.option_groups,
+143             pylintrc=self._rcfile,
+144         )
+145         # register standard checkers
+146         linter.load_default_plugins()
+147         # load command line plugins
+148         linter.load_plugin_modules(self._plugins)
+149 
+150         linter.disable("I")
+151         linter.enable("c-extension-no-member")
+152 
+153         # Register the options needed for 'pylint-config'
+154         # By not registering them by default they don't show up in the normal usage message
+155         if self._is_pylint_config:
+156             _register_generate_config_options(linter._arg_parser)
+157 
+158         args = _config_initialization(
+159             linter, args, reporter, config_file=self._rcfile, verbose_mode=self.verbose
+160         )
+161 
+162         # Handle the 'pylint-config' command
+163         if self._is_pylint_config:
+164             warnings.warn(
+165                 "NOTE: The 'pylint-config' command is experimental and usage can change",
+166                 UserWarning,
+167             )
+168             code = _handle_pylint_config_commands(linter)
+169             if exit:
+170                 sys.exit(code)
+171             return
+172 
+173         # Display help messages if there are no files to lint
+174         if not args:
+175             print(linter.help())
+176             sys.exit(32)
+177 
+178         if linter.config.jobs < 0:
+179             print(
+180                 f"Jobs number ({linter.config.jobs}) should be greater than or equal to 0",
+181                 file=sys.stderr,
+182             )
+183             sys.exit(32)
+184         if linter.config.jobs > 1 or linter.config.jobs == 0:
+185             if multiprocessing is None:
+186                 print(
+187                     "Multiprocessing library is missing, fallback to single process",
+188                     file=sys.stderr,
+189                 )
+190                 linter.set_option("jobs", 1)
+191             elif linter.config.jobs == 0:
+192                 linter.config.jobs = _cpu_count()
+193 
+194         if self._output:
+195             try:
+196                 with open(self._output, "w", encoding="utf-8") as output:
+197                     linter.reporter.out = output
+198                     linter.check(args)
+199                     score_value = linter.generate_reports()
+200             except OSError as ex:
+201                 print(ex, file=sys.stderr)
+202                 sys.exit(32)
+203         else:
+204             linter.check(args)
+205             score_value = linter.generate_reports()
+206 
+207         if do_exit is not UNUSED_PARAM_SENTINEL:
+208             warnings.warn(
+209                 "do_exit is deprecated and it is going to be removed in a future version.",
+210                 DeprecationWarning,
+211             )
+212             exit = do_exit
+213 
+214         if exit:
+215             if linter.config.exit_zero:
+216                 sys.exit(0)
+217             elif linter.any_fail_on_issues():
+218                 # We need to make sure we return a failing exit code in this case.
+219                 # So we use self.linter.msg_status if that is non-zero, otherwise we just return 1.
+220                 sys.exit(self.linter.msg_status or 1)
+221             elif score_value is not None:
+222                 if score_value >= linter.config.fail_under:
+223                     sys.exit(0)
+224                 else:
+225                     # We need to make sure we return a failing exit code in this case.
+226                     # So we use self.linter.msg_status if that is non-zero, otherwise we just return 1.
+227                     sys.exit(self.linter.msg_status or 1)
+228             else:
+229                 sys.exit(self.linter.msg_status)
+230 
+231 
+232 class _PylintConfigRun(Run):
+233     """A private wrapper for the 'pylint-config' command."""
+234 
+235     _is_pylint_config: ClassVar[bool] = True
+236     """Boolean whether or not this is a 'pylint-config' run.
+237 
+238     Used by _PylintConfigRun to make the 'pylint-config' command work.
+239     """
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `pylint/lint/run.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/pylint/lint/run.py b/pylint/lint/run.py
+--- a/pylint/lint/run.py
++++ b/pylint/lint/run.py
+@@ -58,6 +58,13 @@ def _query_cpu() -> int | None:
+             cpu_shares = int(file.read().rstrip())
+         # For AWS, gives correct value * 1024.
+         avail_cpu = int(cpu_shares / 1024)
++
++    # In K8s Pods also a fraction of a single core could be available
++    # As multiprocessing is not able to run only a "fraction" of process
++    # assume we have 1 CPU available
++    if avail_cpu == 0:
++        avail_cpu = 1
++
+     return avail_cpu
+ 
+ 
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/pylint/lint/run.py b/pylint/lint/run.py
+index a7e5d5574..c0408d2d2 100644
+--- a/pylint/lint/run.py
++++ b/pylint/lint/run.py
+@@ -57,7 +57,8 @@ def _query_cpu() -> int | None:
+         with open("/sys/fs/cgroup/cpu/cpu.shares", encoding="utf-8") as file:
+             cpu_shares = int(file.read().rstrip())
+         # For AWS, gives correct value * 1024.
+-        avail_cpu = int(cpu_shares / 1024)
++        # Ensure we return at least 1 CPU when shares are available
++        avail_cpu = max(1, int(cpu_shares / 1024))
+     return avail_cpu
+ 
+ 
+diff --git a/test_package/my_package/__init__.py b/test_package/my_package/__init__.py
+new file mode 100644
+index 000000000..1fb7499b2
+--- /dev/null
++++ b/test_package/my_package/__init__.py
+@@ -0,0 +1 @@
++"""Test package."""
+\ No newline at end of file
+diff --git a/test_package/my_package/example.py b/test_package/my_package/example.py
+new file mode 100644
+index 000000000..86ac31f28
+--- /dev/null
++++ b/test_package/my_package/example.py
+@@ -0,0 +1,5 @@
++"""Example module."""
++
++def hello():
++    """Print hello."""
++    print("Hello world!")
+\ No newline at end of file
+diff --git a/test_package/reproduce.py b/test_package/reproduce.py
+new file mode 100644
+index 000000000..2fe0865cc
+--- /dev/null
++++ b/test_package/reproduce.py
+@@ -0,0 +1,23 @@
++"""Script to reproduce the error with --jobs=0 in Kubernetes."""
++
++import os
++import sys
++
++# Create mock cgroup files to simulate Kubernetes environment
++os.makedirs("/sys/fs/cgroup/cpu", exist_ok=True)
++
++# Write the values from the bug report
++with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "w") as f:
++    f.write("-1\n")
++with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "w") as f:
++    f.write("100000\n")
++with open("/sys/fs/cgroup/cpu/cpu.shares", "w") as f:
++    f.write("2\n")
++
++# Run pylint with --jobs=0
++from pylint.lint import Run
++try:
++    Run(["--jobs=0", "my_package"])
++except ValueError as e:
++    print(f"Error: {e}")
++    sys.exit(1)
+\ No newline at end of file
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `tests/test_pylint_runners.py` that contains the existing tests.
+-----------------------------------------------------------
+# Licensed under the GPL: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+# For details: https://github.com/PyCQA/pylint/blob/main/LICENSE
+# Copyright (c) https://github.com/PyCQA/pylint/blob/main/CONTRIBUTORS.txt
+# pylint: disable=missing-module-docstring, missing-function-docstring
+
+from __future__ import annotations
+
+import os
+import pathlib
+import sys
+from collections.abc import Callable
+from unittest.mock import MagicMock, mock_open, patch
+
+import pytest
+from py._path.local import LocalPath  # type: ignore[import]
+
+from pylint import run_epylint, run_pylint, run_pyreverse, run_symilar
+from pylint.lint import Run
+from pylint.testutils import GenericTestReporter as Reporter
+
+
+@pytest.mark.parametrize(
+    "runner", [run_epylint, run_pylint, run_pyreverse, run_symilar]
+)
+def test_runner(runner: Callable, tmpdir: LocalPath) -> None:
+    filepath = os.path.abspath(__file__)
+    testargs = ["", filepath]
+    with tmpdir.as_cwd():
+        with patch.object(sys, "argv", testargs):
+            with pytest.raises(SystemExit) as err:
+                runner()
+            assert err.value.code == 0
+
+
+
+def test_pylint_run_jobs_equal_zero_dont_crash_with_cpu_fraction(
+    tmpdir: LocalPath,
+) -> None:
+    """Check that the pylint runner does not crash if `pylint.lint.run._query_cpu`
+    determines only a fraction of a CPU core to be available.
+    """
+    builtin_open = open
+
+    def _mock_open(*args, **kwargs):
+        if args[0] == "/sys/fs/cgroup/cpu/cpu.cfs_quota_us":
+            return mock_open(read_data=b"-1")(*args, **kwargs)
+        if args[0] == "/sys/fs/cgroup/cpu/cpu.shares":
+            return mock_open(read_data=b"2")(*args, **kwargs)
+        return builtin_open(*args, **kwargs)
+
+    pathlib_path = pathlib.Path
+
+    def _mock_path(*args, **kwargs):
+        if args[0] == "/sys/fs/cgroup/cpu/cpu.shares":
+            return MagicMock(is_file=lambda: True)
+        return pathlib_path(*args, **kwargs)
+
+    filepath = os.path.abspath(__file__)
+    testargs = [filepath, "--jobs=0"]
+    with tmpdir.as_cwd():
+        with pytest.raises(SystemExit) as err:
+            with patch("builtins.open", _mock_open):
+                with patch("pylint.lint.run.Path", _mock_path):
+                    Run(testargs, reporter=Reporter())
+        assert err.value.code == 0
+
+@pytest.mark.parametrize(
+    "runner", [run_epylint, run_pylint, run_pyreverse, run_symilar]
+)
+def test_runner_with_arguments(runner: Callable, tmpdir: LocalPath) -> None:
+    """Check the runners with arguments as parameter instead of sys.argv."""
+    filepath = os.path.abspath(__file__)
+    testargs = [filepath]
+    with tmpdir.as_cwd():
+        with pytest.raises(SystemExit) as err:
+            runner(testargs)
+        assert err.value.code == 0
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""

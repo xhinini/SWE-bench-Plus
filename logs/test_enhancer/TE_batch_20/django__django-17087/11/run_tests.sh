@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_additional_nested_example_1 migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_additional_nested_example_2 migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_classmethod_nested_three_levels migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_classmethod_nested_two_levels migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_multiple_nested_classes_batch migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_nested_class_method_name_collision migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_nested_class_method_on_existing_writertests_nested migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_nested_class_with_long_chain migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_nested_class_with_multiple_levels_same_name migrations.test_writer_llm.FunctionTypeSerializerQualnameTests.test_serialize_two_different_nested_classes
+coverage json -o coverage.json
+: '>>>>> End Test Output'

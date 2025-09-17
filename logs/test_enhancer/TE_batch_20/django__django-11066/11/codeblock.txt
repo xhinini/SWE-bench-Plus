@@ -1,0 +1,145 @@
+from unittest import mock
+from django.db import connections, IntegrityError, router
+from unittest import mock
+
+from django.apps.registry import apps
+from django.contrib.contenttypes import management as contenttypes_management
+from django.contrib.contenttypes.models import ContentType
+from django.db import IntegrityError, connections
+from django.test import TransactionTestCase, override_settings
+
+
+class AdditionalRenameContentTypeTests(TransactionTestCase):
+    databases = {'default', 'other'}
+    available_apps = ['django.contrib.contenttypes']
+
+    def _get_schema_editor(self, using):
+        return connections[using].schema_editor()
+
+    def test_save_called_with_using_db_in_rename_forward(self):
+        ContentType.objects.using('other').create(app_label='myapp', model='oldmodel')
+        op = contenttypes_management.RenameContentType('myapp', 'oldmodel', 'newmodel')
+        with mock.patch.object(ContentType, 'save', wraps=ContentType.save) as mocked_save:
+            with self._get_schema_editor('other') as schema_editor:
+                op.rename_forward(apps, schema_editor)
+        # The patched save must have been called and include the correct using kwarg.
+        self.assertTrue(mocked_save.called)
+        # Get the kwargs of the last call
+        _, kwargs = mocked_save.call_args
+        self.assertEqual(kwargs.get('using'), 'other')
+        self.assertIn('update_fields', kwargs)
+        self.assertEqual(kwargs['update_fields'], {'model'})
+
+    def test_save_called_with_using_db_in_rename_backward(self):
+        ContentType.objects.using('other').create(app_label='bkapp', model='before')
+        op = contenttypes_management.RenameContentType('bkapp', 'before', 'after')
+        with mock.patch.object(ContentType, 'save', wraps=ContentType.save) as mocked_save:
+            with self._get_schema_editor('other') as schema_editor:
+                # call rename_backward which swaps new/old
+                op.rename_backward(apps, schema_editor)
+        self.assertTrue(mocked_save.called)
+        _, kwargs = mocked_save.call_args
+        self.assertEqual(kwargs.get('using'), 'other')
+        self.assertEqual(kwargs['update_fields'], {'model'})
+
+    def test_clear_cache_called_on_success(self):
+        ContentType.objects.using('other').create(app_label='cacheapp', model='om')
+        op = contenttypes_management.RenameContentType('cacheapp', 'om', 'nm')
+        with mock.patch.object(ContentType.objects, 'clear_cache') as mocked_clear:
+            with self._get_schema_editor('other') as schema_editor:
+                op.rename_forward(apps, schema_editor)
+        mocked_clear.assert_called_once()
+
+    def test_clear_cache_not_called_on_integrity_error(self):
+        ContentType.objects.using('other').create(app_label='errapp', model='orig')
+        op = contenttypes_management.RenameContentType('errapp', 'orig', 'clash')
+        # Force save to raise IntegrityError to exercise the except path.
+        original_save = ContentType.save
+
+        def raise_integrity(self, *args, **kwargs):
+            raise IntegrityError()
+
+        with mock.patch.object(ContentType, 'save', side_effect=raise_integrity):
+            with mock.patch.object(ContentType.objects, 'clear_cache') as mocked_clear:
+                with self._get_schema_editor('other') as schema_editor:
+                    # Should handle IntegrityError gracefully and not call clear_cache
+                    op.rename_forward(apps, schema_editor)
+        mocked_clear.assert_not_called()
+        # Ensure the object in the 'other' DB still has the original model name.
+        ct = ContentType.objects.using('other').get(app_label='errapp')
+        self.assertEqual(ct.model, 'orig')
+
+    def test_no_save_when_contenttype_missing(self):
+        # Ensure no ContentType exists for this app/model
+        ContentType.objects.using('other').filter(app_label='missingapp').delete()
+        op = contenttypes_management.RenameContentType('missingapp', 'i_dont_exist', 'still_not')
+        with mock.patch.object(ContentType, 'save', wraps=ContentType.save) as mocked_save:
+            with self._get_schema_editor('other') as schema_editor:
+                op.rename_forward(apps, schema_editor)
+        self.assertFalse(mocked_save.called)
+
+    def test_no_save_when_router_disallows_migrate_model(self):
+        # Patch the router to disallow migration for the ContentType model on 'other'
+        from django.db import router
+        original_allow = router.allow_migrate_model
+        try:
+            def deny(db, model):
+                # deny only for the ContentType model and 'other' DB
+                if db == 'other' and getattr(model, '__name__', '') == 'ContentType':
+                    return False
+                return original_allow(db, model)
+            router.allow_migrate_model = deny
+
+            ContentType.objects.using('other').create(app_label='noapp', model='one')
+            op = contenttypes_management.RenameContentType('noapp', 'one', 'two')
+            with mock.patch.object(ContentType, 'save', wraps=ContentType.save) as mocked_save:
+                with self._get_schema_editor('other') as schema_editor:
+                    op.rename_forward(apps, schema_editor)
+            # Since allow_migrate_model returned False, save must not be called.
+            self.assertFalse(mocked_save.called)
+        finally:
+            router.allow_migrate_model = original_allow
+
+    def test_rename_affects_correct_database_only(self):
+        # Create entries in both DBs; only 'other' should be affected.
+        ContentType.objects.using('other').create(app_label='checkapp', model='x')
+        # Ensure no such content type in default DB
+        ContentType.objects.using('default').filter(app_label='checkapp').delete()
+        op = contenttypes_management.RenameContentType('checkapp', 'x', 'y')
+        with self._get_schema_editor('other') as schema_editor:
+            op.rename_forward(apps, schema_editor)
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='checkapp', model='y').exists())
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='checkapp', model='y').exists())
+
+    def test_rename_does_not_touch_other_app_contenttypes(self):
+        # Create content types for different app labels to ensure filtering works.
+        ContentType.objects.using('other').create(app_label='app_a', model='m1')
+        ContentType.objects.using('other').create(app_label='app_b', model='m2')
+        op = contenttypes_management.RenameContentType('app_a', 'm1', 'm1_new')
+        with self._get_schema_editor('other') as schema_editor:
+            op.rename_forward(apps, schema_editor)
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='app_a', model='m1_new').exists())
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='app_b', model='m2').exists())
+
+    def test_update_fields_passed_correctly(self):
+        ContentType.objects.using('other').create(app_label='ufapp', model='a')
+        op = contenttypes_management.RenameContentType('ufapp', 'a', 'b')
+        with mock.patch.object(ContentType, 'save', wraps=ContentType.save) as mocked_save:
+            with self._get_schema_editor('other') as schema_editor:
+                op.rename_forward(apps, schema_editor)
+        _, kwargs = mocked_save.call_args
+        # update_fields should be passed exactly as a set with 'model'
+        self.assertEqual(kwargs.get('update_fields'), {'model'})
+
+    def test_transaction_atomic_uses_connection_alias(self):
+        # Ensure transaction.atomic is called with using=<db alias>
+        ContentType.objects.using('other').create(app_label='txnapp', model='orig')
+        op = contenttypes_management.RenameContentType('txnapp', 'orig', 'newname')
+        with mock.patch('django.db.transaction.atomic') as atomic_cm:
+            # atomic should be called as a context manager with using='other'
+            with self._get_schema_editor('other') as schema_editor:
+                op.rename_forward(apps, schema_editor)
+            # Ensure atomic() was called; its first call kwargs should include using='other'
+            self.assertTrue(atomic_cm.called)
+            called_kwargs = atomic_cm.call_args[1]
+            self.assertEqual(called_kwargs.get('using'), 'other')

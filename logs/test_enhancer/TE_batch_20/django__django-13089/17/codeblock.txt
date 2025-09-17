@@ -1,0 +1,159 @@
+# No additional top-level imports are required; tests import locally.
+from django.test import TransactionTestCase
+from django.utils import timezone
+from django.core.cache.backends.db import DatabaseCache
+
+class DummyCursor:
+    """
+    A minimal cursor stub that records executed statements and returns predefined
+    values for successive fetchone() calls.
+    """
+    def __init__(self, fetchone_responses):
+        # Make a shallow copy so tests can reuse lists without mutation surprises.
+        self.fetchone_responses = list(fetchone_responses)
+        self.executed = []
+        self.rowcount = 0
+
+    def execute(self, sql, params=None):
+        # Record the SQL and parameters for later assertions.
+        self.executed.append((sql, params))
+
+    def fetchone(self):
+        if not self.fetchone_responses:
+            return None
+        return self.fetchone_responses.pop(0)
+
+    def fetchall(self):
+        # Not used by _cull, but provided for completeness.
+        return []
+
+class DBCullEdgeCaseTests(TransactionTestCase):
+    """Tests for DatabaseCache._cull edge cases that previously raised exceptions."""
+
+    def setUp(self):
+        # Use the same table name as other tests to ensure consistent quoting behavior.
+        self.cache = DatabaseCache('test cache table', {})
+
+    def _run_cull_with_responses(self, count_value, last_key_response, max_entries=1, cull_frequency=2):
+        """
+        Helper to run _cull with a DummyCursor that will return:
+          - (count_value,) for the SELECT COUNT(*) call
+          - last_key_response for the cache_key_culling_sql() call
+        and returns the DummyCursor instance for inspection.
+        """
+        # Ensure the branch that triggers culling is hit.
+        self.cache._max_entries = max_entries
+        self.cache._cull_frequency = cull_frequency
+        db_alias = 'default'
+        now = timezone.now().replace(microsecond=0)
+        # The cursor will first be used for the DELETE expired and SELECT COUNT(*)
+        # and then for the culling SQL; so the fetchone responses are ordered.
+        cursor = DummyCursor([ (count_value,), last_key_response ])
+        # Call _cull directly. It should not raise.
+        self.cache._cull(db_alias, cursor, now)
+        return cursor
+
+    def test_cull_handles_last_cache_key_none(self):
+        "If the culling query returns None, _cull should not raise and not attempt the final delete."
+        cursor = self._run_cull_with_responses(count_value=5, last_key_response=None)
+        # Ensure the culling SQL was executed (third execute), but no "cache_key <" delete after it.
+        executed_sqls = [sql for sql, params in cursor.executed]
+        # There must be at least one culling SQL executed (cache_key_culling_sql).
+        self.assertTrue(any('cache_key' in sql.lower() for sql in executed_sqls))
+        # Ensure no final delete by checking that no executed SQL contains 'cache_key <'
+        self.assertFalse(any('cache_key <' in sql for sql in executed_sqls))
+
+    def test_cull_handles_last_cache_key_empty_list(self):
+        "If fetchone() returns an empty list, _cull should not raise (original bug raised IndexError)."
+        cursor = self._run_cull_with_responses(count_value=10, last_key_response=[])
+        executed_sqls = [sql for sql, params in cursor.executed]
+        self.assertFalse(any('cache_key <' in sql for sql in executed_sqls))
+
+    def test_cull_handles_last_cache_key_empty_tuple(self):
+        "If fetchone() returns an empty tuple, _cull should not raise (original bug raised IndexError)."
+        cursor = self._run_cull_with_responses(count_value=10, last_key_response=())
+        executed_sqls = [sql for sql, params in cursor.executed]
+        self.assertFalse(any('cache_key <' in sql for sql in executed_sqls))
+
+    def test_cull_deletes_when_last_cache_key_tuple(self):
+        "When the culling query returns a (cache_key,), _cull should perform the delete."
+        cursor = self._run_cull_with_responses(count_value=5, last_key_response=('last-key',))
+        executed = cursor.executed
+        # The final executed statement should be the deletion using the last key.
+        # Look for a 'cache_key <' in the executed SQL strings.
+        self.assertTrue(any('cache_key <' in sql for sql, params in executed))
+        # Verify that the parameters for the deletion included the expected key.
+        delete_params = [params for sql, params in executed if params and any('cache_key <' in s for s in [sql])]
+        # There should be at least one deletion params entry and it should contain our key.
+        self.assertTrue(any(d and d[0] == 'last-key' for d in delete_params))
+
+    def test_cull_deletes_when_last_cache_key_list(self):
+        "A list returned by fetchone() containing the key should trigger the deletion."
+        cursor = self._run_cull_with_responses(count_value=6, last_key_response=['another-key'])
+        executed = cursor.executed
+        self.assertTrue(any('cache_key <' in sql for sql, params in executed))
+        delete_params = [params for sql, params in executed if params and any('cache_key <' in s for s in [sql])]
+        self.assertTrue(any(d and d[0] == 'another-key' for d in delete_params))
+
+    def test_cull_handles_last_cache_key_tuple_with_empty_string_inside(self):
+        "A tuple like ('',) should be treated as present (tuple is truthy) and cause deletion with '' param."
+        cursor = self._run_cull_with_responses(count_value=3, last_key_response=('',))
+        executed = cursor.executed
+        self.assertTrue(any('cache_key <' in sql for sql, params in executed))
+        delete_params = [params for sql, params in executed if params and any('cache_key <' in s for s in [sql])]
+        self.assertTrue(any(d and d[0] == '' for d in delete_params))
+
+    def test_cull_no_delete_when_cull_num_zero_and_no_last_key(self):
+        """
+        If cull_num computes to zero, the backend SQL for culling may return no last key.
+        Ensure this does not raise and no final delete occurs.
+        """
+        # Set cull_frequency large so that num // cull_frequency == 0
+        self.cache._cull_frequency = 1000
+        self.cache._max_entries = 1
+        now = timezone.now().replace(microsecond=0)
+        cursor = DummyCursor([ (1,), None ])  # count=1, last_key=None
+        # Run _cull; should not raise.
+        self.cache._cull('default', cursor, now)
+        executed_sqls = [sql for sql, params in cursor.executed]
+        self.assertFalse(any('cache_key <' in sql for sql in executed_sqls))
+
+    def test_cull_clear_called_when_cull_frequency_zero(self):
+        "If _cull_frequency == 0, clear() should be called (special-case branch)."
+        called = {'clear': False}
+
+        def fake_clear():
+            called['clear'] = True
+        self.cache._cull_frequency = 0
+        # Replace clear with our fake to observe the call.
+        original_clear = self.cache.clear
+        try:
+            self.cache.clear = fake_clear
+            # _cull short-circuits and calls clear() immediately (no cursor required).
+            self.cache._cull('default', DummyCursor([]), timezone.now().replace(microsecond=0))
+        finally:
+            self.cache.clear = original_clear
+        self.assertTrue(called['clear'])
+
+    def test_cull_robust_with_unexpected_fetchone_types(self):
+        "Ensure a variety of unexpected but subscriptable fetchone() returns are handled safely."
+        # e.g., first fetchone returns a list-like count value, second returns a tuple with None element
+        cursor = DummyCursor([ (7,), (None,) ])
+        self.cache._max_entries = 1
+        self.cache._cull_frequency = 2
+        # Should not raise; final delete will be attempted with None as parameter
+        self.cache._cull('default', cursor, timezone.now().replace(microsecond=0))
+        executed = cursor.executed
+        # If deletion attempted, ensure the params include None
+        delete_params = [params for sql, params in executed if params and any('cache_key <' in s for s in [sql])]
+        if delete_params:
+            self.assertTrue(any(d and d[0] is None for d in delete_params))
+
+    def test_cull_handles_multiple_consecutive_calls_with_none(self):
+        "Consecutive culls where the second stage returns None should be safe each time."
+        for _ in range(3):
+            cursor = DummyCursor([ (5,), None ])
+            self.cache._max_entries = 1
+            self.cache._cull_frequency = 2
+            # Should not raise on repeated invocation.
+            self.cache._cull('default', cursor, timezone.now().replace(microsecond=0))

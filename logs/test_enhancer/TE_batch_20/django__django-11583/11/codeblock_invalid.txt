@@ -1,0 +1,196 @@
+import os
+import shutil
+import sys
+import tempfile
+import types
+import zipfile
+from importlib import import_module
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+
+from django.test import SimpleTestCase
+from django.test.utils import extend_sys_path
+from django.utils import autoreload
+
+class TestValueErrorHandling(SimpleTestCase):
+    def setUp(self):
+        # Temporary directory with good and bad files
+        self._tmpdir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self._tmpdir)
+        self.tmpdir = Path(self._tmpdir).resolve().absolute()
+
+        self.good_file = self.tmpdir / 'good.py'
+        self.good_file.parent.mkdir(parents=True, exist_ok=True)
+        self.good_file.touch()
+        # ensure the mtime is stable
+        os.utime(str(self.good_file), None)
+
+        self.bad_file = self.tmpdir / 'badfile.py'
+        # we don't need to actually create bad_file on disk; Path.resolve will be patched
+
+        # Ensure caches cleared between tests
+        autoreload.iter_modules_and_files.cache_clear()
+
+    def fake_resolve_factory(self, original_resolve, keyword='bad'):
+        """
+        Return a fake resolve function that raises ValueError for any path
+        containing the keyword, otherwise delegates to original_resolve.
+        """
+        def fake_resolve(self, strict=True):
+            if keyword in str(self):
+                raise ValueError('network filesystem error')
+            return original_resolve(self, strict=strict)
+        return fake_resolve
+
+    def test_iter_modules_and_files_ignores_valueerror_for_extra_files_pathobj(self):
+        # extra_files supplied as Path objects
+        original_resolve = Path.resolve
+        fake = self.fake_resolve_factory(original_resolve, keyword='badfile')
+        with mock.patch.object(Path, 'resolve', new=fake):
+            autoreload.iter_modules_and_files.cache_clear()
+            results = autoreload.iter_modules_and_files((), frozenset([self.bad_file, self.good_file]))
+        # Good resolved file should be present, bad file should be ignored.
+        self.assertIn(self.good_file.resolve(), results)
+        self.assertTrue(all('badfile' not in str(p) for p in results))
+
+    def test_iter_modules_and_files_ignores_valueerror_for_extra_files_str(self):
+        # extra_files supplied as strings
+        original_resolve = Path.resolve
+        fake = self.fake_resolve_factory(original_resolve, keyword='badfile')
+        with mock.patch.object(Path, 'resolve', new=fake):
+            autoreload.iter_modules_and_files.cache_clear()
+            results = autoreload.iter_modules_and_files((), frozenset([str(self.bad_file), str(self.good_file)]))
+        self.assertIn(self.good_file.resolve(), results)
+        self.assertTrue(all('badfile' not in str(p) for p in results))
+
+    def test_iter_modules_and_files_ignores_valueerror_for_module_spec_origin(self):
+        # A module with __spec__.origin pointing to a bad path should be ignored.
+        original_resolve = Path.resolve
+        fake = self.fake_resolve_factory(original_resolve, keyword='badfile')
+        module_good = types.ModuleType('mod_good')
+        module_good.__spec__ = SimpleNamespace(has_location=True, loader=object(), origin=str(self.good_file))
+        module_bad = types.ModuleType('mod_bad')
+        module_bad.__spec__ = SimpleNamespace(has_location=True, loader=object(), origin=str(self.bad_file))
+
+        with mock.patch.object(Path, 'resolve', new=fake):
+            autoreload.iter_modules_and_files.cache_clear()
+            results = autoreload.iter_modules_and_files((module_good, module_bad), frozenset())
+        self.assertIn(self.good_file.resolve(), results)
+        self.assertTrue(all('badfile' not in str(p) for p in results))
+
+    def test_iter_modules_and_files_ignores_valueerror_for_main_module_file(self):
+        # __main__ module with __file__ pointing to a bad path should be ignored.
+        original_resolve = Path.resolve
+        fake = self.fake_resolve_factory(original_resolve, keyword='badfile')
+        fake_main = types.ModuleType('__main__')
+        fake_main.__file__ = str(self.bad_file)
+        with mock.patch.object(Path, 'resolve', new=fake):
+            autoreload.iter_modules_and_files.cache_clear()
+            results = autoreload.iter_modules_and_files((fake_main,), frozenset())
+        # bad file should not appear
+        self.assertTrue(all('badfile' not in str(p) for p in results))
+
+    def test_iter_modules_and_files_handles_zipimporter_loader_with_valueerror(self):
+        # Create a zip file to use with zipimporter
+        zip_path_good = self.tmpdir / 'good_zip.zip'
+        zip_path_bad = self.tmpdir / 'bad_zip.zip'
+        with zipfile.ZipFile(str(zip_path_good), 'w') as zf:
+            zf.writestr('a.py', '')
+        with zipfile.ZipFile(str(zip_path_bad), 'w') as zf:
+            zf.writestr('b.py', '')
+
+        # Make loader instances
+        from zipimport import zipimporter
+        loader_good = zipimporter(str(zip_path_good))
+        loader_bad = zipimporter(str(zip_path_bad))
+
+        module_good = types.ModuleType('zip_mod_good')
+        module_good.__spec__ = SimpleNamespace(has_location=True, loader=loader_good, origin=None)
+        module_bad = types.ModuleType('zip_mod_bad')
+        module_bad.__spec__ = SimpleNamespace(has_location=True, loader=loader_bad, origin=None)
+
+        original_resolve = Path.resolve
+        fake = self.fake_resolve_factory(original_resolve, keyword='bad_zip')
+        with mock.patch.object(Path, 'resolve', new=fake):
+            autoreload.iter_modules_and_files.cache_clear()
+            results = autoreload.iter_modules_and_files((module_good, module_bad), frozenset())
+        # good zip archive should appear, bad zip ignored
+        self.assertIn(zip_path_good.resolve(), results)
+        self.assertTrue(all('bad_zip' not in str(p) for p in results))
+
+    def test_sys_path_directories_ignores_valueerror(self):
+        # Insert a bad and a good entry into sys.path and ensure the bad one is ignored.
+        bad_entry = str(self.tmpdir / 'bad_entry')
+        good_entry = str(self.tmpdir)
+        sys.path.insert(0, bad_entry)
+        self.addCleanup(lambda: sys.path.remove(bad_entry))
+        # Ensure a known existing path is present
+        sys.path.insert(0, good_entry)
+        self.addCleanup(lambda: sys.path.remove(good_entry))
+
+        original_resolve = Path.resolve
+        fake = self.fake_resolve_factory(original_resolve, keyword='bad_entry')
+        with mock.patch.object(Path, 'resolve', new=fake):
+            dirs = list(autoreload.sys_path_directories())
+        # good directory should be present, bad entry should not cause an exception
+        self.assertIn(Path(good_entry).resolve(), dirs)
+        self.assertTrue(all('bad_entry' not in str(p) for p in dirs))
+
+    def test_iter_modules_and_files_combined_ignores_multiple_valueerrors(self):
+        # Mix of bad modules and bad extra files; good ones should still be present.
+        original_resolve = Path.resolve
+        fake = self.fake_resolve_factory(original_resolve, keyword='bad')
+        module_good = types.ModuleType('m_good')
+        module_good.__spec__ = SimpleNamespace(has_location=True, loader=object(), origin=str(self.good_file))
+        module_bad = types.ModuleType('m_bad')
+        module_bad.__spec__ = SimpleNamespace(has_location=True, loader=object(), origin=str(self.bad_file))
+
+        with mock.patch.object(Path, 'resolve', new=fake):
+            autoreload.iter_modules_and_files.cache_clear()
+            results = autoreload.iter_modules_and_files((module_good, module_bad), frozenset([self.bad_file, self.good_file]))
+        self.assertIn(self.good_file.resolve(), results)
+        self.assertTrue(all('bad' not in str(p) for p in results))
+
+    def test_sys_path_directories_continues_when_resolve_raises_valueerror_and_file_entries_are_handled(self):
+        # Ensure that when resolve raises ValueError for one entry, others still return their parent directories.
+        bad_entry = str(self.tmpdir / 'bad_entry')
+        good_file = self.tmpdir / 'somefile'
+        good_file.touch()
+        good_entry = str(good_file)
+        sys.path.insert(0, bad_entry)
+        self.addCleanup(lambda: sys.path.remove(bad_entry))
+        sys.path.insert(0, good_entry)
+        self.addCleanup(lambda: sys.path.remove(good_entry))
+
+        original_resolve = Path.resolve
+        fake = self.fake_resolve_factory(original_resolve, keyword='bad_entry')
+        with mock.patch.object(Path, 'resolve', new=fake):
+            dirs = list(autoreload.sys_path_directories())
+        # The parent of the good_file should be present
+        self.assertIn(Path(good_file).parent.resolve(), dirs)
+        self.assertTrue(all('bad_entry' not in str(p) for p in dirs))
+
+    def test_iter_modules_and_files_ignores_filenotfounderror_and_valueerror_mixture(self):
+        # Simulate a mix of FileNotFoundError and ValueError from resolve; both should be ignored.
+        original_resolve = Path.resolve
+
+        def fake_resolve(self, strict=True):
+            s = str(self)
+            if 'missing' in s:
+                raise FileNotFoundError()
+            if 'badfile' in s:
+                raise ValueError('network filesystem error')
+            return original_resolve(self, strict=strict)
+
+        missing_file = self.tmpdir / 'missing.py'
+        bad_file = self.tmpdir / 'badfile.py'
+        good_file = self.good_file
+
+        with mock.patch.object(Path, 'resolve', new=fake_resolve):
+            autoreload.iter_modules_and_files.cache_clear()
+            results = autoreload.iter_modules_and_files((), frozenset([missing_file, bad_file, good_file]))
+        self.assertIn(good_file.resolve(), results)
+        self.assertTrue(all('missing' not in str(p) and 'badfile' not in str(p) for p in results))
+new_imports_code: |
+  # No additional imports required beyond those in test_code.

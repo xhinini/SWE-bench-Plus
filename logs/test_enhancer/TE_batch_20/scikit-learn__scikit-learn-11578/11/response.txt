@@ -1,0 +1,197 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests validate that _log_reg_scoring_path uses the requested multi_class
+  mode when instantiating a temporary LogisticRegression used for scoring,
+  and that the scores returned match those produced by constructing an
+  equivalent LogisticRegression (with multi_class set accordingly) and calling
+  the given scorer on the test data. Tests cover multinomial and ovr modes,
+  string labels, sparse input, sample weights, pos_class handling for OvR,
+  several scoring functions, and behavior when fit_intercept is False.
+test_code: |
+  import numpy as np
+  import scipy.sparse as sp
+  from sklearn.datasets import make_classification
+  from sklearn.linear_model.logistic import _log_reg_scoring_path, LogisticRegression
+  from sklearn.metrics.scorer import get_scorer
+  from sklearn.preprocessing import LabelEncoder
+  from sklearn.utils import check_array
+  import pytest
+
+  rng = np.random.RandomState(0)
+
+  def _reconstruct_and_score(coefs, X_test, y_test, fit_intercept, multi_class, scoring):
+      """Reconstruct a LogisticRegression for each coef in coefs and compute scores."""
+      scores = []
+      if isinstance(scoring, str):
+          scorer = get_scorer(scoring)
+      else:
+          scorer = scoring
+      for w in coefs:
+          # Mirror logic inside _log_reg_scoring_path for shaping the predictor
+          if multi_class == 'ovr':
+              w_local = w[np.newaxis, :]
+          else:
+              w_local = w
+          log_reg = LogisticRegression(multi_class=multi_class)
+          if fit_intercept:
+              log_reg.coef_ = np.asarray(w_local)[:, :-1]
+              log_reg.intercept_ = np.asarray(w_local)[:, -1]
+          else:
+              log_reg.coef_ = np.asarray(w_local)
+              log_reg.intercept_ = 0.
+          # set classes_ attribute expected by scorer/predict_proba
+          if multi_class == 'ovr':
+              log_reg.classes_ = np.array([-1, 1])
+          else:
+              # classes_ should be in label order; derive from y_test where possible
+              log_reg.classes_ = np.unique(y_test)
+          scores.append(scorer(log_reg, X_test, y_test))
+      return np.array(scores)
+
+  def test_log_reg_scoring_path_multinomial_neg_log_loss_matches_scorer():
+      X, y = make_classification(n_samples=100, n_features=6, n_classes=3,
+                                 n_informative=4, random_state=1)
+      train = np.arange(80)
+      test = np.arange(80, 100)
+      scoring = 'neg_log_loss'
+      coefs, Cs, scores, n_iter = _log_reg_scoring_path(
+          X, y, train, test, Cs=[1.], scoring=scoring,
+          fit_intercept=True, multi_class='multinomial', solver='lbfgs')
+      # Recompute expected scores
+      expected = _reconstruct_and_score(coefs, X[test], y[test],
+                                        fit_intercept=True, multi_class='multinomial',
+                                        scoring=scoring)
+      assert np.allclose(scores, expected)
+
+  def test_log_reg_scoring_path_multinomial_callable_scorer():
+      X, y = make_classification(n_samples=80, n_features=5, n_classes=3,
+                                 n_informative=3, random_state=2)
+      train = np.arange(64)
+      test = np.arange(64, 80)
+      scorer = get_scorer('neg_log_loss')
+      coefs, Cs, scores, n_iter = _log_reg_scoring_path(
+          X, y, train, test, Cs=[1.], scoring=scorer,
+          fit_intercept=True, multi_class='multinomial', solver='lbfgs')
+      expected = _reconstruct_and_score(coefs, X[test], y[test],
+                                        fit_intercept=True, multi_class='multinomial',
+                                        scoring=scorer)
+      assert np.allclose(scores, expected)
+
+  def test_log_reg_scoring_path_ovr_accuracy_matches_scorer():
+      X, y = make_classification(n_samples=60, n_features=4, n_classes=3,
+                                 n_informative=3, random_state=3)
+      train = np.arange(48)
+      test = np.arange(48, 60)
+      scoring = 'accuracy'
+      coefs, Cs, scores, n_iter = _log_reg_scoring_path(
+          X, y, train, test, Cs=[1.], scoring=scoring,
+          fit_intercept=False, multi_class='ovr', solver='lbfgs')
+      expected = _reconstruct_and_score(coefs, X[test], y[test],
+                                        fit_intercept=False, multi_class='ovr',
+                                        scoring=scoring)
+      assert np.allclose(scores, expected)
+
+  def test_fit_intercept_false_with_sample_weight():
+      X, y = make_classification(n_samples=90, n_features=6, n_classes=3,
+                                 n_informative=4, random_state=4)
+      train = np.arange(72)
+      test = np.arange(72, 90)
+      sample_weight = np.ones(len(train))
+      scoring = 'neg_log_loss'
+      coefs, Cs, scores, n_iter = _log_reg_scoring_path(
+          X, y, train, test, Cs=[1.], scoring=scoring,
+          fit_intercept=False, multi_class='multinomial',
+          solver='lbfgs', sample_weight=sample_weight)
+      expected = _reconstruct_and_score(coefs, X[test], y[test],
+                                        fit_intercept=False, multi_class='multinomial',
+                                        scoring=scoring)
+      assert np.allclose(scores, expected)
+
+  def test_pos_class_masking_for_ovr():
+      # Validate pos_class handling in OvR scoring path compares to manual scoring
+      X, y = make_classification(n_samples=70, n_features=5, n_classes=3,
+                                 n_informative=3, random_state=5)
+      # create a binary problem vs a pos_class taken from labels
+      pos = np.unique(y)[1]
+      train = np.arange(56)
+      test = np.arange(56, 70)
+      # Use accuracy as scoring
+      coefs, Cs, scores, n_iter = _log_reg_scoring_path(
+          X, y, train, test, pos_class=pos, Cs=[1.], scoring='accuracy',
+          fit_intercept=True, multi_class='ovr', solver='lbfgs')
+      # Reconstruct expected labels transformation and scorer
+      y_test = y[test].copy()
+      mask = (y_test == pos)
+      y_test_bin = np.ones_like(y_test, dtype=np.float64)
+      y_test_bin[~mask] = -1.
+      # Reconstruct and score using the same logic as in helper but passing y_test_bin
+      expected = _reconstruct_and_score(coefs, X[test], y_test_bin,
+                                        fit_intercept=True, multi_class='ovr',
+                                        scoring='accuracy')
+      assert np.allclose(scores, expected)
+
+  def test_multiclass_macro_f1_scoring_matches():
+      X, y = make_classification(n_samples=120, n_features=7, n_classes=3,
+                                 n_informative=5, random_state=6)
+      train = np.arange(96)
+      test = np.arange(96, 120)
+      scoring = 'f1_macro'
+      coefs, Cs, scores, n_iter = _log_reg_scoring_path(
+          X, y, train, test, Cs=[1.], scoring=scoring,
+          fit_intercept=True, multi_class='multinomial', solver='lbfgs')
+      expected = _reconstruct_and_score(coefs, X[test], y[test],
+                                        fit_intercept=True, multi_class='multinomial',
+                                        scoring=scoring)
+      assert np.allclose(scores, expected)
+
+  def test_string_labels_handled_correctly():
+      # Ensure string labels are handled by _log_reg_scoring_path
+      X, ynum = make_classification(n_samples=90, n_features=6, n_classes=3,
+                                    n_informative=4, random_state=7)
+      str_labels = LabelEncoder().fit(['cat', 'dog', 'mouse']).inverse_transform(ynum)
+      train = np.arange(72)
+      test = np.arange(72, 90)
+      scoring = 'neg_log_loss'
+      coefs, Cs, scores, n_iter = _log_reg_scoring_path(
+          X, str_labels, train, test, Cs=[1.], scoring=scoring,
+          fit_intercept=True, multi_class='multinomial', solver='lbfgs')
+      expected = _reconstruct_and_score(coefs, X[test], str_labels[test],
+                                        fit_intercept=True, multi_class='multinomial',
+                                        scoring=scoring)
+      assert np.allclose(scores, expected)
+
+  def test_sparse_input_consistency():
+      X, y = make_classification(n_samples=80, n_features=8, n_classes=3,
+                                 n_informative=6, random_state=8)
+      X[X < 0.5] = 0.0
+      X_sparse = sp.csr_matrix(X)
+      train = np.arange(64)
+      test = np.arange(64, 80)
+      scoring = 'accuracy'
+      coefs, Cs, scores_dense, n_iter = _log_reg_scoring_path(
+          X, y, train, test, Cs=[1.], scoring=scoring,
+          fit_intercept=True, multi_class='multinomial', solver='lbfgs')
+      coefs_s, Cs_s, scores_sparse, n_iter_s = _log_reg_scoring_path(
+          X_sparse, y, train, test, Cs=[1.], scoring=scoring,
+          fit_intercept=True, multi_class='multinomial', solver='lbfgs')
+      # scores should be same regardless dense or sparse input
+      assert np.allclose(scores_dense, scores_sparse)
+
+  def test_multiple_Cs_return_length_and_values():
+      X, y = make_classification(n_samples=100, n_features=6, n_classes=3,
+                                 n_informative=4, random_state=9)
+      train = np.arange(80)
+      test = np.arange(80, 100)
+      Cs = [0.1, 1.0, 10.0]
+      scoring = 'neg_log_loss'
+      coefs, Cs_ret, scores, n_iter = _log_reg_scoring_path(
+          X, y, train, test, Cs=Cs, scoring=scoring,
+          fit_intercept=True, multi_class='multinomial', solver='lbfgs')
+      assert len(scores) == len(Cs)
+      expected = _reconstruct_and_score(coefs, X[test], y[test],
+                                        fit_intercept=True, multi_class='multinomial',
+                                        scoring=scoring)
+      assert np.allclose(scores, expected)
+new_imports_code: |
+  # No additional imports beyond those included in the test file block.

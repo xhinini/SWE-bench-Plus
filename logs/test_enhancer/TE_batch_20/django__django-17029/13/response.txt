@@ -1,0 +1,172 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests validate that Apps.clear_cache() reliably clears the cached results of get_swappable_settings_name (the cache created by @functools.cache) in a variety of scenarios, including when apps.ready is False, when clear_cache is called repeatedly, when other app configs' get_models methods call get_swappable_settings_name during the clear loop (a regression that could repopulate the cache mid-clear), when using separate Apps instances, and when register_model triggers a clear. The key regression reproduced here is that get_swappable_settings_name's cache must be empty after clear_cache() completes even if app configs repopulate that cache during clear_cache's internal loops.
+test_code: |
+  from django.test import SimpleTestCase
+  from django.apps import apps, Apps
+  from django.test.utils import isolate_apps
+  from django.core.exceptions import AppRegistryNotReady
+
+  class ClearCacheRegressionTests(SimpleTestCase):
+      def test_clear_cache_clears_swappable_cache_basic(self):
+          # Populate the swappable cache.
+          _ = apps.get_swappable_settings_name("admin.LogEntry")
+          self.assertGreater(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          # And the models cache.
+          _ = apps.get_models()
+          self.assertGreaterEqual(apps.get_models.cache_info().currsize, 0)
+
+          apps.clear_cache()
+
+          self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          self.assertEqual(apps.get_models.cache_info().currsize, 0)
+
+      def test_get_swappable_recomputed_after_clear(self):
+          # Ensure the function still works after clearing and that the cache
+          # is repopulated on demand.
+          first = apps.get_swappable_settings_name("admin.LogEntry")
+          apps.clear_cache()
+          # After clear, cache is empty.
+          self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          # A subsequent call repopulates the cache with same logical result.
+          second = apps.get_swappable_settings_name("admin.LogEntry")
+          self.assertEqual(first, second)
+          self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 1)
+
+      def test_clear_cache_idempotent(self):
+          # Calling clear_cache multiple times is safe and leaves caches empty.
+          apps.get_swappable_settings_name("admin.LogEntry")
+          apps.get_models()
+          apps.clear_cache()
+          apps.clear_cache()
+          self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          self.assertEqual(apps.get_models.cache_info().currsize, 0)
+
+      def test_clear_cache_when_not_ready_clears_swappable(self):
+          # clear_cache should clear swappable cache even if apps.ready is False.
+          apps.get_swappable_settings_name("admin.LogEntry")
+          # Simulate not-ready state (clear_cache should tolerate it).
+          was_ready = apps.ready
+          apps.ready = False
+          try:
+              apps.clear_cache()
+              self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          finally:
+              apps.ready = was_ready
+
+      def test_clear_cache_during_get_models_repopulation(self):
+          """
+          Regression test: If an AppConfig.get_models() implementation calls
+          get_swappable_settings_name() while clear_cache() is iterating over
+          app_configs, the swappable cache must still be empty at the end of
+          clear_cache().
+
+          This reproduces the bug where clear_cache() cleared the swappable cache
+          too early and an app-config's get_models() call repopulated it before
+          clear_cache() finished.
+          """
+          # Populate swappable cache.
+          apps.get_swappable_settings_name("admin.LogEntry")
+          self.assertGreater(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+          # Save original app_configs and prepare a fake one that repopulates
+          # the swappable cache when its get_models() is called during clear_cache.
+          original_app_configs = apps.app_configs
+          class RepopulatingConfig:
+              name = "repop"
+              def import_models(self):
+                  return
+              # The clear_cache loop calls get_models(include_auto_created=True).
+              def get_models(self, include_auto_created=False, include_swapped=False):
+                  # This call would repopulate the swappable cache if it has
+                  # been cleared earlier in clear_cache().
+                  apps.get_swappable_settings_name("admin.LogEntry")
+                  return []
+
+          try:
+              apps.app_configs = {"repop": RepopulatingConfig()}
+              apps.ready = True
+              # Now clear the caches. At the end, swappable cache must be empty.
+              apps.clear_cache()
+              self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          finally:
+              apps.app_configs = original_app_configs
+
+      def test_clear_cache_with_multiple_repopulating_configs(self):
+          """
+          Same as above but with multiple app configs; ensures clear_cache
+          empties the swappable cache at the end regardless of how many
+          get_models() calls repopulate it during the loop.
+          """
+          apps.get_swappable_settings_name("admin.LogEntry")
+          original_app_configs = apps.app_configs
+
+          class RepopulatingConfig:
+              def __init__(self, name):
+                  self.name = name
+              def import_models(self):
+                  return
+              def get_models(self, include_auto_created=False, include_swapped=False):
+                  apps.get_swappable_settings_name("admin.LogEntry")
+                  return []
+
+          try:
+              apps.app_configs = {
+                  "r1": RepopulatingConfig("r1"),
+                  "r2": RepopulatingConfig("r2"),
+              }
+              apps.ready = True
+              apps.clear_cache()
+              self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          finally:
+              apps.app_configs = original_app_configs
+
+      def test_clear_cache_does_not_affect_other_registry_instances(self):
+          # Ensure clearing the main registry doesn't clear an unrelated Apps instance.
+          main_val = apps.get_swappable_settings_name("admin.LogEntry")
+          other = Apps(["apps"])
+          # Populate other registry swappable cache.
+          other_val = other.get_swappable_settings_name("apps.TotallyNormal")
+          self.assertGreater(other.get_swappable_settings_name.cache_info().currsize, 0)
+          apps.clear_cache()
+          # main cleared
+          self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          # other still has its own cache intact (cleared only when clear_cache called on it).
+          self.assertGreater(other.get_swappable_settings_name.cache_info().currsize, 0)
+
+      def test_register_model_triggers_clear_cache_on_registry(self):
+          """
+          When register_model() is called on a registry, it calls clear_cache(),
+          so the swappable cache on that registry should be cleared.
+          """
+          with isolate_apps("my_temp_app") as new_apps_module:
+              # Create a new Apps registry for the isolated app environment.
+              new_registry = Apps(["my_temp_app"])
+              # Populate swappable cache on new registry.
+              _ = new_registry.get_swappable_settings_name("my_temp_app.SomeModel")
+              self.assertGreater(new_registry.get_swappable_settings_name.cache_info().currsize, 0)
+
+              # Create a minimal fake model class with required _meta attributes.
+              class Meta:
+                  app_label = "my_temp_app"
+                  model_name = "sometModel"
+              class FakeModel:
+                  _meta = Meta()
+              # register_model should clear the registry's cache.
+              new_registry.register_model("my_temp_app", FakeModel)
+              self.assertEqual(new_registry.get_swappable_settings_name.cache_info().currsize, 0)
+
+      def test_clear_cache_preserves_ready_flag_and_clears_caches(self):
+          # Ensure ready flag remains unchanged and caches are cleared.
+          was_ready = apps.ready
+          try:
+              apps.get_swappable_settings_name("admin.LogEntry")
+              apps.get_models()
+              apps.clear_cache()
+              self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+              self.assertEqual(apps.get_models.cache_info().currsize, 0)
+          finally:
+              # No matter what, ready flag should be restored by test harness; assert it wasn't flipped by clear_cache.
+              self.assertIs(apps.ready, was_ready)
+new_imports_code: |
+  # No additional imports required beyond what the test module already provides.

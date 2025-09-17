@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_views.test_adminsite_llm.BuildAppDictRegressionTests.setUp admin_views.test_adminsite_llm.BuildAppDictRegressionTests.setUpTestData admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test__build_app_dict_admin_and_add_urls admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test__build_app_dict_has_module_perms_true admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test__build_app_dict_label_filtering admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test__build_app_dict_method_exists admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test__build_app_dict_models_contain_model_key admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test__build_app_dict_object_name_and_name_fields admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test__build_app_dict_returns_models_with_perms_keys admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test__build_app_dict_unknown_label_returns_none admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test_each_context_available_apps_uses__build_app_dict admin_views.test_adminsite_llm.BuildAppDictRegressionTests.test_public_build_app_dict_method_absent
+coverage json -o coverage.json
+: '>>>>> End Test Output'

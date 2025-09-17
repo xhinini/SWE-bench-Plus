@@ -1,0 +1,144 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests ensure that ValueError raised when resolving paths (for reasons other than an embedded null byte) is handled gracefully by iter_modules_and_files and sys_path_directories. They would fail with the candidate model patch which re-raises ValueError unless its message is exactly 'embedded null byte', but pass with the gold patch which always swallows ValueError and logs it.
+test_code: |
+  from pathlib import Path
+  import sys
+  import tempfile
+  import os
+  from unittest import mock
+  
+  from django.test import SimpleTestCase
+  from django.test.utils import extend_sys_path
+  from django.utils import autoreload
+  
+  
+  class IterModulesAndFilesValueErrorHandlingTests(SimpleTestCase):
+      def test_iter_modules_and_files_ignores_valueerror_random_msg(self):
+          # If Path.resolve raises ValueError with an arbitrary message, iter_modules_and_files
+          # should ignore that filename and continue (returning an empty frozenset here).
+          autoreload.iter_modules_and_files.cache_clear()
+          with mock.patch.object(Path, 'resolve', side_effect=ValueError('some random error')):
+              result = autoreload.iter_modules_and_files((), frozenset(['badpath']))
+          self.assertEqual(result, frozenset())
+  
+      def test_iter_modules_and_files_ignores_valueerror_empty_msg(self):
+          # ValueError with empty message should also be ignored (str(e) == '').
+          autoreload.iter_modules_and_files.cache_clear()
+          with mock.patch.object(Path, 'resolve', side_effect=ValueError()):
+              result = autoreload.iter_modules_and_files((), frozenset(['anotherbad']))
+          self.assertEqual(result, frozenset())
+  
+      def test_iter_modules_and_files_ignores_valueerror_and_keeps_valid_paths(self):
+          # When multiple files are provided, a ValueError for one should not prevent
+          # other valid paths from being returned.
+          autoreload.iter_modules_and_files.cache_clear()
+          tempdir = tempfile.TemporaryDirectory()
+          good = Path(tempdir.name) / 'good.py'
+          good.touch()
+          extra = [str(good), 'badpath']
+  
+          original_resolve = Path.resolve
+  
+          def side_effect(self, *args, **kwargs):
+              if 'badpath' in str(self):
+                  raise ValueError('boom')
+              return original_resolve(self, *args, **kwargs)
+  
+          with mock.patch.object(Path, 'resolve', side_effect=side_effect):
+              result = autoreload.iter_modules_and_files((), frozenset(extra))
+          # The good file should be present in the results.
+          self.assertIn(good.resolve(), result)
+          tempdir.cleanup()
+  
+      def test_iter_modules_and_files_logs_debug_on_valueerror(self):
+          # Ensure a debug log entry is made when ValueError is raised resolving a path.
+          autoreload.iter_modules_and_files.cache_clear()
+          with mock.patch.object(Path, 'resolve', side_effect=ValueError('weird fs issue')), \
+               mock.patch.object(autoreload.logger, 'debug') as mocked_debug:
+              result = autoreload.iter_modules_and_files((), frozenset(['badpath']))
+              # Should swallow the error and return empty set.
+              self.assertEqual(result, frozenset())
+              mocked_debug.assert_called()
+  
+      def test_iter_modules_and_files_handles_valueerror_from_mixed_spec_origins(self):
+          # Simulate a situation where some resolves raise ValueError and some succeed.
+          autoreload.iter_modules_and_files.cache_clear()
+          tempdir = tempfile.TemporaryDirectory()
+          good = Path(tempdir.name) / 'good2.py'
+          good.touch()
+          extra = [str(good), 'verybad']
+  
+          original_resolve = Path.resolve
+  
+          def side_effect(self, *args, **kwargs):
+              if 'verybad' in str(self):
+                  raise ValueError('non-embedded null byte error')
+              return original_resolve(self, *args, **kwargs)
+  
+          with mock.patch.object(Path, 'resolve', side_effect=side_effect):
+              result = autoreload.iter_modules_and_files((), frozenset(extra))
+          self.assertIn(good.resolve(), result)
+          tempdir.cleanup()
+  
+  
+  class SysPathDirectoriesValueErrorHandlingTests(SimpleTestCase):
+      def test_sys_path_directories_ignores_valueerror_random_msg(self):
+          # If Path.resolve raises ValueError for an entry in sys.path, sys_path_directories
+          # should skip that entry rather than raising.
+          bad_path = '/nonexistent\x00butdifferent'
+          with extend_sys_path(bad_path):
+              with mock.patch.object(Path, 'resolve', side_effect=ValueError('something bad')):
+                  # Should not raise
+                  result = list(autoreload.sys_path_directories())
+          # Should be a list (may be empty); definitely didn't raise.
+          self.assertIsInstance(result, list)
+  
+      def test_sys_path_directories_ignores_valueerror_empty_msg(self):
+          bad_path = '/also_nonexistent'
+          with extend_sys_path(bad_path):
+              with mock.patch.object(Path, 'resolve', side_effect=ValueError()):
+                  result = list(autoreload.sys_path_directories())
+          self.assertIsInstance(result, list)
+  
+      def test_sys_path_directories_handles_mixed_paths(self):
+          # When sys.path contains both a real directory and a path that raises ValueError,
+          # the real directory should still be yielded.
+          tempdir = tempfile.TemporaryDirectory()
+          real_dir = Path(tempdir.name).resolve()
+          bad = '/this_will_fail'
+          with extend_sys_path(str(real_dir)), extend_sys_path(bad):
+              original_resolve = Path.resolve
+  
+              def side_effect(self, *args, **kwargs):
+                  if str(self) == bad:
+                      raise ValueError('boomboom')
+                  return original_resolve(self, *args, **kwargs)
+  
+              with mock.patch.object(Path, 'resolve', side_effect=side_effect):
+                  dirs = list(autoreload.sys_path_directories())
+          self.assertIn(real_dir, dirs)
+          tempdir.cleanup()
+  
+      def test_sys_path_directories_logs_debug_on_valueerror(self):
+          bad = '/another_bad'
+          with extend_sys_path(bad):
+              with mock.patch.object(Path, 'resolve', side_effect=ValueError('fs quirk')), \
+                   mock.patch.object(autoreload.logger, 'debug') as mocked_debug:
+                  dirs = list(autoreload.sys_path_directories())
+              mocked_debug.assert_called()
+              self.assertIsInstance(dirs, list)
+  
+      def test_sys_path_directories_skips_valueerror_and_not_include_path(self):
+          bad = '/skip_this'
+          with extend_sys_path(bad):
+              with mock.patch.object(Path, 'resolve', side_effect=ValueError('skip it')):
+                  dirs = list(autoreload.sys_path_directories())
+          # The failing entry shouldn't appear in the yielded directories.
+          # We can't assert it's not present as a Path (resolve failed), but we can assert we didn't get a resolved Path matching it.
+          self.assertTrue(all(bad not in str(p) for p in dirs))
+new_imports_code: |
+  from pathlib import Path
+  import tempfile
+  import sys
+  from unittest import mock

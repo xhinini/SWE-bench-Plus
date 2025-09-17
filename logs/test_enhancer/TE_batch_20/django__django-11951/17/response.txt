@@ -1,0 +1,144 @@
+language: Python
+number_of_tests: 10
+test_behavior: "Add 10 unit tests verifying that bulk_create() respects the backend-determined maximum batch size when an explicit batch_size is provided (uses min(batch_size, max_batch_size)), handles None/zero/negative batch_size appropriately, and splits into correct-sized chunks. The tests monkeypatch the DB backend's bulk_batch_size and QuerySet._insert to observe batching behavior without executing real inserts."
+new_imports_code: |
+  from unittest.mock import patch
+  from math import ceil
+  from django.db import connections, connection
+  from django.db.models.query import QuerySet
+test_code: |
+  from django.test import TestCase, skipUnlessDBFeature
+  from django.db import IntegrityError
+  from unittest.mock import patch
+  from math import ceil
+  
+  from .models import TwoFields
+  
+  
+  class BulkCreateBatchingTests(TestCase):
+      def _capture_insert_calls(self, objs, supplied_batch_size, fake_max_batch):
+          """
+          Helper to patch connection.ops.bulk_batch_size and QuerySet._insert
+          to capture calls and sizes of batches passed into _insert.
+          Returns the list of lists that were passed to _insert.
+          """
+          default_conn = connection
+          calls = []
+  
+          # Patch the bulk_batch_size to return our fake_max_batch
+          def fake_bulk_batch_size(fields, items):
+              return fake_max_batch
+  
+          def fake_insert(self, items, *args, **kwargs):
+              # Record the actual chunk passed to _insert
+              # Convert to list in case it's a slice or other iterable
+              calls.append(list(items))
+              # Emulate returning no DB-returned rows
+              return []
+  
+          with patch.object(default_conn.ops, 'bulk_batch_size', new=fake_bulk_batch_size):
+              with patch.object(QuerySet, '_insert', new=fake_insert):
+                  # Run bulk_create; this will call our patched _insert
+                  TwoFields.objects.bulk_create(objs, batch_size=supplied_batch_size)
+          return calls
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_explicit_batch_higher_than_max_uses_max(self):
+          # If explicit batch_size > max_batch_size, the effective batch_size
+          # should be max_batch_size, resulting in ceil(n/max_batch_size) calls.
+          n = 100
+          objs = [TwoFields(f1=i, f2=i) for i in range(n)]
+          fake_max = 10
+          supplied = 1000  # much larger than fake_max
+          calls = self._capture_insert_calls(objs, supplied, fake_max)
+          self.assertEqual(len(calls), ceil(n / fake_max))
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_explicit_batch_lower_than_max_uses_explicit(self):
+          # If explicit batch_size < max_batch_size, the explicit value should be used.
+          n = 100
+          objs = [TwoFields(f1=i, f2=i) for i in range(n)]
+          fake_max = 50
+          supplied = 7
+          calls = self._capture_insert_calls(objs, supplied, fake_max)
+          self.assertEqual(len(calls), ceil(n / supplied))
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_explicit_batch_equal_to_max(self):
+          n = 100
+          objs = [TwoFields(f1=i, f2=i) for i in range(n)]
+          fake_max = 20
+          supplied = 20
+          calls = self._capture_insert_calls(objs, supplied, fake_max)
+          self.assertEqual(len(calls), ceil(n / fake_max))
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batch_size_none_uses_max(self):
+          # When batch_size is None, use the backend-determined max_batch_size.
+          n = 55
+          objs = [TwoFields(f1=i, f2=i) for i in range(n)]
+          fake_max = 10
+          supplied = None
+          calls = self._capture_insert_calls(objs, supplied, fake_max)
+          self.assertEqual(len(calls), ceil(n / fake_max))
+  
+      def test_zero_batch_size_assertion(self):
+          # bulk_create asserts batch_size is None or > 0.
+          objs = [TwoFields(f1=i, f2=i) for i in range(5)]
+          with self.assertRaises(AssertionError):
+              TwoFields.objects.bulk_create(objs, batch_size=0)
+  
+      def test_negative_batch_size_assertion(self):
+          objs = [TwoFields(f1=i, f2=i) for i in range(5)]
+          with self.assertRaises(AssertionError):
+              TwoFields.objects.bulk_create(objs, batch_size=-5)
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batch_size_large_but_max_greater_than_len(self):
+          # If max_batch_size is larger than number of objects, expect a single batch.
+          n = 10
+          objs = [TwoFields(f1=i, f2=i) for i in range(n)]
+          fake_max = 50  # larger than n
+          supplied = 1000
+          calls = self._capture_insert_calls(objs, supplied, fake_max)
+          self.assertEqual(len(calls), 1)
+          self.assertEqual(len(calls[0]), n)
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_ops_returns_zero_uses_one(self):
+          # If backend returns 0 for bulk_batch_size, code should use max(..., 1).
+          # With fake_max == 0 and supplied batch_size > 0, effective batch_size
+          # should be 1, so each object is inserted individually.
+          n = 10
+          objs = [TwoFields(f1=i, f2=i) for i in range(n)]
+          fake_max = 0
+          supplied = 5
+          calls = self._capture_insert_calls(objs, supplied, fake_max)
+          self.assertEqual(len(calls), n)
+          for chunk in calls:
+              self.assertEqual(len(chunk), 1)
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_last_chunk_smaller_size(self):
+          # Ensure last chunk size equals the remainder when batches don't divide evenly.
+          n = 23
+          objs = [TwoFields(f1=i, f2=i) for i in range(n)]
+          fake_max = 10
+          supplied = 7  # effective batch_size = min(7, 10) = 7
+          calls = self._capture_insert_calls(objs, supplied, fake_max)
+          expected_batches = ceil(n / min(supplied, fake_max))
+          self.assertEqual(len(calls), expected_batches)
+          # Last chunk size should be the remainder
+          last_chunk_size = n - (expected_batches - 1) * min(supplied, fake_max)
+          self.assertEqual(len(calls[-1]), last_chunk_size)
+  
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_mixed_pk_and_no_pk_batching_count(self):
+          # Ensure presence or absence of explicit PKs does not affect batching logic.
+          n = 25
+          objs = [TwoFields(id=(i if i % 2 == 0 else None), f1=i, f2=i) for i in range(n)]
+          fake_max = 6
+          supplied = 10
+          calls = self._capture_insert_calls(objs, supplied, fake_max)
+          expected_batches = ceil(n / min(supplied, fake_max))
+          self.assertEqual(len(calls), expected_batches)

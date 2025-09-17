@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.DeleteNoneIndexTests.test_empty_form_access_when_no_forms_exist forms_tests.tests.test_formsets_llm.DeleteNoneIndexTests.test_empty_form_access_with_bound_formset forms_tests.tests.test_formsets_llm.DeleteNoneIndexTests.test_empty_form_access_with_can_delete_and_can_delete_extra_false forms_tests.tests.test_formsets_llm.DeleteNoneIndexTests.test_empty_form_as_ul_renders_and_respects_delete_flag forms_tests.tests.test_formsets_llm.DeleteNoneIndexTests.test_empty_form_consistent_on_multiple_accesses forms_tests.tests.test_formsets_llm.DeleteNoneIndexTests.test_empty_form_contains_delete_when_can_delete_extra_true forms_tests.tests.test_formsets_llm.DeleteNoneIndexTests.test_empty_form_initial_forms_do_not_affect_none_index_check forms_tests.tests.test_formsets_llm.DeleteNoneIndexTests.test_empty_form_widget_is_respectfully_created forms_tests.tests.test_formsets_llm.DeleteNoneIndexTests.test_is_multipart_triggers_empty_form_without_type_error forms_tests.tests.test_formsets_llm.DeleteNoneIndexTests.test_media_property_triggers_empty_form_without_type_error
+coverage json -o coverage.json
+: '>>>>> End Test Output'

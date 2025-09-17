@@ -1,0 +1,241 @@
+from types import SimpleNamespace
+from types import SimpleNamespace
+
+from django.test import SimpleTestCase, isolate_apps
+
+def make_fake_app_config(name, models_list):
+    """
+    Create a fake app config object with a get_models method compatible
+    with Apps' expectations.
+    """
+    class FakeAppConfig:
+        def __init__(self, name):
+            self.name = name
+
+        def get_models(self, include_auto_created=False, include_swapped=False):
+            # Accept keyword args as Apps calls with both flags.
+            return list(models_list)
+
+    return FakeAppConfig(name)
+
+def make_fake_model(app_label, model_name, swapped=None, swappable=None, expire_calls=None, registry=None):
+    """
+    Create a fake model class with a _meta object that has the attributes
+    needed by get_swappable_settings_name and an _expire_cache method that
+    optionally calls back into the registry to simulate repopulation.
+    """
+    meta = SimpleNamespace()
+    meta.app_label = app_label
+    meta.model_name = model_name
+    # label_lower used by get_swappable_settings_name
+    meta.label_lower = f"{app_label}.{model_name}".lower()
+    meta.swapped = swapped
+    meta.swappable = swappable
+
+    def _expire_cache():
+        if expire_calls:
+            for arg in expire_calls:
+                # Call into the registry, to simulate repopulation during clear_cache.
+                registry.get_swappable_settings_name(arg)
+
+    meta._expire_cache = _expire_cache
+
+    Model = SimpleNamespace(_meta=meta)
+    return Model
+
+class ClearCacheSwappableTests(SimpleTestCase):
+    @isolate_apps(kwarg_name="apps")
+    def test_clear_cache_clears_swappable_cache_when_expire_repopulates(self, apps):
+        """
+        If model._meta._expire_cache() calls get_swappable_settings_name() and
+        repopulates the cache during the expire loop, clear_cache() must ensure
+        the swappable cache is empty at the end.
+        """
+        # Create a fake model that is swappable for "other.model".
+        m = make_fake_model(
+            "app1",
+            "MyModel",
+            swapped="other.Model",
+            swappable="SOME_SETTING",
+            expire_calls=["other.model"],
+            registry=apps,
+        )
+        ac = make_fake_app_config("app1", [m])
+        apps.app_configs["app1"] = ac
+        # Ensure registry in a "ready" state so the expire loop runs.
+        apps.ready = True
+
+        # Populate the swappable cache (this will cache the result).
+        res = apps.get_swappable_settings_name("other.model")
+        self.assertEqual(res, "SOME_SETTING")
+        self.assertGreater(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+        # clear_cache should clear any entries, even if they are repopulated
+        # during the expire loop by _expire_cache calling get_swappable_settings_name().
+        apps.clear_cache()
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+    @isolate_apps(kwarg_name="apps")
+    def test_clear_cache_clears_multiple_keys(self, apps):
+        """
+        Verify clear_cache empties multiple cached entries that may get
+        repopulated during the expire loop.
+        """
+        m1 = make_fake_model(
+            "a", "M1", swapped="x.Y", swappable="S1", expire_calls=["x.y"], registry=apps
+        )
+        m2 = make_fake_model(
+            "b", "M2", swapped="u.V", swappable="S2", expire_calls=["u.v"], registry=apps
+        )
+        apps.app_configs["a"] = make_fake_app_config("a", [m1])
+        apps.app_configs["b"] = make_fake_app_config("b", [m2])
+        apps.ready = True
+
+        # Populate two cache entries.
+        self.assertEqual(apps.get_swappable_settings_name("x.y"), "S1")
+        self.assertEqual(apps.get_swappable_settings_name("u.v"), "S2")
+        self.assertGreater(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+        apps.clear_cache()
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+    @isolate_apps(kwarg_name="apps")
+    def test_clear_cache_when_not_ready_still_clears_swappable_cache(self, apps):
+        """
+        When registry.ready is False, the expire loop doesn't run, but
+        clear_cache must still clear the swappable cache.
+        """
+        m = make_fake_model("app", "M", swapped="z.P", swappable="S", expire_calls=["z.p"], registry=apps)
+        apps.app_configs["app"] = make_fake_app_config("app", [m])
+        apps.ready = False
+
+        # Populate cache.
+        self.assertEqual(apps.get_swappable_settings_name("z.p"), "S")
+        self.assertGreater(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+        # Even though ready is False (so expire loop won't run), clear_cache
+        # must clear the swappable cache.
+        apps.clear_cache()
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+    @isolate_apps(kwarg_name="apps")
+    def test_clear_cache_with_no_models_clears_existing_swappable_cache(self, apps):
+        """
+        If there are no models, clear_cache should still clear the swappable cache.
+        """
+        apps.app_configs = {}
+        apps.ready = True
+
+        # Manually prime the cache by creating a trivial model via a temporary app_config.
+        m = make_fake_model("temp", "T", swapped="k.L", swappable="S_K", expire_calls=None, registry=apps)
+        apps.app_configs["temp"] = make_fake_app_config("temp", [m])
+        self.assertEqual(apps.get_swappable_settings_name("k.l"), "S_K")
+        self.assertGreater(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+        # Remove all app_configs so there are no models during clear_cache.
+        apps.app_configs = {}
+        apps.clear_cache()
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+    @isolate_apps(kwarg_name="apps")
+    def test_clear_cache_after_get_models_call(self, apps):
+        """
+        Ensure clear_cache clears swappable cache even if get_models() was called
+        before, populating other caches.
+        """
+        m = make_fake_model("aa", "M", swapped="a.B", swappable="SA", expire_calls=["a.b"], registry=apps)
+        apps.app_configs["aa"] = make_fake_app_config("aa", [m])
+        apps.ready = True
+
+        # Populate both caches.
+        _ = apps.get_models()
+        self.assertEqual(apps.get_swappable_settings_name("a.b"), "SA")
+        self.assertGreater(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertGreater(apps.get_models.cache_info().currsize, 0)
+
+        apps.clear_cache()
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        self.assertEqual(apps.get_models.cache_info().currsize, 0)
+
+    @isolate_apps(kwarg_name="apps")
+    def test_clear_cache_when_expire_calls_multiple_keys(self, apps):
+        """
+        If _expire_cache calls get_swappable_settings_name for several keys,
+        ensure all of those keys get cleared.
+        """
+        m = make_fake_model(
+            "xx",
+            "M",
+            swapped="one.T",
+            swappable="S_ONE",
+            expire_calls=["one.t", "two.t"],
+            registry=apps,
+        )
+        # Add another model so get_swappable can find a match for two.t too.
+        m2 = make_fake_model("yy", "N", swapped="two.T", swappable="S_TWO", expire_calls=None, registry=apps)
+        apps.app_configs["xx"] = make_fake_app_config("xx", [m])
+        apps.app_configs["yy"] = make_fake_app_config("yy", [m2])
+        apps.ready = True
+
+        # Populate both keys.
+        self.assertEqual(apps.get_swappable_settings_name("one.t"), "S_ONE")
+        self.assertEqual(apps.get_swappable_settings_name("two.t"), "S_TWO")
+        self.assertGreater(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+        apps.clear_cache()
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+    @isolate_apps(kwarg_name="apps")
+    def test_clear_cache_idempotent(self, apps):
+        """
+        Multiple calls to clear_cache should keep the swappable cache empty
+        and not raise.
+        """
+        m = make_fake_model("id", "M", swapped="i.X", swappable="SI", expire_calls=["i.x"], registry=apps)
+        apps.app_configs["id"] = make_fake_app_config("id", [m])
+        apps.ready = True
+
+        self.assertEqual(apps.get_swappable_settings_name("i.x"), "SI")
+        apps.clear_cache()
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        # Second call should also be fine.
+        apps.clear_cache()
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+    @isolate_apps(kwarg_name="apps")
+    def test_clear_cache_with_mixed_models(self, apps):
+        """
+        Mixed models, some whose _expire_cache repopulates the cache and some that do not.
+        """
+        m_repop = make_fake_model("r", "R", swapped="rep.X", swappable="REP", expire_calls=["rep.x"], registry=apps)
+        m_plain = make_fake_model("p", "P", swapped=None, swappable=None, expire_calls=None, registry=apps)
+        apps.app_configs["r"] = make_fake_app_config("r", [m_repop])
+        apps.app_configs["p"] = make_fake_app_config("p", [m_plain])
+        apps.ready = True
+
+        self.assertEqual(apps.get_swappable_settings_name("rep.x"), "REP")
+        apps.clear_cache()
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+
+    @isolate_apps(kwarg_name="apps")
+    def test_clear_cache_clears_after_populated_by_expire_only(self, apps):
+        """
+        Simulate the case where the only time get_swappable_settings_name gets populated
+        is via calls from _expire_cache during clear_cache(). Ensure final state is empty.
+        """
+        # Create two models where only during expire the registry is queried and caches a value.
+        # To allow get_swappable_settings_name to return a non-None value, include one model
+        # that will be returned by get_models and has the swapped/swappable attributes.
+        m_target = make_fake_model("t", "Target", swapped="z.Z", swappable="SZ", expire_calls=None, registry=apps)
+        # Another model whose expire triggers the repopulation of the cache.
+        m_repop = make_fake_model("r", "R", swapped=None, swappable=None, expire_calls=["z.z"], registry=apps)
+        apps.app_configs["t"] = make_fake_app_config("t", [m_target])
+        apps.app_configs["r"] = make_fake_app_config("r", [m_repop])
+        apps.ready = True
+
+        # At this point, do not populate the swappable cache manually; it will be populated
+        # only when _expire_cache of m_repop calls get_swappable_settings_name during clear_cache.
+        apps.clear_cache()
+        # Even though _expire_cache attempted to populate it, clear_cache must result
+        # in an empty swappable cache at the end.
+        self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)

@@ -1,0 +1,174 @@
+from types import SimpleNamespace
+import uuid
+from django.db.models.base import Model, NOT_PROVIDED
+
+from types import SimpleNamespace
+import uuid
+from django.test import SimpleTestCase
+from django.db.models.base import Model, NOT_PROVIDED
+
+class FakeField:
+    def __init__(self, name, primary_key=False):
+        self.name = name
+        self.attname = name
+        self.primary_key = primary_key
+        self.is_relation = False
+    def pre_save(self, instance, add):
+        # Return the current attribute value
+        return getattr(instance, self.attname)
+
+class FakePK:
+    def __init__(self, attname, default):
+        self.attname = attname
+        self.default = default
+    def get_pk_value_on_save(self, instance):
+        # Simulate default generation (e.g. uuid.uuid4)
+        val = self.default() if callable(self.default) else self.default
+        setattr(instance, self.attname, val)
+        return val
+
+class SaveTableBehaviorTests(SimpleTestCase):
+    def _run_save_table(self, *, raw, pk_initial, update_fields):
+        """
+        Create a fake 'instance' and 'cls' with minimal attributes required by
+        Model._save_table, monkeypatch _do_update/_do_insert on the instance
+        and run Model._save_table. Return whether _do_update was called.
+        """
+        # Prepare fake meta with a PK that has a default
+        pk_attname = 'id'
+        # Use a callable default to emulate auto-generated PKs (UUID)
+        pk_default = lambda: uuid.uuid4()
+        fake_pk = FakePK(pk_attname, pk_default)
+
+        # Non-PK concrete field that could be targeted by update_fields
+        non_pk_field = FakeField('name', primary_key=False)
+
+        fake_meta = SimpleNamespace(
+            local_concrete_fields=[non_pk_field, FakeField('other', primary_key=False)],
+            local_fields=[non_pk_field],
+            local_many_to_many=[],
+            private_fields=[],
+            fields=[non_pk_field],
+            local_concrete_fields_all=[non_pk_field],
+            pk=fake_pk,
+            auto_field=FakeField('auto', primary_key=True),
+            db_returning_fields=[],
+            order_with_respect_to=None,
+            select_on_save=False,
+        )
+
+        # Fake cls whose _meta will be used by _save_table
+        FakeCls = SimpleNamespace(_meta=fake_meta, _base_manager=None)
+
+        # Create a fake instance object with required attributes and methods
+        inst = SimpleNamespace()
+        inst._meta = None  # not used by _get_pk_val below; we pass meta explicitly
+        inst._state = SimpleNamespace(adding=True, db=None)
+        # initial pk value:
+        if pk_initial is not None:
+            setattr(inst, pk_attname, pk_initial)
+        else:
+            # Ensure attribute exists but is None
+            setattr(inst, pk_attname, None)
+        # set non-pk field value
+        inst.name = 'initial'
+
+        # Provide _get_pk_val method expected by _save_table
+        def _get_pk_val(self_meta=None):
+            # Use the provided meta (cls._meta) inside _save_table
+            return getattr(inst, fake_pk.attname)
+        inst._get_pk_val = _get_pk_val
+
+        # Flags to observe whether update/insert were attempted
+        called = {'update': False, 'insert': False}
+
+        # Monkeypatch instance._do_update and _do_insert to record calls
+        def _do_update(base_qs, using, pk_val, values, update_fields_arg, forced_update):
+            called['update'] = True
+            # Simulate "no rows updated" behavior by returning 0
+            return 0
+
+        def _do_insert(manager, using, fields, returning_fields, raw_arg):
+            called['insert'] = True
+            # Return empty results to satisfy the consumer loop
+            return []
+
+        inst._do_update = _do_update
+        inst._do_insert = _do_insert
+
+        # Call the real _save_table function on our fake instance. Pass cls=FakeCls
+        # Note: Model._save_table is an unbound function; call it with inst as self.
+        # Use force_insert=False, force_update=False in tests to exercise the branch.
+        Model._save_table(
+            inst,
+            raw=raw,
+            cls=FakeCls,
+            force_insert=False,
+            force_update=False,
+            using=None,
+            update_fields=update_fields
+        )
+
+        return called
+
+    # Test matrix: raw True/False x pk_initial None/non-None x update_fields None/list
+    def test_raw_true_with_no_initial_pk_calls_update(self):
+        called = self._run_save_table(raw=True, pk_initial=None, update_fields=None)
+        # For raw=True, the gold patch ensures we do NOT force an INSERT,
+        # thus an UPDATE attempt should occur.
+        self.assertTrue(called['update'])
+        # Since update returns 0, insert should then be attempted.
+        self.assertTrue(called['insert'])
+
+    def test_raw_false_with_no_initial_pk_skips_update(self):
+        called = self._run_save_table(raw=False, pk_initial=None, update_fields=None)
+        # For non-raw saves, the gold behavior forces INSERT when PK default exists,
+        # so _do_update should not be called.
+        self.assertFalse(called['update'])
+        self.assertTrue(called['insert'])
+
+    def test_raw_true_with_initial_pk_calls_update(self):
+        # Instance was pre-populated with a PK (simulating a default applied
+        # at instantiation); raw=True should still attempt UPDATE first.
+        called = self._run_save_table(raw=True, pk_initial=uuid.uuid4(), update_fields=None)
+        self.assertTrue(called['update'])
+        self.assertTrue(called['insert'])
+
+    def test_raw_false_with_initial_pk_skips_update(self):
+        called = self._run_save_table(raw=False, pk_initial=uuid.uuid4(), update_fields=None)
+        self.assertFalse(called['update'])
+        self.assertTrue(called['insert'])
+
+    def test_raw_true_with_update_fields_calls_update(self):
+        called = self._run_save_table(raw=True, pk_initial=None, update_fields=['name'])
+        self.assertTrue(called['update'])
+        self.assertTrue(called['insert'])
+
+    def test_raw_false_with_update_fields_skips_update(self):
+        called = self._run_save_table(raw=False, pk_initial=None, update_fields=['name'])
+        self.assertFalse(called['update'])
+        self.assertTrue(called['insert'])
+
+    def test_raw_true_with_initial_pk_and_update_fields_calls_update(self):
+        called = self._run_save_table(raw=True, pk_initial=uuid.uuid4(), update_fields=['name'])
+        self.assertTrue(called['update'])
+        self.assertTrue(called['insert'])
+
+    def test_raw_false_with_initial_pk_and_update_fields_skips_update(self):
+        called = self._run_save_table(raw=False, pk_initial=uuid.uuid4(), update_fields=['name'])
+        self.assertFalse(called['update'])
+        self.assertTrue(called['insert'])
+
+    # Additional tests to ensure behavior is consistent for different update_fields representations
+    def test_raw_true_with_empty_update_fields_calls_update(self):
+        # Empty list (explicitly provided) should still cause update attempt in raw mode
+        called = self._run_save_table(raw=True, pk_initial=None, update_fields=[])
+        # When update_fields is empty, _save_table bails out early and returns; no update/insert.
+        # Ensure behavior: no update nor insert attempted.
+        self.assertFalse(called['update'])
+        self.assertFalse(called['insert'])
+
+    def test_raw_false_with_empty_update_fields_bails_out(self):
+        called = self._run_save_table(raw=False, pk_initial=None, update_fields=[])
+        self.assertFalse(called['update'])
+        self.assertFalse(called['insert'])

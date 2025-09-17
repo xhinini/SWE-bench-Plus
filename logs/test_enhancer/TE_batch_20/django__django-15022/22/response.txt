@@ -1,0 +1,124 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise ModelAdmin.get_search_results for a variety of search terms and search_field patterns (single-term, multi-term, quoted phrase, and prefix operators ^, =, @). They assert that the queryset returned contains the expected objects and that no unexpected behavior (such as missing results) occurs. The tests are written using Django's TestCase and the sample models already present in the test suite (Child, Parent, Band, etc.). They are intended to detect the bug fixed by the provided patch (ensuring search terms are combined into a single filter that correctly matches all terms); they also cover edge-cases (quoted phrases and special lookup prefixes).
+new_imports_code: |
+  from django.test import TestCase, RequestFactory
+  from django.contrib import admin
+  from django.contrib.admin.options import ModelAdmin
+  from django.contrib.auth.models import User, AnonymousUser
+  from django.http import HttpRequest
+  from django.utils.encoding import force_str
+  from django.db import transaction
+  from django.db import connections
+test_code: |
+  from django.test import TestCase, RequestFactory
+  from django.contrib import admin
+  from django.contrib.admin.options import ModelAdmin
+  from django.contrib.auth.models import User
+  from django.http import HttpRequest
+
+  from tests.admin_changelist.models import Child, Parent, Band, Event, Swallow
+  from tests.admin_changelist.admin import site as test_admin_site
+
+  rf = RequestFactory()
+
+  class ModelAdminSearchTests(TestCase):
+      @classmethod
+      def setUpTestData(cls):
+          # Create some Parent/Child instances used across tests
+          cls.parent1 = Parent.objects.create(name="Parent One")
+          cls.child_a = Child.objects.create(name="Alice", age=10, parent=cls.parent1)
+          cls.child_b = Child.objects.create(name="Bob", age=12, parent=cls.parent1)
+          cls.child_ab = Child.objects.create(name="Alice Bob", age=13, parent=cls.parent1)
+          # Extra model instances for different search fields/prefixes
+          Band.objects.create(name="The Band", nr_of_members=4)
+          Event.objects.create(date="2000-01-01")
+          Swallow.objects.create(origin="Africa", load=1, speed=10)
+
+      def _make_request(self, user=None, method='GET', data=None):
+          if method.upper() == 'POST':
+              req = rf.post('/', data or {})
+          else:
+              req = rf.get('/', data or {})
+          req.user = user or User.objects.create_user(username='tester')
+          # resolver_match not required for get_search_results
+          return req
+
+      def test_single_term_search_matches_name(self):
+          admin_obj = ModelAdmin(Child, test_admin_site)
+          # single-field search
+          admin_obj.search_fields = ('name',)
+          qs, may_have_duplicates = admin_obj.get_search_results(self._make_request(), Child.objects.all(), 'Alice')
+          self.assertIn(self.child_a, list(qs))
+          self.assertIn(self.child_ab, list(qs))
+          self.assertFalse(may_have_duplicates)
+
+      def test_multi_term_search_requires_both_terms(self):
+          admin_obj = ModelAdmin(Child, test_admin_site)
+          admin_obj.search_fields = ('name',)
+          # Searching for two terms should return only the object that contains both terms
+          qs, _ = admin_obj.get_search_results(self._make_request(), Child.objects.all(), 'Alice Bob')
+          # Only child_ab has both words in a single name field
+          self.assertEqual(list(qs), [self.child_ab])
+
+      def test_quoted_phrase_search_treated_as_one_term(self):
+          admin_obj = ModelAdmin(Child, test_admin_site)
+          admin_obj.search_fields = ('name',)
+          qs, _ = admin_obj.get_search_results(self._make_request(), Child.objects.all(), '"Alice Bob"')
+          # Quoted phrase should match the "Alice Bob" record
+          self.assertEqual(list(qs), [self.child_ab])
+
+      def test_prefix_caret_startswith(self):
+          admin_obj = ModelAdmin(Child, test_admin_site)
+          admin_obj.search_fields = ('^name',)
+          qs, _ = admin_obj.get_search_results(self._make_request(), Child.objects.all(), 'Ali')
+          # '^name' uses istartswith - should match Alice and Alice Bob
+          self.assertIn(self.child_a, list(qs))
+          self.assertIn(self.child_ab, list(qs))
+
+      def test_prefix_equals_exact_match(self):
+          admin_obj = ModelAdmin(Child, test_admin_site)
+          admin_obj.search_fields = ('=name',)
+          qs, _ = admin_obj.get_search_results(self._make_request(), Child.objects.all(), 'Alice')
+          # '=name' uses iexact - match exact 'Alice' but not 'Alice Bob'
+          self.assertIn(self.child_a, list(qs))
+          self.assertNotIn(self.child_ab, list(qs))
+
+      def test_prefix_at_fulltext_search(self):
+          admin_obj = ModelAdmin(Child, test_admin_site)
+          # Use '@' prefix if supported - treat as search lookup
+          admin_obj.search_fields = ('@name',)
+          qs, _ = admin_obj.get_search_results(self._make_request(), Child.objects.all(), 'Alice')
+          # At least ensure that Alice is returned for the @ lookup on name
+          self.assertIn(self.child_a, list(qs))
+
+      def test_multiple_search_fields_and_terms(self):
+          # Set up admin that searches both name and age (age as string lookup)
+          admin_obj = ModelAdmin(Child, test_admin_site)
+          admin_obj.search_fields = ('name', 'age')
+          # Search for a term that appears in name 'Bob' and a numeric age '12'
+          qs, _ = admin_obj.get_search_results(self._make_request(), Child.objects.all(), 'Bob 12')
+          # The query should only match objects satisfying both bits; child_b has name Bob and age 12
+          self.assertEqual(list(qs), [self.child_b])
+
+      def test_search_with_pk_alias_pk_uses_pk_name(self):
+          # Use 'pk' in a search field to ensure it is mapped to real pk field name
+          admin_obj = ModelAdmin(Child, test_admin_site)
+          admin_obj.search_fields = ('pk',)
+          qs, _ = admin_obj.get_search_results(self._make_request(), Child.objects.all(), str(self.child_a.pk))
+          self.assertIn(self.child_a, list(qs))
+
+      def test_search_does_not_return_extra_results_for_and_combination(self):
+          admin_obj = ModelAdmin(Child, test_admin_site)
+          admin_obj.search_fields = ('name',)
+          # Searching for 'Alice Bob' should not return 'Alice' alone
+          qs, _ = admin_obj.get_search_results(self._make_request(), Child.objects.all(), 'Alice Bob')
+          results = list(qs)
+          self.assertTrue(all('Alice' in c.name and 'Bob' in c.name for c in results))
+
+      def test_search_is_case_insensitive(self):
+          admin_obj = ModelAdmin(Child, test_admin_site)
+          admin_obj.search_fields = ('name',)
+          qs_lower, _ = admin_obj.get_search_results(self._make_request(), Child.objects.all(), 'alice')
+          qs_mixed, _ = admin_obj.get_search_results(self._make_request(), Child.objects.all(), 'Alice')
+          self.assertEqual(set(qs_lower), set(qs_mixed))

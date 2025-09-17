@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.StartAppTargetNormalizationTests._expected_top admin_scripts.tests_llm.StartAppTargetNormalizationTests._run_and_assert_created admin_scripts.tests_llm.StartAppTargetNormalizationTests.setUp admin_scripts.tests_llm.StartAppTargetNormalizationTests.test_complex_dot_mix_relative admin_scripts.tests_llm.StartAppTargetNormalizationTests.test_multiple_dots_relative admin_scripts.tests_llm.StartAppTargetNormalizationTests.test_parent_dotdot_absolute admin_scripts.tests_llm.StartAppTargetNormalizationTests.test_parent_dotdot_absolute_with_slash admin_scripts.tests_llm.StartAppTargetNormalizationTests.test_parent_dotdot_relative admin_scripts.tests_llm.StartAppTargetNormalizationTests.test_parent_dotdot_with_slash_relative admin_scripts.tests_llm.StartAppTargetNormalizationTests.test_trailing_dot_absolute admin_scripts.tests_llm.StartAppTargetNormalizationTests.test_trailing_dot_absolute_with_slash admin_scripts.tests_llm.StartAppTargetNormalizationTests.test_trailing_dot_relative admin_scripts.tests_llm.StartAppTargetNormalizationTests.test_trailing_dot_with_slash_relative
+coverage json -o coverage.json
+: '>>>>> End Test Output'

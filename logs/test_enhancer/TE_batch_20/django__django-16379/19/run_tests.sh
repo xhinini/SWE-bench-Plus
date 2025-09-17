@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 cache.tests_llm.AdditionalFileBasedCacheHasKeyTests._make_cache_file cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.setUp cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.tearDown cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_deletes_expired_file_and_returns_false cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_handles_race_during_open_and_reports_false cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_propagates_oserror_from_pickle_load cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_propagates_oserror_on_open cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_returns_false_for_empty_cache_file cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_returns_false_on_filenotfound cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_returns_true_for_future_expiry cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_returns_true_for_none_expiry cache.tests_llm.AdditionalFileBasedCacheHasKeyTests.test_has_key_versioning_respected
+coverage json -o coverage.json
+: '>>>>> End Test Output'

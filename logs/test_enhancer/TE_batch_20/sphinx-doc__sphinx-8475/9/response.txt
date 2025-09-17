@@ -1,0 +1,255 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests exercise handling of TooManyRedirects raised during HEAD requests in the
+  linkcheck builder. They monkeypatch the requests.head and/or requests.get used by
+  sphinx.builders.linkcheck to simulate various outcomes, then enqueue a check task
+  to the builder worker queue and inspect the resulting written JSON entry.
+  The tests detect the bug where TooManyRedirects was not handled properly (or not
+  imported) and verify the fallback to GET and the correct handling of different
+  HTTPError status codes, redirect history, and ignored URIs.
+test_code: |
+  import http.server
+  import json
+  import socket
+  from types import SimpleNamespace
+  import pytest
+  from requests.exceptions import HTTPError, TooManyRedirects
+  from pathlib import Path
+  from sphinx.util import logging
+  
+  # Dummy response object to emulate requests.Response sufficiently for linkcheck
+  class DummyResponse:
+      def __init__(self, url, status_code=200, history=None, content_chunks=None):
+          self.url = url
+          self._status_code = status_code
+          self.history = history or []
+          # content_chunks: list of bytes or str chunks for iter_content
+          self._content_chunks = content_chunks or [b'']
+  
+      def raise_for_status(self):
+          if 400 <= self._status_code < 600:
+              err = HTTPError(f"{self._status_code} Error: for url: {self.url}")
+              resp = SimpleNamespace(status_code=self._status_code)
+              err.response = resp
+              raise err
+  
+      def iter_content(self, chunk_size=4096, decode_unicode=False):
+          for chunk in self._content_chunks:
+              yield chunk
+  
+  # Simple HTTP handler for tests that actually run a server (when needed)
+  class SimpleOKHandler(http.server.BaseHTTPRequestHandler):
+      def do_HEAD(self):
+          self.send_response(200, "OK")
+          self.end_headers()
+  
+      def do_GET(self):
+          self.do_HEAD()
+          self.wfile.write(b"ok\n")
+  
+      def log_date_time_string(self):
+          # avoid timestamps in logs that tests assert on
+          return ""
+  
+  # Helper to enqueue a URI and wait for a worker to produce a result; then write the result
+  def enqueue_and_get(builder, uri, docname="index", lineno=1, timeout=5.0):
+      # Ensure workers are present (builder.init should have been called by Sphinx fixture)
+      assert builder.workers, "builder workers not started"
+      builder.wqueue.put((uri, docname, lineno))
+      # get the result put by worker
+      result = builder.rqueue.get(timeout=timeout)
+      # process_result writes the output files (output.json / output.txt)
+      builder.process_result(result)
+      return result
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_too_many_redirects_get_succeeds(app, monkeypatch):
+      """HEAD raises TooManyRedirects, GET succeeds -> status working."""
+      called = {'head': 0, 'get': 0}
+  
+      def fake_head(url, **kwargs):
+          called['head'] += 1
+          raise TooManyRedirects("too many redirects")
+  
+      def fake_get(url, stream=True, config=None, auth=None, **kwargs):
+          called['get'] += 1
+          return DummyResponse(url, status_code=200)
+  
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head', fake_head)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+  
+      enqueue_and_get(app.builder, "http://localhost:7777/")
+  
+      # read last JSON line
+      outjson = Path(app.outdir / 'output.json').read_text().splitlines()[-1]
+      row = json.loads(outjson)
+      assert row['status'] == 'working'
+      assert row['uri'] == 'http://localhost:7777/'
+      assert called['head'] == 1
+      assert called['get'] == 1
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_too_many_redirects_get_404_broken(app, monkeypatch):
+      """HEAD raises TooManyRedirects, GET returns 404 -> broken."""
+      def fake_head(url, **kwargs):
+          raise TooManyRedirects("too many redirects")
+  
+      def fake_get(url, stream=True, config=None, auth=None, **kwargs):
+          return DummyResponse(url, status_code=404)
+  
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head', fake_head)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+  
+      enqueue_and_get(app.builder, "http://localhost:7777/doesnotexist")
+  
+      outjson = Path(app.outdir / 'output.json').read_text().splitlines()[-1]
+      row = json.loads(outjson)
+      assert row['status'] == 'broken'
+      assert '404' in row['info']
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_both_head_and_get_too_many_redirects_mark_broken(app, monkeypatch):
+      """Both HEAD and GET raise TooManyRedirects -> broken with exception info."""
+      def fake_head(url, **kwargs):
+          raise TooManyRedirects("head loop")
+  
+      def fake_get(url, stream=True, config=None, auth=None, **kwargs):
+          raise TooManyRedirects("get loop")
+  
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head', fake_head)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+  
+      enqueue_and_get(app.builder, "http://localhost:7777/")
+  
+      outjson = Path(app.outdir / 'output.json').read_text().splitlines()[-1]
+      row = json.loads(outjson)
+      assert row['status'] == 'broken'
+      assert 'get loop' in row['info'] or 'head loop' in row['info']
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_too_many_redirects_get_401_unauthorized_treated_working(app, monkeypatch):
+      """GET raising HTTPError with 401 -> treated as working (unauthorized)."""
+      def fake_head(url, **kwargs):
+          raise TooManyRedirects("too many redirects")
+  
+      def fake_get(url, stream=True, config=None, auth=None, **kwargs):
+          err = HTTPError("401 Unauthorized")
+          err.response = SimpleNamespace(status_code=401)
+          raise err
+  
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head', fake_head)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+  
+      enqueue_and_get(app.builder, "http://localhost:7777/protected")
+  
+      outjson = Path(app.outdir / 'output.json').read_text().splitlines()[-1]
+      row = json.loads(outjson)
+      assert row['status'] == 'working'
+      assert 'unauthorized' in row['info']
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_too_many_redirects_get_503_ignored(app, monkeypatch):
+      """GET raising HTTPError with 503 -> treated as ignored."""
+      def fake_head(url, **kwargs):
+          raise TooManyRedirects("too many redirects")
+  
+      def fake_get(url, stream=True, config=None, auth=None, **kwargs):
+          err = HTTPError("503 Service Unavailable")
+          err.response = SimpleNamespace(status_code=503)
+          raise err
+  
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head', fake_head)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+  
+      enqueue_and_get(app.builder, "http://localhost:7777/service")
+  
+      outjson = Path(app.outdir / 'output.json').read_text().splitlines()[-1]
+      row = json.loads(outjson)
+      assert row['status'] == 'ignored'
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_too_many_redirects_get_500_broken(app, monkeypatch):
+      """GET raising HTTPError with 500 -> treated as broken."""
+      def fake_head(url, **kwargs):
+          raise TooManyRedirects("too many redirects")
+  
+      def fake_get(url, stream=True, config=None, auth=None, **kwargs):
+          err = HTTPError("500 Internal Server Error")
+          err.response = SimpleNamespace(status_code=500)
+          raise err
+  
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head', fake_head)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+  
+      enqueue_and_get(app.builder, "http://localhost:7777/error500")
+  
+      outjson = Path(app.outdir / 'output.json').read_text().splitlines()[-1]
+      row = json.loads(outjson)
+      assert row['status'] == 'broken'
+  
+  @pytest.mark.sphinx(
+      'linkcheck', testroot='linkcheck-localserver', freshenv=True,
+      confoverrides={'linkcheck_ignore': ['http://localhost:7777/']})
+  def test_ignored_uri_shortcircuits_network(monkeypatch, app):
+      """If URI is configured to be ignored, HEAD must not be called."""
+      called = {'head': 0}
+      def fake_head(url, **kwargs):
+          called['head'] += 1
+          raise TooManyRedirects("should not be called")
+  
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head', fake_head)
+  
+      # Enqueue the ignored URI and process
+      enqueue_and_get(app.builder, "http://localhost:7777/")
+  
+      outjson = Path(app.outdir / 'output.json').read_text().splitlines()[-1]
+      row = json.loads(outjson)
+      assert row['status'] == 'ignored'
+      # ensure head was not invoked
+      assert called['head'] == 0
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_too_many_redirects_get_redirected_with_history(app, monkeypatch):
+      """GET returns a different URL and history with a code -> redirected and proper code returned."""
+      def fake_head(url, **kwargs):
+          raise TooManyRedirects("too many redirects")
+  
+      history_obj = SimpleNamespace(status_code=307)
+      def fake_get(url, stream=True, config=None, auth=None, **kwargs):
+          return DummyResponse("http://localhost:7777/?redirected=1",
+                               status_code=204, history=[history_obj])
+  
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head', fake_head)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+  
+      enqueue_and_get(app.builder, "http://localhost:7777/")
+  
+      outjson = Path(app.outdir / 'output.json').read_text().splitlines()[-1]
+      row = json.loads(outjson)
+      assert row['status'] == 'redirected'
+      assert row['code'] == 307
+      assert 'redirected=1' in row['info']
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+  def test_head_too_many_redirects_anchor_check(app, monkeypatch):
+      """When checking an anchor, HEAD raises TooManyRedirects and GET does not contain the anchor -> broken anchor not found."""
+      def fake_head(url, **kwargs):
+          raise TooManyRedirects("too many redirects")
+  
+      # content does not contain the anchor "#missing-anchor"
+      def fake_get(url, stream=True, config=None, auth=None, **kwargs):
+          return DummyResponse(url, status_code=200, content_chunks=[b"<html><body><a id='other'></a></body></html>"])
+  
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.head', fake_head)
+      monkeypatch.setattr('sphinx.builders.linkcheck.requests.get', fake_get)
+  
+      # Enqueue a URL with an anchor; docname 'index' exists in the testroot env
+      enqueue_and_get(app.builder, "http://localhost:7777/#missing-anchor")
+  
+      outjson = Path(app.outdir / 'output.json').read_text().splitlines()[-1]
+      row = json.loads(outjson)
+      assert row['status'] == 'broken'
+      assert "Anchor 'missing-anchor' not found" in row['info']
+new_imports_code: |
+  # No additional module-level imports required beyond what's in the test file above.

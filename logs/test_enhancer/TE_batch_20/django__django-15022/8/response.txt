@@ -1,0 +1,116 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise ModelAdmin.get_search_results to ensure multiple search tokens are combined correctly (OR across lookups for a single token, AND across multiple tokens), that quoted phrases are treated as single tokens, and that special prefixes (^, =) and the 'pk' alias behave as expected. They will fail if only the last search token is applied (the pre-patch bug) or if token combination behavior is incorrect.
+test_code: |
+  from django.test import TestCase, RequestFactory
+  from django.contrib import admin
+  from django.db import transaction
+  from django.contrib.admin.options import ModelAdmin
+  from .models import Parent, Child
+  
+  
+  class GetSearchResultsTests(TestCase):
+      def setUp(self):
+          self.factory = RequestFactory()
+          # Create parents
+          self.parent_bob = Parent.objects.create(name="Bob")
+          self.parent_carol = Parent.objects.create(name="Carol")
+          # Children:
+          # child1: name contains "Alice", parent name "Bob"
+          self.child1 = Child.objects.create(name="Alice", parent=self.parent_bob)
+          # child2: name contains "Bob" only
+          self.child2 = Child.objects.create(name="Bobby", parent=self.parent_carol)
+          # child3: name contains the phrase "Alice Bob"
+          self.child3 = Child.objects.create(name="Alice Bob", parent=self.parent_carol)
+          # child4: name contains "Alice" but parent is Carol (no Bob)
+          self.child4 = Child.objects.create(name="Alice", parent=self.parent_carol)
+          # child5: name starts with "Al"
+          self.child5 = Child.objects.create(name="Alfred", parent=self.parent_bob)
+  
+      def _get_results(self, model, search_fields, search_term):
+          request = self.factory.get('/', {'q': search_term})
+          ma = ModelAdmin(model, admin.site)
+          ma.search_fields = list(search_fields)
+          qs = model._default_manager.all()
+          return ma.get_search_results(request, qs, search_term)
+  
+      def test_multiple_terms_are_anded_across_lookups(self):
+          # Searching "Alice Bob" should return child1 because:
+          # ('Alice' matches name OR parent__name) AND ('Bob' matches name OR parent__name)
+          qs, may_have_duplicates = self._get_results(Child, ('name', 'parent__name'), 'Alice Bob')
+          pks = set(qs.values_list('pk', flat=True))
+          self.assertIn(self.child1.pk, pks)
+          # child4 has Alice but parent isn't Bob, so should NOT match both tokens
+          self.assertNotIn(self.child4.pk, pks)
+          self.assertFalse(may_have_duplicates)
+  
+      def test_quoted_phrase_is_single_token(self):
+          # Searching the quoted phrase should match child3 whose name is exactly "Alice Bob"
+          qs, may_have_duplicates = self._get_results(Child, ('name', 'parent__name'), '"Alice Bob"')
+          pks = list(qs.values_list('pk', flat=True))
+          self.assertEqual([self.child3.pk], pks)
+  
+      def test_startswith_prefix(self):
+          # ^name should use istartswith; 'Al' matches Alfred (child5) and Alice (child1/4)
+          qs, may_have_duplicates = self._get_results(Child, ('^name',), 'Al')
+          pks = set(qs.values_list('pk', flat=True))
+          expected = {self.child1.pk, self.child4.pk, self.child5.pk}
+          self.assertTrue(expected.issubset(pks))
+  
+      def test_exact_prefix(self):
+          # =name should use iexact; search for exact 'Alice' should match child1 and child4 (both 'Alice')
+          qs, may_have_duplicates = self._get_results(Child, ('=name',), 'Alice')
+          pks = set(qs.values_list('pk', flat=True))
+          self.assertIn(self.child1.pk, pks)
+          self.assertIn(self.child4.pk, pks)
+          # child3 "Alice Bob" should not be in exact matches
+          self.assertNotIn(self.child3.pk, pks)
+  
+      def test_pk_lookup_alias(self):
+          # Use 'pk' in search_fields should allow searching by primary key number
+          qs, may_have_duplicates = self._get_results(Child, ('pk',), str(self.child2.pk))
+          pks = list(qs.values_list('pk', flat=True))
+          self.assertEqual([self.child2.pk], pks)
+  
+      def test_multi_term_requires_all_terms(self):
+          # 'Alice Bob' should not match child4 (Alice but parent Carol)
+          qs, may_have_duplicates = self._get_results(Child, ('name', 'parent__name'), 'Alice Bob')
+          pks = set(qs.values_list('pk', flat=True))
+          self.assertNotIn(self.child4.pk, pks)
+  
+      def test_search_on_related_field(self):
+          # Searching for parent name 'Bob' on parent__name should find child1 and child5
+          qs, may_have_duplicates = self._get_results(Child, ('parent__name',), 'Bob')
+          pks = set(qs.values_list('pk', flat=True))
+          self.assertIn(self.child1.pk, pks)
+          self.assertIn(self.child5.pk, pks)
+  
+      def test_mixed_quoted_and_unquoted_tokens(self):
+          # Mixed tokens: a quoted phrase and an unquoted token should be ANDed.
+          # Searching '"Alice Bob" Alice' should require matches for both tokens.
+          qs, may_have_duplicates = self._get_results(Child, ('name', 'parent__name'), '"Alice Bob" Alice')
+          pks = set(qs.values_list('pk', flat=True))
+          # child3 name is "Alice Bob" which contains the phrase and also includes "Alice"
+          self.assertIn(self.child3.pk, pks)
+  
+      def test_single_token_multiple_fields_or_behavior(self):
+          # Single token should OR across provided lookups (name or parent__name)
+          qs, may_have_duplicates = self._get_results(Child, ('name', 'parent__name'), 'Bob')
+          pks = set(qs.values_list('pk', flat=True))
+          # child1 (parent Bob) and child2 (name Bobby) should both match
+          self.assertIn(self.child1.pk, pks)
+          self.assertIn(self.child2.pk, pks)
+  
+      def test_token_with_apostrophe_quotes(self):
+          # tokens surrounded by single quotes should be unescaped and treated as single tokens
+          # Create special case child
+          special_parent = Parent.objects.create(name="O'Connor")
+          special_child = Child.objects.create(name="Conner", parent=special_parent)
+          qs, may_have_duplicates = self._get_results(Child, ('parent__name',), "'O\\'Connor'")
+          # The quoted search should match the parent name with apostrophe
+          pks = set(qs.values_list('pk', flat=True))
+          self.assertIn(special_child.pk, pks)
+new_imports_code: |
+  from django.test import RequestFactory
+  from django.contrib import admin
+  from django.contrib.admin.options import ModelAdmin

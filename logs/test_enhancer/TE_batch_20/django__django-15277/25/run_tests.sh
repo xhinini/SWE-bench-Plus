@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 expressions.tests_llm.CharFieldValidatorTests.test_charfield_clean_allows_long_string_when_no_max_length expressions.tests_llm.CharFieldValidatorTests.test_charfield_validators_property_does_not_instantiate_broken_validator expressions.tests_llm.CharFieldValidatorTests.test_charfield_with_max_length_has_maxlength_validator expressions.tests_llm.CharFieldValidatorTests.test_charfield_with_max_length_rejects_overlong_value expressions.tests_llm.CharFieldValidatorTests.test_charfield_without_max_length_has_no_maxlength_validator expressions.tests_llm.CharFieldValidatorTests.test_formfield_from_charfield_without_max_length_has_none_max_length expressions.tests_llm.CharFieldValidatorTests.test_get_prep_value_casts_non_str_to_str_when_no_max_length expressions.tests_llm.CharFieldValidatorTests.test_resolved_output_field_for_value_of_type_str_has_no_broken_validators expressions.tests_llm.CharFieldValidatorTests.test_value_resolve_output_field_for_long_string_does_not_raise expressions.tests_llm.CharFieldValidatorTests.test_value_resolve_output_field_with_explicit_charfield_ok
+coverage json -o coverage.json
+: '>>>>> End Test Output'

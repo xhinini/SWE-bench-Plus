@@ -1,0 +1,143 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests verify that _query_cpu never returns 0 even when cgroup files indicate
+  a fractional CPU (resulting in 0 after integer division). They also validate the
+  interaction between _query_cpu and _cpu_count in multiple scenarios (quota-based,
+  shares-based, missing files, and when sched_getaffinity or multiprocessing are used).
+  The tests will fail with the candidate patch because it only ensures shares-based
+  results are at least 1, but does not ensure quota-based calculations that round
+  down to 0 are converted to 1.
+test_code: |
+  # tests/test_query_cpu.py
+  # pylint: disable=missing-function-docstring,protected-access
+  from __future__ import annotations
+  import io
+  import builtins
+  from unittest.mock import patch
+  import pytest
+  from pylint.lint import run as run_module
+
+  def _make_open_mock(files):
+      real_open = builtins.open
+
+      def _open(path, *args, **kwargs):
+          # Normalize Path objects to str if necessary
+          pname = path if isinstance(path, str) else str(path)
+          if pname in files:
+              # Return a text stream similar to open(..., encoding="utf-8")
+              return io.StringIO(files[pname])
+          return real_open(path, *args, **kwargs)
+
+      return _open
+
+  def _patch_path_is_file(paths_that_exist):
+      def _is_file(self):
+          return str(self) in paths_that_exist
+      return _is_file
+
+  def test_quota_division_rounds_down_to_zero_becomes_one():
+      # cpu.cfs_quota_us / cpu.cfs_period_us -> int(500 / 100000) == 0 -> should become 1
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "500\n",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+      }
+      with patch("builtins.open", _make_open_mock(files)):
+          with patch("pylint.lint.run.Path.is_file", _patch_path_is_file(set(files.keys()))):
+              assert run_module._query_cpu() == 1
+
+  def test_quota_exact_two_returns_two():
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "200000\n",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+      }
+      with patch("builtins.open", _make_open_mock(files)):
+          with patch("pylint.lint.run.Path.is_file", _patch_path_is_file(set(files.keys()))):
+              assert run_module._query_cpu() == 2
+
+  def test_quota_negative_and_shares_small_become_one():
+      # quota == -1 triggers shares branch; shares == 2 -> int(2/1024) == 0 -> should become 1
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",
+          "/sys/fs/cgroup/cpu/cpu.shares": "2\n",
+      }
+      with patch("builtins.open", _make_open_mock(files)):
+          with patch("pylint.lint.run.Path.is_file", _patch_path_is_file(set(files.keys()))):
+              assert run_module._query_cpu() == 1
+
+  def test_shares_exact_2048_returns_two():
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",
+          "/sys/fs/cgroup/cpu/cpu.shares": "2048\n",
+      }
+      with patch("builtins.open", _make_open_mock(files)):
+          with patch("pylint.lint.run.Path.is_file", _patch_path_is_file(set(files.keys()))):
+              assert run_module._query_cpu() == 2
+
+  def test_no_cgroup_files_returns_none():
+      # When none of the cgroup files exist we expect None
+      with patch("pylint.lint.run.Path.is_file", _patch_path_is_file(set())):
+          assert run_module._query_cpu() is None
+
+  def test_quota_present_period_missing_uses_shares():
+      # quota present but period missing -> should fall back to shares
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "500\n",  # non -1 but period missing
+          "/sys/fs/cgroup/cpu/cpu.shares": "2048\n",
+      }
+      # only cpu.cfs_quota_us and cpu.shares exist, period does not
+      existent = {"/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.shares"}
+      with patch("builtins.open", _make_open_mock(files)):
+          with patch("pylint.lint.run.Path.is_file", _patch_path_is_file(existent)):
+              assert run_module._query_cpu() == 2
+
+  def test_cpu_count_with_sched_getaffinity_and_quota_rounds_to_one():
+      # Simulate a quota that would round to 0, ensure _cpu_count returns at least 1
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "500\n",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+      }
+      with patch("builtins.open", _make_open_mock(files)):
+          with patch("pylint.lint.run.Path.is_file", _patch_path_is_file(set(files.keys()))):
+              # Patch os.sched_getaffinity to return a set of 4 CPUs
+              with patch("pylint.lint.run.os.sched_getaffinity", return_value={0,1,2,3}):
+                  assert run_module._cpu_count() == 1  # min(1 (from query), 4) == 1
+
+  def test_cpu_count_uses_multiprocessing_when_no_sched_getaffinity():
+      # Simulate shares giving 3 CPUs, no sched_getaffinity, multiprocessing.cpu_count = 8
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",
+          "/sys/fs/cgroup/cpu/cpu.shares": "3072\n",  # 3072/1024 == 3
+      }
+      with patch("builtins.open", _make_open_mock(files)):
+          with patch("pylint.lint.run.Path.is_file", _patch_path_is_file(set(files.keys()))):
+              # Remove sched_getaffinity and provide a fake multiprocessing module
+              fake_mp = type("MP", (), {"cpu_count": staticmethod(lambda: 8)})
+              with patch("pylint.lint.run.os.sched_getaffinity", new=None):
+                  with patch("pylint.lint.run.multiprocessing", fake_mp):
+                      assert run_module._cpu_count() == 3  # min(3, 8) == 3
+
+  def test_query_cpu_shares_small_and_whitespace_handling():
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",
+          # whitespace should be stripped and parsed correctly
+          "/sys/fs/cgroup/cpu/cpu.shares": "   2   \n",
+      }
+      with patch("builtins.open", _make_open_mock(files)):
+          with patch("pylint.lint.run.Path.is_file", _patch_path_is_file(set(files.keys()))):
+              assert run_module._query_cpu() == 1
+
+  def test_quota_zero_from_integer_division_still_becomes_one_on_cpu_count_min():
+      # This ensures that even if both branches somehow produce zero, final result is 1
+      files = {
+          "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "1\n",
+          "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "1000000\n",  # 1/1000000 -> 0
+      }
+      with patch("builtins.open", _make_open_mock(files)):
+          with patch("pylint.lint.run.Path.is_file", _patch_path_is_file(set(files.keys()))):
+              # If sched_getaffinity reports 2 CPUs, final min should be min(1,2) == 1
+              with patch("pylint.lint.run.os.sched_getaffinity", return_value={0,1}):
+                  assert run_module._cpu_count() == 1
+new_imports_code: |
+  import io
+  import builtins

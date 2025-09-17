@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 invalid_models_tests.test_models_llm.DummyField.__init__ invalid_models_tests.test_models_llm.DummyField.__repr__ invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.setUp invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_equality_list_vs_tuple_non_empty_equal invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_identity_empty_list_is_tuple_in_identity invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_identity_empty_tuple_is_tuple_in_identity invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_identity_includes_hashable_for_non_empty invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_identity_none_vs_empty_list_not_equal invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_identity_none_vs_empty_tuple_not_equal invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_unequal_when_through_fields_differ
+coverage json -o coverage.json
+: '>>>>> End Test Output'

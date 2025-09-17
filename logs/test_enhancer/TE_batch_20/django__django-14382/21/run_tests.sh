@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.TemplateCommandPathNormalization._run_and_assert_app_created admin_scripts.tests_llm.TemplateCommandPathNormalization.test_target_is_current_directory_dot admin_scripts.tests_llm.TemplateCommandPathNormalization.test_target_is_current_directory_dot_slash admin_scripts.tests_llm.TemplateCommandPathNormalization.test_target_with_dot_and_trailing_slash admin_scripts.tests_llm.TemplateCommandPathNormalization.test_target_with_double_slash admin_scripts.tests_llm.TemplateCommandPathNormalization.test_target_with_double_slash_and_dot admin_scripts.tests_llm.TemplateCommandPathNormalization.test_target_with_embedded_dot_component admin_scripts.tests_llm.TemplateCommandPathNormalization.test_target_with_leading_dot_slash_path admin_scripts.tests_llm.TemplateCommandPathNormalization.test_target_with_multiple_dot_components admin_scripts.tests_llm.TemplateCommandPathNormalization.test_target_with_redundant_dot_components admin_scripts.tests_llm.TemplateCommandPathNormalization.test_target_with_single_dot_component
+coverage json -o coverage.json
+: '>>>>> End Test Output'

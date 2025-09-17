@@ -1,0 +1,171 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise ModelAdmin.get_search_results to ensure multiple search terms are handled as "AND" of per-term "OR" queries across the configured search_fields (i.e. for each search term, any of the search_fields may match, and all search terms must match). They include checks for quoted phrases, prefix and exact operator lookups (^ and =), pk lookup ('pk'), behavior across related fields, and the detection of duplicate-spawning lookups when searching across related objects. The tests are designed to fail for the candidate patch (which changes the construction of the combined Q object in a way that can produce incorrect result sets in certain cross-field multi-term searches) and pass for the provided gold patch.
+test_code: |
+  from django.test import TestCase, RequestFactory
+  from django.contrib.admin import AdminSite, ModelAdmin
+  from django.contrib.auth.models import AnonymousUser
+  from django.db import transaction
+  from django.utils.http import urlencode
+  
+  from tests.admin_changelist.models import Child, Parent
+  
+  
+  class SimpleAdmin(ModelAdmin):
+      pass
+  
+  
+  class SearchResultsTests(TestCase):
+      def setUp(self):
+          self.site = AdminSite()
+          self.request = RequestFactory().get('/')
+          # Attach a user (not used for permission checks in these tests,
+          # but ModelAdmin.get_search_results expects a request-like object).
+          self.request.user = AnonymousUser()
+  
+      def test_multiple_terms_match_across_different_fields(self):
+          """
+          One term in child.name and another term in parent.name should match
+          when search_fields = ['name', 'parent__name'] and search_term has two words.
+          """
+          parent = Parent.objects.create(name='beta')
+          child = Child.objects.create(name='alpha', parent=parent)
+          # Another child that shouldn't match
+          Parent.objects.create(name='gamma')
+          admin = SimpleAdmin(Child, self.site)
+          admin.search_fields = ['name', 'parent__name']
+  
+          qs = Child.objects.all()
+          result_qs, may_have_duplicates = admin.get_search_results(self.request, qs, 'alpha beta')
+          self.assertIn(child, result_qs)
+          # This search shouldn't spawn duplicates for this setup
+          self.assertFalse(may_have_duplicates)
+  
+      def test_multiple_terms_all_in_single_field(self):
+          """
+          If all terms appear in the same field they should match.
+          """
+          child = Child.objects.create(name='alpha beta')
+          admin = SimpleAdmin(Child, self.site)
+          admin.search_fields = ['name']
+  
+          qs = Child.objects.all()
+          result_qs, may_have_duplicates = admin.get_search_results(self.request, qs, 'alpha beta')
+          self.assertIn(child, result_qs)
+          self.assertFalse(may_have_duplicates)
+  
+      def test_quoted_phrase_search(self):
+          """
+          A quoted phrase should be treated as a single search term.
+          """
+          child = Child.objects.create(name='alpha beta')
+          admin = SimpleAdmin(Child, self.site)
+          admin.search_fields = ['name']
+  
+          qs = Child.objects.all()
+          # search term is a single quoted phrase -> should match
+          result_qs, _ = admin.get_search_results(self.request, qs, '"alpha beta"')
+          self.assertIn(child, result_qs)
+  
+      def test_prefix_lookup_startwith(self):
+          """
+          '^' prefix in search_fields should create istartswith lookups.
+          """
+          child = Child.objects.create(name='StartHere')
+          admin = SimpleAdmin(Child, self.site)
+          admin.search_fields = ['^name']
+  
+          qs = Child.objects.all()
+          result_qs, _ = admin.get_search_results(self.request, qs, 'Start')
+          self.assertIn(child, result_qs)
+  
+      def test_exact_lookup_equals(self):
+          """
+          '=' prefix in search_fields should create iexact lookups.
+          """
+          child = Child.objects.create(name='ExactName')
+          admin = SimpleAdmin(Child, self.site)
+          admin.search_fields = ['=name']
+  
+          qs = Child.objects.all()
+          result_qs, _ = admin.get_search_results(self.request, qs, 'exactname')
+          self.assertIn(child, result_qs)
+  
+      def test_pk_lookup_search(self):
+          """
+          Searching for 'pk' should map to the primary key field name and match by id.
+          """
+          child = Child.objects.create(name='irrelevant')
+          admin = SimpleAdmin(Child, self.site)
+          admin.search_fields = ['pk']
+  
+          qs = Child.objects.all()
+          result_qs, _ = admin.get_search_results(self.request, qs, str(child.pk))
+          self.assertIn(child, result_qs)
+  
+      def test_related_lookup_with_transform(self):
+          """
+          If a search_field contains a lookup/transform, and the transform is valid,
+          it should be used. Example: 'parent__name__icontains' explicitly provided.
+          """
+          parent = Parent.objects.create(name='delta')
+          child = Child.objects.create(name='other', parent=parent)
+          admin = SimpleAdmin(Child, self.site)
+          admin.search_fields = ['parent__name__icontains']
+  
+          qs = Child.objects.all()
+          result_qs, _ = admin.get_search_results(self.request, qs, 'del')
+          self.assertIn(child, result_qs)
+  
+      def test_unmatched_search_returns_empty_queryset(self):
+          """
+          A search with no matching terms should return an empty queryset.
+          """
+          Child.objects.create(name='onlyone')
+          admin = SimpleAdmin(Child, self.site)
+          admin.search_fields = ['name']
+  
+          qs = Child.objects.all()
+          result_qs, _ = admin.get_search_results(self.request, qs, 'doesnotexist')
+          self.assertQuerysetEqual(result_qs, [])
+  
+      def test_multiple_terms_some_from_parent_some_from_child(self):
+          """
+          More complex interplay: one term matches in parent, another term matches in child.
+          This requires per-term OR across fields and AND across terms.
+          """
+          parent = Parent.objects.create(name='pterm')
+          child = Child.objects.create(name='cterm', parent=parent)
+          admin = SimpleAdmin(Child, self.site)
+          admin.search_fields = ['name', 'parent__name']
+  
+          qs = Child.objects.all()
+          result_qs, _ = admin.get_search_results(self.request, qs, 'pterm cterm')
+          self.assertIn(child, result_qs)
+  
+      def test_search_spawns_duplicates_for_related_lookups(self):
+          """
+          If a search spec can spawn duplicates (e.g., relation-based lookups),
+          get_search_results should indicate that by may_have_duplicates=True.
+          Create a parent with two children matching the same search term so that
+          the parent lookup can produce duplicates in result set construction.
+          """
+          parent = Parent.objects.create(name='parentdup')
+          # Create two children under the same parent that match the same term
+          child1 = Child.objects.create(name='dupterm', parent=parent)
+          child2 = Child.objects.create(name='dupterm', parent=parent)
+  
+          # Use ParentAdminTwoSearchFields-like behavior: search on child__name so
+          # that the parent queryset may have duplicates when joined to children.
+          from django.contrib.admin import ModelAdmin as DJModelAdmin
+          admin = DJModelAdmin(Parent, self.site)
+          admin.search_fields = ['child__name']
+  
+          qs = Parent.objects.all()
+          result_qs, may_have_duplicates = admin.get_search_results(self.request, qs, 'dupterm')
+          # The queryset should contain the parent (once), but the flag should indicate possible duplicates
+          self.assertIn(parent, result_qs)
+          self.assertTrue(may_have_duplicates)
+new_imports_code: |
+  from django.test import RequestFactory
+  from django.contrib import admin

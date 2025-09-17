@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 basic.tests_llm.ManagerWrapperMetadataTests.assert_manager_method_wrapped basic.tests_llm.ManagerWrapperMetadataTests.assert_manager_name_and_doc_match_queryset basic.tests_llm.ManagerWrapperMetadataTests.assert_manager_signature_matches_queryset basic.tests_llm.ManagerWrapperMetadataTests.test_bulk_create_is_wrapped_and_signature_matches basic.tests_llm.ManagerWrapperMetadataTests.test_exists_is_wrapped_and_signature_matches basic.tests_llm.ManagerWrapperMetadataTests.test_filter_is_wrapped_and_signature_matches basic.tests_llm.ManagerWrapperMetadataTests.test_get_is_wrapped_and_signature_matches basic.tests_llm.ManagerWrapperMetadataTests.test_iterator_is_wrapped_and_signature_matches basic.tests_llm.ManagerWrapperMetadataTests.test_manager_methods_preserve_signature_for_multiple_methods basic.tests_llm.ManagerWrapperMetadataTests.test_update_is_wrapped_and_signature_matches basic.tests_llm.ManagerWrapperMetadataTests.test_values_is_wrapped_and_signature_matches
+coverage json -o coverage.json
+: '>>>>> End Test Output'

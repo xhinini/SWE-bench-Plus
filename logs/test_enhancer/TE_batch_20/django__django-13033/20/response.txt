@@ -1,0 +1,132 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise SQL generation for ordering by related fields. They assert that ordering by a relation's raw id column (e.g. '...__foo_id') does not cause the related model's default ordering to be appended, while ordering by the relation itself does include the related model's default ordering. The tests also cover negative ordering, nested pk ordering, and second FK fields to ensure the find_ordering_name logic correctly compares against the last path component (pieces[-1]).
+test_code: |
+  from django.test import SimpleTestCase
+  from django.db import connection
+  import re
+
+  from .models import Reference, Article, Author
+
+  def _get_sql(qs):
+      """
+      Helper: compile the queryset's SQL using the default connection.
+      Return the SQL string.
+      """
+      compiler = qs.query.get_compiler(using='default', connection=connection)
+      sql, params = compiler.as_sql()
+      # params are not interpolated; we only need SQL text for ORDER BY inspection.
+      return sql
+
+  def _has_token(sql, token):
+      return token in sql
+
+  class FindOrderingNameTests(SimpleTestCase):
+      # 1
+      def test_order_by_relation_id_does_not_append_related_default_ordering(self):
+          qs = Reference.objects.order_by('article__author_id')
+          sql = _get_sql(qs)
+          # Article has default ordering on pub_date/headline; make sure it's not present.
+          self.assertFalse(_has_token(sql, 'pub_date'), msg=sql)
+          self.assertFalse(_has_token(sql, 'headline'), msg=sql)
+          # The explicit id column should be present.
+          self.assertTrue('author_id' in sql or 'author_id' in sql.lower(), msg=sql)
+
+      # 2
+      def test_order_by_relation_appends_related_default_ordering(self):
+          # ordering by the relation itself: should append Article's default ordering
+          qs = Reference.objects.order_by('article')
+          sql = _get_sql(qs)
+          # Article's Meta.ordering includes pub_date and headline expression; at least pub_date should be included.
+          self.assertTrue(_has_token(sql, 'pub_date'), msg=sql)
+          self.assertTrue(_has_token(sql, 'headline') or 'headline' in sql, msg=sql)
+
+      # 3
+      def test_negative_order_by_relation_id_does_not_append_related_default_ordering(self):
+          qs = Reference.objects.order_by('-article__author_id')
+          sql = _get_sql(qs)
+          self.assertFalse(_has_token(sql, 'pub_date'), msg=sql)
+          self.assertFalse(_has_token(sql, 'headline'), msg=sql)
+          # ensure ordering mentions author_id (with or without a minus in SQL text)
+          self.assertTrue('author_id' in sql or 'author_id' in sql.lower(), msg=sql)
+
+      # 4
+      def test_order_by_nested_pk_does_not_append_related_default_ordering(self):
+          # ordering by nested pk should not append the related model's ordering (special-cased as 'pk')
+          qs = Reference.objects.order_by('article__author__pk')
+          sql = _get_sql(qs)
+          # ordering by pk should not bring in Article's ordering columns
+          self.assertFalse(_has_token(sql, 'pub_date'), msg=sql)
+          self.assertFalse(_has_token(sql, 'headline'), msg=sql)
+          # but 'id' or 'pk' column reference should be present
+          self.assertTrue('id' in sql or 'pk' in sql or 'author_id' in sql, msg=sql)
+
+      # 5
+      def test_order_by_relation_then_field_id_no_duplication(self):
+          # When ordering by the relation's column name explicitly we should not get extra ordering
+          qs = Reference.objects.order_by('article__author_id', 'article')
+          sql = _get_sql(qs)
+          # The SQL ORDER BY should include a pub_date (from ordering by 'article') but the explicit author_id
+          # ordering should not cause an additional, duplicate ordering clause for the same underlying column.
+          order_by_match = re.search(r'ORDER BY (.+)$', sql)
+          self.assertIsNotNone(order_by_match, msg=sql)
+          ordering_clause = order_by_match.group(1)
+          # Count occurrences of author_id token in the ordering clause
+          author_id_count = ordering_clause.count('author_id')
+          self.assertLessEqual(author_id_count, 1, msg='Duplicate author_id ordering: %s' % ordering_clause)
+
+      # 6
+      def test_order_by_deep_relation_id_vs_relation(self):
+          # ordering by different depth: article__author_id vs article__author
+          qs_id = Reference.objects.order_by('article__author_id')
+          qs_rel = Reference.objects.order_by('article__author')
+          sql_id = _get_sql(qs_id)
+          sql_rel = _get_sql(qs_rel)
+          # id-based ordering should not include Article ordering tokens
+          self.assertFalse(_has_token(sql_id, 'pub_date'), msg=sql_id)
+          # relation-based ordering should include author (Author) ordering: Author has Meta.ordering = ('-pk',)
+          # pk might appear as id column on the author table
+          self.assertTrue('pk' in sql_rel or 'id' in sql_rel or 'author_id' in sql_rel, msg=sql_rel)
+
+      # 7
+      def test_order_by_second_author_id_no_related_defaults(self):
+          # Article has second_author FK; ordering by its id should not add Article ordering
+          qs = Article.objects.order_by('second_author_id')
+          sql = _get_sql(qs)
+          self.assertFalse(_has_token(sql, 'pub_date'), msg=sql)
+          # ensure the second_author_id appears
+          self.assertTrue('second_author_id' in sql or 'second_author_id' in sql.lower(), msg=sql)
+
+      # 8
+      def test_order_by_relation_field_name_not_confused_with_full_path(self):
+          # If someone orders by 'article__author_id' the last path component equals the FK attname.
+          # Ensure that find_ordering_name does not treat the full dotted path as the attname.
+          qs = Reference.objects.order_by('article__author_id')
+          sql = _get_sql(qs)
+          # There must not be Article's default ordering tokens (pub_date/headline), only the explicit id ordering.
+          self.assertFalse(_has_token(sql, 'pub_date'), msg=sql)
+          self.assertTrue('author_id' in sql or 'author_id' in sql.lower(), msg=sql)
+
+      # 9
+      def test_order_by_relation_respects_related_model_ordering_when_not_id(self):
+          # ordering by article__author (the relation) should bring in Author default ordering (-pk)
+          qs = Reference.objects.order_by('article__author')
+          sql = _get_sql(qs)
+          # Author Meta.ordering uses '-pk'; the SQL should include a pk/id ordering for author
+          self.assertTrue('author' in sql and ('pk' in sql or 'id' in sql or 'author_id' in sql), msg=sql)
+
+      # 10
+      def test_multiple_ordering_mix_id_and_relation(self):
+          qs = Reference.objects.order_by('article__author_id', '-article')
+          sql = _get_sql(qs)
+          # The explicit id ordering should not result in adding Article's default ordering for that id;
+          # however the '-article' should bring in Article's default ordering (e.g., pub_date).
+          self.assertTrue(_has_token(sql, 'pub_date') or _has_token(sql, 'headline'), msg=sql)
+          # Ensure author_id appears at most once in the ORDER BY clause
+          order_by_match = re.search(r'ORDER BY (.+)$', sql)
+          self.assertIsNotNone(order_by_match, msg=sql)
+          ordering_clause = order_by_match.group(1)
+          author_id_count = ordering_clause.count('author_id')
+          self.assertLessEqual(author_id_count, 1, msg='author_id duplicated: %s' % ordering_clause)
+new_imports_code: |
+  # No additional imports beyond standard Django testing utilities are required.

@@ -1,0 +1,573 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `django/db/models/sql/where.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 """
+2 Code to manage the creation and SQL rendering of 'where' constraints.
+3 """
+4 import operator
+5 from functools import reduce
+6 
+7 from django.core.exceptions import EmptyResultSet, FullResultSet
+8 from django.db.models.expressions import Case, When
+9 from django.db.models.functions import Mod
+10 from django.db.models.lookups import Exact
+11 from django.utils import tree
+12 from django.utils.functional import cached_property
+13 
+14 # Connection types
+15 AND = "AND"
+16 OR = "OR"
+17 XOR = "XOR"
+18 
+19 
+20 class WhereNode(tree.Node):
+21     """
+22     An SQL WHERE clause.
+23 
+24     The class is tied to the Query class that created it (in order to create
+25     the correct SQL).
+26 
+27     A child is usually an expression producing boolean values. Most likely the
+28     expression is a Lookup instance.
+29 
+30     However, a child could also be any class with as_sql() and either
+31     relabeled_clone() method or relabel_aliases() and clone() methods and
+32     contains_aggregate attribute.
+33     """
+34 
+35     default = AND
+36     resolved = False
+37     conditional = True
+38 
+39     def split_having_qualify(self, negated=False, must_group_by=False):
+40         """
+41         Return three possibly None nodes: one for those parts of self that
+42         should be included in the WHERE clause, one for those parts of self
+43         that must be included in the HAVING clause, and one for those parts
+44         that refer to window functions.
+45         """
+46         if not self.contains_aggregate and not self.contains_over_clause:
+47             return self, None, None
+48         in_negated = negated ^ self.negated
+49         # Whether or not children must be connected in the same filtering
+50         # clause (WHERE > HAVING > QUALIFY) to maintain logical semantic.
+51         must_remain_connected = (
+52             (in_negated and self.connector == AND)
+53             or (not in_negated and self.connector == OR)
+54             or self.connector == XOR
+55         )
+56         if (
+57             must_remain_connected
+58             and self.contains_aggregate
+59             and not self.contains_over_clause
+60         ):
+61             # It's must cheaper to short-circuit and stash everything in the
+62             # HAVING clause than split children if possible.
+63             return None, self, None
+64         where_parts = []
+65         having_parts = []
+66         qualify_parts = []
+67         for c in self.children:
+68             if hasattr(c, "split_having_qualify"):
+69                 where_part, having_part, qualify_part = c.split_having_qualify(
+70                     in_negated, must_group_by
+71                 )
+72                 if where_part is not None:
+73                     where_parts.append(where_part)
+74                 if having_part is not None:
+75                     having_parts.append(having_part)
+76                 if qualify_part is not None:
+77                     qualify_parts.append(qualify_part)
+78             elif c.contains_over_clause:
+79                 qualify_parts.append(c)
+80             elif c.contains_aggregate:
+81                 having_parts.append(c)
+82             else:
+83                 where_parts.append(c)
+84         if must_remain_connected and qualify_parts:
+85             # Disjunctive heterogeneous predicates can be pushed down to
+86             # qualify as long as no conditional aggregation is involved.
+87             if not where_parts or (where_parts and not must_group_by):
+88                 return None, None, self
+89             elif where_parts:
+90                 # In theory this should only be enforced when dealing with
+91                 # where_parts containing predicates against multi-valued
+92                 # relationships that could affect aggregation results but this
+93                 # is complex to infer properly.
+94                 raise NotImplementedError(
+95                     "Heterogeneous disjunctive predicates against window functions are "
+96                     "not implemented when performing conditional aggregation."
+97                 )
+98         where_node = (
+99             self.create(where_parts, self.connector, self.negated)
+100             if where_parts
+101             else None
+102         )
+103         having_node = (
+104             self.create(having_parts, self.connector, self.negated)
+105             if having_parts
+106             else None
+107         )
+108         qualify_node = (
+109             self.create(qualify_parts, self.connector, self.negated)
+110             if qualify_parts
+111             else None
+112         )
+113         return where_node, having_node, qualify_node
+114 
+115     def as_sql(self, compiler, connection):
+116         """
+117         Return the SQL version of the where clause and the value to be
+118         substituted in. Return '', [] if this node matches everything,
+119         None, [] if this node is empty, and raise EmptyResultSet if this
+120         node can't match anything.
+121         """
+122         result = []
+123         result_params = []
+124         if self.connector == AND:
+125             full_needed, empty_needed = len(self.children), 1
+126         else:
+127             full_needed, empty_needed = 1, len(self.children)
+128 
+129         if self.connector == XOR and not connection.features.supports_logical_xor:
+130             # Convert if the database doesn't support XOR:
+131             #   a XOR b XOR c XOR ...
+132             # to:
+133             #   (a OR b OR c OR ...) AND MOD(a + b + c + ..., 2) == 1
+134             # The result of an n-ary XOR is true when an odd number of operands
+135             # are true.
+136             lhs = self.__class__(self.children, OR)
+137             rhs_sum = reduce(
+138                 operator.add,
+139                 (Case(When(c, then=1), default=0) for c in self.children),
+140             )
+141             if len(self.children) > 2:
+142                 rhs_sum = Mod(rhs_sum, 2)
+143             rhs = Exact(1, rhs_sum)
+144             return self.__class__([lhs, rhs], AND, self.negated).as_sql(
+145                 compiler, connection
+146             )
+147 
+148         for child in self.children:
+149             try:
+150                 sql, params = compiler.compile(child)
+151             except EmptyResultSet:
+152                 empty_needed -= 1
+153             except FullResultSet:
+154                 full_needed -= 1
+155             else:
+156                 if sql:
+157                     result.append(sql)
+158                     result_params.extend(params)
+159                 else:
+160                     full_needed -= 1
+161             # Check if this node matches nothing or everything.
+162             # First check the amount of full nodes and empty nodes
+163             # to make this node empty/full.
+164             # Now, check if this node is full/empty using the
+165             # counts.
+166             if empty_needed == 0:
+167                 if self.negated:
+168                     raise FullResultSet
+169                 else:
+170                     raise EmptyResultSet
+171             if full_needed == 0:
+172                 if self.negated:
+173                     raise EmptyResultSet
+174                 else:
+175                     raise FullResultSet
+176         conn = " %s " % self.connector
+177         sql_string = conn.join(result)
+178         if not sql_string:
+179             raise FullResultSet
+180         if self.negated:
+181             # Some backends (Oracle at least) need parentheses around the inner
+182             # SQL in the negated case, even if the inner SQL contains just a
+183             # single expression.
+184             sql_string = "NOT (%s)" % sql_string
+185         elif len(result) > 1 or self.resolved:
+186             sql_string = "(%s)" % sql_string
+187         return sql_string, result_params
+188 
+189     def get_group_by_cols(self):
+190         cols = []
+191         for child in self.children:
+192             cols.extend(child.get_group_by_cols())
+193         return cols
+194 
+195     def get_source_expressions(self):
+196         return self.children[:]
+197 
+198     def set_source_expressions(self, children):
+199         assert len(children) == len(self.children)
+200         self.children = children
+201 
+202     def relabel_aliases(self, change_map):
+203         """
+204         Relabel the alias values of any children. 'change_map' is a dictionary
+205         mapping old (current) alias values to the new values.
+206         """
+207         for pos, child in enumerate(self.children):
+208             if hasattr(child, "relabel_aliases"):
+209                 # For example another WhereNode
+210                 child.relabel_aliases(change_map)
+211             elif hasattr(child, "relabeled_clone"):
+212                 self.children[pos] = child.relabeled_clone(change_map)
+213 
+214     def clone(self):
+215         clone = self.create(connector=self.connector, negated=self.negated)
+216         for child in self.children:
+217             if hasattr(child, "clone"):
+218                 child = child.clone()
+219             clone.children.append(child)
+220         return clone
+221 
+222     def relabeled_clone(self, change_map):
+223         clone = self.clone()
+224         clone.relabel_aliases(change_map)
+225         return clone
+226 
+227     def replace_expressions(self, replacements):
+228         if replacement := replacements.get(self):
+229             return replacement
+230         clone = self.create(connector=self.connector, negated=self.negated)
+231         for child in self.children:
+232             clone.children.append(child.replace_expressions(replacements))
+233         return clone
+234 
+235     def get_refs(self):
+236         refs = set()
+237         for child in self.children:
+238             refs |= child.get_refs()
+239         return refs
+240 
+241     @classmethod
+242     def _contains_aggregate(cls, obj):
+243         if isinstance(obj, tree.Node):
+244             return any(cls._contains_aggregate(c) for c in obj.children)
+245         return obj.contains_aggregate
+246 
+247     @cached_property
+248     def contains_aggregate(self):
+249         return self._contains_aggregate(self)
+250 
+251     @classmethod
+252     def _contains_over_clause(cls, obj):
+253         if isinstance(obj, tree.Node):
+254             return any(cls._contains_over_clause(c) for c in obj.children)
+255         return obj.contains_over_clause
+256 
+257     @cached_property
+258     def contains_over_clause(self):
+259         return self._contains_over_clause(self)
+260 
+261     @property
+262     def is_summary(self):
+263         return any(child.is_summary for child in self.children)
+264 
+265     @staticmethod
+266     def _resolve_leaf(expr, query, *args, **kwargs):
+267         if hasattr(expr, "resolve_expression"):
+268             expr = expr.resolve_expression(query, *args, **kwargs)
+269         return expr
+270 
+271     @classmethod
+272     def _resolve_node(cls, node, query, *args, **kwargs):
+273         if hasattr(node, "children"):
+274             for child in node.children:
+275                 cls._resolve_node(child, query, *args, **kwargs)
+276         if hasattr(node, "lhs"):
+277             node.lhs = cls._resolve_leaf(node.lhs, query, *args, **kwargs)
+278         if hasattr(node, "rhs"):
+279             node.rhs = cls._resolve_leaf(node.rhs, query, *args, **kwargs)
+280 
+281     def resolve_expression(self, *args, **kwargs):
+282         clone = self.clone()
+283         clone._resolve_node(clone, *args, **kwargs)
+284         clone.resolved = True
+285         return clone
+286 
+287     @cached_property
+288     def output_field(self):
+289         from django.db.models import BooleanField
+290 
+291         return BooleanField()
+292 
+293     @property
+294     def _output_field_or_none(self):
+295         return self.output_field
+296 
+297     def select_format(self, compiler, sql, params):
+298         # Wrap filters with a CASE WHEN expression if a database backend
+299         # (e.g. Oracle) doesn't support boolean expression in SELECT or GROUP
+300         # BY list.
+301         if not compiler.connection.features.supports_boolean_expr_in_select_clause:
+302             sql = f"CASE WHEN {sql} THEN 1 ELSE 0 END"
+303         return sql, params
+304 
+305     def get_db_converters(self, connection):
+306         return self.output_field.get_db_converters(connection)
+307 
+308     def get_lookup(self, lookup):
+309         return self.output_field.get_lookup(lookup)
+310 
+311     def leaves(self):
+312         for child in self.children:
+313             if isinstance(child, WhereNode):
+314                 yield from child.leaves()
+315             else:
+316                 yield child
+317 
+318 
+319 class NothingNode:
+320     """A node that matches nothing."""
+321 
+322     contains_aggregate = False
+323     contains_over_clause = False
+324 
+325     def as_sql(self, compiler=None, connection=None):
+326         raise EmptyResultSet
+327 
+328 
+329 class ExtraWhere:
+330     # The contents are a black box - assume no aggregates or windows are used.
+331     contains_aggregate = False
+332     contains_over_clause = False
+333 
+334     def __init__(self, sqls, params):
+335         self.sqls = sqls
+336         self.params = params
+337 
+338     def as_sql(self, compiler=None, connection=None):
+339         sqls = ["(%s)" % sql for sql in self.sqls]
+340         return " AND ".join(sqls), list(self.params or ())
+341 
+342 
+343 class SubqueryConstraint:
+344     # Even if aggregates or windows would be used in a subquery,
+345     # the outer query isn't interested about those.
+346     contains_aggregate = False
+347     contains_over_clause = False
+348 
+349     def __init__(self, alias, columns, targets, query_object):
+350         self.alias = alias
+351         self.columns = columns
+352         self.targets = targets
+353         query_object.clear_ordering(clear_default=True)
+354         self.query_object = query_object
+355 
+356     def as_sql(self, compiler, connection):
+357         query = self.query_object
+358         query.set_values(self.targets)
+359         query_compiler = query.get_compiler(connection=connection)
+360         return query_compiler.as_subquery_condition(self.alias, self.columns, compiler)
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `django/db/models/sql/where.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/django/db/models/sql/where.py b/django/db/models/sql/where.py
+--- a/django/db/models/sql/where.py
++++ b/django/db/models/sql/where.py
+@@ -6,6 +6,7 @@
+ 
+ from django.core.exceptions import EmptyResultSet, FullResultSet
+ from django.db.models.expressions import Case, When
++from django.db.models.functions import Mod
+ from django.db.models.lookups import Exact
+ from django.utils import tree
+ from django.utils.functional import cached_property
+@@ -129,12 +130,16 @@ def as_sql(self, compiler, connection):
+             # Convert if the database doesn't support XOR:
+             #   a XOR b XOR c XOR ...
+             # to:
+-            #   (a OR b OR c OR ...) AND (a + b + c + ...) == 1
++            #   (a OR b OR c OR ...) AND MOD(a + b + c + ..., 2) == 1
++            # The result of an n-ary XOR is true when an odd number of operands
++            # are true.
+             lhs = self.__class__(self.children, OR)
+             rhs_sum = reduce(
+                 operator.add,
+                 (Case(When(c, then=1), default=0) for c in self.children),
+             )
++            if len(self.children) > 2:
++                rhs_sum = Mod(rhs_sum, 2)
+             rhs = Exact(1, rhs_sum)
+             return self.__class__([lhs, rhs], AND, self.negated).as_sql(
+                 compiler, connection
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/django/db/models/sql/where.py b/django/db/models/sql/where.py
+index aaab1730b7..375b20c032 100644
+--- a/django/db/models/sql/where.py
++++ b/django/db/models/sql/where.py
+@@ -129,13 +129,14 @@ class WhereNode(tree.Node):
+             # Convert if the database doesn't support XOR:
+             #   a XOR b XOR c XOR ...
+             # to:
+-            #   (a OR b OR c OR ...) AND (a + b + c + ...) == 1
++            #   (a OR b OR c OR ...) AND (a + b + c + ...) % 2 == 1
+             lhs = self.__class__(self.children, OR)
+             rhs_sum = reduce(
+                 operator.add,
+                 (Case(When(c, then=1), default=0) for c in self.children),
+             )
+-            rhs = Exact(1, rhs_sum)
++            # Use modulo 2 to check for odd number of true conditions
++            rhs = Exact(1, rhs_sum % 2)
+             return self.__class__([lhs, rhs], AND, self.negated).as_sql(
+                 compiler, connection
+             )
+diff --git a/test.db b/test.db
+new file mode 100644
+index 0000000000..8f1410e897
+Binary files /dev/null and b/test.db differ
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `tests/xor_lookups/tests.py` that contains the existing tests.
+-----------------------------------------------------------
+from django.db.models import Q
+from django.test import TestCase
+
+from .models import Number
+
+
+class XorLookupsTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.numbers = [Number.objects.create(num=i) for i in range(10)]
+
+    def test_filter(self):
+        self.assertCountEqual(
+            Number.objects.filter(num__lte=7) ^ Number.objects.filter(num__gte=3),
+            self.numbers[:3] + self.numbers[8:],
+        )
+        self.assertCountEqual(
+            Number.objects.filter(Q(num__lte=7) ^ Q(num__gte=3)),
+            self.numbers[:3] + self.numbers[8:],
+        )
+
+    def test_filter_multiple(self):
+        qs = Number.objects.filter(
+            Q(num__gte=1)
+            ^ Q(num__gte=3)
+            ^ Q(num__gte=5)
+            ^ Q(num__gte=7)
+            ^ Q(num__gte=9)
+        )
+        self.assertCountEqual(
+            qs,
+            self.numbers[1:3] + self.numbers[5:7] + self.numbers[9:],
+        )
+        self.assertCountEqual(
+            qs.values_list("num", flat=True),
+            [
+                i
+                for i in range(10)
+                if (i >= 1) ^ (i >= 3) ^ (i >= 5) ^ (i >= 7) ^ (i >= 9)
+            ],
+        )
+
+    def test_filter_negated(self):
+        self.assertCountEqual(
+            Number.objects.filter(Q(num__lte=7) ^ ~Q(num__lt=3)),
+            self.numbers[:3] + self.numbers[8:],
+        )
+        self.assertCountEqual(
+            Number.objects.filter(~Q(num__gt=7) ^ ~Q(num__lt=3)),
+            self.numbers[:3] + self.numbers[8:],
+        )
+        self.assertCountEqual(
+            Number.objects.filter(Q(num__lte=7) ^ ~Q(num__lt=3) ^ Q(num__lte=1)),
+            [self.numbers[2]] + self.numbers[8:],
+        )
+        self.assertCountEqual(
+            Number.objects.filter(~(Q(num__lte=7) ^ ~Q(num__lt=3) ^ Q(num__lte=1))),
+            self.numbers[:2] + self.numbers[3:8],
+        )
+
+    def test_exclude(self):
+        self.assertCountEqual(
+            Number.objects.exclude(Q(num__lte=7) ^ Q(num__gte=3)),
+            self.numbers[3:8],
+        )
+
+    def test_stages(self):
+        numbers = Number.objects.all()
+        self.assertSequenceEqual(
+            numbers.filter(num__gte=0) ^ numbers.filter(num__lte=11),
+            [],
+        )
+        self.assertSequenceEqual(
+            numbers.filter(num__gt=0) ^ numbers.filter(num__lt=11),
+            [self.numbers[0]],
+        )
+
+    def test_pk_q(self):
+        self.assertCountEqual(
+            Number.objects.filter(Q(pk=self.numbers[0].pk) ^ Q(pk=self.numbers[1].pk)),
+            self.numbers[:2],
+        )
+
+    def test_empty_in(self):
+        self.assertCountEqual(
+            Number.objects.filter(Q(pk__in=[]) ^ Q(num__gte=5)),
+            self.numbers[5:],
+        )
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""

@@ -1,0 +1,216 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise SQLCompiler.find_ordering_name logic to ensure that the decision to append a related model's default ordering is based on the last lookup piece (pieces[-1]) rather than the whole lookup string. They verify that when the last lookup piece equals the field.attname, the related model's default ordering is NOT appended. They also check direction handling, non-relation fields, multiple targets, infinite-loop detection and behavior when the last piece is different. The tests are implemented by monkeypatching SQLCompiler._setup_joins to return controlled values so the tests don't need a database or real models.
+test_code: |
+  from django.test import SimpleTestCase
+  from django.db.models.sql.compiler import SQLCompiler
+  from django.db.models.expressions import OrderBy, Value
+  from django.core.exceptions import FieldError
+  
+  
+  class DummyField:
+      def __init__(self, is_relation=True, attname=''):
+          self.is_relation = is_relation
+          self.attname = attname
+  
+  class DummyOpts:
+      def __init__(self, ordering):
+          self.ordering = ordering
+  
+  class FakeQuery:
+      def __init__(self):
+          # Minimal structure used by SQLCompiler in these tests.
+          self.alias_map = {}
+  
+  class FakeConnection:
+      pass
+  
+  
+  class FindOrderingNameTests(SimpleTestCase):
+      def make_compiler_with_setup(self, setup_map):
+          """
+          Create a SQLCompiler instance and monkeypatch its _setup_joins method.
+  
+          setup_map: dict mapping tuple(pieces) -> return tuple expected by _setup_joins:
+              (field, targets, alias, joins, path, opts, transform_function)
+          """
+          compiler = SQLCompiler(query=FakeQuery(), connection=FakeConnection(), using='default')
+  
+          def _setup_joins(pieces, opts, alias):
+              key = tuple(pieces)
+              if key not in setup_map:
+                  raise AssertionError("Unexpected pieces passed to _setup_joins: %r" % (pieces,))
+              return setup_map[key]
+  
+          compiler._setup_joins = _setup_joins
+          return compiler
+  
+      def test_no_default_ordering_appended_when_last_piece_is_attname_simple(self):
+          # name = 'rel__foo', last piece 'foo' equals field.attname -> don't append opts.ordering.
+          name = 'rel__foo'
+          field = DummyField(is_relation=True, attname='foo')
+          targets = ['T1']
+          joins = ['a']
+          opts = DummyOpts(ordering=[OrderBy(Value(1))])  # default ordering exists
+          def transform(t, alias):
+              return Value(t)
+  
+          setup_map = {
+              tuple(name.split('__')): (field, targets, 'A', joins, None, opts, transform),
+          }
+          compiler = self.make_compiler_with_setup(setup_map)
+          res = compiler.find_ordering_name(name, opts=None)
+          # Expect exactly one ordering term (from targets) and no additional ordering from opts.ordering.
+          self.assertEqual(len(res), len(targets))
+          self.assertTrue(all(isinstance(r[0], OrderBy) and r[1] is False for r in res))
+  
+      def test_no_default_ordering_appended_with_descending_prefix(self):
+          name = '-rel__foo'
+          # ensure get_order_dir handles '-' and descending flag is passed through
+          field = DummyField(is_relation=True, attname='foo')
+          targets = ['T1']
+          joins = ['a']
+          opts = DummyOpts(ordering=[OrderBy(Value(1))])
+          def transform(t, alias):
+              return Value(t)
+  
+          setup_map = {
+              tuple('rel__foo'.split('__')): (field, targets, 'A', joins, None, opts, transform),
+          }
+          compiler = self.make_compiler_with_setup(setup_map)
+          res = compiler.find_ordering_name(name, opts=None)
+          self.assertEqual(len(res), 1)
+          # The OrderBy should reflect descending because of the '-' prefix.
+          self.assertTrue(res[0][0].descending)
+  
+      def test_no_default_ordering_with_multiple_targets(self):
+          name = 'rel__foo'
+          field = DummyField(is_relation=True, attname='foo')
+          targets = ['T1', 'T2', 'T3']
+          joins = ['a']
+          opts = DummyOpts(ordering=[OrderBy(Value(1)), OrderBy(Value(2))])
+          def transform(t, alias):
+              return Value(t)
+  
+          setup_map = {
+              tuple(name.split('__')): (field, targets, 'A', joins, None, opts, transform),
+          }
+          compiler = self.make_compiler_with_setup(setup_map)
+          res = compiler.find_ordering_name(name, opts=None)
+          # Should only return one OrderBy per target and not include opts.ordering items.
+          self.assertEqual(len(res), len(targets))
+  
+      def test_default_ordering_appended_when_last_piece_is_not_attname(self):
+          # name = 'rel__bar', last piece 'bar' != field.attname 'foo' -> append opts.ordering
+          name = 'rel__bar'
+          field = DummyField(is_relation=True, attname='foo')
+          targets = ['T1']
+          joins = ['a']
+          # opts.ordering has one OrderBy; if appended, result length should be 1(targets)+1(ordering)
+          opts = DummyOpts(ordering=[OrderBy(Value(1))])
+          def transform(t, alias):
+              return Value(t)
+  
+          setup_map = {
+              tuple(name.split('__')): (field, targets, 'A', joins, None, opts, transform),
+              # If the code tries to recurse for opts.ordering strings, ensure it finds something,
+              # but in this setup opts.ordering contains OrderBy instances which avoid recursion.
+          }
+          compiler = self.make_compiler_with_setup(setup_map)
+          res = compiler.find_ordering_name(name, opts=None)
+          # Because last piece != attname, opts.ordering should be appended.
+          self.assertEqual(len(res), len(targets) + len(opts.ordering))
+  
+      def test_nested_lookup_multiple_parts_last_piece_attname_no_append(self):
+          name = 'a__b__foo'
+          field = DummyField(is_relation=True, attname='foo')
+          targets = ['T1']
+          joins = ['x']
+          opts = DummyOpts(ordering=[OrderBy(Value(9))])
+          def transform(t, alias):
+              return Value(t)
+  
+          setup_map = {
+              tuple(name.split('__')): (field, targets, 'X', joins, None, opts, transform),
+          }
+          compiler = self.make_compiler_with_setup(setup_map)
+          res = compiler.find_ordering_name(name, opts=None)
+          # last piece equals attname -> no append
+          self.assertEqual(len(res), len(targets))
+  
+      def test_pk_shortcut_not_treated_as_relation(self):
+          # name exactly 'pk' should not enter relation default-ordering branch
+          name = 'pk'
+          field = DummyField(is_relation=True, attname='pk')
+          targets = ['T1']
+          joins = ['x']
+          opts = DummyOpts(ordering=[OrderBy(Value(1))])
+          def transform(t, alias):
+              return Value(t)
+  
+          setup_map = {
+              ('pk',): (field, targets, 'X', joins, None, opts, transform),
+          }
+          compiler = self.make_compiler_with_setup(setup_map)
+          res = compiler.find_ordering_name(name, opts=None)
+          # 'pk' shortcut should not cause using the related model's default ordering
+          self.assertEqual(len(res), len(targets))
+  
+      def test_non_relation_field_returns_direct_ordering(self):
+          name = 'somefield'
+          field = DummyField(is_relation=False, attname='somefield')
+          targets = ['T1']
+          joins = []
+          opts = DummyOpts(ordering=[OrderBy(Value(1))])
+          def transform(t, alias):
+              return Value(t)
+  
+          setup_map = {
+              ('somefield',): (field, targets, 'X', joins, None, opts, transform),
+          }
+          compiler = self.make_compiler_with_setup(setup_map)
+          res = compiler.find_ordering_name(name, opts=None)
+          # Non-relation fields should result in direct ordering on the target(s)
+          self.assertEqual(len(res), len(targets))
+  
+      def test_multiple_ordering_items_appended_when_applicable(self):
+          # When last piece is not attname and opts.ordering contains two items,
+          # both should be appended.
+          name = 'rel__bar'
+          field = DummyField(is_relation=True, attname='foo')
+          targets = ['T1']
+          joins = ['a']
+          opts = DummyOpts(ordering=[OrderBy(Value(1)), OrderBy(Value(2))])
+          def transform(t, alias):
+              return Value(t)
+  
+          setup_map = {
+              tuple(name.split('__')): (field, targets, 'A', joins, None, opts, transform),
+          }
+          compiler = self.make_compiler_with_setup(setup_map)
+          res = compiler.find_ordering_name(name, opts=None)
+          self.assertEqual(len(res), len(targets) + len(opts.ordering))
+  
+      def test_infinite_loop_detection_raises_FieldError(self):
+          # Simulate recursive expansion where an ordering item would cause the same joins tuple.
+          name = 'rel__bar'
+          field = DummyField(is_relation=True, attname='foo')
+          targets = ['T1']
+          joins = ['same_join']
+          # opts.ordering contains a string 'repeat' which will cause recursion into find_ordering_name.
+          opts = DummyOpts(ordering=['repeat'])
+          def transform(t, alias):
+              return Value(t)
+  
+          # For both initial pieces and the recursive 'repeat' pieces, return the same joins.
+          setup_map = {
+              tuple(name.split('__')): (field, targets, 'A', joins, None, opts, transform),
+              ('repeat',): (field, targets, 'A', joins, None, opts, transform),
+          }
+          compiler = self.make_compiler_with_setup(setup_map)
+          # Because recursion will cause the same join tuple, a FieldError is expected.
+          with self.assertRaises(FieldError):
+              compiler.find_ordering_name(name, opts=None)
+test_imports_code: |
+  from django.db.models.expressions import OrderBy, Value
+  from django.core.exceptions import FieldError

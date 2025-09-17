@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 async.tests_llm.HttpMethodNotAllowedAsyncTests.setUp async.tests_llm.HttpMethodNotAllowedAsyncTests.test_allowed_methods_changes_after_setup_head_added async.tests_llm.HttpMethodNotAllowedAsyncTests.test_as_view_callback_returns_coroutine_and_resolves async.tests_llm.HttpMethodNotAllowedAsyncTests.test_dispatch_returns_coroutine_for_async_view_and_awaits async.tests_llm.HttpMethodNotAllowedAsyncTests.test_http_method_not_allowed_awaitable_when_called_via_as_view_dispatch_flow async.tests_llm.HttpMethodNotAllowedAsyncTests.test_http_method_not_allowed_non_coroutine_for_base_view async.tests_llm.HttpMethodNotAllowedAsyncTests.test_http_method_not_allowed_with_post_only_async_subclass async.tests_llm.HttpMethodNotAllowedAsyncTests.test_instance_http_method_not_allowed_async_is_coroutine_and_awaits async.tests_llm.HttpMethodNotAllowedAsyncTests.test_logger_warning_called_for_async_view_before_await async.tests_llm.HttpMethodNotAllowedAsyncTests.test_logger_warning_called_for_sync_view async.tests_llm.HttpMethodNotAllowedAsyncTests.test_multiple_calls_to_http_method_not_allowed_do_not_change_behavior_async
+coverage json -o coverage.json
+: '>>>>> End Test Output'

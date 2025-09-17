@@ -1,0 +1,182 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise VotingClassifier and VotingRegressor behaviors when some estimators are set to None and when sample_weight is provided. They verify that None estimators are ignored when checking support for sample weights, that weights for None estimators are excluded from averaging, that transform/predict_proba shapes account only for non-None estimators, and that setting estimators to None via set_params works with sample_weight. They also check that at least one real estimator is required. The tests use small deterministic mock estimators for clarity.
+test_code: |
+  import numpy as np
+  import pytest
+
+  from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin
+  from sklearn.ensemble import VotingClassifier, VotingRegressor
+  from sklearn.utils.validation import has_fit_parameter
+  from sklearn.utils.testing import assert_array_almost_equal, assert_array_equal, assert_raise_message
+
+  class MockProbaClassifier(BaseEstimator, ClassifierMixin):
+      """A simple classifier that returns a fixed probability matrix."""
+      def __init__(self, proba):
+          # proba shape: (n_samples, n_classes)
+          self.proba = np.asarray(proba)
+
+      def fit(self, X, y, sample_weight=None):
+          # store whether sample_weight was passed (for testing)
+          self.received_sw = sample_weight is not None
+          return self
+
+      def predict(self, X):
+          # return argmax of stored proba (assumes same number of rows)
+          return np.argmax(self.proba, axis=1)
+
+      def predict_proba(self, X):
+          # ignore X, just repeat/provide proba slices up to n_samples
+          n = X.shape[0]
+          if self.proba.shape[0] == n:
+              return self.proba
+          # if proba provided for a single sample, tile it
+          if self.proba.shape[0] == 1:
+              return np.tile(self.proba, (n, 1))
+          raise ValueError("MockProbaClassifier: proba shape mismatch")
+
+  class MockRegressor(BaseEstimator, RegressorMixin):
+      """A simple regressor that returns a fixed prediction vector."""
+      def __init__(self, pred):
+          self.pred = np.asarray(pred)
+
+      def fit(self, X, y, sample_weight=None):
+          self.received_sw = sample_weight is not None
+          return self
+
+      def predict(self, X):
+          n = X.shape[0]
+          if self.pred.shape[0] == n:
+              return self.pred
+          if self.pred.shape[0] == 1:
+              return np.tile(self.pred, n)
+          raise ValueError("MockRegressor: pred shape mismatch")
+
+  def test_weights_not_none_excludes_none_estimator_in_predict_proba():
+      # Two real classifiers with a None in the middle. The weights for the None
+      # estimator should be ignored when averaging probabilities.
+      X = np.zeros((2, 1))
+      y = np.array([0, 1])
+
+      # classifier 1 favors class 0, classifier 3 favors class 1
+      c1 = MockProbaClassifier([[0.9, 0.1], [0.9, 0.1]])
+      c3 = MockProbaClassifier([[0.2, 0.8], [0.2, 0.8]])
+      # weights: c1=1, None=100 (should be ignored), c3=3
+      eclf = VotingClassifier(estimators=[('c1', c1), ('none', None), ('c3', c3)],
+                              voting='soft', weights=[1, 100, 3])
+      eclf.fit(X, y, sample_weight=np.ones(y.shape))
+      # ensure _weights_not_none excludes the weight for the None estimator
+      assert_array_equal(eclf._weights_not_none, [1, 3])
+
+      # compute expected weighted average manually (axis=0 average over classifiers)
+      avg = np.average(np.asarray([c1.predict_proba(X), c3.predict_proba(X)]),
+                       axis=0, weights=[1, 3])
+      got = eclf.predict_proba(X)
+      assert_array_almost_equal(got, avg)
+
+  def test_transform_shapes_with_none_estimator_soft_flatten_true_and_false():
+      # When flatten_transform=True (default), transform should horizontally stack
+      # probabilities from only the non-None estimators.
+      X = np.zeros((3, 1))
+      y = np.array([0, 1, 0])
+      c1 = MockProbaClassifier([[0.6, 0.4]])
+      c2 = MockProbaClassifier([[0.3, 0.7]])
+      eclf_flat = VotingClassifier(estimators=[('c1', c1), ('none', None), ('c2', c2)],
+                                   voting='soft', flatten_transform=True)
+      eclf_flat.fit(X, y)
+      res_flat = eclf_flat.transform(X)
+      # each classifier contributes n_classes columns; we have 2 classifiers × 2 classes
+      assert res_flat.shape == (3, 4)
+
+      eclf_not_flat = VotingClassifier(estimators=[('c1', c1), ('none', None), ('c2', c2)],
+                                       voting='soft', flatten_transform=False)
+      eclf_not_flat.fit(X, y)
+      res_not_flat = eclf_not_flat.transform(X)
+      # shape should be (n_non_none_classifiers, n_samples, n_classes)
+      assert res_not_flat.shape == (2, 3, 2)
+
+  def test_sample_weight_passed_to_estimators_with_none_present():
+      # Ensure that when some estimators are None, the sample_weight check and
+      # passing still works for the real estimators.
+      X = np.zeros((4, 2))
+      y = np.array([0, 1, 0, 1])
+
+      class SwAccepting(BaseEstimator, ClassifierMixin):
+          def fit(self, X, y, sample_weight=None):
+              # assert that sample_weight arrives as keyword arg (or None)
+              # store for inspection
+              self.sw = sample_weight
+              return self
+          def predict(self, X):
+              return np.zeros(X.shape[0], dtype=int)
+          def predict_proba(self, X):
+              return np.tile([0.5, 0.5], (X.shape[0], 1))
+
+      sw_clf = SwAccepting()
+      eclf = VotingClassifier(estimators=[('a', sw_clf), ('b', None)], voting='soft')
+      # Should not raise and should forward sample_weight to the real estimator
+      sw = np.arange(len(y))
+      eclf.fit(X, y, sample_weight=sw)
+      assert hasattr(eclf.named_estimators_['a'], 'sw')
+      assert_array_equal(eclf.named_estimators_['a'].sw, sw)
+
+  def test_set_params_none_then_fit_with_sample_weight_regressor_and_classifier():
+      # set_params should allow setting estimators to None and fitting with sample_weight
+      X = np.zeros((5, 1))
+      y_clf = np.array([0, 1, 0, 1, 0])
+      y_reg = np.array([1., 2., 3., 4., 5.])
+
+      rc1 = MockProbaClassifier([[0.7, 0.3]] * 5)
+      rc2 = MockProbaClassifier([[0.4, 0.6]] * 5)
+      voter = VotingClassifier(estimators=[('a', rc1), ('b', rc2)], voting='soft')
+      voter.set_params(b=None)
+      # should still be able to fit with sample_weight even if one estimator is None
+      voter.fit(X, y_clf, sample_weight=np.ones(y_clf.shape))
+
+      rr1 = MockRegressor([2.0])
+      rr2 = MockRegressor([4.0])
+      vreg = VotingRegressor(estimators=[('r1', rr1), ('r2', rr2)])
+      vreg.set_params(r2=None)
+      vreg.fit(X, y_reg, sample_weight=np.ones(y_reg.shape))
+      preds = vreg.predict(X)
+      # predictions should have same shape as y_reg
+      assert preds.shape == y_reg.shape
+
+  def test_none_estimator_positions_first_and_last_do_not_break_sample_weight_check():
+      # Ensure None in first or last position does not cause issues when sample_weight provided
+      X = np.zeros((3, 1))
+      y = np.array([0, 1, 0])
+
+      c_mid = MockProbaClassifier([[0.5, 0.5]] * 3)
+
+      # None first
+      eclf_first_none = VotingClassifier(estimators=[('none', None), ('c', c_mid)], voting='soft')
+      eclf_first_none.fit(X, y, sample_weight=np.ones(y.shape))
+      assert_array_equal(eclf_first_none.predict(X), c_mid.predict(X))
+
+      # None last
+      eclf_last_none = VotingClassifier(estimators=[('c', c_mid), ('none', None)], voting='soft')
+      eclf_last_none.fit(X, y, sample_weight=np.ones(y.shape))
+      assert_array_equal(eclf_last_none.predict(X), c_mid.predict(X))
+
+  def test_multiple_none_estimators_and_at_least_one_real_required():
+      # If all estimators are None, a ValueError is raised. If mix, fit works.
+      X = np.zeros((2, 1))
+      y = np.array([0, 1])
+
+      c = MockProbaClassifier([[0.5, 0.5], [0.5, 0.5]])
+      eclf = VotingClassifier(estimators=[('a', None), ('b', c), ('c', None)], voting='soft')
+      # should work with mix
+      eclf.fit(X, y)
+      assert 'b' in eclf.named_estimators_
+
+      eclf_all_none = VotingClassifier(estimators=[('a', None), ('b', None)], voting='hard')
+      msg = 'All estimators are None. At least one is required!'
+      assert_raise_message(ValueError, msg, eclf_all_none.fit, X, y)
+new_imports_code: |
+  import numpy as np
+  import pytest
+
+  from sklearn.base import BaseEstimator, RegressorMixin, ClassifierMixin
+  from sklearn.ensemble import VotingClassifier, VotingRegressor
+  from sklearn.utils.testing import assert_array_almost_equal, assert_array_equal, assert_raise_message

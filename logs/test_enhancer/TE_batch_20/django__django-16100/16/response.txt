@@ -1,0 +1,311 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These tests verify that the changelist-view bulk-edit path is wrapped in an
+  atomic transaction using the correct database alias (router.db_for_write(self.model)).
+  They patch the FormSet used by the changelist, provide controlled forms (changed /
+  unchanged), and assert that transaction.atomic was invoked with the expected
+  using=... argument. The gold patch calls transaction.atomic(using=router.db_for_write(self.model))
+  and will pass these assertions; the candidate patch that calls transaction.atomic()
+  without the using argument will fail these tests.
+test_code: |
+  from unittest.mock import patch, MagicMock
+  from django.test import TestCase
+  from django.test.client import RequestFactory
+  from django.contrib.auth.models import User
+  from django.urls import reverse
+  from django.core.exceptions import ValidationError
+  from django.db import DatabaseError
+  from django.contrib import admin
+  from django.contrib.admin.options import ModelAdmin
+  from django.contrib.admin.tests import AdminSeleniumTestCase  # imported to ensure test app context
+  from django.contrib.admin.views.main import ALL_VAR
+  from django.db import router
+  
+  from .models import Swallow
+  
+  class TransactionAtomicTests(TestCase):
+      @classmethod
+      def setUpTestData(cls):
+          cls.superuser = User.objects.create_superuser(
+              username="atomic_super", email="a@b.com", password="pwd"
+          )
+  
+      def setUp(self):
+          self.factory = RequestFactory()
+          # create a couple of swallows to reference by PKs in the fake formset
+          Swallow.objects.all().delete()
+          self.a = Swallow.objects.create(origin="A", load=1, speed=1)
+          self.b = Swallow.objects.create(origin="B", load=2, speed=2)
+  
+      def _make_request(self, post_data=None):
+          data = {
+              "form-TOTAL_FORMS": "2",
+              "form-INITIAL_FORMS": "2",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(self.a.pk),
+              "form-1-uuid": str(self.b.pk),
+              "_save": "Save",
+          }
+          if post_data:
+              data.update(post_data)
+          request = self.factory.post(reverse("admin:admin_changelist_swallow_changelist"), data=data)
+          request.user = self.superuser
+          return request
+  
+      def _patch_get_changelist_instance(self, admin_instance):
+          """
+          Patch the admin_instance.get_changelist_instance to return a dummy
+          object with list_editable True and a get_queryset method.
+          """
+          class DummyCL:
+              list_editable = True
+              is_popup = False
+              to_field = None
+              opts = admin_instance.opts
+              result_list = []
+              def get_queryset(self, request):
+                  return admin_instance.get_queryset(request)
+  
+          patcher = patch.object(admin_instance, "get_changelist_instance", return_value=DummyCL())
+          patcher.start()
+          self.addCleanup(patcher.stop)
+  
+      def _make_fake_formset_class(self, changed_flags, prefix="form"):
+          """
+          Create a Fake FormSet class with get_default_prefix returning prefix and
+          that, when instantiated, has .is_valid() True and .forms list with form objects
+          whose has_changed() return values are driven by changed_flags list.
+          """
+          class FakeForm:
+              def __init__(self, changed, instance):
+                  self._changed = changed
+                  self.instance = instance
+              def has_changed(self):
+                  return self._changed
+  
+          class FakeFormSet:
+              @classmethod
+              def get_default_prefix(cls):
+                  return prefix
+              def __init__(self, data, files, queryset):
+                  # Build instances for forms from queryset in order to have .instance
+                  instances = list(queryset)
+                  self.forms = []
+                  # If not enough instances, repeat last one to match length
+                  for idx, flag in enumerate(changed_flags):
+                      inst = instances[idx] if idx < len(instances) else (instances[-1] if instances else None)
+                      self.forms.append(FakeForm(flag, inst))
+              def is_valid(self):
+                  return True
+              @property
+              def media(self):
+                  return None
+          return FakeFormSet
+  
+      def test_atomic_called_with_using_single_changed_form(self):
+          m = admin.site._registry.get(Swallow) or admin.ModelAdmin(Swallow, admin.site)
+          # Ensure we use a ModelAdmin instance for Swallow
+          m = admin.site._registry.get(Swallow, None) or admin.ModelAdmin(Swallow, admin.site)
+          # if not registered in current admin.site, create local instance
+          model_admin = type("MA", (ModelAdmin,), {}) (Swallow, admin.site)
+  
+          self._patch_get_changelist_instance(model_admin)
+  
+          # Formset where only first form changed
+          FakeFormSet = self._make_fake_formset_class([True, False], prefix="form")
+          patcher = patch.object(model_admin, "get_changelist_formset", return_value=FakeFormSet)
+          patcher.start()
+          self.addCleanup(patcher.stop)
+  
+          # Patch out save operations to avoid touching DB beyond what's necessary
+          patcher_sf = patch.object(model_admin, "save_form", return_value=self.a)
+          patcher_sm = patch.object(model_admin, "save_model", return_value=None)
+          patcher_sr = patch.object(model_admin, "save_related", return_value=None)
+          patcher_lc = patch.object(model_admin, "log_change", return_value=None)
+          patcher_sf.start(); patcher_sm.start(); patcher_sr.start(); patcher_lc.start()
+          self.addCleanup(patcher_sf.stop); self.addCleanup(patcher_sm.stop)
+          self.addCleanup(patcher_sr.stop); self.addCleanup(patcher_lc.stop)
+  
+          request = self._make_request()
+  
+          with patch("django.contrib.admin.options.transaction.atomic") as atomic_mock:
+              response = model_admin.changelist_view(request)
+              # The view should redirect after successful save
+              self.assertEqual(response.status_code, 302)
+              # transaction.atomic must be invoked with using equal to router.db_for_write(model)
+              expected_using = router.db_for_write(model_admin.model)
+              atomic_mock.assert_called_once_with(using=expected_using)
+  
+      def test_atomic_called_with_using_multiple_changed_forms(self):
+          model_admin = type("MA", (ModelAdmin,), {}) (Swallow, admin.site)
+          self._patch_get_changelist_instance(model_admin)
+          FakeFormSet = self._make_fake_formset_class([True, True], prefix="form")
+          patcher = patch.object(model_admin, "get_changelist_formset", return_value=FakeFormSet)
+          patcher.start()
+          self.addCleanup(patcher.stop)
+          patcher_sf = patch.object(model_admin, "save_form", return_value=self.a)
+          patcher_sm = patch.object(model_admin, "save_model", return_value=None)
+          patcher_sr = patch.object(model_admin, "save_related", return_value=None)
+          patcher_lc = patch.object(model_admin, "log_change", return_value=None)
+          patcher_sf.start(); patcher_sm.start(); patcher_sr.start(); patcher_lc.start()
+          self.addCleanup(patcher_sf.stop); self.addCleanup(patcher_sm.stop)
+          self.addCleanup(patcher_sr.stop); self.addCleanup(patcher_lc.stop)
+          request = self._make_request()
+          with patch("django.contrib.admin.options.transaction.atomic") as atomic_mock:
+              response = model_admin.changelist_view(request)
+              self.assertEqual(response.status_code, 302)
+              atomic_mock.assert_called_once_with(using=router.db_for_write(model_admin.model))
+  
+      def test_atomic_called_with_using_some_changed_some_not(self):
+          model_admin = type("MA", (ModelAdmin,), {}) (Swallow, admin.site)
+          self._patch_get_changelist_instance(model_admin)
+          FakeFormSet = self._make_fake_formset_class([False, True], prefix="form")
+          patcher = patch.object(model_admin, "get_changelist_formset", return_value=FakeFormSet)
+          patcher.start(); self.addCleanup(patcher.stop)
+          patcher_sf = patch.object(model_admin, "save_form", return_value=self.b)
+          patcher_sm = patch.object(model_admin, "save_model", return_value=None)
+          patcher_sr = patch.object(model_admin, "save_related", return_value=None)
+          patcher_lc = patch.object(model_admin, "log_change", return_value=None)
+          patcher_sf.start(); patcher_sm.start(); patcher_sr.start(); patcher_lc.start()
+          self.addCleanup(patcher_sf.stop); self.addCleanup(patcher_sm.stop)
+          self.addCleanup(patcher_sr.stop); self.addCleanup(patcher_lc.stop)
+          request = self._make_request()
+          with patch("django.contrib.admin.options.transaction.atomic") as atomic_mock:
+              response = model_admin.changelist_view(request)
+              self.assertEqual(response.status_code, 302)
+              atomic_mock.assert_called_once_with(using=router.db_for_write(model_admin.model))
+  
+      def test_atomic_called_with_using_no_changed_forms(self):
+          """
+          Even if no individual forms report has_changed() True, the atomic()
+          context in the gold patch wraps the processing and must be called.
+          """
+          model_admin = type("MA", (ModelAdmin,), {}) (Swallow, admin.site)
+          self._patch_get_changelist_instance(model_admin)
+          FakeFormSet = self._make_fake_formset_class([False, False], prefix="form")
+          patcher = patch.object(model_admin, "get_changelist_formset", return_value=FakeFormSet)
+          patcher.start(); self.addCleanup(patcher.stop)
+          # No save operations should be called, but atomic still used
+          request = self._make_request()
+          with patch("django.contrib.admin.options.transaction.atomic") as atomic_mock:
+              response = model_admin.changelist_view(request)
+              self.assertEqual(response.status_code, 302)
+              atomic_mock.assert_called_once_with(using=router.db_for_write(model_admin.model))
+  
+      def test_atomic_called_with_using_regex_prefix(self):
+          """
+          Ensure that prefixes containing regex-significant characters are handled
+          and the database atomic() call uses the right using argument.
+          """
+          model_admin = type("MA", (ModelAdmin,), {}) (Swallow, admin.site)
+          self._patch_get_changelist_instance(model_admin)
+          # Use a prefix with a regex-special char "$"
+          FakeFormSet = self._make_fake_formset_class([True, False], prefix="form$")
+          patcher = patch.object(model_admin, "get_changelist_formset", return_value=FakeFormSet)
+          patcher.start(); self.addCleanup(patcher.stop)
+          patcher_sf = patch.object(model_admin, "save_form", return_value=self.a)
+          patcher_sm = patch.object(model_admin, "save_model", return_value=None)
+          patcher_sr = patch.object(model_admin, "save_related", return_value=None)
+          patcher_lc = patch.object(model_admin, "log_change", return_value=None)
+          patcher_sf.start(); patcher_sm.start(); patcher_sr.start(); patcher_lc.start()
+          self.addCleanup(patcher_sf.stop); self.addCleanup(patcher_sm.stop)
+          self.addCleanup(patcher_sr.stop); self.addCleanup(patcher_lc.stop)
+          # Make POST keys use the regex-like prefix
+          post = {"form$-0-uuid": str(self.a.pk), "form$-1-uuid": str(self.b.pk)}
+          request = self._make_request(post_data=post)
+          with patch("django.contrib.admin.options.transaction.atomic") as atomic_mock:
+              response = model_admin.changelist_view(request)
+              self.assertEqual(response.status_code, 302)
+              atomic_mock.assert_called_once_with(using=router.db_for_write(model_admin.model))
+  
+      def test_atomic_called_with_using_router_db_different(self):
+          """
+          Confirm that the using argument is taken from router.db_for_write(self.model).
+          Patch router.db_for_write to return a sentinel name and assert atomic called with it.
+          """
+          model_admin = type("MA", (ModelAdmin,), {}) (Swallow, admin.site)
+          self._patch_get_changelist_instance(model_admin)
+          FakeFormSet = self._make_fake_formset_class([True, True], prefix="form")
+          patcher = patch.object(model_admin, "get_changelist_formset", return_value=FakeFormSet)
+          patcher.start(); self.addCleanup(patcher.stop)
+          patcher_sf = patch.object(model_admin, "save_form", return_value=self.a)
+          patcher_sm = patch.object(model_admin, "save_model", return_value=None)
+          patcher_sr = patch.object(model_admin, "save_related", return_value=None)
+          patcher_lc = patch.object(model_admin, "log_change", return_value=None)
+          patcher_sf.start(); patcher_sm.start(); patcher_sr.start(); patcher_lc.start()
+          self.addCleanup(patcher_sf.stop); self.addCleanup(patcher_sm.stop)
+          self.addCleanup(patcher_sr.stop); self.addCleanup(patcher_lc.stop)
+  
+          request = self._make_request()
+          with patch("django.contrib.admin.options.router.db_for_write", return_value="other_db"):
+              with patch("django.contrib.admin.options.transaction.atomic") as atomic_mock:
+                  response = model_admin.changelist_view(request)
+                  self.assertEqual(response.status_code, 302)
+                  atomic_mock.assert_called_once_with(using="other_db")
+  
+      def test_atomic_called_when_log_change_raises(self):
+          """
+          If log_change raises, the exception should propagate and atomic() must have
+          been entered with the correct using argument.
+          """
+          model_admin = type("MA", (ModelAdmin,), {}) (Swallow, admin.site)
+          self._patch_get_changelist_instance(model_admin)
+          FakeFormSet = self._make_fake_formset_class([True, True], prefix="form")
+          patcher = patch.object(model_admin, "get_changelist_formset", return_value=FakeFormSet)
+          patcher.start(); self.addCleanup(patcher.stop)
+          patch.object(model_admin, "save_form", return_value=self.a).start()
+          patch.object(model_admin, "save_model", return_value=None).start()
+          patch.object(model_admin, "save_related", return_value=None).start()
+          # Make log_change raise DatabaseError on call so we can assert atomic was used
+          patch.object(model_admin, "log_change", side_effect=DatabaseError).start()
+          request = self._make_request()
+          with patch("django.contrib.admin.options.transaction.atomic") as atomic_mock:
+              with self.assertRaises(DatabaseError):
+                  model_admin.changelist_view(request)
+              atomic_mock.assert_called_once_with(using=router.db_for_write(model_admin.model))
+  
+      def test_atomic_called_when_save_related_raises(self):
+          """
+          If save_related raises, the exception should propagate and atomic() must have
+          been entered with the correct using argument.
+          """
+          model_admin = type("MA", (ModelAdmin,), {}) (Swallow, admin.site)
+          self._patch_get_changelist_instance(model_admin)
+          FakeFormSet = self._make_fake_formset_class([True, False], prefix="form")
+          patcher = patch.object(model_admin, "get_changelist_formset", return_value=FakeFormSet)
+          patcher.start(); self.addCleanup(patcher.stop)
+          patch.object(model_admin, "save_form", return_value=self.a).start()
+          patch.object(model_admin, "save_model", return_value=None).start()
+          patch.object(model_admin, "log_change", return_value=None).start()
+          # Make save_related raise to simulate an error during related-object save
+          patch.object(model_admin, "save_related", side_effect=RuntimeError("save_related failed")).start()
+          request = self._make_request()
+          with patch("django.contrib.admin.options.transaction.atomic") as atomic_mock:
+              with self.assertRaises(RuntimeError):
+                  model_admin.changelist_view(request)
+              atomic_mock.assert_called_once_with(using=router.db_for_write(model_admin.model))
+  
+      def test_atomic_called_exactly_once_even_with_multiple_changed_forms(self):
+          """
+          Ensure atomic() is invoked exactly once for the bulk edit operation,
+          even if multiple forms trigger saves.
+          """
+          model_admin = type("MA", (ModelAdmin,), {}) (Swallow, admin.site)
+          self._patch_get_changelist_instance(model_admin)
+          FakeFormSet = self._make_fake_formset_class([True, True, True][:2], prefix="form")
+          patcher = patch.object(model_admin, "get_changelist_formset", return_value=FakeFormSet)
+          patcher.start(); self.addCleanup(patcher.stop)
+          patch.object(model_admin, "save_form", return_value=self.a).start()
+          patch.object(model_admin, "save_model", return_value=None).start()
+          patch.object(model_admin, "save_related", return_value=None).start()
+          patch.object(model_admin, "log_change", return_value=None).start()
+          request = self._make_request()
+          with patch("django.contrib.admin.options.transaction.atomic") as atomic_mock:
+              response = model_admin.changelist_view(request)
+              self.assertEqual(response.status_code, 302)
+              # Called once only
+              atomic_mock.assert_called_once_with(using=router.db_for_write(model_admin.model))
+new_imports_code: |
+  from unittest.mock import patch, MagicMock

@@ -1,0 +1,160 @@
+# No additional imports required beyond those in test_code.
+from django.db.models import F
+from django.test import TestCase
+
+from .models import Note, Number
+
+class ExpressionLike:
+    """
+    A thin wrapper that pretends to be an expression by exposing
+    resolve_expression and returning the wrapped real expression.
+    """
+
+    def __init__(self, expr, counter=None):
+        self._expr = expr
+        # Optional mutable counter (e.g., a dict) so tests can assert resolve_expression was called.
+        self.counter = counter
+
+    def resolve_expression(self, *args, **kwargs):
+        if self.counter is not None:
+            self.counter['count'] += 1
+        return self._expr
+
+    def __repr__(self):
+        return f"ExpressionLike({self._expr!r})"
+
+
+class BulkUpdateExpressionLikeTests(TestCase):
+    def test_single_expression_like_charfield(self):
+        note = Note.objects.create(note='alpha', misc='old')
+        note.misc = ExpressionLike(F('note'))
+        Note.objects.bulk_update([note], ['misc'])
+        note.refresh_from_db()
+        self.assertEqual(note.misc, 'alpha')
+
+    def test_multiple_expression_like_charfield(self):
+        notes = [
+            Note.objects.create(note=f'item{i}', misc='old')
+            for i in range(5)
+        ]
+        for n in notes:
+            n.misc = ExpressionLike(F('note'))
+        Note.objects.bulk_update(notes, ['misc'])
+        self.assertCountEqual(
+            Note.objects.values_list('misc', flat=True),
+            [n.note for n in notes]
+        )
+
+    def test_expression_like_with_batch_size_one(self):
+        notes = [
+            Note.objects.create(note=f'b{i}', misc='old')
+            for i in range(3)
+        ]
+        for n in notes:
+            n.misc = ExpressionLike(F('note'))
+        # Force multiple batches
+        rows = Note.objects.bulk_update(notes, ['misc'], batch_size=1)
+        # Each batch updates 1 row, total should be len(notes)
+        self.assertEqual(rows, len(notes))
+        self.assertCountEqual(
+            Note.objects.values_list('misc', flat=True),
+            [n.note for n in notes]
+        )
+
+    def test_expression_like_on_integer_field(self):
+        numbers = [Number.objects.create(num=0) for _ in range(4)]
+        for num in numbers:
+            # ExpressionLike wrapping an arithmetic expression
+            num.num = ExpressionLike(F('num') + 1)
+        Number.objects.bulk_update(numbers, ['num'])
+        self.assertCountEqual(Number.objects.filter(num=1), numbers)
+
+    def test_mixed_expression_like_and_F(self):
+        notes = [
+            Note.objects.create(note=f'mix{i}', misc='old')
+            for i in range(4)
+        ]
+        # Alternate between real F and ExpressionLike(F(...))
+        for i, n in enumerate(notes):
+            if i % 2:
+                n.misc = F('note')
+            else:
+                n.misc = ExpressionLike(F('note'))
+        Note.objects.bulk_update(notes, ['misc'])
+        self.assertCountEqual(
+            Note.objects.values_list('misc', flat=True),
+            [n.note for n in notes]
+        )
+
+    def test_duplicates_in_list_with_expression_like(self):
+        note = Note.objects.create(note='dup', misc='old')
+        note.misc = ExpressionLike(F('note'))
+        # Passing same object twice; behavior should match existing semantics.
+        rows = Note.objects.bulk_update([note, note], ['misc'])
+        # According to existing semantics, duplicates in different batches count separately.
+        # With a default batch size large enough, duplicates in same batch count once.
+        # We assert at least one row updated and value set correctly.
+        self.assertGreaterEqual(rows, 1)
+        note.refresh_from_db()
+        self.assertEqual(note.misc, 'dup')
+
+    def test_expression_like_and_none_values(self):
+        notes = [
+            Note.objects.create(note=f'null{i}', misc='old')
+            for i in range(3)
+        ]
+        # First stays None, others use expression-like
+        notes[0].misc = None
+        notes[1].misc = ExpressionLike(F('note'))
+        notes[2].misc = ExpressionLike(F('note'))
+        Note.objects.bulk_update(notes, ['misc'])
+        refreshed = list(Note.objects.order_by('pk'))
+        self.assertIsNone(refreshed[0].misc)
+        self.assertEqual(refreshed[1].misc, refreshed[1].note)
+        self.assertEqual(refreshed[2].misc, refreshed[2].note)
+
+    def test_resolve_expression_is_called_for_each_instance(self):
+        notes = [
+            Note.objects.create(note=f'call{i}', misc='old')
+            for i in range(4)
+        ]
+        counter = {'count': 0}
+        for n in notes:
+            n.misc = ExpressionLike(F('note'), counter=counter)
+        Note.objects.bulk_update(notes, ['misc'])
+        # Expect resolve_expression to be invoked at least once per instance during SQL compilation.
+        self.assertGreaterEqual(counter['count'], len(notes))
+
+    def test_expression_like_in_large_batches(self):
+        notes = [Note.objects.create(note=f'lb{i}', misc='old') for i in range(30)]
+        for n in notes:
+            n.misc = ExpressionLike(F('note'))
+        # Use a small batch size to force many batches and exercise batching logic.
+        rows = Note.objects.bulk_update(notes, ['misc'], batch_size=5)
+        self.assertEqual(rows, len(notes))
+        self.assertCountEqual(
+            Note.objects.values_list('misc', flat=True),
+            [n.note for n in notes]
+        )
+
+    def test_mixed_none_and_expression_like_with_duplicates_and_batching(self):
+        notes = [Note.objects.create(note=f'md{i}', misc='old') for i in range(6)]
+        # Some None, some expression-like
+        for i, n in enumerate(notes):
+            if i % 3 == 0:
+                n.misc = None
+            else:
+                n.misc = ExpressionLike(F('note'))
+        # Duplicate some entries to ensure dedup and batching don't break expression-like handling.
+        input_list = notes + [notes[1], notes[2]]
+        rows = Note.objects.bulk_update(input_list, ['misc'], batch_size=2)
+        self.assertGreaterEqual(rows, 4)
+        # Refresh and check values
+        for n in notes:
+            n.refresh_from_db()
+        self.assertIsNone(notes[0].misc)
+        for i in range(1, 6):
+            if i % 3 == 0:
+                self.assertIsNone(notes[i].misc)
+            else:
+                self.assertEqual(notes[i].misc, notes[i].note)

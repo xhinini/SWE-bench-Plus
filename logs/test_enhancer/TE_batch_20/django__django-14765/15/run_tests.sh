@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_state_llm.RealAppsAssertionMessageTests._assert_no_message_assertion migrations.test_state_llm.RealAppsAssertionMessageTests.test_real_apps_bytes_has_no_message migrations.test_state_llm.RealAppsAssertionMessageTests.test_real_apps_dict_has_no_message migrations.test_state_llm.RealAppsAssertionMessageTests.test_real_apps_empty_list_has_no_message migrations.test_state_llm.RealAppsAssertionMessageTests.test_real_apps_empty_tuple_has_no_message migrations.test_state_llm.RealAppsAssertionMessageTests.test_real_apps_frozenset_has_no_message migrations.test_state_llm.RealAppsAssertionMessageTests.test_real_apps_generator_has_no_message migrations.test_state_llm.RealAppsAssertionMessageTests.test_real_apps_list_has_no_message migrations.test_state_llm.RealAppsAssertionMessageTests.test_real_apps_range_has_no_message migrations.test_state_llm.RealAppsAssertionMessageTests.test_real_apps_string_has_no_message migrations.test_state_llm.RealAppsAssertionMessageTests.test_real_apps_tuple_has_no_message
+coverage json -o coverage.json
+: '>>>>> End Test Output'

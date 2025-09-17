@@ -1,0 +1,1427 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `django/db/migrations/writer.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 import os
+2 import re
+3 from importlib import import_module
+4 
+5 from django import get_version
+6 from django.apps import apps
+7 
+8 # SettingsReference imported for backwards compatibility in Django 2.2.
+9 from django.conf import SettingsReference  # NOQA
+10 from django.db import migrations
+11 from django.db.migrations.loader import MigrationLoader
+12 from django.db.migrations.serializer import Serializer, serializer_factory
+13 from django.utils.inspect import get_func_args
+14 from django.utils.module_loading import module_dir
+15 from django.utils.timezone import now
+16 
+17 
+18 class OperationWriter:
+19     def __init__(self, operation, indentation=2):
+20         self.operation = operation
+21         self.buff = []
+22         self.indentation = indentation
+23 
+24     def serialize(self):
+25         def _write(_arg_name, _arg_value):
+26             if _arg_name in self.operation.serialization_expand_args and isinstance(
+27                 _arg_value, (list, tuple, dict)
+28             ):
+29                 if isinstance(_arg_value, dict):
+30                     self.feed("%s={" % _arg_name)
+31                     self.indent()
+32                     for key, value in _arg_value.items():
+33                         key_string, key_imports = MigrationWriter.serialize(key)
+34                         arg_string, arg_imports = MigrationWriter.serialize(value)
+35                         args = arg_string.splitlines()
+36                         if len(args) > 1:
+37                             self.feed("%s: %s" % (key_string, args[0]))
+38                             for arg in args[1:-1]:
+39                                 self.feed(arg)
+40                             self.feed("%s," % args[-1])
+41                         else:
+42                             self.feed("%s: %s," % (key_string, arg_string))
+43                         imports.update(key_imports)
+44                         imports.update(arg_imports)
+45                     self.unindent()
+46                     self.feed("},")
+47                 else:
+48                     self.feed("%s=[" % _arg_name)
+49                     self.indent()
+50                     for item in _arg_value:
+51                         arg_string, arg_imports = MigrationWriter.serialize(item)
+52                         args = arg_string.splitlines()
+53                         if len(args) > 1:
+54                             for arg in args[:-1]:
+55                                 self.feed(arg)
+56                             self.feed("%s," % args[-1])
+57                         else:
+58                             self.feed("%s," % arg_string)
+59                         imports.update(arg_imports)
+60                     self.unindent()
+61                     self.feed("],")
+62             else:
+63                 arg_string, arg_imports = MigrationWriter.serialize(_arg_value)
+64                 args = arg_string.splitlines()
+65                 if len(args) > 1:
+66                     self.feed("%s=%s" % (_arg_name, args[0]))
+67                     for arg in args[1:-1]:
+68                         self.feed(arg)
+69                     self.feed("%s," % args[-1])
+70                 else:
+71                     self.feed("%s=%s," % (_arg_name, arg_string))
+72                 imports.update(arg_imports)
+73 
+74         imports = set()
+75         name, args, kwargs = self.operation.deconstruct()
+76         operation_args = get_func_args(self.operation.__init__)
+77 
+78         # See if this operation is in django.db.migrations. If it is,
+79         # We can just use the fact we already have that imported,
+80         # otherwise, we need to add an import for the operation class.
+81         if getattr(migrations, name, None) == self.operation.__class__:
+82             self.feed("migrations.%s(" % name)
+83         else:
+84             imports.add("import %s" % (self.operation.__class__.__module__))
+85             self.feed("%s.%s(" % (self.operation.__class__.__module__, name))
+86 
+87         self.indent()
+88 
+89         for i, arg in enumerate(args):
+90             arg_value = arg
+91             arg_name = operation_args[i]
+92             _write(arg_name, arg_value)
+93 
+94         i = len(args)
+95         # Only iterate over remaining arguments
+96         for arg_name in operation_args[i:]:
+97             if arg_name in kwargs:  # Don't sort to maintain signature order
+98                 arg_value = kwargs[arg_name]
+99                 _write(arg_name, arg_value)
+100 
+101         self.unindent()
+102         self.feed("),")
+103         return self.render(), imports
+104 
+105     def indent(self):
+106         self.indentation += 1
+107 
+108     def unindent(self):
+109         self.indentation -= 1
+110 
+111     def feed(self, line):
+112         self.buff.append(" " * (self.indentation * 4) + line)
+113 
+114     def render(self):
+115         return "\n".join(self.buff)
+116 
+117 
+118 class MigrationWriter:
+119     """
+120     Take a Migration instance and is able to produce the contents
+121     of the migration file from it.
+122     """
+123 
+124     def __init__(self, migration, include_header=True):
+125         self.migration = migration
+126         self.include_header = include_header
+127         self.needs_manual_porting = False
+128 
+129     def as_string(self):
+130         """Return a string of the file contents."""
+131         items = {
+132             "replaces_str": "",
+133             "initial_str": "",
+134         }
+135 
+136         imports = set()
+137 
+138         # Deconstruct operations
+139         operations = []
+140         for operation in self.migration.operations:
+141             operation_string, operation_imports = OperationWriter(operation).serialize()
+142             imports.update(operation_imports)
+143             operations.append(operation_string)
+144         items["operations"] = "\n".join(operations) + "\n" if operations else ""
+145 
+146         # Format dependencies and write out swappable dependencies right
+147         dependencies = []
+148         for dependency in self.migration.dependencies:
+149             if dependency[0] == "__setting__":
+150                 dependencies.append(
+151                     "        migrations.swappable_dependency(settings.%s),"
+152                     % dependency[1]
+153                 )
+154                 imports.add("from django.conf import settings")
+155             else:
+156                 dependencies.append("        %s," % self.serialize(dependency)[0])
+157         items["dependencies"] = "\n".join(dependencies) + "\n" if dependencies else ""
+158 
+159         # Format imports nicely, swapping imports of functions from migration files
+160         # for comments
+161         migration_imports = set()
+162         for line in list(imports):
+163             if re.match(r"^import (.*)\.\d+[^\s]*$", line):
+164                 migration_imports.add(line.split("import")[1].strip())
+165                 imports.remove(line)
+166                 self.needs_manual_porting = True
+167 
+168         # django.db.migrations is always used, but models import may not be.
+169         # If models import exists, merge it with migrations import.
+170         if "from django.db import models" in imports:
+171             imports.discard("from django.db import models")
+172             imports.add("from django.db import migrations, models")
+173         else:
+174             imports.add("from django.db import migrations")
+175 
+176         # Sort imports by the package / module to be imported (the part after
+177         # "from" in "from ... import ..." or after "import" in "import ...").
+178         # First group the "import" statements, then "from ... import ...".
+179         sorted_imports = sorted(
+180             imports, key=lambda i: (i.split()[0] == "from", i.split()[1])
+181         )
+182         items["imports"] = "\n".join(sorted_imports) + "\n" if imports else ""
+183         if migration_imports:
+184             items["imports"] += (
+185                 "\n\n# Functions from the following migrations need manual "
+186                 "copying.\n# Move them and any dependencies into this file, "
+187                 "then update the\n# RunPython operations to refer to the local "
+188                 "versions:\n# %s"
+189             ) % "\n# ".join(sorted(migration_imports))
+190         # If there's a replaces, make a string for it
+191         if self.migration.replaces:
+192             items["replaces_str"] = (
+193                 "\n    replaces = %s\n" % self.serialize(self.migration.replaces)[0]
+194             )
+195         # Hinting that goes into comment
+196         if self.include_header:
+197             items["migration_header"] = MIGRATION_HEADER_TEMPLATE % {
+198                 "version": get_version(),
+199                 "timestamp": now().strftime("%Y-%m-%d %H:%M"),
+200             }
+201         else:
+202             items["migration_header"] = ""
+203 
+204         if self.migration.initial:
+205             items["initial_str"] = "\n    initial = True\n"
+206 
+207         return MIGRATION_TEMPLATE % items
+208 
+209     @property
+210     def basedir(self):
+211         migrations_package_name, _ = MigrationLoader.migrations_module(
+212             self.migration.app_label
+213         )
+214 
+215         if migrations_package_name is None:
+216             raise ValueError(
+217                 "Django can't create migrations for app '%s' because "
+218                 "migrations have been disabled via the MIGRATION_MODULES "
+219                 "setting." % self.migration.app_label
+220             )
+221 
+222         # See if we can import the migrations module directly
+223         try:
+224             migrations_module = import_module(migrations_package_name)
+225         except ImportError:
+226             pass
+227         else:
+228             try:
+229                 return module_dir(migrations_module)
+230             except ValueError:
+231                 pass
+232 
+233         # Alright, see if it's a direct submodule of the app
+234         app_config = apps.get_app_config(self.migration.app_label)
+235         (
+236             maybe_app_name,
+237             _,
+238             migrations_package_basename,
+239         ) = migrations_package_name.rpartition(".")
+240         if app_config.name == maybe_app_name:
+241             return os.path.join(app_config.path, migrations_package_basename)
+242 
+243         # In case of using MIGRATION_MODULES setting and the custom package
+244         # doesn't exist, create one, starting from an existing package
+245         existing_dirs, missing_dirs = migrations_package_name.split("."), []
+246         while existing_dirs:
+247             missing_dirs.insert(0, existing_dirs.pop(-1))
+248             try:
+249                 base_module = import_module(".".join(existing_dirs))
+250             except (ImportError, ValueError):
+251                 continue
+252             else:
+253                 try:
+254                     base_dir = module_dir(base_module)
+255                 except ValueError:
+256                     continue
+257                 else:
+258                     break
+259         else:
+260             raise ValueError(
+261                 "Could not locate an appropriate location to create "
+262                 "migrations package %s. Make sure the toplevel "
+263                 "package exists and can be imported." % migrations_package_name
+264             )
+265 
+266         final_dir = os.path.join(base_dir, *missing_dirs)
+267         os.makedirs(final_dir, exist_ok=True)
+268         for missing_dir in missing_dirs:
+269             base_dir = os.path.join(base_dir, missing_dir)
+270             with open(os.path.join(base_dir, "__init__.py"), "w"):
+271                 pass
+272 
+273         return final_dir
+274 
+275     @property
+276     def filename(self):
+277         return "%s.py" % self.migration.name
+278 
+279     @property
+280     def path(self):
+281         return os.path.join(self.basedir, self.filename)
+282 
+283     @classmethod
+284     def serialize(cls, value):
+285         return serializer_factory(value).serialize()
+286 
+287     @classmethod
+288     def register_serializer(cls, type_, serializer):
+289         Serializer.register(type_, serializer)
+290 
+291     @classmethod
+292     def unregister_serializer(cls, type_):
+293         Serializer.unregister(type_)
+294 
+295 
+296 MIGRATION_HEADER_TEMPLATE = """\
+297 # Generated by Django %(version)s on %(timestamp)s
+298 
+299 """
+300 
+301 
+302 MIGRATION_TEMPLATE = """\
+303 %(migration_header)s%(imports)s
+304 
+305 class Migration(migrations.Migration):
+306 %(replaces_str)s%(initial_str)s
+307     dependencies = [
+308 %(dependencies)s\
+309     ]
+310 
+311     operations = [
+312 %(operations)s\
+313     ]
+314 """
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `django/db/migrations/writer.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/django/db/migrations/writer.py b/django/db/migrations/writer.py
+--- a/django/db/migrations/writer.py
++++ b/django/db/migrations/writer.py
+@@ -175,7 +175,10 @@ def as_string(self):
+ 
+         # Sort imports by the package / module to be imported (the part after
+         # "from" in "from ... import ..." or after "import" in "import ...").
+-        sorted_imports = sorted(imports, key=lambda i: i.split()[1])
++        # First group the "import" statements, then "from ... import ...".
++        sorted_imports = sorted(
++            imports, key=lambda i: (i.split()[0] == "from", i.split()[1])
++        )
+         items["imports"] = "\n".join(sorted_imports) + "\n" if imports else ""
+         if migration_imports:
+             items["imports"] += (
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/django/db/migrations/writer.py b/django/db/migrations/writer.py
+index a59f0c8dcb..aee11a7a9f 100644
+--- a/django/db/migrations/writer.py
++++ b/django/db/migrations/writer.py
+@@ -173,9 +173,12 @@ class MigrationWriter:
+         else:
+             imports.add("from django.db import migrations")
+ 
+-        # Sort imports by the package / module to be imported (the part after
+-        # "from" in "from ... import ..." or after "import" in "import ...").
+-        sorted_imports = sorted(imports, key=lambda i: i.split()[1])
++        # Separate imports into two groups: "import" and "from"
++        import_statements = sorted(i for i in imports if i.startswith('import '))
++        from_statements = sorted(i for i in imports if i.startswith('from '))
++        
++        # Join the groups with import statements first
++        sorted_imports = import_statements + from_statements
+         items["imports"] = "\n".join(sorted_imports) + "\n" if imports else ""
+         if migration_imports:
+             items["imports"] += (
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `tests/migrations/test_writer.py` that contains the existing tests.
+-----------------------------------------------------------
+import datetime
+import decimal
+import enum
+import functools
+import math
+import os
+import pathlib
+import re
+import sys
+import time
+import uuid
+import zoneinfo
+from types import NoneType
+from unittest import mock
+
+import custom_migration_operations.more_operations
+import custom_migration_operations.operations
+
+from django import get_version
+from django.conf import SettingsReference, settings
+from django.core.validators import EmailValidator, RegexValidator
+from django.db import migrations, models
+from django.db.migrations.serializer import BaseSerializer
+from django.db.migrations.writer import MigrationWriter, OperationWriter
+from django.test import SimpleTestCase
+from django.utils.deconstruct import deconstructible
+from django.utils.functional import SimpleLazyObject
+from django.utils.timezone import get_default_timezone, get_fixed_timezone
+from django.utils.translation import gettext_lazy as _
+
+from .models import FoodManager, FoodQuerySet
+
+
+class DeconstructibleInstances:
+    def deconstruct(self):
+        return ("DeconstructibleInstances", [], {})
+
+
+class Money(decimal.Decimal):
+    def deconstruct(self):
+        return (
+            "%s.%s" % (self.__class__.__module__, self.__class__.__name__),
+            [str(self)],
+            {},
+        )
+
+
+class TestModel1:
+    def upload_to(self):
+        return "/somewhere/dynamic/"
+
+    thing = models.FileField(upload_to=upload_to)
+
+
+class TextEnum(enum.Enum):
+    A = "a-value"
+    B = "value-b"
+
+
+class TextTranslatedEnum(enum.Enum):
+    A = _("a-value")
+    B = _("value-b")
+
+
+class BinaryEnum(enum.Enum):
+    A = b"a-value"
+    B = b"value-b"
+
+
+class IntEnum(enum.IntEnum):
+    A = 1
+    B = 2
+
+
+class IntFlagEnum(enum.IntFlag):
+    A = 1
+    B = 2
+
+
+class OperationWriterTests(SimpleTestCase):
+    def test_empty_signature(self):
+        operation = custom_migration_operations.operations.TestOperation()
+        buff, imports = OperationWriter(operation, indentation=0).serialize()
+        self.assertEqual(imports, {"import custom_migration_operations.operations"})
+        self.assertEqual(
+            buff,
+            "custom_migration_operations.operations.TestOperation(\n),",
+        )
+
+    def test_args_signature(self):
+        operation = custom_migration_operations.operations.ArgsOperation(1, 2)
+        buff, imports = OperationWriter(operation, indentation=0).serialize()
+        self.assertEqual(imports, {"import custom_migration_operations.operations"})
+        self.assertEqual(
+            buff,
+            "custom_migration_operations.operations.ArgsOperation(\n"
+            "    arg1=1,\n"
+            "    arg2=2,\n"
+            "),",
+        )
+
+    def test_kwargs_signature(self):
+        operation = custom_migration_operations.operations.KwargsOperation(kwarg1=1)
+        buff, imports = OperationWriter(operation, indentation=0).serialize()
+        self.assertEqual(imports, {"import custom_migration_operations.operations"})
+        self.assertEqual(
+            buff,
+            "custom_migration_operations.operations.KwargsOperation(\n"
+            "    kwarg1=1,\n"
+            "),",
+        )
+
+    def test_args_kwargs_signature(self):
+        operation = custom_migration_operations.operations.ArgsKwargsOperation(
+            1, 2, kwarg2=4
+        )
+        buff, imports = OperationWriter(operation, indentation=0).serialize()
+        self.assertEqual(imports, {"import custom_migration_operations.operations"})
+        self.assertEqual(
+            buff,
+            "custom_migration_operations.operations.ArgsKwargsOperation(\n"
+            "    arg1=1,\n"
+            "    arg2=2,\n"
+            "    kwarg2=4,\n"
+            "),",
+        )
+
+    def test_nested_args_signature(self):
+        operation = custom_migration_operations.operations.ArgsOperation(
+            custom_migration_operations.operations.ArgsOperation(1, 2),
+            custom_migration_operations.operations.KwargsOperation(kwarg1=3, kwarg2=4),
+        )
+        buff, imports = OperationWriter(operation, indentation=0).serialize()
+        self.assertEqual(imports, {"import custom_migration_operations.operations"})
+        self.assertEqual(
+            buff,
+            "custom_migration_operations.operations.ArgsOperation(\n"
+            "    arg1=custom_migration_operations.operations.ArgsOperation(\n"
+            "        arg1=1,\n"
+            "        arg2=2,\n"
+            "    ),\n"
+            "    arg2=custom_migration_operations.operations.KwargsOperation(\n"
+            "        kwarg1=3,\n"
+            "        kwarg2=4,\n"
+            "    ),\n"
+            "),",
+        )
+
+    def test_multiline_args_signature(self):
+        operation = custom_migration_operations.operations.ArgsOperation(
+            "test\n    arg1", "test\narg2"
+        )
+        buff, imports = OperationWriter(operation, indentation=0).serialize()
+        self.assertEqual(imports, {"import custom_migration_operations.operations"})
+        self.assertEqual(
+            buff,
+            "custom_migration_operations.operations.ArgsOperation(\n"
+            "    arg1='test\\n    arg1',\n"
+            "    arg2='test\\narg2',\n"
+            "),",
+        )
+
+    def test_expand_args_signature(self):
+        operation = custom_migration_operations.operations.ExpandArgsOperation([1, 2])
+        buff, imports = OperationWriter(operation, indentation=0).serialize()
+        self.assertEqual(imports, {"import custom_migration_operations.operations"})
+        self.assertEqual(
+            buff,
+            "custom_migration_operations.operations.ExpandArgsOperation(\n"
+            "    arg=[\n"
+            "        1,\n"
+            "        2,\n"
+            "    ],\n"
+            "),",
+        )
+
+    def test_nested_operation_expand_args_signature(self):
+        operation = custom_migration_operations.operations.ExpandArgsOperation(
+            arg=[
+                custom_migration_operations.operations.KwargsOperation(
+                    kwarg1=1,
+                    kwarg2=2,
+                ),
+            ]
+        )
+        buff, imports = OperationWriter(operation, indentation=0).serialize()
+        self.assertEqual(imports, {"import custom_migration_operations.operations"})
+        self.assertEqual(
+            buff,
+            "custom_migration_operations.operations.ExpandArgsOperation(\n"
+            "    arg=[\n"
+            "        custom_migration_operations.operations.KwargsOperation(\n"
+            "            kwarg1=1,\n"
+            "            kwarg2=2,\n"
+            "        ),\n"
+            "    ],\n"
+            "),",
+        )
+
+
+class WriterTests(SimpleTestCase):
+    """
+    Tests the migration writer (makes migration files from Migration instances)
+    """
+
+    class NestedEnum(enum.IntEnum):
+        A = 1
+        B = 2
+
+    class NestedChoices(models.TextChoices):
+        X = "X", "X value"
+        Y = "Y", "Y value"
+
+    def safe_exec(self, string, value=None):
+        d = {}
+        try:
+            exec(string, globals(), d)
+        except Exception as e:
+            if value:
+                self.fail(
+                    "Could not exec %r (from value %r): %s" % (string.strip(), value, e)
+                )
+            else:
+                self.fail("Could not exec %r: %s" % (string.strip(), e))
+        return d
+
+    def serialize_round_trip(self, value):
+        string, imports = MigrationWriter.serialize(value)
+        return self.safe_exec(
+            "%s\ntest_value_result = %s" % ("\n".join(imports), string), value
+        )["test_value_result"]
+
+    def assertSerializedEqual(self, value):
+        self.assertEqual(self.serialize_round_trip(value), value)
+
+    def assertSerializedResultEqual(self, value, target):
+        self.assertEqual(MigrationWriter.serialize(value), target)
+
+    def assertSerializedFieldEqual(self, value):
+        new_value = self.serialize_round_trip(value)
+        self.assertEqual(value.__class__, new_value.__class__)
+        self.assertEqual(value.max_length, new_value.max_length)
+        self.assertEqual(value.null, new_value.null)
+        self.assertEqual(value.unique, new_value.unique)
+
+    def test_serialize_numbers(self):
+        self.assertSerializedEqual(1)
+        self.assertSerializedEqual(1.2)
+        self.assertTrue(math.isinf(self.serialize_round_trip(float("inf"))))
+        self.assertTrue(math.isinf(self.serialize_round_trip(float("-inf"))))
+        self.assertTrue(math.isnan(self.serialize_round_trip(float("nan"))))
+
+        self.assertSerializedEqual(decimal.Decimal("1.3"))
+        self.assertSerializedResultEqual(
+            decimal.Decimal("1.3"), ("Decimal('1.3')", {"from decimal import Decimal"})
+        )
+
+        self.assertSerializedEqual(Money("1.3"))
+        self.assertSerializedResultEqual(
+            Money("1.3"),
+            ("migrations.test_writer.Money('1.3')", {"import migrations.test_writer"}),
+        )
+
+    def test_serialize_constants(self):
+        self.assertSerializedEqual(None)
+        self.assertSerializedEqual(True)
+        self.assertSerializedEqual(False)
+
+    def test_serialize_strings(self):
+        self.assertSerializedEqual(b"foobar")
+        string, imports = MigrationWriter.serialize(b"foobar")
+        self.assertEqual(string, "b'foobar'")
+        self.assertSerializedEqual("föobár")
+        string, imports = MigrationWriter.serialize("foobar")
+        self.assertEqual(string, "'foobar'")
+
+    def test_serialize_multiline_strings(self):
+        self.assertSerializedEqual(b"foo\nbar")
+        string, imports = MigrationWriter.serialize(b"foo\nbar")
+        self.assertEqual(string, "b'foo\\nbar'")
+        self.assertSerializedEqual("föo\nbár")
+        string, imports = MigrationWriter.serialize("foo\nbar")
+        self.assertEqual(string, "'foo\\nbar'")
+
+    def test_serialize_collections(self):
+        self.assertSerializedEqual({1: 2})
+        self.assertSerializedEqual(["a", 2, True, None])
+        self.assertSerializedEqual({2, 3, "eighty"})
+        self.assertSerializedEqual({"lalalala": ["yeah", "no", "maybe"]})
+        self.assertSerializedEqual(_("Hello"))
+
+    def test_serialize_builtin_types(self):
+        self.assertSerializedEqual([list, tuple, dict, set, frozenset])
+        self.assertSerializedResultEqual(
+            [list, tuple, dict, set, frozenset],
+            ("[list, tuple, dict, set, frozenset]", set()),
+        )
+
+    def test_serialize_lazy_objects(self):
+        pattern = re.compile(r"^foo$")
+        lazy_pattern = SimpleLazyObject(lambda: pattern)
+        self.assertEqual(self.serialize_round_trip(lazy_pattern), pattern)
+
+    def test_serialize_enums(self):
+        self.assertSerializedResultEqual(
+            TextEnum.A,
+            ("migrations.test_writer.TextEnum['A']", {"import migrations.test_writer"}),
+        )
+        self.assertSerializedResultEqual(
+            TextTranslatedEnum.A,
+            (
+                "migrations.test_writer.TextTranslatedEnum['A']",
+                {"import migrations.test_writer"},
+            ),
+        )
+        self.assertSerializedResultEqual(
+            BinaryEnum.A,
+            (
+                "migrations.test_writer.BinaryEnum['A']",
+                {"import migrations.test_writer"},
+            ),
+        )
+        self.assertSerializedResultEqual(
+            IntEnum.B,
+            ("migrations.test_writer.IntEnum['B']", {"import migrations.test_writer"}),
+        )
+        self.assertSerializedResultEqual(
+            self.NestedEnum.A,
+            (
+                "migrations.test_writer.WriterTests.NestedEnum['A']",
+                {"import migrations.test_writer"},
+            ),
+        )
+        self.assertSerializedEqual(self.NestedEnum.A)
+
+        field = models.CharField(
+            default=TextEnum.B, choices=[(m.value, m) for m in TextEnum]
+        )
+        string = MigrationWriter.serialize(field)[0]
+        self.assertEqual(
+            string,
+            "models.CharField(choices=["
+            "('a-value', migrations.test_writer.TextEnum['A']), "
+            "('value-b', migrations.test_writer.TextEnum['B'])], "
+            "default=migrations.test_writer.TextEnum['B'])",
+        )
+        field = models.CharField(
+            default=TextTranslatedEnum.A,
+            choices=[(m.value, m) for m in TextTranslatedEnum],
+        )
+        string = MigrationWriter.serialize(field)[0]
+        self.assertEqual(
+            string,
+            "models.CharField(choices=["
+            "('a-value', migrations.test_writer.TextTranslatedEnum['A']), "
+            "('value-b', migrations.test_writer.TextTranslatedEnum['B'])], "
+            "default=migrations.test_writer.TextTranslatedEnum['A'])",
+        )
+        field = models.CharField(
+            default=BinaryEnum.B, choices=[(m.value, m) for m in BinaryEnum]
+        )
+        string = MigrationWriter.serialize(field)[0]
+        self.assertEqual(
+            string,
+            "models.CharField(choices=["
+            "(b'a-value', migrations.test_writer.BinaryEnum['A']), "
+            "(b'value-b', migrations.test_writer.BinaryEnum['B'])], "
+            "default=migrations.test_writer.BinaryEnum['B'])",
+        )
+        field = models.IntegerField(
+            default=IntEnum.A, choices=[(m.value, m) for m in IntEnum]
+        )
+        string = MigrationWriter.serialize(field)[0]
+        self.assertEqual(
+            string,
+            "models.IntegerField(choices=["
+            "(1, migrations.test_writer.IntEnum['A']), "
+            "(2, migrations.test_writer.IntEnum['B'])], "
+            "default=migrations.test_writer.IntEnum['A'])",
+        )
+
+    def test_serialize_enum_flags(self):
+        self.assertSerializedResultEqual(
+            IntFlagEnum.A,
+            (
+                "migrations.test_writer.IntFlagEnum['A']",
+                {"import migrations.test_writer"},
+            ),
+        )
+        self.assertSerializedResultEqual(
+            IntFlagEnum.B,
+            (
+                "migrations.test_writer.IntFlagEnum['B']",
+                {"import migrations.test_writer"},
+            ),
+        )
+        field = models.IntegerField(
+            default=IntFlagEnum.A, choices=[(m.value, m) for m in IntFlagEnum]
+        )
+        string = MigrationWriter.serialize(field)[0]
+        self.assertEqual(
+            string,
+            "models.IntegerField(choices=["
+            "(1, migrations.test_writer.IntFlagEnum['A']), "
+            "(2, migrations.test_writer.IntFlagEnum['B'])], "
+            "default=migrations.test_writer.IntFlagEnum['A'])",
+        )
+        self.assertSerializedResultEqual(
+            IntFlagEnum.A | IntFlagEnum.B,
+            (
+                "migrations.test_writer.IntFlagEnum['A'] | "
+                "migrations.test_writer.IntFlagEnum['B']",
+                {"import migrations.test_writer"},
+            ),
+        )
+
+    def test_serialize_choices(self):
+        class TextChoices(models.TextChoices):
+            A = "A", "A value"
+            B = "B", "B value"
+
+        class IntegerChoices(models.IntegerChoices):
+            A = 1, "One"
+            B = 2, "Two"
+
+        class DateChoices(datetime.date, models.Choices):
+            DATE_1 = 1969, 7, 20, "First date"
+            DATE_2 = 1969, 11, 19, "Second date"
+
+        self.assertSerializedResultEqual(TextChoices.A, ("'A'", set()))
+        self.assertSerializedResultEqual(IntegerChoices.A, ("1", set()))
+        self.assertSerializedResultEqual(
+            DateChoices.DATE_1,
+            ("datetime.date(1969, 7, 20)", {"import datetime"}),
+        )
+        field = models.CharField(default=TextChoices.B, choices=TextChoices.choices)
+        string = MigrationWriter.serialize(field)[0]
+        self.assertEqual(
+            string,
+            "models.CharField(choices=[('A', 'A value'), ('B', 'B value')], "
+            "default='B')",
+        )
+        field = models.IntegerField(
+            default=IntegerChoices.B, choices=IntegerChoices.choices
+        )
+        string = MigrationWriter.serialize(field)[0]
+        self.assertEqual(
+            string,
+            "models.IntegerField(choices=[(1, 'One'), (2, 'Two')], default=2)",
+        )
+        field = models.DateField(
+            default=DateChoices.DATE_2, choices=DateChoices.choices
+        )
+        string = MigrationWriter.serialize(field)[0]
+        self.assertEqual(
+            string,
+            "models.DateField(choices=["
+            "(datetime.date(1969, 7, 20), 'First date'), "
+            "(datetime.date(1969, 11, 19), 'Second date')], "
+            "default=datetime.date(1969, 11, 19))",
+        )
+
+    def test_serialize_nested_class(self):
+        for nested_cls in [self.NestedEnum, self.NestedChoices]:
+            cls_name = nested_cls.__name__
+            with self.subTest(cls_name):
+                self.assertSerializedResultEqual(
+                    nested_cls,
+                    (
+                        "migrations.test_writer.WriterTests.%s" % cls_name,
+                        {"import migrations.test_writer"},
+                    ),
+                )
+
+    def test_serialize_uuid(self):
+        self.assertSerializedEqual(uuid.uuid1())
+        self.assertSerializedEqual(uuid.uuid4())
+
+        uuid_a = uuid.UUID("5c859437-d061-4847-b3f7-e6b78852f8c8")
+        uuid_b = uuid.UUID("c7853ec1-2ea3-4359-b02d-b54e8f1bcee2")
+        self.assertSerializedResultEqual(
+            uuid_a,
+            ("uuid.UUID('5c859437-d061-4847-b3f7-e6b78852f8c8')", {"import uuid"}),
+        )
+        self.assertSerializedResultEqual(
+            uuid_b,
+            ("uuid.UUID('c7853ec1-2ea3-4359-b02d-b54e8f1bcee2')", {"import uuid"}),
+        )
+
+        field = models.UUIDField(
+            choices=((uuid_a, "UUID A"), (uuid_b, "UUID B")), default=uuid_a
+        )
+        string = MigrationWriter.serialize(field)[0]
+        self.assertEqual(
+            string,
+            "models.UUIDField(choices=["
+            "(uuid.UUID('5c859437-d061-4847-b3f7-e6b78852f8c8'), 'UUID A'), "
+            "(uuid.UUID('c7853ec1-2ea3-4359-b02d-b54e8f1bcee2'), 'UUID B')], "
+            "default=uuid.UUID('5c859437-d061-4847-b3f7-e6b78852f8c8'))",
+        )
+
+    def test_serialize_pathlib(self):
+        # Pure path objects work in all platforms.
+        self.assertSerializedEqual(pathlib.PurePosixPath())
+        self.assertSerializedEqual(pathlib.PureWindowsPath())
+        path = pathlib.PurePosixPath("/path/file.txt")
+        expected = ("pathlib.PurePosixPath('/path/file.txt')", {"import pathlib"})
+        self.assertSerializedResultEqual(path, expected)
+        path = pathlib.PureWindowsPath("A:\\File.txt")
+        expected = ("pathlib.PureWindowsPath('A:/File.txt')", {"import pathlib"})
+        self.assertSerializedResultEqual(path, expected)
+        # Concrete path objects work on supported platforms.
+        if sys.platform == "win32":
+            self.assertSerializedEqual(pathlib.WindowsPath.cwd())
+            path = pathlib.WindowsPath("A:\\File.txt")
+            expected = ("pathlib.PureWindowsPath('A:/File.txt')", {"import pathlib"})
+            self.assertSerializedResultEqual(path, expected)
+        else:
+            self.assertSerializedEqual(pathlib.PosixPath.cwd())
+            path = pathlib.PosixPath("/path/file.txt")
+            expected = ("pathlib.PurePosixPath('/path/file.txt')", {"import pathlib"})
+            self.assertSerializedResultEqual(path, expected)
+
+        field = models.FilePathField(path=pathlib.PurePosixPath("/home/user"))
+        string, imports = MigrationWriter.serialize(field)
+        self.assertEqual(
+            string,
+            "models.FilePathField(path=pathlib.PurePosixPath('/home/user'))",
+        )
+        self.assertIn("import pathlib", imports)
+
+    def test_serialize_path_like(self):
+        with os.scandir(os.path.dirname(__file__)) as entries:
+            path_like = list(entries)[0]
+        expected = (repr(path_like.path), {})
+        self.assertSerializedResultEqual(path_like, expected)
+
+        field = models.FilePathField(path=path_like)
+        string = MigrationWriter.serialize(field)[0]
+        self.assertEqual(string, "models.FilePathField(path=%r)" % path_like.path)
+
+    def test_serialize_functions(self):
+        with self.assertRaisesMessage(ValueError, "Cannot serialize function: lambda"):
+            self.assertSerializedEqual(lambda x: 42)
+        self.assertSerializedEqual(models.SET_NULL)
+        string, imports = MigrationWriter.serialize(models.SET(42))
+        self.assertEqual(string, "models.SET(42)")
+        self.serialize_round_trip(models.SET(42))
+
+    def test_serialize_datetime(self):
+        self.assertSerializedEqual(datetime.datetime.now())
+        self.assertSerializedEqual(datetime.datetime.now)
+        self.assertSerializedEqual(datetime.datetime.today())
+        self.assertSerializedEqual(datetime.datetime.today)
+        self.assertSerializedEqual(datetime.date.today())
+        self.assertSerializedEqual(datetime.date.today)
+        self.assertSerializedEqual(datetime.datetime.now().time())
+        self.assertSerializedEqual(
+            datetime.datetime(2014, 1, 1, 1, 1, tzinfo=get_default_timezone())
+        )
+        self.assertSerializedEqual(
+            datetime.datetime(2013, 12, 31, 22, 1, tzinfo=get_fixed_timezone(180))
+        )
+        self.assertSerializedResultEqual(
+            datetime.datetime(2014, 1, 1, 1, 1),
+            ("datetime.datetime(2014, 1, 1, 1, 1)", {"import datetime"}),
+        )
+        self.assertSerializedResultEqual(
+            datetime.datetime(2012, 1, 1, 1, 1, tzinfo=datetime.timezone.utc),
+            (
+                "datetime.datetime(2012, 1, 1, 1, 1, tzinfo=datetime.timezone.utc)",
+                {"import datetime"},
+            ),
+        )
+        self.assertSerializedResultEqual(
+            datetime.datetime(
+                2012, 1, 1, 2, 1, tzinfo=zoneinfo.ZoneInfo("Europe/Paris")
+            ),
+            (
+                "datetime.datetime(2012, 1, 1, 1, 1, tzinfo=datetime.timezone.utc)",
+                {"import datetime"},
+            ),
+        )
+
+    def test_serialize_fields(self):
+        self.assertSerializedFieldEqual(models.CharField(max_length=255))
+        self.assertSerializedResultEqual(
+            models.CharField(max_length=255),
+            ("models.CharField(max_length=255)", {"from django.db import models"}),
+        )
+        self.assertSerializedFieldEqual(models.TextField(null=True, blank=True))
+        self.assertSerializedResultEqual(
+            models.TextField(null=True, blank=True),
+            (
+                "models.TextField(blank=True, null=True)",
+                {"from django.db import models"},
+            ),
+        )
+
+    def test_serialize_settings(self):
+        self.assertSerializedEqual(
+            SettingsReference(settings.AUTH_USER_MODEL, "AUTH_USER_MODEL")
+        )
+        self.assertSerializedResultEqual(
+            SettingsReference("someapp.model", "AUTH_USER_MODEL"),
+            ("settings.AUTH_USER_MODEL", {"from django.conf import settings"}),
+        )
+
+    def test_serialize_iterators(self):
+        self.assertSerializedResultEqual(
+            ((x, x * x) for x in range(3)), ("((0, 0), (1, 1), (2, 4))", set())
+        )
+
+    def test_serialize_compiled_regex(self):
+        """
+        Make sure compiled regex can be serialized.
+        """
+        regex = re.compile(r"^\w+$")
+        self.assertSerializedEqual(regex)
+
+    def test_serialize_class_based_validators(self):
+        """
+        Ticket #22943: Test serialization of class-based validators, including
+        compiled regexes.
+        """
+        validator = RegexValidator(message="hello")
+        string = MigrationWriter.serialize(validator)[0]
+        self.assertEqual(
+            string, "django.core.validators.RegexValidator(message='hello')"
+        )
+        self.serialize_round_trip(validator)
+
+        # Test with a compiled regex.
+        validator = RegexValidator(regex=re.compile(r"^\w+$"))
+        string = MigrationWriter.serialize(validator)[0]
+        self.assertEqual(
+            string,
+            "django.core.validators.RegexValidator(regex=re.compile('^\\\\w+$'))",
+        )
+        self.serialize_round_trip(validator)
+
+        # Test a string regex with flag
+        validator = RegexValidator(r"^[0-9]+$", flags=re.S)
+        string = MigrationWriter.serialize(validator)[0]
+        self.assertEqual(
+            string,
+            "django.core.validators.RegexValidator('^[0-9]+$', "
+            "flags=re.RegexFlag['DOTALL'])",
+        )
+        self.serialize_round_trip(validator)
+
+        # Test message and code
+        validator = RegexValidator("^[-a-zA-Z0-9_]+$", "Invalid", "invalid")
+        string = MigrationWriter.serialize(validator)[0]
+        self.assertEqual(
+            string,
+            "django.core.validators.RegexValidator('^[-a-zA-Z0-9_]+$', 'Invalid', "
+            "'invalid')",
+        )
+        self.serialize_round_trip(validator)
+
+        # Test with a subclass.
+        validator = EmailValidator(message="hello")
+        string = MigrationWriter.serialize(validator)[0]
+        self.assertEqual(
+            string, "django.core.validators.EmailValidator(message='hello')"
+        )
+        self.serialize_round_trip(validator)
+
+        validator = deconstructible(path="migrations.test_writer.EmailValidator")(
+            EmailValidator
+        )(message="hello")
+        string = MigrationWriter.serialize(validator)[0]
+        self.assertEqual(
+            string, "migrations.test_writer.EmailValidator(message='hello')"
+        )
+
+        validator = deconstructible(path="custom.EmailValidator")(EmailValidator)(
+            message="hello"
+        )
+        with self.assertRaisesMessage(ImportError, "No module named 'custom'"):
+            MigrationWriter.serialize(validator)
+
+        validator = deconstructible(path="django.core.validators.EmailValidator2")(
+            EmailValidator
+        )(message="hello")
+        with self.assertRaisesMessage(
+            ValueError,
+            "Could not find object EmailValidator2 in django.core.validators.",
+        ):
+            MigrationWriter.serialize(validator)
+
+    def test_serialize_complex_func_index(self):
+        index = models.Index(
+            models.Func("rating", function="ABS"),
+            models.Case(
+                models.When(name="special", then=models.Value("X")),
+                default=models.Value("other"),
+            ),
+            models.ExpressionWrapper(
+                models.F("pages"),
+                output_field=models.IntegerField(),
+            ),
+            models.OrderBy(models.F("name").desc()),
+            name="complex_func_index",
+        )
+        string, imports = MigrationWriter.serialize(index)
+        self.assertEqual(
+            string,
+            "models.Index(models.Func('rating', function='ABS'), "
+            "models.Case(models.When(name='special', then=models.Value('X')), "
+            "default=models.Value('other')), "
+            "models.ExpressionWrapper("
+            "models.F('pages'), output_field=models.IntegerField()), "
+            "models.OrderBy(models.OrderBy(models.F('name'), descending=True)), "
+            "name='complex_func_index')",
+        )
+        self.assertEqual(imports, {"from django.db import models"})
+
+    def test_serialize_empty_nonempty_tuple(self):
+        """
+        Ticket #22679: makemigrations generates invalid code for (an empty
+        tuple) default_permissions = ()
+        """
+        empty_tuple = ()
+        one_item_tuple = ("a",)
+        many_items_tuple = ("a", "b", "c")
+        self.assertSerializedEqual(empty_tuple)
+        self.assertSerializedEqual(one_item_tuple)
+        self.assertSerializedEqual(many_items_tuple)
+
+    def test_serialize_range(self):
+        string, imports = MigrationWriter.serialize(range(1, 5))
+        self.assertEqual(string, "range(1, 5)")
+        self.assertEqual(imports, set())
+
+    def test_serialize_builtins(self):
+        string, imports = MigrationWriter.serialize(range)
+        self.assertEqual(string, "range")
+        self.assertEqual(imports, set())
+
+    def test_serialize_unbound_method_reference(self):
+        """An unbound method used within a class body can be serialized."""
+        self.serialize_round_trip(TestModel1.thing)
+
+    def test_serialize_local_function_reference(self):
+        """A reference in a local scope can't be serialized."""
+
+        class TestModel2:
+            def upload_to(self):
+                return "somewhere dynamic"
+
+            thing = models.FileField(upload_to=upload_to)
+
+        with self.assertRaisesMessage(
+            ValueError, "Could not find function upload_to in migrations.test_writer"
+        ):
+            self.serialize_round_trip(TestModel2.thing)
+
+    def test_serialize_managers(self):
+        self.assertSerializedEqual(models.Manager())
+        self.assertSerializedResultEqual(
+            FoodQuerySet.as_manager(),
+            (
+                "migrations.models.FoodQuerySet.as_manager()",
+                {"import migrations.models"},
+            ),
+        )
+        self.assertSerializedEqual(FoodManager("a", "b"))
+        self.assertSerializedEqual(FoodManager("x", "y", c=3, d=4))
+
+    def test_serialize_frozensets(self):
+        self.assertSerializedEqual(frozenset())
+        self.assertSerializedEqual(frozenset("let it go"))
+
+    def test_serialize_set(self):
+        self.assertSerializedEqual(set())
+        self.assertSerializedResultEqual(set(), ("set()", set()))
+        self.assertSerializedEqual({"a"})
+        self.assertSerializedResultEqual({"a"}, ("{'a'}", set()))
+
+    def test_serialize_timedelta(self):
+        self.assertSerializedEqual(datetime.timedelta())
+        self.assertSerializedEqual(datetime.timedelta(minutes=42))
+
+    def test_serialize_functools_partial(self):
+        value = functools.partial(datetime.timedelta, 1, seconds=2)
+        result = self.serialize_round_trip(value)
+        self.assertEqual(result.func, value.func)
+        self.assertEqual(result.args, value.args)
+        self.assertEqual(result.keywords, value.keywords)
+
+    def test_serialize_functools_partialmethod(self):
+        value = functools.partialmethod(datetime.timedelta, 1, seconds=2)
+        result = self.serialize_round_trip(value)
+        self.assertIsInstance(result, functools.partialmethod)
+        self.assertEqual(result.func, value.func)
+        self.assertEqual(result.args, value.args)
+        self.assertEqual(result.keywords, value.keywords)
+
+    def test_serialize_type_none(self):
+        self.assertSerializedEqual(NoneType)
+
+    def test_serialize_type_model(self):
+        self.assertSerializedEqual(models.Model)
+        self.assertSerializedResultEqual(
+            MigrationWriter.serialize(models.Model),
+            ("('models.Model', {'from django.db import models'})", set()),
+        )
+
+    def test_simple_migration(self):
+        """
+        Tests serializing a simple migration.
+        """
+        fields = {
+            "charfield": models.DateTimeField(default=datetime.datetime.now),
+            "datetimefield": models.DateTimeField(default=datetime.datetime.now),
+        }
+
+        options = {
+            "verbose_name": "My model",
+            "verbose_name_plural": "My models",
+        }
+
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.CreateModel(
+                        "MyModel", tuple(fields.items()), options, (models.Model,)
+                    ),
+                    migrations.CreateModel(
+                        "MyModel2", tuple(fields.items()), bases=(models.Model,)
+                    ),
+                    migrations.CreateModel(
+                        name="MyModel3",
+                        fields=tuple(fields.items()),
+                        options=options,
+                        bases=(models.Model,),
+                    ),
+                    migrations.DeleteModel("MyModel"),
+                    migrations.AddField(
+                        "OtherModel", "datetimefield", fields["datetimefield"]
+                    ),
+                ],
+                "dependencies": [("testapp", "some_other_one")],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        # We don't test the output formatting - that's too fragile.
+        # Just make sure it runs for now, and that things look alright.
+        result = self.safe_exec(output)
+        self.assertIn("Migration", result)
+
+    def test_migration_path(self):
+        test_apps = [
+            "migrations.migrations_test_apps.normal",
+            "migrations.migrations_test_apps.with_package_model",
+            "migrations.migrations_test_apps.without_init_file",
+        ]
+
+        base_dir = os.path.dirname(os.path.dirname(__file__))
+
+        for app in test_apps:
+            with self.modify_settings(INSTALLED_APPS={"append": app}):
+                migration = migrations.Migration("0001_initial", app.split(".")[-1])
+                expected_path = os.path.join(
+                    base_dir, *(app.split(".") + ["migrations", "0001_initial.py"])
+                )
+                writer = MigrationWriter(migration)
+                self.assertEqual(writer.path, expected_path)
+
+    def test_custom_operation(self):
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    custom_migration_operations.operations.TestOperation(),
+                    custom_migration_operations.operations.CreateModel(),
+                    migrations.CreateModel("MyModel", (), {}, (models.Model,)),
+                    custom_migration_operations.more_operations.TestOperation(),
+                ],
+                "dependencies": [],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        result = self.safe_exec(output)
+        self.assertIn("custom_migration_operations", result)
+        self.assertNotEqual(
+            result["custom_migration_operations"].operations.TestOperation,
+            result["custom_migration_operations"].more_operations.TestOperation,
+        )
+
+    def test_sorted_imports(self):
+        """
+        #24155 - Tests ordering of imports.
+        """
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "mymodel",
+                        "myfield",
+                        models.DateTimeField(
+                            default=datetime.datetime(
+                                2012, 1, 1, 1, 1, tzinfo=datetime.timezone.utc
+                            ),
+                        ),
+                    ),
+                    migrations.AddField(
+                        "mymodel",
+                        "myfield2",
+                        models.FloatField(default=time.time),
+                    ),
+                ]
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        self.assertIn(
+            "import datetime\nimport time\nfrom django.db import migrations, models\n",
+            output,
+        )
+
+    def test_migration_file_header_comments(self):
+        """
+        Test comments at top of file.
+        """
+        migration = type("Migration", (migrations.Migration,), {"operations": []})
+        dt = datetime.datetime(2015, 7, 31, 4, 40, 0, 0, tzinfo=datetime.timezone.utc)
+        with mock.patch("django.db.migrations.writer.now", lambda: dt):
+            for include_header in (True, False):
+                with self.subTest(include_header=include_header):
+                    writer = MigrationWriter(migration, include_header)
+                    output = writer.as_string()
+
+                    self.assertEqual(
+                        include_header,
+                        output.startswith(
+                            "# Generated by Django %s on 2015-07-31 04:40\n\n"
+                            % get_version()
+                        ),
+                    )
+                    if not include_header:
+                        # Make sure the output starts with something that's not
+                        # a comment or indentation or blank line
+                        self.assertRegex(
+                            output.splitlines(keepends=True)[0], r"^[^#\s]+"
+                        )
+
+    def test_models_import_omitted(self):
+        """
+        django.db.models shouldn't be imported if unused.
+        """
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AlterModelOptions(
+                        name="model",
+                        options={
+                            "verbose_name": "model",
+                            "verbose_name_plural": "models",
+                        },
+                    ),
+                ]
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        self.assertIn("from django.db import migrations\n", output)
+
+    def test_deconstruct_class_arguments(self):
+        # Yes, it doesn't make sense to use a class as a default for a
+        # CharField. It does make sense for custom fields though, for example
+        # an enumfield that takes the enum class as an argument.
+        string = MigrationWriter.serialize(
+            models.CharField(default=DeconstructibleInstances)
+        )[0]
+        self.assertEqual(
+            string,
+            "models.CharField(default=migrations.test_writer.DeconstructibleInstances)",
+        )
+
+    def test_register_serializer(self):
+        class ComplexSerializer(BaseSerializer):
+            def serialize(self):
+                return "complex(%r)" % self.value, {}
+
+        MigrationWriter.register_serializer(complex, ComplexSerializer)
+        self.assertSerializedEqual(complex(1, 2))
+        MigrationWriter.unregister_serializer(complex)
+        with self.assertRaisesMessage(ValueError, "Cannot serialize: (1+2j)"):
+            self.assertSerializedEqual(complex(1, 2))
+
+    def test_register_non_serializer(self):
+        with self.assertRaisesMessage(
+            ValueError, "'TestModel1' must inherit from 'BaseSerializer'."
+        ):
+            MigrationWriter.register_serializer(complex, TestModel1)
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""

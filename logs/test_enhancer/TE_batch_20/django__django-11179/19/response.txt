@@ -1,0 +1,202 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  Regression tests verifying that single-object fast-delete correctly clears the instance
+  primary key/attname (sets it to None) across different primary key types and contexts,
+  that the delete() return value is correct, and that pre/post delete signals are not
+  triggered for the fast-delete single-object path.
+test_code: |
+  from django.db import connection, models
+  from django.db import transaction
+  from django.db.models import signals
+  from django.test import TestCase
+  
+  def make_model(name, fields=None):
+      """
+      Dynamically create a model class and its table in the test database.
+      `fields` is a dict of name: Field instances (e.g. {'id': models.CharField(...)}).
+      """
+      attrs = {'__module__': 'tests.dynamic_models'}
+      if fields:
+          attrs.update(fields)
+      # Provide an inner Meta with an app_label so Django accepts the model.
+      class Meta:
+          app_label = 'tests'
+      attrs['Meta'] = Meta
+      Model = type(name, (models.Model,), attrs)
+      # Create the DB table for the dynamic model.
+      with connection.schema_editor() as schema_editor:
+          schema_editor.create_model(Model)
+      return Model
+  
+  class FastDeletePkRegressionTests(TestCase):
+      def test_single_instance_fast_delete_clears_auto_pk(self):
+          """
+          Deleting a single-instance (fast-delete path) should clear instance.pk.
+          """
+          ModelA = make_model('TempAutoA')
+          obj = ModelA.objects.create()
+          # Ensure the object exists before delete.
+          self.assertIsNotNone(obj.pk)
+          deleted, deleted_dict = obj.delete()
+          # Confirm deletion count and per-model deletion counts.
+          self.assertEqual(deleted, 1)
+          self.assertEqual(deleted_dict.get(ModelA._meta.label, 0), 1)
+          # Instance PK should be set to None after delete (fast-delete path).
+          self.assertIsNone(obj.pk)
+          # And the underlying attname attribute should also be None.
+          self.assertIsNone(getattr(obj, ModelA._meta.pk.attname))
+  
+      def test_single_instance_fast_delete_clears_custom_pk_charfield(self):
+          """
+          Deleting a single-instance with a non-auto (CharField) primary key
+          should clear the instance primary key attribute (attname) to None.
+          """
+          fields = {
+              'id': models.CharField(max_length=32, primary_key=True),
+              'name': models.CharField(max_length=10, default='x'),
+          }
+          ModelB = make_model('TempCharPKB', fields=fields)
+          obj = ModelB.objects.create(id='custom-1', name='n')
+          self.assertEqual(obj.pk, 'custom-1')
+          res = obj.delete()
+          # delete() returns (num_deleted, deleted_dict)
+          deleted, deleted_dict = res
+          self.assertEqual(deleted, 1)
+          self.assertEqual(deleted_dict.get(ModelB._meta.label, 0), 1)
+          # Both obj.pk and the attname should be None after deletion.
+          self.assertIsNone(obj.pk)
+          self.assertIsNone(getattr(obj, ModelB._meta.pk.attname))
+  
+      def test_single_instance_fast_delete_attname_is_same_as_pk_property(self):
+          """
+          Ensure the Test checks both the .pk property and the attname attribute
+          are cleared for the fast-delete single-object path.
+          """
+          ModelC = make_model('TempAutoC')
+          obj = ModelC.objects.create()
+          pk_before = obj.pk
+          self.assertIsNotNone(pk_before)
+          obj.delete()
+          # pk property cleared
+          self.assertIsNone(obj.pk)
+          # attribute corresponding to attname cleared
+          self.assertIsNone(getattr(obj, ModelC._meta.pk.attname))
+  
+      def test_fast_delete_single_instance_does_not_emit_pre_post_delete_signals(self):
+          """
+          The fast-delete single-instance path should not emit pre_delete/post_delete
+          signals for that model class.
+          """
+          ModelD = make_model('TempAutoD')
+          obj = ModelD.objects.create()
+  
+          called = {'pre': False, 'post': False}
+  
+          def pre(sender, **kwargs):
+              if sender is ModelD:
+                  called['pre'] = True
+          def post(sender, **kwargs):
+              if sender is ModelD:
+                  called['post'] = True
+  
+          signals.pre_delete.connect(pre)
+          signals.post_delete.connect(post)
+          try:
+              obj.delete()
+          finally:
+              signals.pre_delete.disconnect(pre)
+              signals.post_delete.disconnect(post)
+  
+          # Fast delete path for a single instance should avoid sending model-specific signals.
+          self.assertFalse(called['pre'])
+          self.assertFalse(called['post'])
+  
+      def test_queryset_delete_does_not_clear_instance_pk_on_returned_instances(self):
+          """
+          Deleting via a QuerySet returns counts and should not clear the pk
+          on instances that were previously fetched (only Model.delete single-instance
+          optimization clears the instance pk).
+          """
+          ModelE = make_model('TempAutoE')
+          o1 = ModelE.objects.create()
+          o2 = ModelE.objects.create()
+          # Fetch one instance and then perform a queryset delete.
+          fetched = [x for x in ModelE.objects.filter(pk=o1.pk)]
+          self.assertEqual(len(fetched), 1)
+          # Delete via queryset
+          deleted, deleted_dict = ModelE.objects.filter(pk__in=[o1.pk, o2.pk]).delete()
+          self.assertEqual(deleted, 2)
+          # The previously fetched instance's pk should remain as it was in-memory.
+          self.assertIsNotNone(fetched[0].pk)
+  
+      def test_single_instance_delete_return_dict_key_matches_label(self):
+          """
+          Ensure the returned deleted dict uses the model label as key and that
+          the value is 1 for a single-instance fast delete.
+          """
+          ModelF = make_model('TempAutoF')
+          obj = ModelF.objects.create()
+          deleted, deleted_dict = obj.delete()
+          self.assertIn(ModelF._meta.label, deleted_dict)
+          self.assertEqual(deleted_dict[ModelF._meta.label], 1)
+  
+      def test_delete_clears_pk_for_models_with_inheritance_parent(self):
+          """
+          If a concrete model has a parent pointer (inheritance), deleting the
+          single instance using the fast-path should still clear the PK on the
+          instance object returned to the caller.
+          """
+          # Create parent base model
+          Parent = make_model('TempParentG')
+          # Create child model that inherits Parent
+          Child = type('TempChildG', (Parent,), {'__module__': 'tests.dynamic_models'})
+          # Give the child a Meta with app_label and ensure table creation only for concrete model (Parent).
+          class MetaChild:
+              app_label = 'tests'
+          Child.Meta = MetaChild
+          # Create the concrete parent table already exists; now create child table as concrete model.
+          with connection.schema_editor() as schema_editor:
+              # Child is a concrete subclass; ensure the table exists for child.
+              schema_editor.create_model(Child)
+          # Create an instance of the child and delete it.
+          c = Child.objects.create()
+          self.assertIsNotNone(c.pk)
+          res = c.delete()
+          deleted, deleted_dict = res
+          # Ensure deletion happened and pk cleared on instance.
+          self.assertGreaterEqual(deleted, 1)
+          self.assertIsNone(c.pk)
+  
+      def test_multiple_deletes_do_not_use_single_fast_path(self):
+          """
+          Ensure that deleting multiple instances (QuerySet.delete) doesn't
+          accidentally take the single-instance fast-delete path.
+          The in-memory instance pks should remain unchanged for instances fetched
+          before the delete call.
+          """
+          ModelH = make_model('TempAutoH')
+          o1 = ModelH.objects.create()
+          o2 = ModelH.objects.create()
+          fetched_before = list(ModelH.objects.filter(pk=o1.pk))
+          self.assertEqual(len(fetched_before), 1)
+          ModelH.objects.filter(pk__in=[o1.pk, o2.pk]).delete()
+          # The fetched instance should still retain its in-memory pk (QuerySet path).
+          self.assertIsNotNone(fetched_before[0].pk)
+  
+      def test_collector_can_fast_delete_reflects_after_delete_state(self):
+          """
+          Confirm that before delete the collector can fast delete the instance
+          and after obj.delete() the instance pk is cleared to None.
+          """
+          ModelI = make_model('TempAutoI')
+          obj = ModelI.objects.create()
+          # Use Collector.can_fast_delete to verify the candidate fast-delete path exists.
+          from django.db.models.deletion import Collector
+          collector = Collector(using='default')
+          # This instance should be eligible for fast-delete.
+          self.assertTrue(collector.can_fast_delete(obj))
+          obj.delete()
+          self.assertIsNone(obj.pk)
+new_imports_code: |
+  # No new global imports required; the tests rely on standard Django testing utilities.

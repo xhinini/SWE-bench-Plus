@@ -1,0 +1,169 @@
+import re
+from datetime import datetime
+from django.db.models import Count, Max, Value, CharField
+from django.db.models.functions import Upper
+from datetime import datetime
+import re
+
+from django.db.models import Count, Max, Value, CharField
+from django.db.models.functions import Upper
+from django.test import TestCase
+
+from .models import Article, Author
+
+
+class GroupByRegressionTests(TestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        # Recreate a small dataset similar to the main ordering tests.
+        cls.author_1 = Author.objects.create(name="Name 1")
+        cls.author_2 = Author.objects.create(name="Name 2")
+        # Create extra authors to ensure multiple authors in DB.
+        for i in range(2):
+            Author.objects.create()
+        cls.a1 = Article.objects.create(headline="Article 1", pub_date=datetime(2005, 7, 26))
+        cls.a2 = Article.objects.create(headline="Article 2", pub_date=datetime(2005, 7, 27))
+        cls.a3 = Article.objects.create(headline="Article 3", pub_date=datetime(2005, 7, 27))
+        cls.a4 = Article.objects.create(headline="Article 4", pub_date=datetime(2005, 7, 28))
+        # Assign authors so grouping by author will produce multiple groups.
+        Article.objects.filter(headline='Article 1').update(author=cls.author_1)
+        Article.objects.filter(headline='Article 2').update(author=cls.author_1)
+        Article.objects.filter(headline='Article 3').update(author=cls.author_1)
+        Article.objects.filter(headline='Article 4').update(author=cls.author_2)
+
+    def _group_by_columns_from_sql(self, qs):
+        """
+        Extract the GROUP BY clause columns from the SQL for the given queryset.
+        Returns a list of upper-cased, stripped column fragments.
+        """
+        sql = str(qs.query).upper()
+        m = re.search(r'\bGROUP\s+BY\b(.*?)(?:\bHAVING\b|\bORDER\s+BY\b|\bLIMIT\b|$)', sql, re.S)
+        if not m:
+            return []
+        cols = m.group(1)
+        return [c.strip() for c in cols.split(',') if c.strip()]
+
+    def test_values_author_group_by_sql_no_meta_columns(self):
+        """
+        GROUP BY for .values('author').annotate(...) should not include
+        model Meta.ordering columns (headline, pub_date).
+        """
+        qs = Article.objects.values('author').annotate(count=Count('author'))
+        gb_cols = self._group_by_columns_from_sql(qs)
+        # Ensure meta ordering columns are not part of GROUP BY
+        forbidden = ('HEADLINE', 'PUB_DATE')
+        for f in forbidden:
+            self.assertFalse(any(f in col for col in gb_cols), "Found meta ordering column %r in GROUP BY: %s" % (f, gb_cols))
+        # Also validate result counts to ensure correct grouping
+        rows = list(qs)
+        # Expect two groups (author_1 with 3 articles, author_2 with 1)
+        self.assertCountEqual(rows, [
+            {'author': self.author_1.pk, 'count': 3},
+            {'author': self.author_2.pk, 'count': 1},
+        ])
+
+    def test_values_author_order_by_headline_group_by_sql(self):
+        """
+        Even if ordering would use 'headline' (a meta-ordering column), the
+        GROUP BY produced by .values('author').annotate(...) must not include it.
+        """
+        qs = Article.objects.values('author').annotate(count=Count('author')).order_by('headline')
+        gb_cols = self._group_by_columns_from_sql(qs)
+        self.assertFalse(any('HEADLINE' in col for col in gb_cols))
+        # Results should still be correct independent of ordering.
+        self.assertCountEqual(list(qs), [
+            {'author': self.author_1.pk, 'count': 3},
+            {'author': self.author_2.pk, 'count': 1},
+        ])
+
+    def test_values_author_annotate_last_date_group_by_sql(self):
+        """
+        Annotating with an aggregate on a meta-ordering field (pub_date) must
+        not cause headline/pub_date to leak into GROUP BY beyond the selected fields.
+        """
+        qs = Article.objects.values('author').annotate(last_date=Max('pub_date'))
+        gb_cols = self._group_by_columns_from_sql(qs)
+        # Only 'author' (and any DB specific qualification) should be present.
+        self.assertFalse(any('HEADLINE' in col or 'PUB_DATE' in col for col in gb_cols))
+        # Ensure the annotated values are correct for authors.
+        expected = {
+            self.author_1.pk: datetime(2005, 7, 27),
+            self.author_2.pk: datetime(2005, 7, 28),
+        }
+        result_map = {row['author']: row['last_date'] for row in qs}
+        self.assertEqual(result_map, expected)
+
+    def test_values_author_and_id_group_by_sql(self):
+        """
+        values('author', 'pk') with annotate should only GROUP BY the selected
+        columns, not the model Meta.ordering columns.
+        """
+        qs = Article.objects.values('author', 'pk').annotate(cnt=Count('pk'))
+        gb_cols = self._group_by_columns_from_sql(qs)
+        # Ensure neither headline nor pub_date appear in the GROUP BY clause.
+        self.assertFalse(any('HEADLINE' in col or 'PUB_DATE' in col for col in gb_cols))
+        # Confirm that group-by columns include author/ pk (at least by count).
+        self.assertTrue(any('AUTHOR' in col for col in gb_cols))
+
+    def test_values_author_distinct_group_by_sql(self):
+        """
+        Combining distinct() with values()/annotate() shouldn't pick up
+        Meta.ordering columns into GROUP BY.
+        """
+        qs = Article.objects.values('author').annotate(cnt=Count('author')).distinct()
+        gb_cols = self._group_by_columns_from_sql(qs)
+        self.assertFalse(any('HEADLINE' in col or 'PUB_DATE' in col for col in gb_cols))
+        # Distinct should not change the grouped counts here.
+        self.assertCountEqual(list(qs), [
+            {'author': self.author_1.pk, 'cnt': 3},
+            {'author': self.author_2.pk, 'cnt': 1},
+        ])
+
+    def test_values_with_explicit_ordering_cleared_group_by_sql(self):
+        """
+        Clearing the ordering (order_by()) and then grouping must not include
+        meta-ordering columns.
+        """
+        qs = Article.objects.order_by().values('author').annotate(cnt=Count('author'))
+        gb_cols = self._group_by_columns_from_sql(qs)
+        self.assertFalse(any('HEADLINE' in col or 'PUB_DATE' in col for col in gb_cols))
+
+    def test_annotate_then_values_group_by_sql(self):
+        """
+        Annotate first then values() should produce GROUP BY consistent with
+        the values() output and not include Meta.ordering columns.
+        """
+        qs = Article.objects.annotate(foo=Value('1', output_field=CharField())).values('author').annotate(cnt=Count('author'))
+        gb_cols = self._group_by_columns_from_sql(qs)
+        self.assertFalse(any('HEADLINE' in col or 'PUB_DATE' in col for col in gb_cols))
+        # Validate result still correct after chaining annotate/values.
+        self.assertCountEqual(list(qs), [
+            {'author': self.author_1.pk, 'cnt': 3},
+            {'author': self.author_2.pk, 'cnt': 1},
+        ])
+
+    def test_values_author_order_by_upper_expression_group_by_sql(self):
+        """
+        Ordering by a function expression based on a related field should not
+        affect GROUP BY when values() is used (meta ordering must not leak).
+        """
+        qs = Article.objects.values('author').annotate(cnt=Count('author')).order_by(Upper('headline'))
+        gb_cols = self._group_by_columns_from_sql(qs)
+        self.assertFalse(any('HEADLINE' in col or 'PUB_DATE' in col for col in gb_cols))
+
+    def test_values_author_multiple_annotations_group_by_sql(self):
+        """
+        Multiple annotations combined with values() must not cause meta-ordering
+        columns to be added to GROUP BY.
+        """
+        qs = Article.objects.values('author').annotate(
+            cnt=Count('author'),
+            last_date=Max('pub_date'),
+        )
+        gb_cols = self._group_by_columns_from_sql(qs)
+        self.assertFalse(any('HEADLINE' in col or 'PUB_DATE' in col for col in gb_cols))
+        # Ensure both annotations exist in the result.
+        rows = {r['author']: (r['cnt'], r['last_date']) for r in qs}
+        self.assertEqual(rows[self.author_1.pk][0], 3)
+        self.assertEqual(rows[self.author_2.pk][0], 1)

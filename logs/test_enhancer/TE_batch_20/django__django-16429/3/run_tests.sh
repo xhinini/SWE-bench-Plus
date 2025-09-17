@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 utils_tests.test_timesince_llm.TZAwarePivotTests.test_depth_with_aware_datetimes utils_tests.test_timesince_llm.TZAwarePivotTests.test_end_of_month_to_next_month_start utils_tests.test_timesince_llm.TZAwarePivotTests.test_large_years_aware utils_tests.test_timesince_llm.TZAwarePivotTests.test_month_and_weeks_remainder_across_timezones utils_tests.test_timesince_llm.TZAwarePivotTests.test_month_difference_across_timezones utils_tests.test_timesince_llm.TZAwarePivotTests.test_multiple_months_with_equal_day_across_timezones utils_tests.test_timesince_llm.TZAwarePivotTests.test_same_instant_different_timezones_results_in_zero utils_tests.test_timesince_llm.TZAwarePivotTests.test_timeuntil_with_months_across_timezones utils_tests.test_timesince_llm.TZAwarePivotTests.test_year_and_month_difference_across_timezones utils_tests.test_timesince_llm.TZAwarePivotTests.test_year_difference_across_timezones
+coverage json -o coverage.json
+: '>>>>> End Test Output'

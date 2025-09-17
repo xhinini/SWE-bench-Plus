@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 utils_tests.test_datastructures_llm.OrderedSetReversedMutationTests.test_reversed_add_mid_iteration_raises utils_tests.test_datastructures_llm.OrderedSetReversedMutationTests.test_reversed_clear_mid_iteration_raises utils_tests.test_datastructures_llm.OrderedSetReversedMutationTests.test_reversed_delitem_mid_iteration_raises utils_tests.test_datastructures_llm.OrderedSetReversedMutationTests.test_reversed_multiple_steps_then_mutate_raises utils_tests.test_datastructures_llm.OrderedSetReversedMutationTests.test_reversed_pop_mid_iteration_raises utils_tests.test_datastructures_llm.OrderedSetReversedMutationTests.test_reversed_popitem_mid_iteration_raises utils_tests.test_datastructures_llm.OrderedSetReversedMutationTests.test_reversed_remove_mid_iteration_raises utils_tests.test_datastructures_llm.OrderedSetReversedMutationTests.test_reversed_setdefault_mid_iteration_raises utils_tests.test_datastructures_llm.OrderedSetReversedMutationTests.test_reversed_setitem_mid_iteration_raises utils_tests.test_datastructures_llm.OrderedSetReversedMutationTests.test_reversed_update_mid_iteration_raises
+coverage json -o coverage.json
+: '>>>>> End Test Output'

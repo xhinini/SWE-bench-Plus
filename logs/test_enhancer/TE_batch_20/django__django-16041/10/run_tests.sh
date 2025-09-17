@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.EmptyFormKwargsCollisionTests.test_empty_form_prefix_format_when_prefix_in_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsCollisionTests.test_empty_form_preserves_custom_kwarg_when_collisions_present forms_tests.tests.test_formsets_llm.EmptyFormKwargsCollisionTests.test_empty_form_renderer_matches_formset_renderer_when_renderer_in_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsCollisionTests.test_empty_form_use_required_attribute_false_even_if_set_in_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsCollisionTests.test_empty_form_with_form_kwargs_including_auto_id forms_tests.tests.test_formsets_llm.EmptyFormKwargsCollisionTests.test_empty_form_with_form_kwargs_including_prefix forms_tests.tests.test_formsets_llm.EmptyFormKwargsCollisionTests.test_empty_form_with_form_kwargs_including_renderer forms_tests.tests.test_formsets_llm.EmptyFormKwargsCollisionTests.test_empty_form_with_form_kwargs_including_use_required_attribute forms_tests.tests.test_formsets_llm.EmptyFormKwargsCollisionTests.test_empty_form_with_multiple_colliding_keys
+coverage json -o coverage.json
+: '>>>>> End Test Output'

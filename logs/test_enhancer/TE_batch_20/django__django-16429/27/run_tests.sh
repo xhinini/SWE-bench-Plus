@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timesince_aware_different_timezones_years_months utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timesince_day_overflow_pivot_aware utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timesince_exact_year_aware_no_extra_units utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timesince_jan31_to_mar31_aware_returns_2_months utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timesince_months_edge_aware_jan_to_jan31 utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timesince_no_typeerror_for_aware_datetimes_with_different_tz utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timesince_pivot_month_wrap_aware utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timesince_time_comparison_decrement_months_aware utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timeuntil_aware_different_timezones_years_months utils_tests.test_timesince_llm.TZAwarePivotTimesinceTests.test_timeuntil_pivot_month_wrap_aware
+coverage json -o coverage.json
+: '>>>>> End Test Output'

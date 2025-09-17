@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.ManageRunserverAddressOutput.test_custom_default_ipv4_and_port_are_respected_in_output admin_scripts.tests_llm.ManageRunserverAddressOutput.test_custom_default_ipv6_is_bracketed_in_output admin_scripts.tests_llm.ManageRunserverAddressOutput.test_default_ipv6_prints_bracketed_address admin_scripts.tests_llm.ManageRunserverAddressOutput.test_explicit_bracketed_ipv6_address_is_printed_as_given admin_scripts.tests_llm.ManageRunserverAddressOutput.test_hostname_is_printed_without_brackets admin_scripts.tests_llm.ManageRunserverAddressOutput.test_ipv4_literal_prints_exact_ipv4 admin_scripts.tests_llm.ManageRunserverAddressOutput.test_ipv6_with_port_only_uses_default_ipv6_addr admin_scripts.tests_llm.ManageRunserverAddressOutput.test_no_double_brackets_for_ipv6_literal admin_scripts.tests_llm.ManageRunserverAddressOutput.test_zero_ip_prints_0_0_0_0 admin_scripts.tests_llm.RunserverOutputFormattingTests.run_and_get_output
+coverage json -o coverage.json
+: '>>>>> End Test Output'

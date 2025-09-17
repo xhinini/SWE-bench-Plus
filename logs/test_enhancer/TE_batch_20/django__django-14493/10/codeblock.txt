@@ -1,0 +1,173 @@
+from django.core.files.base import ContentFile
+from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
+import os
+import shutil
+import tempfile
+import unittest
+from io import BytesIO
+from django.core.files.base import ContentFile
+from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
+from django.conf import settings
+
+class ZeroPassManifestStorage(ManifestStaticFilesStorage):
+    # Force the edge case the original bug exposed.
+    max_post_process_passes = 0
+
+class TestMaxPostProcessPasses(unittest.TestCase):
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        # Use a filesystem location and a non-empty STATIC_URL.
+        self.storage = ZeroPassManifestStorage(location=self.temp_dir, base_url='/static/')
+        self.addCleanup(shutil.rmtree, self.temp_dir)
+
+    def write_file(self, name, content_bytes):
+        # Ensure directory exists for nested paths.
+        full_path = os.path.join(self.temp_dir, name)
+        dir_name = os.path.dirname(full_path)
+        if dir_name and not os.path.exists(dir_name):
+            os.makedirs(dir_name)
+        # Use the storage API to create the file so storage can handle permission bits same way.
+        return self.storage._save(name, ContentFile(content_bytes))
+
+    def test_post_process_simple_css_with_image_no_unboundlocal(self):
+        # CSS references an image in same directory. Should be post-processed without error.
+        self.write_file('test/image.png', b'image-contents')
+        self.write_file('test/test.css', b'body { background: url("image.png"); }')
+        paths = {
+            'test/test.css': (self.storage, 'test/test.css'),
+            'test/image.png': (self.storage, 'test/image.png'),
+        }
+        # Should not raise; should produce processed entries.
+        results = list(self.storage.post_process(paths, dry_run=False))
+        # Confirm that the css got post-processed and storage has a hashed file for it.
+        self.assertTrue(self.storage.hashed_files)
+        key = self.storage.clean_name('test/test.css')
+        self.assertIn(key, self.storage.hashed_files)
+        hashed_name = self.storage.hashed_files[key]
+        # The processed file should exist on disk.
+        self.assertTrue(os.path.exists(self.storage.path(hashed_name)))
+        # The CSS content should reference a hashed png (i.e., contains ".png").
+        with self.storage.open(hashed_name) as f:
+            content = f.read()
+        self.assertIn(b'.png', content)
+
+    def test_post_process_with_fragment_preserved(self):
+        # File references image with a fragment (#hash)
+        self.write_file('frag/img.png', b'img')
+        self.write_file('frag/styles.css', b'url("img.png#somefrag")')
+        paths = {
+            'frag/styles.css': (self.storage, 'frag/styles.css'),
+            'frag/img.png': (self.storage, 'frag/img.png'),
+        }
+        results = list(self.storage.post_process(paths, dry_run=False))
+        key = self.storage.clean_name('frag/styles.css')
+        hashed_css = self.storage.hashed_files[key]
+        with self.storage.open(hashed_css) as f:
+            content = f.read()
+        # Fragment should be preserved (either '#somefrag' or encoded as appropriate).
+        self.assertIn(b'#somefrag', content)
+
+    def test_post_process_with_querystring_preserved(self):
+        # File references image with querystring (?v=1)
+        self.write_file('qry/img.png', b'img')
+        self.write_file('qry/styles.css', b'url("img.png?v=1")')
+        paths = {
+            'qry/styles.css': (self.storage, 'qry/styles.css'),
+            'qry/img.png': (self.storage, 'qry/img.png'),
+        }
+        results = list(self.storage.post_process(paths, dry_run=False))
+        key = self.storage.clean_name('qry/styles.css')
+        hashed_css = self.storage.hashed_files[key]
+        with self.storage.open(hashed_css) as f:
+            content = f.read()
+        self.assertIn(b'?v=1', content)
+
+    def test_font_face_question_hash_hack_preserved(self):
+        # The special font-face hack uses '?#' in the URL and the code special-cases this.
+        self.write_file('fonts/myfont.eot', b'font-data')
+        self.write_file('fonts/fonts.css', b'url("myfont.eot?#iefix")')
+        paths = {
+            'fonts/fonts.css': (self.storage, 'fonts/fonts.css'),
+            'fonts/myfont.eot': (self.storage, 'fonts/myfont.eot'),
+        }
+        results = list(self.storage.post_process(paths, dry_run=False))
+        key = self.storage.clean_name('fonts/fonts.css')
+        hashed_css = self.storage.hashed_files[key]
+        with self.storage.open(hashed_css) as f:
+            content = f.read()
+        # The '?#' hack should result in a '?' appended to the URL path in the final URL.
+        self.assertIn(b'?#iefix', content)
+
+    def test_absolute_urls_are_ignored(self):
+        # External absolute URLs must be left untouched.
+        css_content = b'background: url("http://example.com/external.png");'
+        self.write_file('abs/styles.css', css_content)
+        paths = {'abs/styles.css': (self.storage, 'abs/styles.css')}
+        results = list(self.storage.post_process(paths, dry_run=False))
+        key = self.storage.clean_name('abs/styles.css')
+        hashed_css = self.storage.hashed_files[key]
+        with self.storage.open(hashed_css) as f:
+            content = f.read()
+        self.assertIn(b'http://example.com/external.png', content)
+
+    def test_data_uris_ignored(self):
+        # data: URIs should be ignored and preserved verbatim.
+        css_content = b'background: url("data:image/png;base64,AAAA")'
+        self.write_file('data/styles.css', css_content)
+        paths = {'data/styles.css': (self.storage, 'data/styles.css')}
+        results = list(self.storage.post_process(paths, dry_run=False))
+        key = self.storage.clean_name('data/styles.css')
+        hashed_css = self.storage.hashed_files[key]
+        with self.storage.open(hashed_css) as f:
+            content = f.read()
+        self.assertIn(b'data:image/png;base64,AAAA', content)
+
+    def test_multiple_files_with_zero_passes(self):
+        # Ensure multiple files are processed without error when max_post_process_passes == 0.
+        self.write_file('multi/a.png', b'a')
+        self.write_file('multi/b.png', b'b')
+        self.write_file('multi/style1.css', b'url("../multi/a.png")')
+        self.write_file('multi/style2.css', b'url("b.png")')
+        paths = {
+            'multi/style1.css': (self.storage, 'multi/style1.css'),
+            'multi/style2.css': (self.storage, 'multi/style2.css'),
+            'multi/a.png': (self.storage, 'multi/a.png'),
+            'multi/b.png': (self.storage, 'multi/b.png'),
+        }
+        results = list(self.storage.post_process(paths, dry_run=False))
+        # both CSS files should be present in hashed_files
+        self.assertIn(self.storage.clean_name('multi/style1.css'), self.storage.hashed_files)
+        self.assertIn(self.storage.clean_name('multi/style2.css'), self.storage.hashed_files)
+
+    def test_manifest_is_saved_after_post_process(self):
+        # ManifestFilesMixin.save_manifest should run after post_process when not a dry run.
+        self.write_file('man/img.png', b'img')
+        self.write_file('man/styles.css', b'url("img.png")')
+        paths = {
+            'man/styles.css': (self.storage, 'man/styles.css'),
+            'man/img.png': (self.storage, 'man/img.png'),
+        }
+        # Remove any existing manifest
+        manifest_path = os.path.join(self.temp_dir, self.storage.manifest_name)
+        if os.path.exists(manifest_path):
+            os.unlink(manifest_path)
+        # Run post_process (which should in turn save the manifest)
+        list(self.storage.post_process(paths, dry_run=False))
+        # Manifest file should now exist on disk
+        self.assertTrue(os.path.exists(manifest_path))
+        # And load_manifest should return a mapping that includes our file
+        manifest = self.storage.load_manifest()
+        self.assertIn(self.storage.clean_name('man/styles.css'), manifest)
+
+    def test_stored_name_works_with_zero_passes(self):
+        # stored_name should compute a hashed name even when max_post_process_passes == 0
+        self.write_file('sfile/asset.png', b'asset')
+        # Directly call stored_name for an existing file; should not error and should return a string.
+        result = self.storage.stored_name('sfile/asset.png')
+        self.assertIsInstance(result, str)
+        # If returned is a path, it should point to a file under storage
+        # We don't require the file to exist at that exact name (intermediates), but it must be a non-empty string.
+        self.assertTrue(result)
+
+if __name__ == "__main__":
+    unittest.main()

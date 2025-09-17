@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_writer_llm.CustomOp.__init__ migrations.test_writer_llm.CustomOp.deconstruct migrations.test_writer_llm.DummySerializer.serialize migrations.test_writer_llm.DummyValue.__repr__ migrations.test_writer_llm.LeadingWhitespaceImportsTests.make_migration_and_render migrations.test_writer_llm.LeadingWhitespaceImportsTests.setUp migrations.test_writer_llm.LeadingWhitespaceImportsTests.tearDown migrations.test_writer_llm.LeadingWhitespaceImportsTests.test_leading_space_and_no_whitespace_mixed migrations.test_writer_llm.LeadingWhitespaceImportsTests.test_leading_space_does_not_break_generation migrations.test_writer_llm.LeadingWhitespaceImportsTests.test_leading_space_from_db_models_and_migrations_present migrations.test_writer_llm.LeadingWhitespaceImportsTests.test_leading_space_import_included migrations.test_writer_llm.LeadingWhitespaceImportsTests.test_leading_space_multiple_operations migrations.test_writer_llm.LeadingWhitespaceImportsTests.test_leading_space_preserved_as_substring migrations.test_writer_llm.LeadingWhitespaceImportsTests.test_leading_spaces_from_included migrations.test_writer_llm.LeadingWhitespaceImportsTests.test_leading_tab_import_included migrations.test_writer_llm.LeadingWhitespaceImportsTests.test_mixed_whitespace_imports_included migrations.test_writer_llm.LeadingWhitespaceImportsTests.test_multiple_leading_whitespace_variants
+coverage json -o coverage.json
+: '>>>>> End Test Output'

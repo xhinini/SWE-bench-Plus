@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.tests_llm.test_list_editable_atomic_called_even_when_some_forms_unchanged admin_changelist.tests_llm.test_list_editable_atomic_called_for_multiple_saved_forms_ordering admin_changelist.tests_llm.test_list_editable_atomic_called_when_log_change_raises admin_changelist.tests_llm.test_list_editable_atomic_called_when_prefix_contains_regex_chars admin_changelist.tests_llm.test_list_editable_atomic_called_when_select_across_flag_present admin_changelist.tests_llm.test_list_editable_atomic_called_with_router_db_for_write_multiple_changes admin_changelist.tests_llm.test_list_editable_atomic_called_with_router_db_for_write_single_change admin_changelist.tests_llm.test_list_editable_atomic_called_with_router_db_for_write_when_router_returns_default admin_changelist.tests_llm.test_list_editable_atomic_called_with_router_db_for_write_when_router_returns_none
+coverage json -o coverage.json
+: '>>>>> End Test Output'

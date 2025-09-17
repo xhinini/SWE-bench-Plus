@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.UserCreationFormM2MTests._make_form_class auth_tests.test_forms_llm.UserCreationFormM2MTests.setUp auth_tests.test_forms_llm.UserCreationFormM2MTests.test_commit_false_without_save_m2m_does_not_create_m2m auth_tests.test_forms_llm.UserCreationFormM2MTests.test_empty_m2m_selection_results_in_no_relations auth_tests.test_forms_llm.UserCreationFormM2MTests.test_m2m_saved_on_commit_true_multiple auth_tests.test_forms_llm.UserCreationFormM2MTests.test_m2m_saved_on_commit_true_single auth_tests.test_forms_llm.UserCreationFormM2MTests.test_m2m_saved_with_mixed_pk_types auth_tests.test_forms_llm.UserCreationFormM2MTests.test_no_exception_when_save_m2m_attribute_access_raises auth_tests.test_forms_llm.UserCreationFormM2MTests.test_repeated_saves_do_not_duplicate_relations auth_tests.test_forms_llm.UserCreationFormM2MTests.test_save_commit_false_then_manual_save_m2m auth_tests.test_forms_llm.UserCreationFormM2MTests.test_updating_m2m_replaces_previous_selection
+coverage json -o coverage.json
+: '>>>>> End Test Output'

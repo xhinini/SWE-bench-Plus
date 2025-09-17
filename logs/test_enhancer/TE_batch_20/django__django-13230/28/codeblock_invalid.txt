@@ -1,0 +1,286 @@
+from types import SimpleNamespace
+from io import BytesIO
+from django.test import SimpleTestCase, RequestFactory
+from django.utils import feedgenerator
+from django.utils.timezone import datetime, timedelta
+from django.template import Template, Context
+from django.utils.safestring import SafeString
+from django.contrib.syndication import views
+
+# Make get_current_site deterministic for tests
+views.get_current_site = lambda request: SimpleNamespace(domain='example.com')
+
+class DummyItem:
+    def __init__(self, pk=1, title='Item title', published=None, updated=None):
+        self.pk = pk
+        self._title = title
+        self.published = published or datetime(2020, 1, 1, 12, 0, 0)
+        self.updated = updated or (self.published + timedelta(hours=1))
+
+    def __str__(self):
+        return self._title
+
+    def get_absolute_url(self):
+        return '/items/%s/' % self.pk
+
+def render_feed(feed_instance, request):
+    """
+    Helper: get feed generator and render to string (utf-8).
+    """
+    feedgen = feed_instance.get_feed(None, request)
+    buf = BytesIO()
+    feedgen.write(buf, 'utf-8')
+    return buf.getvalue().decode('utf-8')
+
+class CommentsOrderingTests(SimpleTestCase):
+    def setUp(self):
+        self.rf = RequestFactory()
+
+    def test_rss2_comments_before_category_and_copyright(self):
+        class F(views.Feed):
+            feed_type = feedgenerator.Rss201rev2Feed
+            title = 'T'
+            link = '/blog/'
+
+            def items(self):
+                return [DummyItem()]
+
+            def item_comments(self, item):
+                return 'http://example.com%scomments' % item.get_absolute_url()
+
+            item_categories = ('alpha',)
+            item_copyright = '© Me'
+
+        feed = F()
+        req = self.rf.get('/blog/')
+        xml = render_feed(feed, req)
+        # Ensure <comments> present and before <category> and <copyright>
+        cpos = xml.find('<comments>')
+        catpos = xml.find('<category>')
+        copyrightpos = xml.find('<copyright>')
+        self.assertNotEqual(cpos, -1, "comments element missing")
+        self.assertNotEqual(catpos, -1, "category element missing")
+        self.assertNotEqual(copyrightpos, -1, "copyright element missing")
+        self.assertLess(cpos, catpos, "comments should appear before category")
+        self.assertLess(cpos, copyrightpos, "comments should appear before copyright")
+
+    def test_rss091_comments_before_category_and_copyright(self):
+        class F(views.Feed):
+            feed_type = feedgenerator.RssUserland091Feed
+            title = 'T'
+            link = '/blog/'
+
+            def items(self):
+                return [DummyItem()]
+
+            def item_comments(self, item):
+                return 'http://example.com%scomments' % item.get_absolute_url()
+
+            item_categories = ('one',)
+            item_copyright = '© Author'
+
+        feed = F()
+        req = self.rf.get('/blog/')
+        xml = render_feed(feed, req)
+        cpos = xml.find('<comments>')
+        catpos = xml.find('<category>')
+        copyrightpos = xml.find('<copyright>')
+        self.assertNotEqual(cpos, -1, "comments element missing in RSS 0.91")
+        self.assertLess(cpos, catpos)
+        self.assertLess(cpos, copyrightpos)
+
+    def test_atom_comments_link_before_category_and_copyright(self):
+        class F(views.Feed):
+            feed_type = feedgenerator.Atom1Feed
+            title = 'T'
+            link = '/blog/'
+
+            def items(self):
+                return [DummyItem()]
+
+            def item_comments(self, item):
+                # Atom feedgenerator uses rel="replies" for comments
+                return 'http://example.com%scomments' % item.get_absolute_url()
+
+            item_categories = ('x',)
+            item_copyright = '© AtomAuthor'
+
+        feed = F()
+        req = self.rf.get('/blog/')
+        xml = render_feed(feed, req)
+        # Atom uses a <link rel="replies" href="..."/> element for comments.
+        # Ensure the replies link exists and comes before category/self copyright tags.
+        replies_pos = xml.find('rel="replies"')
+        category_pos = xml.find('<category')
+        copyright_pos = xml.find('<rights>')
+        self.assertNotEqual(replies_pos, -1, "Atom replies link missing")
+        # If category is present, ensure ordering
+        if category_pos != -1:
+            self.assertLess(replies_pos, category_pos)
+        if copyright_pos != -1:
+            self.assertLess(replies_pos, copyright_pos)
+
+    def test_multiple_items_each_has_comments_before_category(self):
+        class F(views.Feed):
+            feed_type = feedgenerator.Rss201rev2Feed
+            title = 'T'
+            link = '/blog/'
+
+            def items(self):
+                return [DummyItem(pk=1), DummyItem(pk=2)]
+
+            def item_comments(self, item):
+                return 'http://example.com%scomments' % item.get_absolute_url()
+
+            item_categories = ('cat',)
+
+        feed = F()
+        req = self.rf.get('/blog/')
+        xml = render_feed(feed, req)
+        # Verify each item's comments tag appears before category tag within that item.
+        # We check occurrence order: first <comments> should appear before first <category>.
+        first_comments = xml.find('<comments>')
+        first_category = xml.find('<category>')
+        self.assertLess(first_comments, first_category)
+
+    def test_template_title_and_description_do_not_affect_comments_order(self):
+        class F(views.Feed):
+            feed_type = feedgenerator.Rss201rev2Feed
+            title = 'T'
+            link = '/blog/'
+            title_template = 'ignored_title_template.html'
+            description_template = 'ignored_desc_template.html'
+
+            def items(self):
+                return [DummyItem()]
+
+            def item_comments(self, item):
+                return 'http://example.com%scomments' % item.get_absolute_url()
+
+            # Provide a get_template that returns a simple template for testing.
+            def __init__(self):
+                super().__init__()
+                # Monkeypatch loader.get_template used in Feed.get_feed
+                self._saved_loader = views.loader.get_template
+                views.loader.get_template = lambda name: Template("title: {{ obj }} - {{ foo }}")
+
+            def __del__(self):
+                # Restore loader
+                views.loader.get_template = self._saved_loader
+
+            def get_context_data(self, **kwargs):
+                ctx = super().get_context_data(**kwargs)
+                ctx['foo'] = 'bar'
+                return ctx
+
+        feed = F()
+        req = self.rf.get('/blog/')
+        xml = render_feed(feed, req)
+        cpos = xml.find('<comments>')
+        catpos = xml.find('<category>')
+        self.assertNotEqual(cpos, -1)
+        self.assertLess(cpos, catpos)
+
+    def test_comments_present_when_author_missing(self):
+        class F(views.Feed):
+            feed_type = feedgenerator.Rss201rev2Feed
+            title = 'T'
+            link = '/blog/'
+
+            def items(self):
+                return [DummyItem()]
+
+            def item_comments(self, item):
+                return 'http://example.com%scomments' % item.get_absolute_url()
+
+            # Do not set item_author_name to test None-handling path in get_feed
+
+        feed = F()
+        req = self.rf.get('/blog/')
+        xml = render_feed(feed, req)
+        self.assertIn('<comments>', xml)
+
+    def test_comments_and_categories_with_item_extra_kwargs_ordering(self):
+        # Ensure that presence of item_extra_kwargs does not remove comments nor change ordering.
+        class F(views.Feed):
+            feed_type = feedgenerator.Rss201rev2Feed
+            title = 'T'
+            link = '/blog/'
+
+            def items(self):
+                return [DummyItem()]
+
+            def item_comments(self, item):
+                return 'http://example.com%scomments' % item.get_absolute_url()
+
+            def item_extra_kwargs(self, item):
+                # Provide an unrelated extra kw to ensure **item_extra_kwargs is present.
+                return {'foo': 'bar'}
+
+            item_categories = ('misc',)
+
+        feed = F()
+        req = self.rf.get('/blog/')
+        xml = render_feed(feed, req)
+        cpos = xml.find('<comments>')
+        catpos = xml.find('<category>')
+        self.assertNotEqual(cpos, -1)
+        self.assertLess(cpos, catpos)
+
+    def test_comments_href_iri_conversion_and_presence(self):
+        class F(views.Feed):
+            feed_type = feedgenerator.Rss201rev2Feed
+            title = 'T'
+            link = '/blog/'
+
+            def items(self):
+                # Simulate an item whose get_absolute_url returns non-ASCII characters
+                class I(DummyItem):
+                    def get_absolute_url(self):
+                        return '/mö/'
+
+                return [I()]
+
+            def item_comments(self, item):
+                return 'http://example.com%scomments' % item.get_absolute_url()
+
+        feed = F()
+        req = self.rf.get('/blog/')
+        xml = render_feed(feed, req)
+        # Ensure iri_to_uri conversion has taken place and comments element exists
+        self.assertIn('<comments>http://example.com/',''.join(xml.splitlines())[:400])
+    
+    def test_comments_order_when_item_has_custom_guid_and_permalink_flag(self):
+        class F(views.Feed):
+            feed_type = feedgenerator.Rss201rev2Feed
+            title = 'T'
+            link = '/blog/'
+
+            def items(self):
+                return [DummyItem()]
+
+            def item_comments(self, item):
+                return 'http://example.com%scomments' % item.get_absolute_url()
+
+            def item_guid(self, item):
+                return 'custom-guid-1234'
+
+            def item_guid_is_permalink(self, item):
+                return False
+
+            item_categories = ('cat',)
+            item_copyright = '© Some'
+
+        feed = F()
+        req = self.rf.get('/blog/')
+        xml = render_feed(feed, req)
+        cpos = xml.find('<comments>')
+        guidpos = xml.find('<guid')
+        catpos = xml.find('<category>')
+        # comments should be present and appear before category; guid may be present as well
+        self.assertNotEqual(cpos, -1)
+        self.assertLess(cpos, catpos)
+new_imports_code: |
+  from types import SimpleNamespace
+  from io import BytesIO
+  from django.test import RequestFactory, SimpleTestCase

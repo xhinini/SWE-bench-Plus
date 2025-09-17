@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 queries.test_bulk_update_llm.BulkUpdateRegressionTests.setUpTestData queries.test_bulk_update_llm.BulkUpdateRegressionTests.test_bulk_update_with_foreignkey_set_to_none queries.test_bulk_update_llm.BulkUpdateRegressionTests.test_case_expression_assigned_to_field queries.test_bulk_update_llm.BulkUpdateRegressionTests.test_cast_expression_assigned_to_integer_field queries.test_bulk_update_llm.BulkUpdateRegressionTests.test_combined_expression_arithmetic_assigned queries.test_bulk_update_llm.BulkUpdateRegressionTests.test_custom_db_column_with_F_expression queries.test_bulk_update_llm.BulkUpdateRegressionTests.test_falsey_numeric_value_preserved queries.test_bulk_update_llm.BulkUpdateRegressionTests.test_function_expression_assigned queries.test_bulk_update_llm.BulkUpdateRegressionTests.test_mixed_literal_and_F_expression queries.test_bulk_update_llm.BulkUpdateRegressionTests.test_value_instance_assigned_to_field queries.test_bulk_update_llm.BulkUpdateRegressionTests.test_value_wrapped_expression_not_wrapped_again
+coverage json -o coverage.json
+: '>>>>> End Test Output'

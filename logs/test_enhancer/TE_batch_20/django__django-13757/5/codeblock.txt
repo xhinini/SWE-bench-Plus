@@ -1,0 +1,164 @@
+from django.db.models.fields.json import KeyTransformIsNull, KeyTransform, HasKey
+import types
+from django.test import SimpleTestCase
+from django.db.models.fields.json import (
+    KeyTransform,
+    KeyTransformIsNull,
+    HasKey,
+)
+
+class DummyCompiler:
+    """
+    Very small compiler stub that returns a preconfigured SQL and params
+    for whatever expression is compiled. preprocess_lhs expects a (sql, params)
+    tuple from compiler.compile(...).
+    """
+    def __init__(self, sql='"value"', params=None):
+        self._sql = sql
+        self._params = list(params or [])
+
+    def compile(self, expression):
+        # Return the configured SQL and params. The tests examine how
+        # KeyTransformIsNull composes SQL/params from these values.
+        return self._sql, self._params
+
+class DummyConnection:
+    def __init__(self, vendor):
+        self.vendor = vendor
+        # Minimal features object used by some code paths (not extensive).
+        self.features = types.SimpleNamespace(
+            has_native_json_field=True,
+            supports_json_field=True,
+            supports_json_field_contains=True,
+        )
+        # MySQL specific flag (unused here but present on real connection)
+        self.mysql_is_mariadb = False
+
+class KeyTransformIsNullSQLTests(SimpleTestCase):
+    def test_oracle_isnull_false_returns_haskey_sql(self):
+        # When isnull=False we expect the same SQL as a HasKey lookup
+        compiler = DummyCompiler(sql='"value"', params=[])
+        connection = DummyConnection(vendor='oracle')
+        kt = KeyTransform('a', 'value')
+        lookup = KeyTransformIsNull(kt, False)
+
+        expected_sql, expected_params = HasKey('value', 'a').as_oracle(compiler, connection)
+        sql, params = lookup.as_oracle(compiler, connection)
+
+        self.assertEqual(sql, expected_sql)
+        self.assertEqual(params, expected_params)
+
+    def test_oracle_isnull_true_contains_not_and_is_null(self):
+        # isnull=True should produce a combined condition with NOT <has_key>
+        # OR <lhs> IS NULL (per gold patch)
+        compiler = DummyCompiler(sql='"value"', params=[])
+        connection = DummyConnection(vendor='oracle')
+        kt = KeyTransform('a', 'value')
+        lookup = KeyTransformIsNull(kt, True)
+
+        sql, params = lookup.as_oracle(compiler, connection)
+        # Must contain a NOT of the has_key expression and an IS NULL check on the lhs.
+        self.assertIn('NOT', sql)
+        self.assertIn('IS NULL', sql)
+        # The JSON path used by has_key for key 'a' should be present (oracle gets formatted SQL)
+        self.assertIn('$."a"', sql)
+        # No parameters expected in this simple compile() case.
+        self.assertEqual(params, ())
+
+    def test_oracle_isnull_true_includes_lhs_params(self):
+        # If the lhs compile produces parameters, these must be propagated in the
+        # returned params. The candidate patch fails to include lhs params.
+        compiler = DummyCompiler(sql='"value"', params=['p1', 'p2'])
+        connection = DummyConnection(vendor='oracle')
+        kt = KeyTransform('a', 'value')
+        lookup = KeyTransformIsNull(kt, True)
+
+        sql, params = lookup.as_oracle(compiler, connection)
+        # The HasKey.as_oracle result is formatted SQL (no params), but lhs params
+        # coming from compiler.compile(previous) must be appended by the lookup.
+        self.assertIn('IS NULL', sql)
+        self.assertEqual(tuple(params), ('p1', 'p2'))
+
+    def test_sqlite_isnull_false_uses_is_not_null_template_and_params(self):
+        compiler = DummyCompiler(sql='"value"', params=[])
+        connection = DummyConnection(vendor='sqlite')
+        kt = KeyTransform('a', 'value')
+        lookup = KeyTransformIsNull(kt, False)
+
+        sql, params = lookup.as_sqlite(compiler, connection)
+        # Template should be the IS NOT NULL variant for isnull=False
+        self.assertIn('IS NOT NULL', sql)
+        # The path parameter should be provided as a parameter ('$."a"')
+        self.assertIn('$."a"', params[0])
+
+    def test_sqlite_isnull_true_uses_is_null_template_and_params(self):
+        compiler = DummyCompiler(sql='"value"', params=[])
+        connection = DummyConnection(vendor='sqlite')
+        kt = KeyTransform('a', 'value')
+        lookup = KeyTransformIsNull(kt, True)
+
+        sql, params = lookup.as_sqlite(compiler, connection)
+        # Template should be the IS NULL variant for isnull=True
+        self.assertIn('IS NULL', sql)
+        self.assertIn('$."a"', params[0])
+
+    def test_sqlite_isnull_true_does_not_wrap_with_not(self):
+        # The candidate patch wrapped the SQLite SQL with NOT(...). The gold patch
+        # uses the JSON_TYPE(... ) IS NULL template directly. Ensure NOT is not used.
+        compiler = DummyCompiler(sql='"value"', params=[])
+        connection = DummyConnection(vendor='sqlite')
+        kt = KeyTransform('a', 'value')
+        lookup = KeyTransformIsNull(kt, True)
+
+        sql, params = lookup.as_sqlite(compiler, connection)
+        # The SQL should not be a NOT(...) wrapper
+        self.assertNotIn('NOT (', sql)
+        self.assertIn('JSON_TYPE', sql)
+
+    def test_sqlite_numeric_key_path_uses_array_index(self):
+        # Numeric key transforms should produce array index paths like $[1]
+        compiler = DummyCompiler(sql='"value"', params=[])
+        connection = DummyConnection(vendor='sqlite')
+        kt = KeyTransform(1, 'value')  # numeric key
+        lookup = KeyTransformIsNull(kt, True)
+
+        sql, params = lookup.as_sqlite(compiler, connection)
+        # Parameterized JSON path should include array index notation
+        self.assertIn('$[1]', params[0])
+
+    def test_oracle_numeric_key_path_in_haskey(self):
+        # Ensure Postgres/Oracle style JSON path (via HasKey.as_oracle formatting)
+        # includes an array index for numeric key transforms when formatted into SQL.
+        compiler = DummyCompiler(sql='"value"', params=[])
+        connection = DummyConnection(vendor='oracle')
+        # For this test use HasKey directly to check formatting into SQL (oracle formats paths into SQL)
+        haskey_sql, haskey_params = HasKey('value', 1).as_oracle(compiler, connection)
+        # Should include $[1] in the SQL returned by HasKey.as_oracle for numeric key
+        self.assertIn('$[1]', haskey_sql)
+
+    def test_sqlite_lhs_with_params_includes_lhs_params_for_isnull_true(self):
+        # For SQLite path-building the HasKey.as_sql will include lhs params (from compiler),
+        # and KeyTransformIsNull.as_sqlite must return them unchanged.
+        compiler = DummyCompiler(sql='"value"', params=['p'])
+        connection = DummyConnection(vendor='sqlite')
+        kt = KeyTransform('a', 'value')
+        lookup = KeyTransformIsNull(kt, True)
+
+        sql, params = lookup.as_sqlite(compiler, connection)
+        # The lhs params should be present in the returned params (appended before path param)
+        self.assertIn('p', params)
+        # And the JSON path param should also be present
+        self.assertTrue(any('$."a"' in p for p in params))
+
+    def test_oracle_key_with_percent_is_escaped_in_preprocess_lhs(self):
+        # Oracle-specific logic in preprocess_lhs replaces '%' with '%%' in key transforms.
+        compiler = DummyCompiler(sql='"value"', params=[])
+        connection = DummyConnection(vendor='oracle')
+        # Key contains a percent sign
+        kt = KeyTransform('a%pct', 'value')
+        lookup = KeyTransformIsNull(kt, True)
+
+        sql, params = lookup.as_oracle(compiler, connection)
+        # The JSON path embedded in the SQL should contain an escaped percent '%%'
+        # (JSON dumps will quote the key, we check for the doubled percent inside the SQL)
+        self.assertIn('%%', sql)

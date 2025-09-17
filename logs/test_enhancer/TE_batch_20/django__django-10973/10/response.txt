@@ -1,0 +1,224 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests ensure that the environment variable PGPASSWORD passed to subprocess.run is always a string (i.e., str(passwd)), even when the provided password value is an int, bytes, bool, list, or arbitrary object. They also check that no legacy PGPASSFILE env var is leaked into os.environ and that special-character passwords are preserved. The candidate model patch assigns non-string values directly into the env mapping, which would cause these tests to fail (they assert string conversion). All tests mock subprocess.run to capture the env mapping and command arguments without executing an external process.
+test_code: |
+  import os
+  import signal
+  import subprocess
+  from unittest import mock
+  
+  from django.db.backends.postgresql.client import DatabaseClient
+  from django.test import SimpleTestCase
+  
+  
+  class PostgreSqlDbshellCommandTestCase(SimpleTestCase):
+  
+      def _run_it(self, dbinfo):
+          """
+          Existing helper: invokes runshell command, mocking subprocess.run().
+          Returns a 2-tuple with the command list and the PGPASSWORD env var (or None).
+          """
+          def _mock_subprocess_run(*args, env=os.environ, **kwargs):
+              self.subprocess_args = list(*args)
+              self.pgpassword = env.get('PGPASSWORD')
+              return subprocess.CompletedProcess(self.subprocess_args, 0)
+          with mock.patch('subprocess.run', new=_mock_subprocess_run):
+              DatabaseClient.runshell_db(dbinfo)
+          return self.subprocess_args, self.pgpassword
+  
+      def _capture_run_env(self, dbinfo):
+          """
+          New helper: captures both the arguments list and the full env mapping
+          passed to subprocess.run by mocking it.
+          """
+          captured = {}
+  
+          def _mock_subprocess_run(*args, **kwargs):
+              # Extract the command list from positional arg or kwargs.
+              cmd = args[0] if args else kwargs.get('args')
+              captured['args'] = list(cmd) if cmd is not None else None
+              captured['env'] = kwargs.get('env')
+              return subprocess.CompletedProcess(captured['args'], 0)
+  
+          with mock.patch('subprocess.run', new=_mock_subprocess_run):
+              DatabaseClient.runshell_db(dbinfo)
+          return captured['args'], captured.get('env')
+  
+      def test_basic(self):
+          self.assertEqual(
+              self._run_it({
+                  'database': 'dbname',
+                  'user': 'someuser',
+                  'password': 'somepassword',
+                  'host': 'somehost',
+                  'port': '444',
+              }), (
+                  ['psql', '-U', 'someuser', '-h', 'somehost', '-p', '444', 'dbname'],
+                  'somepassword',
+              )
+          )
+  
+      def test_nopass(self):
+          self.assertEqual(
+              self._run_it({
+                  'database': 'dbname',
+                  'user': 'someuser',
+                  'host': 'somehost',
+                  'port': '444',
+              }), (
+                  ['psql', '-U', 'someuser', '-h', 'somehost', '-p', '444', 'dbname'],
+                  None,
+              )
+          )
+  
+      def test_column(self):
+          self.assertEqual(
+              self._run_it({
+                  'database': 'dbname',
+                  'user': 'some:user',
+                  'password': 'some:password',
+                  'host': '::1',
+                  'port': '444',
+              }), (
+                  ['psql', '-U', 'some:user', '-h', '::1', '-p', '444', 'dbname'],
+                  'some:password',
+              )
+          )
+  
+      def test_accent(self):
+          username = 'rôle'
+          password = 'sésame'
+          self.assertEqual(
+              self._run_it({
+                  'database': 'dbname',
+                  'user': username,
+                  'password': password,
+                  'host': 'somehost',
+                  'port': '444',
+              }), (
+                  ['psql', '-U', username, '-h', 'somehost', '-p', '444', 'dbname'],
+                  password,
+              )
+          )
+  
+      def test_sigint_handler(self):
+          """SIGINT is ignored in Python and passed to psql to abort quries."""
+          def _mock_subprocess_run(*args, **kwargs):
+              handler = signal.getsignal(signal.SIGINT)
+              self.assertEqual(handler, signal.SIG_IGN)
+  
+          sigint_handler = signal.getsignal(signal.SIGINT)
+          # The default handler isn't SIG_IGN.
+          self.assertNotEqual(sigint_handler, signal.SIG_IGN)
+          with mock.patch('subprocess.run', new=_mock_subprocess_run):
+              DatabaseClient.runshell_db({})
+          # dbshell restores the original handler.
+          self.assertEqual(sigint_handler, signal.getsignal(signal.SIGINT))
+  
+      # --- New regression tests start here ---
+  
+      def test_password_int_is_converted_to_str_in_env(self):
+          args, env = self._capture_run_env({
+              'database': 'd',
+              'user': 'u',
+              'password': 123,  # integer password
+          })
+          # Expect PGPASSWORD present and equal to str(123)
+          self.assertIn('PGPASSWORD', env)
+          self.assertEqual(env['PGPASSWORD'], str(123))
+          # Ensure args are formed correctly
+          self.assertEqual(args, ['psql', '-U', 'u', 'd'])
+  
+      def test_password_bytes_is_converted_to_str_in_env(self):
+          pw = b'bytespass'
+          args, env = self._capture_run_env({
+              'database': 'd2',
+              'user': 'u2',
+              'password': pw,
+          })
+          self.assertIn('PGPASSWORD', env)
+          self.assertEqual(env['PGPASSWORD'], str(pw))
+          self.assertEqual(args, ['psql', '-U', 'u2', 'd2'])
+  
+      def test_password_bool_is_converted_to_str_in_env(self):
+          pw = True
+          args, env = self._capture_run_env({
+              'database': 'd3',
+              'user': 'u3',
+              'password': pw,
+          })
+          self.assertIn('PGPASSWORD', env)
+          self.assertEqual(env['PGPASSWORD'], str(pw))
+          self.assertEqual(args, ['psql', '-U', 'u3', 'd3'])
+  
+      def test_password_list_is_converted_to_str_in_env(self):
+          pw = [1, 2, 3]
+          args, env = self._capture_run_env({
+              'database': 'd4',
+              'user': 'u4',
+              'password': pw,
+          })
+          self.assertIn('PGPASSWORD', env)
+          self.assertEqual(env['PGPASSWORD'], str(pw))
+          self.assertEqual(args, ['psql', '-U', 'u4', 'd4'])
+  
+      def test_password_object_is_converted_to_str_in_env(self):
+          class PwdObj:
+              def __str__(self):
+                  return 'objpass'
+  
+          pw = PwdObj()
+          args, env = self._capture_run_env({
+              'database': 'd5',
+              'user': 'u5',
+              'password': pw,
+          })
+          self.assertIn('PGPASSWORD', env)
+          self.assertEqual(env['PGPASSWORD'], str(pw))
+          self.assertEqual(args, ['psql', '-U', 'u5', 'd5'])
+  
+      def test_password_none_does_not_set_env_var(self):
+          args, env = self._capture_run_env({
+              'database': 'd6',
+              'user': 'u6',
+              'password': None,
+          })
+          # None is falsy: PGPASSWORD should not be set
+          self.assertIsNone(env.get('PGPASSWORD'))
+          self.assertEqual(args, ['psql', '-U', 'u6', 'd6'])
+  
+      def test_empty_password_string_does_not_set_env_var(self):
+          args, env = self._capture_run_env({
+              'database': 'd7',
+              'user': 'u7',
+              'password': '',
+          })
+          # Empty string is falsy: PGPASSWORD should not be set
+          self.assertIsNone(env.get('PGPASSWORD'))
+          self.assertEqual(args, ['psql', '-U', 'u7', 'd7'])
+  
+      def test_special_characters_password_preserved_as_string(self):
+          pw = 'pa:ss\\word'
+          args, env = self._capture_run_env({
+              'database': 'd8',
+              'user': 'u8',
+              'password': pw,
+          })
+          # Ensure special characters are preserved and present as string
+          self.assertEqual(env.get('PGPASSWORD'), pw)
+          self.assertEqual(args, ['psql', '-U', 'u8', 'd8'])
+  
+      def test_no_pgpassfile_left_in_os_environ(self):
+          # Ensure that no legacy PGPASSFILE variable is left in the real os.environ
+          # after running runshell_db (the code should not set PGPASSFILE).
+          _, env = self._capture_run_env({
+              'database': 'd9',
+              'user': 'u9',
+              'password': 'p9',
+          })
+          # The environment passed to subprocess.run should not contain PGPASSFILE
+          self.assertNotIn('PGPASSFILE', env or {})
+          # And the real os.environ also must not have PGPASSFILE
+          self.assertNotIn('PGPASSFILE', os.environ)
+new_imports_code: |
+  # No additional imports required.

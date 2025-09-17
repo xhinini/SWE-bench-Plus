@@ -1,0 +1,193 @@
+from django.contrib.admin import AdminSite
+from django.contrib.auth.admin import UserAdmin
+from django.test import RequestFactory
+
+@override_settings(ROOT_URLCONF='auth_tests.urls_admin')
+def test_password_help_text_contains_instance_pk(self):
+    """Help text should contain '../../<pk>/password/' for the instance."""
+    user = User.objects.get(username='testclient')
+    form = UserChangeForm(instance=user)
+    help_text = form.fields['password'].help_text
+    expected_substring = f'../../{user.pk}/password/'
+    self.assertIn(expected_substring, help_text)
+    self.assertNotIn('"../password/', help_text)
+
+@override_settings(ROOT_URLCONF='auth_tests.urls_admin')
+def test_password_link_resolves_to_password_change_for_pk_based_admin_url(self):
+    """Anchor href in help text should resolve to the password-change URL when admin change URL uses PK."""
+    user = User.objects.get(username='testclient')
+    form = UserChangeForm(instance=user)
+    help_text = form.fields['password'].help_text
+    matches = re.search('<a href="(.*?)">', help_text)
+    self.assertIsNotNone(matches, 'No anchor tag found in password help text')
+    href = matches.group(1)
+    admin_user_change_url = reverse(f'admin:{user._meta.app_label}_{user._meta.model_name}_change', args=(user.pk,))
+    joined = urllib.parse.urljoin(admin_user_change_url, href)
+    pw_change_url = reverse(f'admin:{user._meta.app_label}_{user._meta.model_name}_password_change', args=(user.pk,))
+    self.assertEqual(joined, pw_change_url)
+
+@override_settings(ROOT_URLCONF='auth_tests.urls_admin')
+def test_password_link_resolves_to_password_change_for_to_field_admin_url(self):
+    """When admin change URL uses to_field (username), the anchor href should still point to the password-change URL for the pk."""
+    user = User.objects.get(username='testclient')
+    form = UserChangeForm(instance=user)
+    help_text = form.fields['password'].help_text
+    matches = re.search('<a href="(.*?)">', help_text)
+    self.assertIsNotNone(matches, 'No anchor tag found in password help text')
+    href = matches.group(1)
+    admin_user_change_url = reverse(f'admin:{user._meta.app_label}_{user._meta.model_name}_change', args=(user.username,))
+    joined = urllib.parse.urljoin(admin_user_change_url, href)
+    pw_change_url = reverse(f'admin:{user._meta.app_label}_{user._meta.model_name}_password_change', args=(user.pk,))
+    self.assertEqual(joined, pw_change_url)
+
+def test_password_help_text_for_unsaved_instance_includes_none_pk(self):
+    """Unsaved instance should not raise; help text should include the stringified PK (None)."""
+    unsaved = User(username='tempuser')
+    form = UserChangeForm(instance=unsaved)
+    help_text = form.fields['password'].help_text
+    self.assertIn('../../None/password/', help_text)
+
+def test_help_text_uses_double_dot_prefix_not_single(self):
+    """Ensure the help text uses '../../' prefix rather than a single '../' prefix."""
+    user = User.objects.get(username='testclient')
+    form = UserChangeForm(instance=user)
+    help_text = form.fields['password'].help_text
+    self.assertIn(f'../../{user.pk}/password/', help_text)
+    self.assertNotIn(f'../password/', help_text)
+
+def test_password_help_text_for_unicode_username_to_field(self):
+    """A unicode username used in to_field admin URL should still result in a password link that resolves to the pk-based password change URL."""
+    unicode_user = User.objects.create_user(username='ユニコード', password='pwd')
+    form = UserChangeForm(instance=unicode_user)
+    help_text = form.fields['password'].help_text
+    matches = re.search('<a href="(.*?)">', help_text)
+    self.assertIsNotNone(matches, 'No anchor tag found in password help text')
+    href = matches.group(1)
+    admin_user_change_url = reverse(f'admin:{unicode_user._meta.app_label}_{unicode_user._meta.model_name}_change', args=(unicode_user.username,))
+    joined = urllib.parse.urljoin(admin_user_change_url, href)
+    pw_change_url = reverse(f'admin:{unicode_user._meta.app_label}_{unicode_user._meta.model_name}_password_change', args=(unicode_user.pk,))
+    self.assertEqual(joined, pw_change_url)
+
+def test_admin_get_form_with_custom_to_field_inserts_pk_into_help_text(self):
+    """UserAdmin.get_form with a custom to_field should produce a form whose password help_text still includes the instance PK."""
+    user = User.objects.get(username='testclient')
+    request = RequestFactory().get('/')
+    admin_site = AdminSite()
+    admin = UserAdmin(User, admin_site)
+    admin.to_field = 'username'
+    form_class = admin.get_form(request, user)
+    form = form_class(instance=user)
+    help_text = form.fields['password'].help_text
+    self.assertIn(f'../../{user.pk}/password/', help_text)
+    self.assertNotIn('"../password/', help_text)
+
+@override_settings(ROOT_URLCONF='auth_tests.urls_admin')
+def test_extracted_anchor_href_matches_password_change_url_even_when_accessed_via_pk_change_url(self):
+    """Extract the anchor href and ensure it is the correct relative link for password change when starting from a pk-based admin change URL."""
+    user = User.objects.get(username='testclient')
+    form = UserChangeForm(instance=user)
+    help_text = form.fields['password'].help_text
+    matches = re.search('<a href="(.*?)">', help_text)
+    self.assertIsNotNone(matches)
+    href = matches.group(1)
+    admin_user_change_url = reverse(f'admin:{user._meta.app_label}_{user._meta.model_name}_change', args=(user.pk,))
+    joined = urllib.parse.urljoin(admin_user_change_url, href)
+    expected = reverse(f'admin:{user._meta.app_label}_{user._meta.model_name}_password_change', args=(user.pk,))
+    self.assertEqual(joined, expected)
+
+def test_help_text_does_not_raise_when_password_field_absent(self):
+    """If a subclass excludes the password field (password=None), ensure no exception is raised when constructing the form."""
+
+    class UserChangeFormWithoutPassword(UserChangeForm):
+        password = None
+
+        class Meta:
+            model = User
+            exclude = ['password']
+    form = UserChangeFormWithoutPassword()
+    self.assertNotIn('password', form.fields)
+
+from django.contrib.admin import AdminSite
+from django.contrib.auth.admin import UserAdmin
+from django.test import RequestFactory
+
+def test_password_helptext_contains_expected_pk(self):
+    user = User.objects.get(username='testclient')
+    form = UserChangeForm(instance=user)
+    help_text = form.fields['password'].help_text
+    self.assertIn(f'../../{user.pk}/password/', help_text)
+
+def test_password_helptext_href_contains_expected_path(self):
+    user = User.objects.get(username='testclient')
+    form = UserChangeForm(instance=user)
+    help_text = form.fields['password'].help_text
+    matches = re.search('<a href="(.*?)">', help_text)
+    self.assertIsNotNone(matches)
+    self.assertEqual(matches.group(1), f'../../{user.pk}/password/')
+
+def test_admin_get_form_to_field_uses_pk_in_helptext(self):
+    from django.contrib.admin import AdminSite
+    from django.contrib.auth.admin import UserAdmin
+    from django.test import RequestFactory
+    user = User.objects.get(username='testclient')
+    request = RequestFactory().get('/')
+    admin_site = AdminSite()
+    admin = UserAdmin(User, admin_site)
+    admin.to_field = 'username'
+    FormClass = admin.get_form(request, user)
+    form = FormClass(instance=user)
+    help_text = form.fields['password'].help_text
+    self.assertIn(f'../../{user.pk}/password/', help_text)
+
+@override_settings(ROOT_URLCONF='auth_tests.urls_admin')
+def test_admin_get_form_to_field_joined_url_matches_password_change(self):
+    from django.contrib.admin import AdminSite
+    from django.contrib.auth.admin import UserAdmin
+    from django.test import RequestFactory
+    user = User.objects.get(username='testclient')
+    request = RequestFactory().get('/')
+    admin_site = AdminSite()
+    admin = UserAdmin(User, admin_site)
+    admin.to_field = 'username'
+    FormClass = admin.get_form(request, user)
+    form = FormClass(instance=user)
+    help_text = form.fields['password'].help_text
+    matches = re.search('<a href="(.*?)">', help_text)
+    self.assertIsNotNone(matches)
+    admin_user_change_url = reverse(f'admin:{user._meta.app_label}_{user._meta.model_name}_change', args=(user.username,))
+    joined_url = urllib.parse.urljoin(admin_user_change_url, matches.group(1))
+    pw_change_url = reverse(f'admin:{user._meta.app_label}_{user._meta.model_name}_password_change', args=(user.pk,))
+    self.assertEqual(joined_url, pw_change_url)
+
+def test_password_link_for_inactive_user_uses_pk(self):
+    user = User.objects.get(username='inactive')
+    form = UserChangeForm(instance=user)
+    help_text = form.fields['password'].help_text
+    self.assertIn(f'../../{user.pk}/password/', help_text)
+
+def test_password_link_for_unusable_password_user_uses_pk(self):
+    user = User.objects.get(username='empty_password')
+    form = UserChangeForm(instance=user)
+    help_text = form.fields['password'].help_text
+    self.assertIn(f'../../{user.pk}/password/', help_text)
+
+def test_password_link_for_user_with_plus_in_username_uses_pk(self):
+    user = User.objects.create_user(username='plus+user', password='pwd')
+    form = UserChangeForm(instance=user)
+    help_text = form.fields['password'].help_text
+    self.assertIn(f'../../{user.pk}/password/', help_text)
+
+def test_password_helptext_does_not_use_one_dot_relative(self):
+    user = User.objects.get(username='testclient')
+    form = UserChangeForm(instance=user)
+    help_text = form.fields['password'].help_text
+    self.assertNotIn('../password/', help_text)
+
+def test_password_helptext_href_starts_with_double_dot_slash_double_dot(self):
+    user = User.objects.get(username='testclient')
+    form = UserChangeForm(instance=user)
+    help_text = form.fields['password'].help_text
+    matches = re.search('<a href="(.*?)">', help_text)
+    self.assertIsNotNone(matches)
+    href = matches.group(1)
+    self.assertTrue(href.startswith(f'../../{user.pk}/'))

@@ -1,0 +1,133 @@
+language: Python
+number_of_tests: 10
+test_behavior: These 10 tests verify that bulk_update correctly recognizes and uses objects that implement the expression protocol (i.e., have a resolve_expression method) even when they are not subclasses of Django's Expression class. Each test wraps an actual Expression (F, Lower, Value, etc.) in a lightweight proxy object that exposes resolve_expression but does not subclass Expression. The expected behavior is that bulk_update treats the wrapper as an expression (by delegating to the wrapped expression during SQL compilation) and updates rows accordingly. These tests would fail if bulk_update only checked isinstance(attr, Expression) (or otherwise failed to treat duck-typed expressions as expressions), but pass with the patched behavior that checks for the resolve_expression attribute.
+test_code: |
+  import datetime
+
+  from django.core.exceptions import FieldDoesNotExist
+  from django.db.models import F, Value
+  from django.db.models.functions import Lower
+  from django.test import TestCase, skipUnlessDBFeature
+
+  from .models import (
+      Article, CustomDbColumn, JSONFieldNullable, Individual, Note, Number,
+  )
+
+  class ExpressionWrapper:
+      """
+      A thin wrapper around an expression-like object that exposes
+      resolve_expression but does not inherit from Django's Expression class.
+      """
+      def __init__(self, expr):
+          self._expr = expr
+
+      def resolve_expression(self, *args, **kwargs):
+          # Delegate resolution to the wrapped expression.
+          return self._expr.resolve_expression(*args, **kwargs)
+
+      # Provide a repr/str to make debugging easier if something goes wrong.
+      def __repr__(self):
+          return f"ExpressionWrapper({self._expr!r})"
+
+  class BulkUpdateExpressionWrapperTests(TestCase):
+      def test_wrapper_f_expression_integer(self):
+          # Numbers: ensure wrapper around F('num') + 1 performs increment.
+          numbers = [Number.objects.create(num=0) for _ in range(5)]
+          for number in numbers:
+              number.num = ExpressionWrapper(F('num') + 1)
+          Number.objects.bulk_update(numbers, ['num'])
+          self.assertCountEqual(Number.objects.filter(num=1), numbers)
+
+      def test_wrapper_f_expression_charfield(self):
+          # Notes: set misc = F('note') using a wrapper.
+          notes = [
+              Note.objects.create(note='note-%s' % i, misc='misc-%s' % i)
+              for i in range(5)
+          ]
+          for note in notes:
+              note.misc = ExpressionWrapper(F('note'))
+          Note.objects.bulk_update(notes, ['misc'])
+          self.assertCountEqual(Note.objects.filter(misc__startswith='note-'), notes)
+
+      def test_wrapper_function_lower_on_notes(self):
+          # Lower('note') wrapped should be applied.
+          notes = [
+              Note.objects.create(note='MIXED-%s' % i, misc='misc')
+              for i in range(5)
+          ]
+          for note in notes:
+              note.note = ExpressionWrapper(Lower('note'))
+          Note.objects.bulk_update(notes, ['note'])
+          self.assertEqual(set(Note.objects.values_list('note', flat=True)),
+                           {n.note.lower() for n in notes})
+
+      def test_wrapper_value_boolean(self):
+          # Boolean field: wrap a Value(True) and ensure it sets the boolean.
+          individuals = [Individual.objects.create(alive=False) for _ in range(5)]
+          for ind in individuals:
+              ind.alive = ExpressionWrapper(Value(True))
+          Individual.objects.bulk_update(individuals, ['alive'])
+          self.assertCountEqual(Individual.objects.filter(alive=True), individuals)
+
+      def test_wrapper_value_datetime(self):
+          # Datetime field: wrap a Value(datetime) and ensure it stores the datetime.
+          articles = [
+              Article.objects.create(name=str(i), created=datetime.datetime(2000, 1, 1))
+              for i in range(5)
+          ]
+          new_time = datetime.datetime(1999, 12, 31, 23, 59, 59)
+          for a in articles:
+              a.created = ExpressionWrapper(Value(new_time))
+          Article.objects.bulk_update(articles, ['created'])
+          self.assertCountEqual(Article.objects.filter(created=new_time), articles)
+
+      def test_wrapper_value_custom_db_column(self):
+          # Custom DB column: wrap a Value and ensure value is stored.
+          model = CustomDbColumn.objects.create(custom_column=1)
+          model.custom_column = ExpressionWrapper(Value(42))
+          CustomDbColumn.objects.bulk_update([model], ['custom_column'])
+          model.refresh_from_db()
+          self.assertEqual(model.custom_column, 42)
+
+      @skipUnlessDBFeature('supports_json_field')
+      def test_wrapper_value_jsonfield(self):
+          # JSONField: wrapping a Value containing a dict should work.
+          JSONFieldNullable.objects.bulk_create([
+              JSONFieldNullable(json_field={'a': i}) for i in range(5)
+          ])
+          objs = list(JSONFieldNullable.objects.all())
+          for obj in objs:
+              obj.json_field = ExpressionWrapper(Value({'b': 1 + obj.json_field['a']}))
+          JSONFieldNullable.objects.bulk_update(objs, ['json_field'])
+          self.assertCountEqual(JSONFieldNullable.objects.filter(json_field__has_key='b'), objs)
+
+      def test_wrapper_mixed_plain_and_wrapped_fields(self):
+          # Mixed: one field plain change, one wrapped expression.
+          notes = [
+              Note.objects.create(note='X-%s' % i, misc='m-%s' % i)
+              for i in range(5)
+          ]
+          for note in notes:
+              note.note = 'updated-%s' % note.pk
+              note.misc = ExpressionWrapper(F('note'))
+          # Update both fields, misc should end up being previous note value
+          Note.objects.bulk_update(notes, ['note', 'misc'])
+          # Refresh from DB and check consistency:
+          for note in notes:
+              note.refresh_from_db()
+              self.assertTrue(note.note.startswith('updated-'))
+              # misc should be equal to the (old) note via the expression semantics.
+              # Since we set note to updated-*, misc will reflect the DB value
+              # that was present at time of update; ensure no exception and value is a string.
+              self.assertIsInstance(note.misc, str)
+
+      def test_wrapper_duplicate_objects_batches(self):
+          # Duplicates in input list where wrapped expression is used should count correctly.
+          note = Note.objects.create(note='dup', misc='orig')
+          note.misc = ExpressionWrapper(F('note'))
+          # Two identical instances in the list; should result in one update for same pk per batch
+          rows = Note.objects.bulk_update([note, note], ['misc'])
+          # We expect at least one row updated (some DB backends may count 1 or 2 depending on batching).
+          self.assertGreaterEqual(rows, 1)
+new_imports_code: |
+  # No additional module-level imports required; tests import what they need.

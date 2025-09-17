@@ -1,0 +1,179 @@
+# No new top-level imports required; tests reuse existing imports in the test module.
+import types
+from django.db import connections
+from django.utils import timezone
+from django.core.cache import cache
+from django.conf import settings
+from django.test import override_settings
+
+# Helper fake cursor used to simulate fetchone() return values.
+class FakeCursor:
+    def __init__(self, fetchone_values):
+        """
+        fetchone_values: an iterable of values to return for successive fetchone() calls.
+        execute calls are recorded in self.calls.
+        """
+        self._fetch_iter = iter(fetchone_values)
+        self.calls = []
+        self.rowcount = 0
+
+    def execute(self, sql, params=None):
+        # Record SQL and params for inspection by the test.
+        self.calls.append((sql, params))
+
+    def fetchone(self):
+        try:
+            return next(self._fetch_iter)
+        except StopIteration:
+            return None
+
+# Tests added to the existing DBCacheTests class contextually rely on a DatabaseCache being configured
+# by the existing override in the test module. We add standalone functions that operate similarly
+# to test methods and assert expected behavior.
+
+def _get_table_for_default_cache():
+    # Get the quoted table name for the default cache's connection
+    db = cache._router.db_for_write(cache.cache_model_class)
+    connection = connections[db]
+    return connection.ops.quote_name(cache._table), connection
+
+# 1) No exception when last_cache_key fetch returns None (normal cull path)
+def test_cull_handles_none_last_cache_key_no_exception():
+    table, connection = _get_table_for_default_cache()
+    # Simulate: first fetchone() returns count (10,), second fetchone() returns None (no last key)
+    fake_cursor = FakeCursor([(10,), None])
+    now = timezone.now()
+    cache._max_entries = 5
+    cache._cull_frequency = 3
+    # Should not raise
+    cache._cull(connection.alias, fake_cursor, now)
+
+# 2) No extra DELETE executed when last_cache_key is None
+def test_cull_does_not_execute_delete_when_no_last_cache_key():
+    table, connection = _get_table_for_default_cache()
+    fake_cursor = FakeCursor([(10,), None])
+    now = timezone.now()
+    cache._max_entries = 5
+    cache._cull_frequency = 3
+    cache._cull(connection.alias, fake_cursor, now)
+    # Expected execute calls:
+    # 1) DELETE expired
+    # 2) SELECT COUNT(*)
+    # 3) cache_key_culling_sql SELECT (to find last key)
+    # There should NOT be a fourth call for the DELETE ... WHERE cache_key < %s
+    assert len(fake_cursor.calls) == 3, "Unexpected DELETE executed when no last_cache_key was returned"
+
+# 3) DELETE executed when a last_cache_key is returned
+def test_cull_executes_delete_when_last_cache_key_present():
+    table, connection = _get_table_for_default_cache()
+    # Simulate: first fetchone() returns count (10,), second fetchone() returns last cache key tuple
+    fake_cursor = FakeCursor([(10,), ("last-key",)]) 
+    now = timezone.now()
+    cache._max_entries = 5
+    cache._cull_frequency = 3
+    cache._cull(connection.alias, fake_cursor, now)
+    # Now there should be a fourth execute call for the actual DELETE using the last key
+    assert len(fake_cursor.calls) == 4, "Expected a DELETE to be executed when last_cache_key is present"
+    # Verify the last execute is a DELETE ... WHERE cache_key < %s
+    last_sql = fake_cursor.calls[-1][0]
+    assert 'DELETE' in last_sql and 'cache_key <' in last_sql, "Last executed SQL was not the expected culling DELETE"
+
+# 4) When count <= max_entries, no culling SQL is executed (only two calls: delete expired and count)
+def test_cull_skips_culling_when_num_below_max_entries():
+    table, connection = _get_table_for_default_cache()
+    fake_cursor = FakeCursor([(2,)])
+    now = timezone.now()
+    cache._max_entries = 5
+    cache._cull_frequency = 3
+    cache._cull(connection.alias, fake_cursor, now)
+    # Only two execute calls should have occurred: delete expired, select count
+    assert len(fake_cursor.calls) == 2, "Unexpected culling when count is below max_entries"
+
+# 5) When _cull_frequency == 0, clear() is called (clear path)
+def test_cull_calls_clear_when_cull_frequency_zero(monkeypatch):
+    called = {'clear': False}
+    def fake_clear():
+        called['clear'] = True
+    monkeypatch.setattr(cache, 'clear', fake_clear)
+    table, connection = _get_table_for_default_cache()
+    # fetchone should not need to be used because cull_frequency==0 triggers clear()
+    fake_cursor = FakeCursor([(10,), ("will-not-be-used",)]) 
+    now = timezone.now()
+    cache._max_entries = -1  # force cull path
+    cache._cull_frequency = 0
+    cache._cull(connection.alias, fake_cursor, now)
+    assert called['clear'] is True, "clear() was not called when _cull_frequency == 0"
+
+# 6) Multiple sequential calls where last_cache_key is None are safe
+def test_cull_multiple_times_with_none_last_key():
+    table, connection = _get_table_for_default_cache()
+    # The fake cursor returns (10,), None for each call. Call _cull multiple times.
+    for _ in range(3):
+        fake_cursor = FakeCursor([(10,), None])
+        now = timezone.now()
+        cache._max_entries = 5
+        cache._cull_frequency = 3
+        cache._cull(connection.alias, fake_cursor, now)
+
+# 7) If last_cache_key is an empty tuple element (e.g. ('',)), treat as present and perform delete
+def test_cull_with_empty_string_key_performs_delete():
+    table, connection = _get_table_for_default_cache()
+    fake_cursor = FakeCursor([(10,), ("",)])  # last key present but empty string
+    now = timezone.now()
+    cache._max_entries = 5
+    cache._cull_frequency = 3
+    cache._cull(connection.alias, fake_cursor, now)
+    assert len(fake_cursor.calls) == 4, "Expected DELETE to be executed even with empty string last key"
+
+# 8) Ensure no exception when fetchone() returns None immediately for last key even if adapter is called
+def test_cull_none_last_key_when_adapter_used():
+    table, connection = _get_table_for_default_cache()
+    # Simulate adapter use: still, fetchone sequence is (10,), None
+    fake_cursor = FakeCursor([(10,), None])
+    now = timezone.now()
+    cache._max_entries = 1
+    cache._cull_frequency = 2
+    # Should not raise
+    cache._cull(connection.alias, fake_cursor, now)
+
+# 9) Ensure culling SQL executed with expected parameter (cull_num) and that subsequent fetchone() may be None
+def test_cull_executes_culling_sql_with_cull_num_and_handles_no_result():
+    table, connection = _get_table_for_default_cache()
+    # Provide values so that cull_num > 0; fetchone for last key is None
+    fake_cursor = FakeCursor([(20,), None])
+    now = timezone.now()
+    cache._max_entries = 5
+    cache._cull_frequency = 4
+    cache._cull(connection.alias, fake_cursor, now)
+    # The culling SQL (3rd call) should have params containing the computed cull_num
+    # The third call is at index 2
+    assert len(fake_cursor.calls) >= 3, "Expected at least 3 execute calls"
+    culling_call = fake_cursor.calls[2]
+    cull_params = culling_call[1]
+    assert isinstance(cull_params, list) and len(cull_params) == 1 and isinstance(cull_params[0], int), "cull_num parameter missing or invalid"
+
+# 10) Repeated direct _cull call with varying counts behaves without exceptions (sanity regression)
+def test_repeated_cull_varied_counts():
+    table, connection = _get_table_for_default_cache()
+    now = timezone.now()
+    for count, expected_execs in ((1, 2), (6, 3), (100, 3)):
+        # For count <= max_entries expect only 2 executes; for larger counts, at least 3 executes (culling SELECT)
+        fake_cursor = FakeCursor([(count,), None])
+        cache._max_entries = 5
+        cache._cull_frequency = 3
+        cache._cull(connection.alias, fake_cursor, now)
+        assert len(fake_cursor.calls) >= expected_execs, "Unexpected number of SQL executes for count=%r" % (count,)
+
+# Expose the tests to the test runner by binding them into the module namespace with names similar to test methods.
+globals().update({
+    'test_cull_handles_none_last_cache_key_no_exception': test_cull_handles_none_last_cache_key_no_exception,
+    'test_cull_does_not_execute_delete_when_no_last_cache_key': test_cull_does_not_execute_delete_when_no_last_cache_key,
+    'test_cull_executes_delete_when_last_cache_key_present': test_cull_executes_delete_when_last_cache_key_present,
+    'test_cull_skips_culling_when_num_below_max_entries': test_cull_skips_culling_when_num_below_max_entries,
+    'test_cull_calls_clear_when_cull_frequency_zero': test_cull_calls_clear_when_cull_frequency_zero,
+    'test_cull_multiple_times_with_none_last_key': test_cull_multiple_times_with_none_last_key,
+    'test_cull_with_empty_string_key_performs_delete': test_cull_with_empty_string_key_performs_delete,
+    'test_cull_none_last_key_when_adapter_used': test_cull_none_last_key_when_adapter_used,
+    'test_cull_executes_culling_sql_with_cull_num_and_handles_no_result': test_cull_executes_culling_sql_with_cull_num_and_handles_no_result,
+    'test_repeated_cull_varied_counts': test_repeated_cull_varied_counts,
+})

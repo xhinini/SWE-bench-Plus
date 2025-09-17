@@ -1,0 +1,243 @@
+import sys
+import types
+from collections import UserList
+import sys
+import types
+from collections import UserList
+from importlib import import_module
+
+from django.test import TestCase, override_settings, modify_settings
+from django.db.migrations.loader import MigrationLoader
+
+
+class AdditionalLoaderTests(TestCase):
+    """
+    Regression tests for distinguishing between regular packages without
+    __file__ and namespace packages.
+    """
+
+    def _make_migration_submodule(self, full_name):
+        """
+        Create a fake migration submodule with a minimal Migration class to
+        allow loader.load_disk() to instantiate it.
+        """
+        submod = types.ModuleType(full_name)
+
+        class MigrationStub:
+            def __init__(self, name, app_label):
+                self.name = name
+                self.app_label = app_label
+                # Attributes accessed later by MigrationLoader/graph code.
+                self.dependencies = []
+                self.replaces = []
+                self.run_before = []
+                self.atomic = False
+        submod.Migration = MigrationStub
+        sys.modules[full_name] = submod
+        return submod
+
+    def _make_package_module(self, package_name, file_attr, path_obj, submodules=()):
+        """
+        Create and register a package-like module in sys.modules.
+        - package_name: full dotted module path (e.g. 'migrations.test_migrations_x')
+        - file_attr: value for __file__ (use None to simulate missing __file__)
+        - path_obj: value for __path__ (omit attribute by passing None)
+        - submodules: iterable of submodule short names to pre-create (e.g. ('0001_initial',))
+        """
+        mod = types.ModuleType(package_name)
+        # Set __spec__ minimally to avoid some importlib.reload issues.
+        # Many tests don't rely on reload, but be conservative.
+        spec = types.SimpleNamespace(origin=file_attr, has_location=(file_attr is not None))
+        mod.__spec__ = spec
+        # Set or delete __file__
+        if file_attr is None:
+            mod.__file__ = None
+        else:
+            mod.__file__ = file_attr
+        if path_obj is not None:
+            mod.__path__ = path_obj
+        elif hasattr(mod, '__path__'):
+            delattr(mod, '__path__')
+        sys.modules[package_name] = mod
+        # Pre-create any submodules the loader may try to import.
+        for name in submodules:
+            full = package_name + '.' + name
+            self._make_migration_submodule(full)
+        return mod
+
+    @override_settings(MIGRATION_MODULES={'migrations': 'migrations.test_migrations_a'})
+    @modify_settings(INSTALLED_APPS={'append': 'migrations'})
+    def test_regular_package_no_file_path_list_is_migrated(self):
+        """
+        Regular package with __file__ == None but __path__ is a list should be
+        treated as a migrated app.
+        """
+        module_name = 'migrations.test_migrations_a'
+        pkg = self._make_package_module(module_name, file_attr=None, path_obj=[])
+        try:
+            loader = MigrationLoader(connection=None, load=False)
+            loader.load_disk()
+            self.assertIn('migrations', loader.migrated_apps)
+            self.assertNotIn('migrations', loader.unmigrated_apps)
+        finally:
+            sys.modules.pop(module_name, None)
+
+    @override_settings(MIGRATION_MODULES={'migrations': 'migrations.test_migrations_b'})
+    @modify_settings(INSTALLED_APPS={'append': 'migrations'})
+    def test_regular_package_no_file_and_list_subclass_is_migrated(self):
+        """
+        __path__ that is a subclass of list should be accepted as a regular
+        package even if __file__ is None.
+        """
+        class MyList(list):
+            pass
+        module_name = 'migrations.test_migrations_b'
+        pkg = self._make_package_module(module_name, file_attr=None, path_obj=MyList())
+        try:
+            loader = MigrationLoader(connection=None, load=False)
+            loader.load_disk()
+            self.assertIn('migrations', loader.migrated_apps)
+            self.assertNotIn('migrations', loader.unmigrated_apps)
+        finally:
+            sys.modules.pop(module_name, None)
+
+    @override_settings(MIGRATION_MODULES={'migrations': 'migrations.test_migrations_c'})
+    @modify_settings(INSTALLED_APPS={'append': 'migrations'})
+    def test_namespace_package_no_file_and_non_list_path_is_ignored(self):
+        """
+        Namespace packages (no __file__ and __path__ is not a list) must be
+        ignored (treated as unmigrated).
+        """
+        module_name = 'migrations.test_migrations_c'
+        # Use a tuple to represent a non-list __path__ type.
+        pkg = self._make_package_module(module_name, file_attr=None, path_obj=('/',))
+        try:
+            loader = MigrationLoader(connection=None, load=False)
+            loader.load_disk()
+            self.assertIn('migrations', loader.unmigrated_apps)
+            self.assertNotIn('migrations', loader.migrated_apps)
+        finally:
+            sys.modules.pop(module_name, None)
+
+    @override_settings(MIGRATION_MODULES={'migrations': 'migrations.test_migrations_d'})
+    @modify_settings(INSTALLED_APPS={'append': 'migrations'})
+    def test_non_list_path_with_file_present_is_migrated(self):
+        """
+        If __file__ is present (not None), a module with a non-list __path__
+        should still be considered migrated (the __file__ being present wins).
+        """
+        module_name = 'migrations.test_migrations_d'
+        pkg = self._make_package_module(module_name, file_attr='/some/location', path_obj=('/',))
+        try:
+            loader = MigrationLoader(connection=None, load=False)
+            loader.load_disk()
+            self.assertIn('migrations', loader.migrated_apps)
+            self.assertNotIn('migrations', loader.unmigrated_apps)
+        finally:
+            sys.modules.pop(module_name, None)
+
+    @override_settings(MIGRATION_MODULES={'migrations': 'migrations.test_migrations_e'})
+    @modify_settings(INSTALLED_APPS={'append': 'migrations'})
+    def test_missing_path_attribute_is_treated_as_module_file_and_ignored(self):
+        """
+        A migrations module that is actually a plain module (no __path__)
+        should be ignored (unmigrated).
+        """
+        module_name = 'migrations.test_migrations_e'
+        # Create a module without __path__ attribute.
+        mod = types.ModuleType(module_name)
+        mod.__spec__ = types.SimpleNamespace(origin='/some/location', has_location=True)
+        mod.__file__ = '/some/location'
+        sys.modules[module_name] = mod
+        try:
+            loader = MigrationLoader(connection=None, load=False)
+            loader.load_disk()
+            self.assertIn('migrations', loader.unmigrated_apps)
+        finally:
+            sys.modules.pop(module_name, None)
+
+    @override_settings(MIGRATION_MODULES={'migrations': 'migrations.test_migrations_f'})
+    @modify_settings(INSTALLED_APPS={'append': 'migrations'})
+    def test_userlist_path_is_treated_as_namespace_and_ignored_if_no_file(self):
+        """
+        collections.UserList is list-like but not an instance of list. When
+        __file__ is None and __path__ is a UserList, it must be treated as
+        a namespace package (unmigrated).
+        """
+        module_name = 'migrations.test_migrations_f'
+        pkg = self._make_package_module(module_name, file_attr=None, path_obj=UserList(['/tmp']))
+        try:
+            loader = MigrationLoader(connection=None, load=False)
+            loader.load_disk()
+            self.assertIn('migrations', loader.unmigrated_apps)
+            self.assertNotIn('migrations', loader.migrated_apps)
+        finally:
+            sys.modules.pop(module_name, None)
+
+    @override_settings(MIGRATION_MODULES={'migrations': 'migrations.test_migrations_g'})
+    @modify_settings(INSTALLED_APPS={'append': 'migrations'})
+    def test_custom_iterable_path_is_treated_as_namespace_if_no_file(self):
+        """
+        A custom iterable (not a list instance) for __path__ with __file__ == None
+        is considered a namespace package and should be ignored.
+        """
+        class PathLike:
+            def __init__(self, seq):
+                self._seq = list(seq)
+            def __iter__(self):
+                return iter(self._seq)
+            def __repr__(self):
+                return "<PathLike>"
+
+        module_name = 'migrations.test_migrations_g'
+        pkg = self._make_package_module(module_name, file_attr=None, path_obj=PathLike(['/tmp']))
+        try:
+            loader = MigrationLoader(connection=None, load=False)
+            loader.load_disk()
+            self.assertIn('migrations', loader.unmigrated_apps)
+            self.assertNotIn('migrations', loader.migrated_apps)
+        finally:
+            sys.modules.pop(module_name, None)
+
+    @override_settings(MIGRATION_MODULES={'migrations': 'migrations.test_migrations_h'})
+    @modify_settings(INSTALLED_APPS={'append': 'migrations'})
+    def test_loading_actual_migration_submodule_when_package_has_no_file_but_list_path(self):
+        """
+        Ensure that a package with __file__ == None and __path__ a list can
+        still have migration modules discovered/imported when submodules are
+        pre-registered in sys.modules.
+        """
+        module_name = 'migrations.test_migrations_h'
+        pkg = self._make_package_module(module_name, file_attr=None, path_obj=[])
+        # Pre-create the migration submodule the loader will import.
+        submodname = module_name + '.0001_initial'
+        self._make_migration_submodule(submodname)
+        try:
+            loader = MigrationLoader(connection=None, load=False)
+            loader.load_disk()
+            # The loader will construct disk_migrations entries for any
+            # migration submodule names it finds; because we pre-registered a
+            # submodule with that name, it should be present.
+            self.assertIn(('migrations', '0001_initial'), loader.disk_migrations)
+        finally:
+            sys.modules.pop(submodname, None)
+            sys.modules.pop(module_name, None)
+
+    @override_settings(MIGRATION_MODULES={'migrations': 'migrations.test_migrations_i'})
+    @modify_settings(INSTALLED_APPS={'append': 'migrations'})
+    def test_tuple_subclass_path_without_file_is_ignored(self):
+        """
+        A tuple used as __path__ (not a list instance) and __file__ is None
+        must be treated as a namespace package (unmigrated).
+        """
+        class MyTuple(tuple):
+            pass
+        module_name = 'migrations.test_migrations_i'
+        pkg = self._make_package_module(module_name, file_attr=None, path_obj=MyTuple(('/tmp',)))
+        try:
+            loader = MigrationLoader(connection=None, load=False)
+            loader.load_disk()
+            self.assertIn('migrations', loader.unmigrated_apps)
+            self.assertNotIn('migrations', loader.migrated_apps)
+        finally:
+            sys.modules.pop(module_name, None)

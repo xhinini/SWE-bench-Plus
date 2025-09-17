@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.SaveM2MRegressionTests._assert_form_saves_user auth_tests.test_forms_llm.SaveM2MRegressionTests._make_no_save_m2m_form auth_tests.test_forms_llm.SaveM2MRegressionTests.test_save_commit_false_customuser_does_not_call_save_m2m auth_tests.test_forms_llm.SaveM2MRegressionTests.test_saved_user_has_password_set_when_save_called auth_tests.test_forms_llm.SaveM2MRegressionTests.test_usercreationform_save_without_save_m2m_default_commit_customuser auth_tests.test_forms_llm.SaveM2MRegressionTests.test_usercreationform_save_without_save_m2m_default_commit_extensionuser auth_tests.test_forms_llm.SaveM2MRegressionTests.test_usercreationform_save_without_save_m2m_default_commit_user auth_tests.test_forms_llm.SaveM2MRegressionTests.test_usercreationform_save_without_save_m2m_explicit_commit_true_customuser auth_tests.test_forms_llm.SaveM2MRegressionTests.test_usercreationform_save_without_save_m2m_explicit_commit_true_extensionuser auth_tests.test_forms_llm.SaveM2MRegressionTests.test_usercreationform_save_without_save_m2m_explicit_commit_true_user
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_auth_backends_llm.MissingCredentialsRegressionTests.setUpTestData auth_tests.test_auth_backends_llm.MissingCredentialsRegressionTests.test_authenticate_other_kwargs_do_not_unintentionally_map_to_username auth_tests.test_auth_backends_llm.MissingCredentialsRegressionTests.test_authenticate_with_request_and_missing_credentials_no_hash auth_tests.test_auth_backends_llm.MissingCredentialsRegressionTests.test_authenticate_with_username_in_kwargs_and_no_password_short_circuits auth_tests.test_auth_backends_llm.MissingCredentialsRegressionTests.test_missing_username_key_in_kwargs_with_other_kwargs_no_queries_no_hashing auth_tests.test_auth_backends_llm.MissingCredentialsRegressionTests.test_only_password_kwarg_no_queries_no_hashing auth_tests.test_auth_backends_llm.MissingCredentialsRegressionTests.test_only_username_kwarg_no_queries_no_hashing auth_tests.test_auth_backends_llm.MissingCredentialsRegressionTests.test_successful_authentication_triggers_hash_and_returns_user auth_tests.test_auth_backends_llm.MissingCredentialsRegressionTests.test_username_empty_string_triggers_hash_when_password_present auth_tests.test_auth_backends_llm.MissingCredentialsRegressionTests.test_username_none_and_password_none_no_queries_no_hashing auth_tests.test_auth_backends_llm.MissingCredentialsRegressionTests.test_username_none_password_provided_no_queries_no_hashing
+coverage json -o coverage.json
+: '>>>>> End Test Output'

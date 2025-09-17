@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests._base_context admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_add_permission_only_shows_save_as_new admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_add_permission_only_with_add_flag_true admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_add_permission_only_with_has_editable_inline_admin_formsets admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_add_permission_only_with_has_view_permission_false admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_add_permission_only_with_show_delete_false admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_add_permission_only_with_show_save_flags admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_change_false_suppresses_save_as_new admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_context_as_Django_Context_object admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_is_popup_suppresses_save_as_new admin_views.test_templatetags_llm.SubmitRowSaveAsNewTests.test_save_as_flag_false_suppresses_save_as_new
+coverage json -o coverage.json
+: '>>>>> End Test Output'

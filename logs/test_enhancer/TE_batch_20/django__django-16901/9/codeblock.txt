@@ -1,0 +1,258 @@
+# No additional imports required beyond what's in the test module.
+from django.test import SimpleTestCase
+from django.db.models.sql import where as where_mod
+
+
+class FakeChild:
+    """A simple leaf condition used as a child in the tests."""
+
+    def __init__(self, ident):
+        self.ident = ident
+        # Attributes used by WhereNode logic
+        self.contains_aggregate = False
+        self.contains_over_clause = False
+        self.is_summary = False
+        self.negated = False
+
+    def __repr__(self):
+        return f"<FakeChild {self.ident}>"
+
+
+class FakeWhen:
+    def __init__(self, cond, then):
+        self.cond = cond
+        self.then = then
+        # When objects in Django have no contains_* attrs used in this context.
+        self.contains_aggregate = False
+        self.contains_over_clause = False
+
+
+class FakeCase:
+    def __init__(self, when_obj, default=0):
+        # For our usage, we expect one When per Case in the generator
+        self.when = when_obj
+        self.default = default
+        self.contains_aggregate = False
+        self.contains_over_clause = False
+
+    def __add__(self, other):
+        # Return a SumExpr combining two Case/SumExpr pieces.
+        if isinstance(other, SumExpr):
+            return SumExpr([self] + other.operands)
+        if isinstance(other, FakeCase):
+            return SumExpr([self, other])
+        raise TypeError("Unsupported add operand for FakeCase: %r" % (other,))
+
+
+class SumExpr:
+    def __init__(self, operands):
+        # operands is a list of FakeCase or SumExpr operands flattened
+        self.operands = []
+        for o in operands:
+            if isinstance(o, SumExpr):
+                self.operands.extend(o.operands)
+            else:
+                self.operands.append(o)
+        self.contains_aggregate = False
+        self.contains_over_clause = False
+
+    def __add__(self, other):
+        if isinstance(other, (FakeCase, SumExpr)):
+            return SumExpr(self.operands + (other.operands if isinstance(other, SumExpr) else [other]))
+        raise TypeError("Unsupported add operand for SumExpr: %r" % (other,))
+
+    def __mod__(self, other):
+        # Simulate real Django expressions which don't implement Python's % operator.
+        # This will raise a TypeError for the candidate patch which uses rhs_sum % 2.
+        raise TypeError("unsupported operand type(s) for %: 'SumExpr' and 'int'")
+
+
+class ModExpr:
+    def __init__(self, inner, mod_value):
+        self.inner = inner
+        self.mod_value = mod_value
+        self.contains_aggregate = False
+        self.contains_over_clause = False
+
+
+class FakeExact:
+    def __init__(self, lhs, rhs):
+        # lhs is typically an integer literal here
+        self.lhs = lhs
+        self.rhs = rhs
+        self.contains_aggregate = False
+        self.contains_over_clause = False
+
+
+class FakeCompiler:
+    def __init__(self, connection):
+        self.connection = connection
+
+    def compile(self, obj):
+        # Delegate compilation based on the fake object types we've defined.
+        if isinstance(obj, where_mod.WhereNode):
+            return obj.as_sql(self, self.connection)
+        if isinstance(obj, FakeChild):
+            return (f"col{obj.ident}", [])
+        if isinstance(obj, FakeWhen):
+            cond_sql, params = self.compile(obj.cond)
+            case_sql = f"{cond_sql}"
+            return case_sql, params
+        if isinstance(obj, FakeCase):
+            # Build "(CASE WHEN <cond> THEN 1 ELSE 0 END)" for this Case
+            cond_sql, cond_params = self.compile(obj.when.cond)
+            sql = f"(CASE WHEN {cond_sql} THEN 1 ELSE 0 END)"
+            return sql, cond_params
+        if isinstance(obj, SumExpr):
+            parts = []
+            params = []
+            for operand in obj.operands:
+                sql, p = self.compile(operand)
+                parts.append(sql)
+                params.extend(p)
+            # Use ' + ' to represent the sum expression in SQL
+            return "(" + " + ".join(parts) + ")", params
+        if isinstance(obj, ModExpr):
+            inner_sql, params = self.compile(obj.inner)
+            return f"MOD({inner_sql}, {obj.mod_value})", params
+        if isinstance(obj, FakeExact):
+            lhs = obj.lhs
+            rhs_sql, params = self.compile(obj.rhs)
+            return f"{lhs} = {rhs_sql}", params
+        # Unknown object type - fail to help catch issues in the tests.
+        raise TypeError("Unexpected object to compile: %r" % (obj,))
+
+
+class WhereNodeModConversionTests(SimpleTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        # Save originals to restore later
+        cls._orig_Case = where_mod.Case
+        cls._orig_When = where_mod.When
+        cls._orig_Mod = where_mod.Mod
+        cls._orig_Exact = where_mod.Exact
+        # Monkeypatch the module-level names used by WhereNode
+        where_mod.Case = FakeCase
+        where_mod.When = FakeWhen
+        where_mod.Mod = lambda inner, m: ModExpr(inner, m)
+        where_mod.Exact = FakeExact
+
+    @classmethod
+    def tearDownClass(cls):
+        # Restore originals
+        where_mod.Case = cls._orig_Case
+        where_mod.When = cls._orig_When
+        where_mod.Mod = cls._orig_Mod
+        where_mod.Exact = cls._orig_Exact
+        super().tearDownClass()
+
+    def make_children(self, n):
+        return [FakeChild(i) for i in range(n)]
+
+    def make_connection(self, supports_logical_xor):
+        class Features:
+            def __init__(self, supports):
+                self.supports_logical_xor = supports
+                self.supports_boolean_expr_in_select_clause = True
+        class Conn:
+            features = Features(supports_logical_xor)
+        return Conn()
+
+    def test_three_children_uses_mod_in_sql(self):
+        children = self.make_children(3)
+        node = where_mod.WhereNode(children, where_mod.XOR)
+        connection = self.make_connection(supports_logical_xor=False)
+        compiler = FakeCompiler(connection)
+        sql, params = node.as_sql(compiler, connection)
+        # Gold patch: uses MOD(...) for n-ary XOR; expect MOD present
+        self.assertIn("MOD(", sql)
+        self.assertIn(" = ", sql)
+        self.assertEqual(params, [])
+
+    def test_two_children_no_mod_in_sql(self):
+        children = self.make_children(2)
+        node = where_mod.WhereNode(children, where_mod.XOR)
+        connection = self.make_connection(supports_logical_xor=False)
+        compiler = FakeCompiler(connection)
+        sql, params = node.as_sql(compiler, connection)
+        # For two children, gold patch doesn't wrap with MOD; should not contain "MOD("
+        self.assertNotIn("MOD(", sql)
+        # Should still contain a sum of two CASE WHEN pieces
+        self.assertIn("CASE WHEN", sql)
+        self.assertEqual(params, [])
+
+    def test_three_children_compiles_case_when_count(self):
+        children = self.make_children(3)
+        node = where_mod.WhereNode(children, where_mod.XOR)
+        connection = self.make_connection(supports_logical_xor=False)
+        compiler = FakeCompiler(connection)
+        sql, params = node.as_sql(compiler, connection)
+        # There should be three CASE WHEN occurrences inside the summed expression
+        self.assertEqual(sql.count("CASE WHEN"), 3)
+
+    def test_two_children_compiles_case_when_count(self):
+        children = self.make_children(2)
+        node = where_mod.WhereNode(children, where_mod.XOR)
+        connection = self.make_connection(supports_logical_xor=False)
+        compiler = FakeCompiler(connection)
+        sql, params = node.as_sql(compiler, connection)
+        self.assertEqual(sql.count("CASE WHEN"), 2)
+
+    def test_supports_logical_xor_true_uses_xor_connector(self):
+        # When the backend supports XOR, WhereNode shouldn't convert to MOD
+        children = self.make_children(4)
+        node = where_mod.WhereNode(children, where_mod.XOR)
+        connection = self.make_connection(supports_logical_xor=True)
+        compiler = FakeCompiler(connection)
+        sql, params = node.as_sql(compiler, connection)
+        # The connector used by WhereNode should remain XOR in that case
+        # (the SQL will be the OR of compiled children with the XOR connector)
+        self.assertIn("XOR", sql)
+        # No MOD should be present since the conversion is skipped
+        self.assertNotIn("MOD(", sql)
+
+    def test_negated_xor_three_children_wrapped_in_not(self):
+        children = self.make_children(3)
+        node = where_mod.WhereNode(children, where_mod.XOR, negated=True)
+        connection = self.make_connection(supports_logical_xor=False)
+        compiler = FakeCompiler(connection)
+        sql, params = node.as_sql(compiler, connection)
+        # Negated node should be wrapped with NOT ( ... )
+        self.assertTrue(sql.startswith("NOT (") or sql.startswith("NOT(") or "NOT (" in sql)
+        # The inner should still contain MOD
+        self.assertIn("MOD(", sql)
+
+    def test_sum_expression_mod_not_called_under_gold(self):
+        # This test ensures that we do not call Python's % operator on the SumExpr
+        # (which we simulated to raise TypeError in __mod__). Under the gold patch,
+        # Mod(...) is used instead and no exception is raised.
+        children = self.make_children(3)
+        node = where_mod.WhereNode(children, where_mod.XOR)
+        connection = self.make_connection(supports_logical_xor=False)
+        compiler = FakeCompiler(connection)
+        # Should not raise TypeError (which would be raised if candidate used rhs_sum % 2)
+        try:
+            sql, params = node.as_sql(compiler, connection)
+        except TypeError as e:
+            self.fail(f"WhereNode.as_sql raised TypeError unexpectedly: {e}")
+        self.assertIn("MOD(", sql)
+
+    def test_resolved_flag_adds_parentheses_when_resolved(self):
+        # A single child but resolved True should add parentheses around the SQL.
+        children = self.make_children(1)
+        node = where_mod.WhereNode(children, where_mod.AND)
+        connection = self.make_connection(supports_logical_xor=False)
+        compiler = FakeCompiler(connection)
+        resolved = node.resolve_expression(None, None)
+        sql, params = resolved.as_sql(compiler, connection)
+        # Because resolved is True, result must be parenthesized
+        self.assertTrue(sql.startswith("(") and sql.endswith(")"))
+
+    def test_leaves_yield_only_leaf_children(self):
+        # leaves() should yield the original leaf children, not WhereNode wrappers.
+        children = self.make_children(3)
+        node = where_mod.WhereNode(children, where_mod.OR)
+        leaves = list(node.leaves())
+        self.assertEqual(len(leaves), 3)
+        self.assertTrue(all(isinstance(l, FakeChild) for l in leaves))

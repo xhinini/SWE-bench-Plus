@@ -1,0 +1,224 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These tests validate the import-sorting and import-generation behavior of
+  django.db.migrations.writer.MigrationWriter.as_string(). They cover grouping
+  of "import" and "from ..." statements, the special merging of the
+  "from django.db import models" import into "from django.db import migrations, models",
+  the inclusion of settings when swappable dependencies are present, handling of
+  migration imports (which are converted into a commented manual-porting block),
+  and general ordering expectations for imports produced by migrations.
+test_code: |
+  import os
+  import re
+  from types import SimpleNamespace
+  from unittest import mock
+  
+  from django import get_version
+  from django.conf import settings
+  from django.db import migrations, models
+  from django.db.migrations.writer import MigrationWriter
+  from django.test import SimpleTestCase
+  from django.utils.timezone import now
+  
+  class ImportSortingTests(SimpleTestCase):
+      def _as_string_for_ops(self, ops, dependencies=None, include_header=False):
+          # Helper to build a minimal Migration class and return as_string
+          migration = type(
+              "Migration",
+              (migrations.Migration,),
+              {
+                  "operations": ops,
+                  "dependencies": dependencies or [],
+                  "replaces": None,
+                  "initial": False,
+                  "name": "0001_initial",
+                  "app_label": "tests",
+              },
+          )
+          writer = MigrationWriter(migration, include_header=include_header)
+          return writer.as_string()
+  
+      def test_group_imports_and_ordering(self):
+          # Ensure import statements come before "from ..." and that common cases
+          # like datetime and time result in the expected snippet.
+          ops = [
+              migrations.AddField(
+                  "mymodel",
+                  "myfield",
+                  models.DateTimeField(
+                      default=__import__("datetime").datetime(
+                          2012, 1, 1, 1, 1, tzinfo=__import__("datetime").timezone.utc
+                      )
+                  ),
+              ),
+              migrations.AddField(
+                  "mymodel",
+                  "myfield2",
+                  models.FloatField(default=__import__("time").time),
+              ),
+          ]
+          output = self._as_string_for_ops(ops)
+          # The imports block should have the bare imports first, then from django.db...
+          imports_block = "import datetime\nimport time\nfrom django.db import migrations, models\n"
+          self.assertIn(imports_block, output)
+  
+      def test_models_import_merged_with_migrations(self):
+          # If models import would be present, it should be merged into
+          # "from django.db import migrations, models"
+          ops = [
+              migrations.CreateModel(
+                  "MyModel", fields=(("f", models.CharField(max_length=10)),), options={}
+              )
+          ]
+          output = self._as_string_for_ops(ops)
+          # Should contain a single from django.db line with both migrations and models
+          self.assertIn("from django.db import migrations, models\n", output)
+          # It must not contain "from django.db import models" by itself
+          self.assertNotIn("from django.db import models\n\n", output)
+  
+      def test_swappable_dependency_includes_settings_import(self):
+          # Using a swappable dependency should inject "from django.conf import settings"
+          deps = [("__setting__", "AUTH_USER_MODEL")]
+          output = self._as_string_for_ops([], dependencies=deps)
+          self.assertIn("from django.conf import settings", output)
+          # And the django.db import should still be present
+          self.assertIn("from django.db import migrations\n", output)
+  
+      def test_migration_imports_become_comment_block(self):
+          # Create a custom serializer that claims an import of the form
+          # "import custom.pkg.0001_initial", which should be converted into
+          # the "Functions from the following migrations need manual copying" block.
+          class Dummy:
+              pass
+  
+          # Register a serializer temporarily to cause the import entry.
+          from django.db.migrations.writer import MigrationWriter as MW, Serializer, serializer_factory
+          class DummySerializer(Serializer):
+              def serialize(self):
+                  # Return a value string and an "import" entry that matches
+                  # the migration-import regex in the writer.
+                  return ("Dummy()", {"import custom.pkg.0001_initial"})
+  
+          try:
+              MW.register_serializer(Dummy, DummySerializer)
+              ops = [
+                  migrations.AddField(
+                      "mymodel",
+                      "dummy",
+                      models.IntegerField(default=Dummy()),
+                  )
+              ]
+              output = self._as_string_for_ops(ops, include_header=True)
+              # Ensure the manual-porting comment is present and mentions the package.
+              self.assertIn(
+                  "# Functions from the following migrations need manual copying.",
+                  output,
+              )
+              self.assertIn("# custom.pkg.0001_initial", output)
+          finally:
+              # Clean up serializer registration
+              MW.unregister_serializer(Dummy)
+  
+      def test_imports_grouping_with_custom_operations(self):
+          # Custom operations should generate import lines that are "import <module>"
+          # and those should appear before "from ..." imports.
+          import custom_migration_operations.operations as cm_ops
+          ops = [
+              cm_ops.TestOperation(),
+              migrations.CreateModel("MyModel", (), {}, (models.Model,)),
+          ]
+          output = self._as_string_for_ops(ops)
+          # The custom import (module import) should appear, then the from django.db...
+          self.assertIn("import custom_migration_operations.operations", output)
+          # And the django.db line should be present (with migrations at least)
+          self.assertIn("from django.db import migrations", output)
+          # Ensure the custom import appears before the django.db from import
+          self.assertLess(
+              output.index("import custom_migration_operations.operations"),
+              output.index("from django.db import migrations"),
+          )
+  
+      def test_imports_order_with_varied_modules(self):
+          # Ensure that "import x" lines still come before "from y import z"
+          # even if y < x lexicographically (the grouping should prioritize import/from).
+          # We'll induce imports for two modules using serializers via fields.
+          class A:
+              pass
+          class B:
+              pass
+          from django.db.migrations.writer import MigrationWriter as MW, Serializer
+          class SerializerA(Serializer):
+              def serialize(self):
+                  return ("A()", {"import alpha"})
+          class SerializerB(Serializer):
+              def serialize(self):
+                  return ("B()", {"from beta import something"})
+  
+          try:
+              MW.register_serializer(A, SerializerA)
+              MW.register_serializer(B, SerializerB)
+              ops = [
+                  migrations.AddField("m", "a", models.IntegerField(default=A())),
+                  migrations.AddField("m", "b", models.IntegerField(default=B())),
+              ]
+              output = self._as_string_for_ops(ops)
+              # The "import alpha" line should appear before the "from beta import something"
+              self.assertLess(
+                  output.index("import alpha"),
+                  output.index("from beta import something"),
+              )
+          finally:
+              MW.unregister_serializer(A)
+              MW.unregister_serializer(B)
+  
+      def test_multiple_from_same_module_present(self):
+          # Ensure multiple "from x import y" style lines generated for the same module are present.
+          # We'll register two serializers that both return from-statements from the same module.
+          class C1: pass
+          class C2: pass
+          from django.db.migrations.writer import MigrationWriter as MW, Serializer
+          class SerializerC1(Serializer):
+              def serialize(self):
+                  return ("C1()", {"from samepkg import alpha"})
+          class SerializerC2(Serializer):
+              def serialize(self):
+                  return ("C2()", {"from samepkg import beta"})
+  
+          try:
+              MW.register_serializer(C1, SerializerC1)
+              MW.register_serializer(C2, SerializerC2)
+              ops = [
+                  migrations.AddField("m", "c1", models.IntegerField(default=C1())),
+                  migrations.AddField("m", "c2", models.IntegerField(default=C2())),
+              ]
+              output = self._as_string_for_ops(ops)
+              # Both from-lines must be present in the imports section.
+              self.assertIn("from samepkg import alpha", output)
+              self.assertIn("from samepkg import beta", output)
+          finally:
+              MW.unregister_serializer(C1)
+              MW.unregister_serializer(C2)
+  
+      def test_header_inclusion_control(self):
+          # include_header=False should omit the generated-by comment at the top.
+          migration = type("Migration", (migrations.Migration,), {"operations": []})
+          dt = __import__("datetime").datetime(2015, 7, 31, 4, 40, tzinfo=__import__("datetime").timezone.utc)
+          with mock.patch("django.db.migrations.writer.now", lambda: dt):
+              writer_with_header = MigrationWriter(migration, include_header=True)
+              writer_without_header = MigrationWriter(migration, include_header=False)
+              out_with = writer_with_header.as_string()
+              out_without = writer_without_header.as_string()
+              self.assertTrue(out_with.startswith("# Generated by Django %s on 2015-07-31 04:40\n\n" % get_version()))
+              # When header omitted the first non-empty non-comment character should not be '#'
+              first_line = out_without.splitlines(keepends=True)[0]
+              self.assertRegex(first_line, r"^[^#\s]+")
+  
+      def test_filename_and_path_properties(self):
+          # Basic sanity checks for filename and path properties; basedir logic is exercised
+          # in existing tests, so here just confirm filename uses migration.name.
+          mig = type("Migration", (migrations.Migration,), {"operations": [], "name": "0002_custom"})
+          writer = MigrationWriter(mig)
+          self.assertEqual(writer.filename, "0002_custom.py")
+new_imports_code: |
+  # No additional imports required beyond what's used in the test module.

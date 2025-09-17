@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_optimizer_llm.ManagersOptimizerTests.test_alter_managers_for_other_model_does_not_merge migrations.test_optimizer_llm.ManagersOptimizerTests.test_create_addfield_alter_managers_merges_into_create migrations.test_optimizer_llm.ManagersOptimizerTests.test_create_alter_managers_and_alter_options migrations.test_optimizer_llm.ManagersOptimizerTests.test_create_alter_managers_then_delete_collapses migrations.test_optimizer_llm.ManagersOptimizerTests.test_create_alter_managers_then_rename_model migrations.test_optimizer_llm.ManagersOptimizerTests.test_create_remove_field_then_alter_managers migrations.test_optimizer_llm.ManagersOptimizerTests.test_create_then_alter_managers_merges migrations.test_optimizer_llm.ManagersOptimizerTests.test_create_with_bases_and_alter_managers_preserves_bases migrations.test_optimizer_llm.ManagersOptimizerTests.test_multiple_alter_managers_last_wins
+coverage json -o coverage.json
+: '>>>>> End Test Output'

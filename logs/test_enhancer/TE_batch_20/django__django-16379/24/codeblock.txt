@@ -1,0 +1,106 @@
+# new imports used by tests (if any) are included in the test_code block above.
+from django.test import TestCase, override_settings
+from django.test.signals import setting_changed
+from django.conf import settings
+from django.core.cache import cache, caches
+import tempfile
+import shutil
+import os
+import time
+from unittest import mock
+
+
+@override_settings(
+    CACHES={
+        "default": {
+            "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
+        }
+    }
+)
+class FileBasedCacheRegressionTests(TestCase):
+    """
+    Regression tests for FileBasedCache.has_key race conditions and error
+    handling. These tests mirror real-world races where files may be removed
+    between existence checks and open(), and ensure only FileNotFoundError
+    is swallowed into a False return value.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.dirname = tempfile.mkdtemp()
+        # Update all caches locations to point at our temp dir and notify signal
+        for cache_params in settings.CACHES.values():
+            cache_params["LOCATION"] = self.dirname
+        setting_changed.send(self.__class__, setting="CACHES", enter=False)
+
+    def tearDown(self):
+        super().tearDown()
+        try:
+            shutil.rmtree(self.dirname)
+        except FileNotFoundError:
+            pass
+
+    def test_has_key_returns_false_on_concurrent_delete(self):
+        cache.set("racekey", "value")
+        # Simulate the race where open raises FileNotFoundError.
+        with mock.patch("builtins.open", side_effect=FileNotFoundError):
+            self.assertIs(cache.has_key("racekey"), False)
+
+    def test_has_key_propagates_non_filenotfound_exceptions(self):
+        cache.set("errorkey", "value")
+        # Non-FileNotFoundError exceptions should not be swallowed.
+        with mock.patch("builtins.open", side_effect=OSError("disk error")):
+            with self.assertRaises(OSError):
+                cache.has_key("errorkey")
+
+    def test_has_key_expired_file_deleted(self):
+        cache.set("expkey", "value", timeout=1)
+        # Wait until expired
+        time.sleep(1.1)
+        self.assertIs(cache.has_key("expkey"), False)
+        # File should have been removed by _is_expired
+        fname = cache._key_to_file("expkey")
+        self.assertFalse(os.path.exists(fname))
+
+    def test_has_key_with_version_missing_file(self):
+        # has_key should return False for missing key with a version specified.
+        self.assertIs(cache.has_key("nonexistent", version=2), False)
+
+    def test_in_operator_uses_has_key_race(self):
+        cache.set("inopkey", "value")
+        # If open raises FileNotFoundError, `in` should be False (no exception).
+        with mock.patch("builtins.open", side_effect=FileNotFoundError):
+            self.assertNotIn("inopkey", cache)
+
+    def test_has_key_handles_empty_cache_file(self):
+        # Create an empty cache file (treated as expired).
+        fname = cache._key_to_file("emptykey")
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(fname), exist_ok=True)
+        with open(fname, "wb") as fh:
+            fh.write(b"")
+        # has_key should report False and remove the empty file.
+        self.assertIs(cache.has_key("emptykey"), False)
+        self.assertFalse(os.path.exists(fname))
+
+    def test_has_key_after_clear_returns_false(self):
+        cache.set("akey", "bval")
+        cache.clear()
+        self.assertIs(cache.has_key("akey"), False)
+
+    def test_has_key_permission_error_propagates(self):
+        cache.set("permkey", "value")
+        with mock.patch("builtins.open", side_effect=PermissionError("denied")):
+            with self.assertRaises(PermissionError):
+                cache.has_key("permkey")
+
+    def test_has_key_propagates_exceptions_from_is_expired(self):
+        cache.set("boomkey", "value", timeout=None)
+        # Force _is_expired to raise an exception; has_key should propagate it.
+        with mock.patch.object(type(cache), "_is_expired", side_effect=ValueError("boom")):
+            with self.assertRaises(ValueError):
+                cache.has_key("boomkey")
+
+    def test_has_key_returns_true_for_non_expired_file(self):
+        cache.set("validkey", "value", timeout=10)
+        self.assertIs(cache.has_key("validkey"), True)

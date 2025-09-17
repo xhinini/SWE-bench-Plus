@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 xor_lookups.tests_llm.DummyCompiler.__init__ xor_lookups.tests_llm.DummyCompiler.compile xor_lookups.tests_llm.WhereNodeXorConversionTests.setUp xor_lookups.tests_llm.WhereNodeXorConversionTests.test_xor_five_children_compiles_without_error xor_lookups.tests_llm.WhereNodeXorConversionTests.test_xor_five_children_uses_mod_on_rhs xor_lookups.tests_llm.WhereNodeXorConversionTests.test_xor_multiple_children_mixed_field_names xor_lookups.tests_llm.WhereNodeXorConversionTests.test_xor_three_children_compiles_without_error xor_lookups.tests_llm.WhereNodeXorConversionTests.test_xor_three_children_contains_or_for_lhs xor_lookups.tests_llm.WhereNodeXorConversionTests.test_xor_three_children_exact_rhs_is_mod_instance_before_compile xor_lookups.tests_llm.WhereNodeXorConversionTests.test_xor_three_children_negated_compiles_without_error xor_lookups.tests_llm.WhereNodeXorConversionTests.test_xor_three_children_params_is_list xor_lookups.tests_llm.WhereNodeXorConversionTests.test_xor_three_children_top_level_joins xor_lookups.tests_llm.WhereNodeXorConversionTests.test_xor_three_children_uses_mod_on_rhs
+coverage json -o coverage.json
+: '>>>>> End Test Output'

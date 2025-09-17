@@ -1,0 +1,184 @@
+from django.apps import apps
+from django.db import connections, router, IntegrityError
+from django.contrib.contenttypes.models import ContentType
+from django.apps import apps
+from django.conf import settings
+from django.contrib.contenttypes.management import RenameContentType
+from django.contrib.contenttypes.models import ContentType
+from django.db import IntegrityError, connections, router
+from django.test import TransactionTestCase, override_settings
+
+
+class RenameContentTypeUsingDBTests(TransactionTestCase):
+    databases = {'default', 'other'}
+    available_apps = [
+        'django.contrib.contenttypes',
+    ]
+
+    def setUp(self):
+        # Ensure a clean state in both DBs for our app_label values used in tests.
+        ContentType.objects.using('default').filter(app_label__in=('rct_test', 'rct_conflict')).delete()
+        ContentType.objects.using('other').filter(app_label__in=('rct_test', 'rct_conflict')).delete()
+
+    def tearDown(self):
+        ContentType.objects.using('default').filter(app_label__in=('rct_test', 'rct_conflict')).delete()
+        ContentType.objects.using('other').filter(app_label__in=('rct_test', 'rct_conflict')).delete()
+
+    def test_rename_writes_to_correct_db_direct(self):
+        # Create only on 'other' DB and rename there.
+        ContentType.objects.using('other').create(app_label='rct_test', model='old')
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='rct_test').exists())
+
+        op = RenameContentType('rct_test', 'old', 'new')
+        with connections['other'].schema_editor() as schema_editor:
+            op._rename(apps, schema_editor, 'old', 'new')
+
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='rct_test', model='new').exists())
+        self.assertFalse(ContentType.objects.using('other').filter(app_label='rct_test', model='old').exists())
+        # default DB must remain untouched
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='rct_test').exists())
+
+    def test_rename_forward_writes_to_correct_db(self):
+        ContentType.objects.using('other').create(app_label='rct_test', model='old2')
+        op = RenameContentType('rct_test', 'old2', 'new2')
+        with connections['other'].schema_editor() as schema_editor:
+            op.rename_forward(apps, schema_editor)
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='rct_test', model='new2').exists())
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='rct_test', model='new2').exists())
+
+    def test_rename_backward_writes_to_correct_db(self):
+        ContentType.objects.using('other').create(app_label='rct_test', model='old3')
+        op = RenameContentType('rct_test', 'old3', 'new3')
+        # First forward
+        with connections['other'].schema_editor() as schema_editor:
+            op.rename_forward(apps, schema_editor)
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='rct_test', model='new3').exists())
+        # Then backward
+        with connections['other'].schema_editor() as schema_editor:
+            op.rename_backward(apps, schema_editor)
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='rct_test', model='old3').exists())
+        # Ensure default never had the change
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='rct_test', model__in=('old3', 'new3')).exists())
+
+    def test_rename_conflict_restores_db_state(self):
+        # Create both old and new on 'other' so the rename should hit IntegrityError and be a no-op on 'other'.
+        ContentType.objects.using('other').create(app_label='rct_conflict', model='old')
+        ContentType.objects.using('other').create(app_label='rct_conflict', model='new')
+        op = RenameContentType('rct_conflict', 'old', 'new')
+        with connections['other'].schema_editor() as schema_editor:
+            # Should handle IntegrityError gracefully and leave both entries in 'other' unchanged.
+            op._rename(apps, schema_editor, 'old', 'new')
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='rct_conflict', model='old').exists())
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='rct_conflict', model='new').exists())
+        # default DB must remain untouched
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='rct_conflict').exists())
+
+    def test_save_called_with_using_on_success(self):
+        # Spy on save to assert it receives using='other' and update_fields={'model'} on success.
+        ContentType.objects.using('other').create(app_label='rct_test', model='saveok')
+        ct_model = apps.get_model('contenttypes', 'ContentType')
+        original_save = ct_model.save
+        called = {}
+        def spy_save(self, *args, **kwargs):
+            called['kwargs'] = kwargs.copy()
+            # Call through to actually persist so normal flow continues.
+            return original_save(self, *args, **kwargs)
+        try:
+            ct_model.save = spy_save
+            op = RenameContentType('rct_test', 'saveok', 'saveok_new')
+            with connections['other'].schema_editor() as schema_editor:
+                op._rename(apps, schema_editor, 'saveok', 'saveok_new')
+            self.assertIn('kwargs', called)
+            self.assertEqual(called['kwargs'].get('using'), 'other')
+            self.assertEqual(called['kwargs'].get('update_fields'), {'model'})
+        finally:
+            ct_model.save = original_save
+
+    def test_save_called_with_using_on_forward(self):
+        ContentType.objects.using('other').create(app_label='rct_test', model='savefwd')
+        ct_model = apps.get_model('contenttypes', 'ContentType')
+        original_save = ct_model.save
+        called = {}
+        def spy_save(self, *args, **kwargs):
+            called['kwargs'] = kwargs.copy()
+            return original_save(self, *args, **kwargs)
+        try:
+            ct_model.save = spy_save
+            op = RenameContentType('rct_test', 'savefwd', 'savefwd_new')
+            with connections['other'].schema_editor() as schema_editor:
+                op.rename_forward(apps, schema_editor)
+            self.assertEqual(called['kwargs'].get('using'), 'other')
+            self.assertEqual(called['kwargs'].get('update_fields'), {'model'})
+        finally:
+            ct_model.save = original_save
+
+    def test_save_called_with_using_on_backward(self):
+        ContentType.objects.using('other').create(app_label='rct_test', model='savebwd')
+        ct_model = apps.get_model('contenttypes', 'ContentType')
+        original_save = ct_model.save
+        called = {}
+        def spy_save(self, *args, **kwargs):
+            called['kwargs'] = kwargs.copy()
+            return original_save(self, *args, **kwargs)
+        try:
+            ct_model.save = spy_save
+            op = RenameContentType('rct_test', 'savebwd', 'savebwd_new')
+            # perform forward then backward to hit both code paths
+            with connections['other'].schema_editor() as schema_editor:
+                op.rename_forward(apps, schema_editor)
+            with connections['other'].schema_editor() as schema_editor:
+                op.rename_backward(apps, schema_editor)
+            # The last save (backward) must have used 'other'
+            self.assertEqual(called['kwargs'].get('using'), 'other')
+            self.assertEqual(called['kwargs'].get('update_fields'), {'model'})
+        finally:
+            ct_model.save = original_save
+
+    @override_settings(DATABASE_ROUTERS=[type('RouterDefaultWrite', (), {
+        'db_for_write': lambda self, model, **hints: 'default',
+        'allow_migrate': lambda self, db, app_label, model_name=None, **hints: db == 'other',
+    })()])
+    def test_save_uses_schema_editor_alias_not_router_db_for_write(self):
+        """
+        If router.db_for_write would choose 'default', ensure save() is still called with using='other'
+        because the schema_editor connection alias is 'other'. This detects the bug where save() omitted
+        using and would have used router.db_for_write to pick a wrong DB.
+        """
+        ContentType.objects.using('other').create(app_label='rct_test', model='routercheck')
+        ct_model = apps.get_model('contenttypes', 'ContentType')
+        original_save = ct_model.save
+        called = {}
+        def spy_save(self, *args, **kwargs):
+            called['kwargs'] = kwargs.copy()
+            return original_save(self, *args, **kwargs)
+        try:
+            ct_model.save = spy_save
+            op = RenameContentType('rct_test', 'routercheck', 'routercheck_new')
+            with connections['other'].schema_editor() as schema_editor:
+                op._rename(apps, schema_editor, 'routercheck', 'routercheck_new')
+            # Even though the router's db_for_write returns 'default', save must be invoked with using='other'
+            self.assertEqual(called['kwargs'].get('using'), 'other')
+            self.assertEqual(ContentType.objects.using('other').filter(app_label='rct_test', model='routercheck_new').exists(), True)
+            self.assertFalse(ContentType.objects.using('default').filter(app_label='rct_test', model='routercheck_new').exists())
+        finally:
+            ct_model.save = original_save
+
+    def test_rename_noop_when_router_disallows_migrate(self):
+        # Temporarily stub router.allow_migrate_model to return False for 'other'
+        original_allow = router.allow_migrate_model
+        def fake_allow(db, model):
+            if db == 'other':
+                return False
+            return original_allow(db, model)
+        router.allow_migrate_model = fake_allow
+        try:
+            ContentType.objects.using('other').create(app_label='rct_test', model='noallow')
+            op = RenameContentType('rct_test', 'noallow', 'noallow_new')
+            with connections['other'].schema_editor() as schema_editor:
+                # Because allow_migrate_model returns False for 'other', nothing should happen.
+                op._rename(apps, schema_editor, 'noallow', 'noallow_new')
+            self.assertTrue(ContentType.objects.using('other').filter(app_label='rct_test', model='noallow').exists())
+            self.assertFalse(ContentType.objects.using('other').filter(app_label='rct_test', model='noallow_new').exists())
+            self.assertFalse(ContentType.objects.using('default').filter(app_label='rct_test', model='noallow_new').exists())
+        finally:
+            router.allow_migrate_model = original_allow

@@ -1,0 +1,209 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests target build_instance() in django.core.serializers.base and verify that when a Model
+  implements natural_key() that needs to resolve related data (i.e. needs the instance's _state.db
+  to be set), build_instance correctly sets the instance's _state.db to the provided db so the
+  natural key resolution uses the correct database. The candidate (incorrect) patch created an
+  instance without setting _state.db and/or without relational attributes, which causes natural_key
+  to fail (or to be skipped) and thus prevents build_instance from populating the primary key.
+  The tests build small fake Model classes that simulate this behavior and assert that the returned
+  instance has its primary key set when the related object is available only on the specified db.
+test_code: |
+  from types import SimpleNamespace
+  import unittest
+  
+  from django.core.serializers.base import build_instance
+  
+  
+  def make_model(natural_key_func, pk_by_db, pk_attname="id", to_python=lambda x: int(x)):
+      """
+      Helper to create a fake Model-like class for testing build_instance.
+  
+      natural_key_func: function(self) -> tuple used as Model.natural_key
+      pk_by_db: dict mapping db alias -> pk to return from get_by_natural_key
+      """
+  
+      class DefaultManager:
+          # expose get_by_natural_key attr to satisfy hasattr check in build_instance
+          def __init__(self, pk_by_db):
+              self._pk_by_db = pk_by_db
+  
+          def get_by_natural_key(self, *args, **kwargs):
+              # dummy on the manager object itself; not used by build_instance directly
+              raise NotImplementedError("use db_manager(...).get_by_natural_key")
+  
+          def db_manager(self, db):
+              def get_by_natural_key_inner(*args):
+                  if db not in self._pk_by_db:
+                      raise Model.DoesNotExist("not found")
+                  return SimpleNamespace(pk=self._pk_by_db[db])
+  
+              return SimpleNamespace(get_by_natural_key=get_by_natural_key_inner)
+  
+      class PKDescriptor:
+          def __init__(self, attname, to_python):
+              self.attname = attname
+              self.to_python = staticmethod(to_python)
+  
+      class ModelClass:
+          DoesNotExist = type("DoesNotExist", (Exception,), {})
+          _meta = SimpleNamespace(
+              pk=PKDescriptor(pk_attname, to_python),
+              default_manager=DefaultManager(pk_by_db),
+          )
+  
+          def __init__(self, **data):
+              # set all provided attrs; relational attrs may be set via e.g. author_id
+              for k, v in data.items():
+                  setattr(self, k, v)
+              # _state.db should be set by build_instance to the db arg
+              self._state = SimpleNamespace(db=None)
+  
+          # attach the natural_key implementation passed in
+          def natural_key(self):
+              return natural_key_func(self)
+  
+      return ModelClass
+  
+  
+  class BuildInstanceTests(unittest.TestCase):
+      def test_basic_related_natural_key_single_component(self):
+          # natural_key depends on _state.db; it raises if _state.db is None
+          def nk(self):
+              if self._state.db is None:
+                  raise AttributeError("db not set")
+              return ("nk1",)
+  
+          pk_by_db = {"other": "42"}
+          Model = make_model(nk, pk_by_db)
+          data = {"name": "obj"}  # no pk provided
+          inst = build_instance(Model, data, "other")
+          # pk should be set from pk_by_db['other'] and converted to int
+          self.assertEqual(getattr(inst, "id"), 42)
+  
+      def test_multiple_component_natural_key(self):
+          def nk(self):
+              if self._state.db is None:
+                  raise AttributeError("db not set")
+              return ("a", "b", "c")
+  
+          pk_by_db = {"other": "123"}
+          Model = make_model(nk, pk_by_db)
+          inst = build_instance(Model, {}, "other")
+          self.assertEqual(getattr(inst, "id"), 123)
+  
+      def test_nested_natural_key_calls(self):
+          # Simulate nested natural_key that would require relational resolution.
+          def nk(self):
+              if self._state.db is None:
+                  raise AttributeError("db not set")
+              # nested composition
+              return ("parent",) + ("child",)
+  
+          pk_by_db = {"other": "7"}
+          Model = make_model(nk, pk_by_db)
+          inst = build_instance(Model, {"some": "field"}, "other")
+          self.assertEqual(getattr(inst, "id"), 7)
+  
+      def test_to_python_called_on_pk_string(self):
+          # to_python should be called to convert "007" -> 7
+          def nk(self):
+              if self._state.db is None:
+                  raise AttributeError("db not set")
+              return ("nk",)
+  
+          # to_python strips leading zeros
+          def to_python(val):
+              return int(str(val))
+  
+          pk_by_db = {"other": "007"}
+          Model = make_model(nk, pk_by_db, pk_attname="id", to_python=to_python)
+          inst = build_instance(Model, {}, "other")
+          self.assertEqual(getattr(inst, "id"), 7)
+  
+      def test_uses_specified_db_not_default(self):
+          # Ensure the db argument to build_instance influences resolution
+          def nk(self):
+              if self._state.db is None:
+                  raise AttributeError("db not set")
+              # return different natural key depending on chosen db (to help triage)
+              return ("nk",)
+  
+          pk_by_db = {"default": "1", "other": "999"}
+          Model = make_model(nk, pk_by_db)
+          inst_other = build_instance(Model, {}, "other")
+          inst_default = build_instance(Model, {}, "default")
+          self.assertEqual(getattr(inst_other, "id"), 999)
+          self.assertEqual(getattr(inst_default, "id"), 1)
+  
+      def test_missing_get_by_natural_key_results_in_no_pk(self):
+          # If get_by_natural_key raises DoesNotExist, build_instance should leave pk unset
+          def nk(self):
+              if self._state.db is None:
+                  raise AttributeError("db not set")
+              return ("nk",)
+  
+          pk_by_db = {}  # no entries -> get_by_natural_key will raise DoesNotExist
+          Model = make_model(nk, pk_by_db)
+          inst = build_instance(Model, {}, "other")
+          # No pk attribute should be set (build_instance should return Model(**data) without adding pk)
+          self.assertIsNone(getattr(inst, "id", None))
+  
+      def test_natural_key_raises_attributeerror_without_state_db(self):
+          # natural_key raises AttributeError if _state.db is None, must be prevented by build_instance
+          def nk(self):
+              if self._state.db is None:
+                  # Simulate needing to access a related descriptor which would raise/require db
+                  raise AttributeError("requires state.db")
+              return ("nk",)
+  
+          pk_by_db = {"other": "55"}
+          Model = make_model(nk, pk_by_db)
+          inst = build_instance(Model, {}, "other")
+          self.assertEqual(getattr(inst, "id"), 55)
+  
+      def test_non_string_natural_key_component(self):
+          # natural_key can return non-string components; ensure we still get pk
+          def nk(self):
+              if self._state.db is None:
+                  raise AttributeError("db not set")
+              return (42, b"bytes")
+  
+          pk_by_db = {"other": "314"}
+          Model = make_model(nk, pk_by_db)
+          inst = build_instance(Model, {}, "other")
+          self.assertEqual(getattr(inst, "id"), 314)
+  
+      def test_db_none_works_as_valid_db_argument(self):
+          # If db is None, build_instance must still set _state.db to None on the instance
+          # and natural_key should work if it expects None
+          def nk(self):
+              # this natural_key expects _state.db to be present (can be None)
+              if not hasattr(self, "_state"):
+                  raise AttributeError("no state")
+              # treat None as a valid db
+              return ("nk_none",)
+  
+          pk_by_db = {None: "88"}
+          Model = make_model(nk, pk_by_db)
+          inst = build_instance(Model, {}, None)
+          self.assertEqual(getattr(inst, "id"), 88)
+  
+      def test_varied_field_names_and_attnames(self):
+          # Ensure that build_instance uses Model(**data) and sets pk correctly even if other fields are present.
+          def nk(self):
+              if self._state.db is None:
+                  raise AttributeError("db not set")
+              # include other data in the natural key composite
+              return (getattr(self, "other_field", "x"),)
+  
+          pk_by_db = {"other": "2025"}
+          Model = make_model(nk, pk_by_db)
+          inst = build_instance(Model, {"other_field": "testval", "some": "data"}, "other")
+          self.assertEqual(getattr(inst, "id"), 2025)
+  
+  if __name__ == "__main__":
+      unittest.main()
+new_imports_code: |
+  from types import SimpleNamespace

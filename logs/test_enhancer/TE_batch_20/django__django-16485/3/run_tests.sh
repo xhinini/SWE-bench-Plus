@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.filter_tests.test_floatformat_llm.FloatformatRegressionTests.test_decimal_scientific_repr template_tests.filter_tests.test_floatformat_llm.FloatformatRegressionTests.test_force_grouping_p_zero template_tests.filter_tests.test_floatformat_llm.FloatformatRegressionTests.test_integer_decimal_p_zero template_tests.filter_tests.test_floatformat_llm.FloatformatRegressionTests.test_integer_decimal_str_arg_zero template_tests.filter_tests.test_floatformat_llm.FloatformatRegressionTests.test_integer_float_p_zero template_tests.filter_tests.test_floatformat_llm.FloatformatRegressionTests.test_integer_mark_safe template_tests.filter_tests.test_floatformat_llm.FloatformatRegressionTests.test_integer_str_p_zero template_tests.filter_tests.test_floatformat_llm.FloatformatRegressionTests.test_negative_integer_decimal_p_zero template_tests.filter_tests.test_floatformat_llm.FloatformatRegressionTests.test_negative_integer_float_p_zero template_tests.filter_tests.test_floatformat_llm.FloatformatRegressionTests.test_no_trailing_dot_for_integer_result
+coverage json -o coverage.json
+: '>>>>> End Test Output'

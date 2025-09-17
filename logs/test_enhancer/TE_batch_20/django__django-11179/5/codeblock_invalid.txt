@@ -1,0 +1,184 @@
+from uuid import uuid4
+
+from django.db import connection, models
+from django.db.models.deletion import Collector
+from django.test import TestCase
+
+def make_model(name, fields):
+    """
+    Dynamically construct a Django model for testing and create its table.
+    Returns the model class.
+    """
+    attrs = dict(fields)
+    # Required metadata
+    class Meta:
+        app_label = "tests"
+    attrs["__module__"] = __name__
+    attrs["Meta"] = Meta
+    model = type(name, (models.Model,), attrs)
+    # Create DB table for the model
+    with connection.schema_editor() as schema_editor:
+        schema_editor.create_model(model)
+    return model
+
+def destroy_model(model):
+    with connection.schema_editor() as schema_editor:
+        schema_editor.delete_model(model)
+
+class FastDeletePkClearingTests(TestCase):
+    def test_auto_pk_cleared_on_model_delete(self):
+        # AutoField primary key
+        ModelA = make_model("ModelA", {"name": models.CharField(max_length=10)})
+        try:
+            inst = ModelA.objects.create(name="a")
+            # Sanity: .pk is set before delete
+            self.assertIsNotNone(inst.pk)
+            deleted, mapping = inst.delete()
+            # Delete should report one row deleted
+            self.assertEqual(deleted, 1)
+            # Instance pk should be cleared
+            self.assertIsNone(inst.pk)
+            # The concrete attname should also be None
+            self.assertIsNone(getattr(inst, ModelA._meta.pk.attname))
+        finally:
+            destroy_model(ModelA)
+
+    def test_charfield_pk_cleared_on_model_delete(self):
+        # CharField as primary key
+        ModelC = make_model(
+            "ModelC",
+            {
+                "slug": models.CharField(max_length=32, primary_key=True),
+                "name": models.CharField(max_length=10),
+            }
+        )
+        try:
+            inst = ModelC.objects.create(slug="s1", name="n")
+            self.assertEqual(inst.pk, "s1")
+            deleted, mapping = inst.delete()
+            self.assertEqual(deleted, 1)
+            self.assertIsNone(inst.pk)
+            self.assertIsNone(getattr(inst, ModelC._meta.pk.attname))
+        finally:
+            destroy_model(ModelC)
+
+    def test_integer_pk_field_name_cleared_on_model_delete(self):
+        # IntegerField primary key with custom name
+        ModelI = make_model(
+            "ModelI",
+            {
+                "custom_id": models.IntegerField(primary_key=True),
+                "name": models.CharField(max_length=10),
+            }
+        )
+        try:
+            inst = ModelI.objects.create(custom_id=42, name="n")
+            self.assertEqual(inst.pk, 42)
+            deleted, mapping = inst.delete()
+            self.assertEqual(deleted, 1)
+            self.assertIsNone(inst.pk)
+            self.assertIsNone(getattr(inst, ModelI._meta.pk.attname))
+        finally:
+            destroy_model(ModelI)
+
+    def test_uuid_pk_cleared_on_model_delete(self):
+        # UUIDField primary key
+        ModelU = make_model(
+            "ModelU",
+            {
+                "uuid": models.UUIDField(primary_key=True, default=uuid4, editable=False),
+                "name": models.CharField(max_length=10),
+            }
+        )
+        try:
+            inst = ModelU.objects.create(name="n")
+            self.assertIsNotNone(inst.pk)
+            deleted, mapping = inst.delete()
+            self.assertEqual(deleted, 1)
+            self.assertIsNone(inst.pk)
+            self.assertIsNone(getattr(inst, ModelU._meta.pk.attname))
+        finally:
+            destroy_model(ModelU)
+
+    def test_collector_delete_single_instance_clears_pk(self):
+        # Use Collector directly to exercise the same fast-path
+        ModelD = make_model("ModelD", {"name": models.CharField(max_length=10)})
+        try:
+            inst = ModelD.objects.create(name="x")
+            collector = Collector(using="default")
+            # Collector.collect expects an iterable of instances
+            collector.collect([inst])
+            # After delete(), instance.pk should be cleared
+            deleted_count, deleted_map = collector.delete()
+            self.assertEqual(deleted_count, 1)
+            self.assertIsNone(inst.pk)
+            self.assertIsNone(getattr(inst, ModelD._meta.pk.attname))
+            # Mapping should contain the model label
+            self.assertIn(ModelD._meta.label, deleted_map)
+            self.assertEqual(deleted_map[ModelD._meta.label], 1)
+        finally:
+            destroy_model(ModelD)
+
+    def test_multiple_calls_single_instance_delete_clears_pk_every_time(self):
+        ModelE = make_model("ModelE", {"name": models.CharField(max_length=10)})
+        try:
+            inst = ModelE.objects.create(name="x")
+            # Call delete multiple times; the first one removes from DB and should clear pk
+            deleted_first, _ = inst.delete()
+            self.assertEqual(deleted_first, 1)
+            self.assertIsNone(inst.pk)
+            # Calling delete again should be a no-op (0 deleted) but not raise
+            deleted_second, _ = inst.delete()
+            self.assertEqual(deleted_second, 0)
+            self.assertIsNone(inst.pk)
+        finally:
+            destroy_model(ModelE)
+
+    def test_delete_return_values_and_pk_for_custom_pk_model(self):
+        ModelF = make_model(
+            "ModelF",
+            {"code": models.CharField(max_length=8, primary_key=True), "name": models.CharField(max_length=10)}
+        )
+        try:
+            inst = ModelF.objects.create(code="C1", name="n")
+            result = inst.delete()
+            # Expect a (count, dict) result where count == 1
+            self.assertIsInstance(result, tuple)
+            self.assertEqual(result[0], 1)
+            self.assertIsNone(inst.pk)
+            self.assertIsNone(getattr(inst, ModelF._meta.pk.attname))
+        finally:
+            destroy_model(ModelF)
+
+    def test_fast_delete_with_no_signals_still_clears_pk(self):
+        # Ensure clearing works when there are no pre/post delete listeners
+        ModelG = make_model("ModelG", {"name": models.CharField(max_length=10)})
+        try:
+            inst = ModelG.objects.create(name="n")
+            # Ensure no listeners are connected by directly deleting the instance
+            inst.delete()
+            self.assertIsNone(inst.pk)
+            self.assertIsNone(getattr(inst, ModelG._meta.pk.attname))
+        finally:
+            destroy_model(ModelG)
+
+    def test_delete_after_bulk_creation_single_instance_clears_pk(self):
+        # Create multiple instances but delete a single instance via Model.delete()
+        ModelH = make_model("ModelH", {"name": models.CharField(max_length=10)})
+        try:
+            objs = [ModelH(name=str(i)) for i in range(5)]
+            ModelH.objects.bulk_create(objs)
+            inst = ModelH.objects.first()
+            self.assertIsNotNone(inst.pk)
+            deleted, _ = inst.delete()
+            self.assertEqual(deleted, 1)
+            self.assertIsNone(inst.pk)
+            self.assertIsNone(getattr(inst, ModelH._meta.pk.attname))
+        finally:
+            destroy_model(ModelH)
+
+new_imports_code: |
+  from uuid import uuid4
+  from django.db import connection, models
+  from django.db.models.deletion import Collector
+  from django.test import TestCase

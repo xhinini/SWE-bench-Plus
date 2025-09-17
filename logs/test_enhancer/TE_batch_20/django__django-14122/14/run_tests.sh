@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 ordering.tests_llm.GroupByMetaOrderingTests._group_by_clause ordering.tests_llm.GroupByMetaOrderingTests.setUpTestData ordering.tests_llm.GroupByMetaOrderingTests.test_aggregate_after_values_group_by_sql_has_exact_columns ordering.tests_llm.GroupByMetaOrderingTests.test_annotate_with_expression_value_groups_only_requested_name ordering.tests_llm.GroupByMetaOrderingTests.test_distinct_with_values_and_annotate_group_by_is_values_only ordering.tests_llm.GroupByMetaOrderingTests.test_group_by_for_subquery_annotate_excludes_meta_ordering ordering.tests_llm.GroupByMetaOrderingTests.test_values_and_annotate_results_count_matches_expected_groups ordering.tests_llm.GroupByMetaOrderingTests.test_values_author_annotate_group_by_excludes_meta_ordering ordering.tests_llm.GroupByMetaOrderingTests.test_values_author_headline_groups_by_both_requested_fields ordering.tests_llm.GroupByMetaOrderingTests.test_values_headline_only_groups_by_headline ordering.tests_llm.GroupByMetaOrderingTests.test_values_pub_date_groups_by_pub_date_not_headline ordering.tests_llm.GroupByMetaOrderingTests.test_values_with_annotation_alias_and_meta_ordering
+coverage json -o coverage.json
+: '>>>>> End Test Output'

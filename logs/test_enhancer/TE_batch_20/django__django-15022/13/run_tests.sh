@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.test_admin_llm.SearchResultsTestCase._get_request admin_changelist.test_admin_llm.SearchResultsTestCase.setUp admin_changelist.test_admin_llm.SearchResultsTestCase.test_multi_term_with_overlap_only_matches_when_all_terms_satisfied admin_changelist.test_admin_llm.SearchResultsTestCase.test_multiple_lookup_fields_are_considered_for_each_term admin_changelist.test_admin_llm.SearchResultsTestCase.test_pk_token_maps_to_primary_key admin_changelist.test_admin_llm.SearchResultsTestCase.test_prefix_caret_uses_startswith admin_changelist.test_admin_llm.SearchResultsTestCase.test_prefix_equals_uses_exact_match admin_changelist.test_admin_llm.SearchResultsTestCase.test_quoted_phrase_is_treated_as_single_search_term admin_changelist.test_admin_llm.SearchResultsTestCase.test_search_with_unknown_transform_does_not_raise admin_changelist.test_admin_llm.SearchResultsTestCase.test_single_term_matches_any_configured_lookup admin_changelist.test_admin_llm.SearchResultsTestCase.test_two_terms_are_anded_across_lookups
+coverage json -o coverage.json
+: '>>>>> End Test Output'

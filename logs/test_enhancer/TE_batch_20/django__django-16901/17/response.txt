@@ -1,0 +1,190 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise the conversion of n-ary XOR nodes into an OR + parity test when the database backend does not support a native XOR operator. The gold patch wraps the sum of boolean CASE expressions with Mod(..., 2) for >2 operands, while the candidate patch attempts to use Python's % operator on expression objects (or otherwise produces an incorrect SQL token). The tests assert that (1) for more than two XOR operands the generated SQL contains MOD(, (2) for exactly two operands MOD( is not used, and (3) queries using 3, 4 and 5 XOR operands produce the expected result sets and compile without errors. The tests also cover negated XOR expressions and combinations including an empty IN. These would fail under the candidate patch (either by producing incorrect SQL or raising errors) and pass under the gold patch.
+test_code: |
+  from django.db.models import Q
+  from django.test import TestCase
+  from django.db import connection
+  import operator
+  from .models import Number
+  
+  
+  class XorAdditionalTests(TestCase):
+      @classmethod
+      def setUpTestData(cls):
+          cls.numbers = [Number.objects.create(num=i) for i in range(10)]
+  
+      def _compile_where_sql(self, qs):
+          """
+          Helper to compile the WHERE node of a queryset into SQL using the
+          queryset's compiler and the current connection.
+          """
+          where = qs.query.where
+          compiler = qs.query.get_compiler(connection=connection)
+          return where.as_sql(compiler, connection)
+  
+      def test_sql_contains_mod_for_three_operands(self):
+          # Force the XOR conversion path
+          orig = connection.features.supports_logical_xor
+          connection.features.supports_logical_xor = False
+          try:
+              qs = Number.objects.filter(
+                  Q(num__gte=1) ^ Q(num__gte=3) ^ Q(num__gte=5)
+              )
+              sql, params = self._compile_where_sql(qs)
+              # For more than two operands, the gold patch uses MOD(..., 2)
+              self.assertIn("MOD(", sql.upper())
+              # Ensure it compiles to something non-empty
+              self.assertTrue(sql)
+          finally:
+              connection.features.supports_logical_xor = orig
+  
+      def test_sql_does_not_contain_mod_for_two_operands(self):
+          orig = connection.features.supports_logical_xor
+          connection.features.supports_logical_xor = False
+          try:
+              qs = Number.objects.filter(Q(num__gte=1) ^ Q(num__gte=3))
+              sql, params = self._compile_where_sql(qs)
+              # For exactly two operands, MOD should not be used by the gold patch.
+              self.assertNotIn("MOD(", sql.upper())
+              self.assertTrue(sql)
+          finally:
+              connection.features.supports_logical_xor = orig
+  
+      def test_filter_three_operands_results(self):
+          orig = connection.features.supports_logical_xor
+          connection.features.supports_logical_xor = False
+          try:
+              qs = Number.objects.filter(
+                  Q(num__gte=1) ^ Q(num__gte=3) ^ Q(num__gte=5)
+              )
+              expected = [
+                  i
+                  for i in range(10)
+                  if operator.xor(operator.xor(i >= 1, i >= 3), i >= 5)
+              ]
+              self.assertCountEqual(list(qs.values_list("num", flat=True)), expected)
+          finally:
+              connection.features.supports_logical_xor = orig
+  
+      def test_filter_four_operands_results(self):
+          orig = connection.features.supports_logical_xor
+          connection.features.supports_logical_xor = False
+          try:
+              qs = Number.objects.filter(
+                  Q(num__gte=0)
+                  ^ Q(num__gte=2)
+                  ^ Q(num__gte=4)
+                  ^ Q(num__gte=6)
+              )
+              def xor_many(i, thresholds):
+                  return reduce(operator.xor, (i >= t for t in thresholds), False)
+              thresholds = [0, 2, 4, 6]
+              expected = [i for i in range(10) if xor_many(i, thresholds)]
+              self.assertCountEqual(list(qs.values_list("num", flat=True)), expected)
+          finally:
+              connection.features.supports_logical_xor = orig
+  
+      def test_filter_five_operands_results_and_compile(self):
+          orig = connection.features.supports_logical_xor
+          connection.features.supports_logical_xor = False
+          try:
+              qs = Number.objects.filter(
+                  Q(num__gte=1)
+                  ^ Q(num__gte=3)
+                  ^ Q(num__gte=5)
+                  ^ Q(num__gte=7)
+                  ^ Q(num__gte=9)
+              )
+              # Ensure compilation succeeds and uses MOD
+              sql, params = self._compile_where_sql(qs)
+              self.assertIn("MOD(", sql.upper())
+              expected = [
+                  i
+                  for i in range(10)
+                  if (
+                      i >= 1
+                  )
+                  ^ (i >= 3)
+                  ^ (i >= 5)
+                  ^ (i >= 7)
+                  ^ (i >= 9)
+              ]
+              self.assertCountEqual(list(qs.values_list("num", flat=True)), expected)
+          finally:
+              connection.features.supports_logical_xor = orig
+  
+      def test_negated_xor_three_operands(self):
+          orig = connection.features.supports_logical_xor
+          connection.features.supports_logical_xor = False
+          try:
+              qs = Number.objects.filter(~Q(num__gte=1) ^ Q(num__gte=3) ^ Q(num__gte=5))
+              # Ensure SQL compiles
+              sql, params = self._compile_where_sql(qs)
+              self.assertIn("MOD(", sql.upper())
+              # Validate results
+              expected = [
+                  i
+                  for i in range(10)
+                  if operator.xor(operator.xor(not (i >= 1), i >= 3), i >= 5)
+              ]
+              self.assertCountEqual(list(qs.values_list("num", flat=True)), expected)
+          finally:
+              connection.features.supports_logical_xor = orig
+  
+      def test_xor_with_empty_in_and_more_than_two_operands(self):
+          # Ensure empty-in short-circuiting still works when combined with multi-operand XOR
+          orig = connection.features.supports_logical_xor
+          connection.features.supports_logical_xor = False
+          try:
+              qs = Number.objects.filter(Q(pk__in=[]) ^ Q(num__gte=5) ^ Q(num__gte=7))
+              # Should compile and return expected set (numbers >=5 but parity will be applied)
+              sql, params = self._compile_where_sql(qs)
+              self.assertIn("MOD(", sql.upper())
+              expected = [
+                  i
+                  for i in range(10)
+                  if operator.xor(operator.xor(False, i >= 5), i >= 7)
+              ]
+              self.assertCountEqual(list(qs.values_list("num", flat=True)), expected)
+          finally:
+              connection.features.supports_logical_xor = orig
+  
+      def test_compile_does_not_raise_type_error_for_three_operands(self):
+          # This test ensures that constructing the RHS parity expression does not
+          # result in a Python-level TypeError (e.g., from using % on expression objects).
+          orig = connection.features.supports_logical_xor
+          connection.features.supports_logical_xor = False
+          try:
+              qs = Number.objects.filter(Q(num__gte=1) ^ Q(num__gte=3) ^ Q(num__gte=5))
+              # If the candidate patch attempted to use Python % on expression objects,
+              # a TypeError would be raised here during compilation. The gold patch
+              # should compile cleanly.
+              sql, params = self._compile_where_sql(qs)
+              self.assertIsInstance(sql, str)
+          finally:
+              connection.features.supports_logical_xor = orig
+  
+      def test_nested_xor_groups_compile_and_produce_correct_results(self):
+          orig = connection.features.supports_logical_xor
+          connection.features.supports_logical_xor = False
+          try:
+              # (A ^ B) ^ (C ^ D ^ E)
+              qs = Number.objects.filter(
+                  (Q(num__gte=1) ^ Q(num__gte=3)) ^ (Q(num__gte=5) ^ Q(num__gte=7) ^ Q(num__gte=9))
+              )
+              sql, params = self._compile_where_sql(qs)
+              # Because there are groups with >2 operands, MOD should appear
+              self.assertIn("MOD(", sql.upper())
+              def eval_group(i):
+                  left = operator.xor(i >= 1, i >= 3)
+                  right = operator.xor(i >= 5, i >= 7, i >= 9) if False else (
+                      operator.xor(operator.xor(i >= 5, i >= 7), i >= 9)
+                  )
+                  return operator.xor(left, right)
+              expected = [i for i in range(10) if eval_group(i)]
+              self.assertCountEqual(list(qs.values_list("num", flat=True)), expected)
+          finally:
+              connection.features.supports_logical_xor = orig
+new_imports_code: |
+  from functools import reduce

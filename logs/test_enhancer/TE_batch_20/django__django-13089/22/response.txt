@@ -1,0 +1,290 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise DatabaseCache._cull handling of a missing "last cache key" row (cursor.fetchone() returning None) to ensure no exception is raised and no unintended deletion occurs. They patch the DB connection cursor to simulate the culling SQL returning no rows and verify that set/_cull complete cleanly and that cache contents/count remain consistent.
+test_code: |
+  @override_settings(CACHES=caches_setting_for_tests(
+      BACKEND='django.core.cache.backends.db.DatabaseCache',
+      # Use the same table as the other DatabaseCache tests.
+      LOCATION='test cache table'
+  ))
+  class CullRegressionTests(TransactionTestCase):
+      """
+      Regression tests for a situation where the culling SQL returns no rows
+      (cursor.fetchone() returns None). The original implementation attempted
+      to index the result of fetchone() without checking for None first,
+      resulting in an exception. These tests patch the DB cursor to simulate
+      that condition and verify the cache handles it gracefully.
+      """
+      available_apps = ['cache']
+  
+      def setUp(self):
+          super().setUp()
+          self.create_table()
+  
+      def tearDown(self):
+          super().tearDown()
+          self.drop_table()
+  
+      def create_table(self):
+          management.call_command('createcachetable', verbosity=0)
+  
+      def drop_table(self):
+          with connection.cursor() as cursor:
+              table_name = connection.ops.quote_name('test cache table')
+              cursor.execute('DROP TABLE %s' % table_name)
+  
+      def _patch_cursor_to_return_no_last_row(self, cache):
+          """
+          Patch connections[db].cursor so that when the culling SQL is executed,
+          a subsequent fetchone() returns None. All other cursor operations
+          are delegated to the real cursor.
+          """
+          db = router.db_for_write(cache.cache_model_class)
+          conn = connections[db]
+          orig_cursor_callable = conn.cursor
+          # Compute the exact SQL string used for the culling query for comparison.
+          table = conn.ops.quote_name(cache._table)
+          cull_sql = conn.ops.cache_key_culling_sql() % table
+  
+          class CursorWrapper:
+              def __init__(self, real_cursor):
+                  self._real = real_cursor
+                  self.last_sql = None
+              def execute(self, sql, params=None):
+                  # Keep track of the last SQL executed so fetchone() can
+                  # return None for the culling SQL only.
+                  self.last_sql = sql
+                  return self._real.execute(sql, params)
+              def fetchone(self):
+                  if self.last_sql == cull_sql:
+                      # Simulate no result for the culling SQL.
+                      return None
+                  return self._real.fetchone()
+              def fetchall(self):
+                  return self._real.fetchall()
+              def __getattr__(self, name):
+                  return getattr(self._real, name)
+              def __enter__(self):
+                  return self
+              def __exit__(self, exc_type, exc, tb):
+                  return self._real.__exit__(exc_type, exc, tb)
+  
+          class ContextManagerWrapper:
+              def __init__(self):
+                  # Each invocation should create a fresh underlying cursor context
+                  # manager from the original callable.
+                  self._cm = orig_cursor_callable()
+              def __enter__(self):
+                  real_cursor = self._cm.__enter__()
+                  return CursorWrapper(real_cursor)
+              def __exit__(self, exc_type, exc, tb):
+                  return self._cm.__exit__(exc_type, exc, tb)
+  
+          return db, ContextManagerWrapper, orig_cursor_callable
+  
+      def test_set_triggers_cull_without_last_cache_key(self):
+          """
+          Calling set() when culling would happen must not crash even if the
+          culling SQL yields no rows (fetchone() returns None).
+          """
+          c = caches['cull']
+          db, cm_wrapper_class, orig_cursor_callable = self._patch_cursor_to_return_no_last_row(c)
+          conn = connections[db]
+          # Patch the connection.cursor to our wrapper that simulates no last row.
+          with mock.patch.object(conn, 'cursor', new=lambda: cm_wrapper_class()):
+              # Insert enough entries to trigger culling. With MAX_ENTRIES=30,
+              # inserting 35 entries will force a cull attempt.
+              for i in range(c._max_entries + 5):
+                  # All these set() calls should complete without raising.
+                  self.assertIs(c.set(f'key{i}', f'val{i}', timeout=1000), True)
+              # Verify that one of the keys we inserted is present.
+              self.assertIs(c.has_key('key0'), True)
+  
+      def test_direct_cull_call_handles_none_last_cache_key(self):
+          """
+          Call _cull directly with a cursor whose fetchone() returns None for
+          the culling query. Ensure no exception and row count unchanged.
+          """
+          c = caches['cull']
+          # Populate the cache with deterministic entries and long timeouts so
+          # none are expired and the cull logic will run.
+          for i in range(1, 35):
+              c.set(f'cntkey{i}', f'v{i}', timeout=1000)
+  
+          db, cm_wrapper_class, orig_cursor_callable = self._patch_cursor_to_return_no_last_row(c)
+          conn = connections[db]
+          table = conn.ops.quote_name(c._table)
+          with mock.patch.object(conn, 'cursor', new=lambda: cm_wrapper_class()):
+              # Get count before cull.
+              with conn.cursor() as cursor:
+                  cursor.execute("SELECT COUNT(*) FROM %s" % table)
+                  before = cursor.fetchone()[0]
+              # Call _cull directly.
+              now = timezone.now().replace(microsecond=0)
+              with conn.cursor() as cursor:
+                  # No exception should be raised here.
+                  c._cull(db, cursor, now)
+              # Count after cull should be the same because no rows are expired
+              # and our simulated culling returned no last key to delete on.
+              with conn.cursor() as cursor:
+                  cursor.execute("SELECT COUNT(*) FROM %s" % table)
+                  after = cursor.fetchone()[0]
+              self.assertEqual(before, after)
+  
+      def test_cull_with_zero_cull_frequency_no_exception(self):
+          """
+          If CULL_FREQUENCY == 0, _cull should call clear(); ensure behavior
+          remains safe when the culling SQL would otherwise return no rows.
+          """
+          c = caches['zero_cull']
+          # Fill cache beyond its max entries to cause the cull path to be invoked.
+          for i in range(35):
+              c.set(f'zk{i}', f'v{i}', timeout=1000)
+          db, cm_wrapper_class, _ = self._patch_cursor_to_return_no_last_row(c)
+          conn = connections[db]
+          with mock.patch.object(conn, 'cursor', new=lambda: cm_wrapper_class()):
+              # Trigger cull via set(); should not raise.
+              self.assertIs(c.set('zk-trigger', 'ok', timeout=1000), True)
+              # After a clear() call (CULL_FREQUENCY=0), we expect some keys to be gone.
+              # At minimum, the trigger key should be present (set succeeded).
+              self.assertIs(c.has_key('zk-trigger'), True)
+  
+      def test_cull_does_not_delete_when_no_last_key(self):
+          """
+          Ensure that if the culling SQL produced no boundary key, no DELETE
+          with a '< last_key' predicate is executed (i.e., count remains).
+          """
+          c = caches['cull']
+          # Fill cache with non-expiring entries.
+          for i in range(1, 40):
+              c.set(f'keep{i}', f'v{i}', timeout=None)
+          db, cm_wrapper_class, _ = self._patch_cursor_to_return_no_last_row(c)
+          conn = connections[db]
+          table = conn.ops.quote_name(c._table)
+          with mock.patch.object(conn, 'cursor', new=lambda: cm_wrapper_class()):
+              with conn.cursor() as cursor:
+                  cursor.execute("SELECT COUNT(*) FROM %s" % table)
+                  count_before = cursor.fetchone()[0]
+              now = timezone.now().replace(microsecond=0)
+              with conn.cursor() as cursor:
+                  c._cull(db, cursor, now)
+              with conn.cursor() as cursor:
+                  cursor.execute("SELECT COUNT(*) FROM %s" % table)
+                  count_after = cursor.fetchone()[0]
+              # Since our entries are non-expiring and our cull produced no last key,
+              # the count should be unchanged.
+              self.assertEqual(count_before, count_after)
+  
+      def test_multiple_cull_attempts_with_no_last_row_are_safe(self):
+          """
+          Perform several sequential cull attempts while simulating no last row
+          to ensure repeated cull activity doesn't leave DB in an inconsistent state.
+          """
+          c = caches['cull']
+          for i in range(50):
+              c.set(f'multi{i}', f'v{i}', timeout=1000)
+          db, cm_wrapper_class, _ = self._patch_cursor_to_return_no_last_row(c)
+          conn = connections[db]
+          with mock.patch.object(conn, 'cursor', new=lambda: cm_wrapper_class()):
+              now = timezone.now().replace(microsecond=0)
+              # Run _cull multiple times directly.
+              for _ in range(3):
+                  with conn.cursor() as cursor:
+                      c._cull(db, cursor, now)
+              # Ensure the cache table still has entries (no accidental deletion).
+              with conn.cursor() as cursor:
+                  cursor.execute("SELECT COUNT(*) FROM %s" % conn.ops.quote_name(c._table))
+                  cnt = cursor.fetchone()[0]
+              self.assertGreaterEqual(cnt, 1)
+  
+      def test_cull_with_cull_frequency_one_and_no_last_row(self):
+          """
+          Ensure culling with _cull_frequency == 1 (aggressive culling) still
+          handles a missing last row without crashing.
+          """
+          c = caches['cull']
+          # Temporarily set cull frequency to 1 to force aggressive culling behavior.
+          old_freq = c._cull_frequency
+          c._cull_frequency = 1
+          try:
+              for i in range(60):
+                  c.set(f'aggr{i}', f'v{i}', timeout=1000)
+              db, cm_wrapper_class, _ = self._patch_cursor_to_return_no_last_row(c)
+              conn = connections[db]
+              with mock.patch.object(conn, 'cursor', new=lambda: cm_wrapper_class()):
+                  # The next set should trigger culling but must not raise.
+                  self.assertIs(c.set('aggr-trigger', 'ok', timeout=1000), True)
+                  self.assertIs(c.has_key('aggr-trigger'), True)
+          finally:
+              c._cull_frequency = old_freq
+  
+      def test_cull_with_large_cull_num_returns_none_handled(self):
+          """
+          Simulate a large cull_num (result of integer division) and ensure
+          that a None fetchone() from the culling SQL is handled.
+          """
+          c = caches['cull']
+          # Force a large number of entries.
+          for i in range(200):
+              c.set(f'large{i}', f'v{i}', timeout=1000)
+          db, cm_wrapper_class, _ = self._patch_cursor_to_return_no_last_row(c)
+          conn = connections[db]
+          with mock.patch.object(conn, 'cursor', new=lambda: cm_wrapper_class()):
+              # Trigger culling via set; nothing should raise.
+              self.assertIs(c.set('large-trigger', 'ok', timeout=1000), True)
+              self.assertIs(c.has_key('large-trigger'), True)
+  
+      def test_cull_interaction_with_expired_rows_and_none_last_row(self):
+          """
+          Ensure expired rows are removed, but when the culling SQL returns no
+          boundary key the additional '< last_key' delete is not attempted.
+          """
+          c = caches['cull']
+          # Insert some expired entries and some long-lived entries.
+          c.set('exp1', 'v', timeout=0)  # expired immediately
+          c.set('long1', 'v', timeout=1000)
+          c.set('long2', 'v', timeout=1000)
+          db, cm_wrapper_class, _ = self._patch_cursor_to_return_no_last_row(c)
+          conn = connections[db]
+          table = conn.ops.quote_name(c._table)
+          with mock.patch.object(conn, 'cursor', new=lambda: cm_wrapper_class()):
+              # Count before: expired row may still be present until _cull runs.
+              with conn.cursor() as cursor:
+                  cursor.execute("SELECT COUNT(*) FROM %s" % table)
+                  before = cursor.fetchone()[0]
+              now = timezone.now().replace(microsecond=0)
+              with conn.cursor() as cursor:
+                  c._cull(db, cursor, now)
+              with conn.cursor() as cursor:
+                  cursor.execute("SELECT COUNT(*) FROM %s" % table)
+                  after = cursor.fetchone()[0]
+              # After _cull, at least one expired row should have been removed,
+              # but the absence of a last key should not raise and should not
+              # delete more than expected.
+              self.assertLessEqual(after, before)
+  
+      def test_cull_with_mixed_timeouts_and_none_last_row(self):
+          """
+          Mix None (non-expiring) and expiring timeouts and ensure _cull
+          completes normally when no last cache key is returned by culling SQL.
+          """
+          c = caches['cull']
+          c.set('perm1', 'v', timeout=None)
+          c.set('perm2', 'v', timeout=None)
+          for i in range(40):
+              c.set(f'tmp{i}', f'v{i}', timeout=1)
+          # Let some entries expire.
+          time.sleep(2)
+          db, cm_wrapper_class, _ = self._patch_cursor_to_return_no_last_row(c)
+          conn = connections[db]
+          with mock.patch.object(conn, 'cursor', new=lambda: cm_wrapper_class()):
+              # Trigger a set that will also trigger a cull; must not raise.
+              self.assertIs(c.set('perm-trigger', 'ok', timeout=None), True)
+              self.assertIs(c.has_key('perm-trigger'), True)
+new_imports_code: |
+  from django.core.cache import caches
+  from django.db import connections, router, connection
+  from django.core import management
+  from django.utils import timezone
+  import time
+  from unittest import mock

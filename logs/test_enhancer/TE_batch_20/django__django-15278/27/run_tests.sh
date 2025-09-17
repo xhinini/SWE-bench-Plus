@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 schema.tests_llm.AddFieldRegressionTests.test_add_boolean_field_default_false_does_not_raise_attribute_error schema.tests_llm.AddFieldRegressionTests.test_add_charfield_null_true_does_not_raise_attribute_error schema.tests_llm.AddFieldRegressionTests.test_add_field_with_default_non_null_triggers_no_attribute_error_and_creates_column schema.tests_llm.AddFieldRegressionTests.test_add_foreignkey_field_does_not_raise_attribute_error schema.tests_llm.AddFieldRegressionTests.test_add_integer_field_null_true_does_not_raise_attribute_error schema.tests_llm.AddFieldRegressionTests.test_add_one_to_one_field_nullable schema.tests_llm.AddFieldRegressionTests.test_add_primary_key_auto_field_after_removing_old_pk schema.tests_llm.AddFieldRegressionTests.test_add_primary_key_big_auto_field_after_removing_old_pk schema.tests_llm.AddFieldRegressionTests.test_add_primary_key_remake_emits_create_table schema.tests_llm.AddFieldRegressionTests.test_add_textfield_with_unhashable_default_does_not_raise
+coverage json -o coverage.json
+: '>>>>> End Test Output'

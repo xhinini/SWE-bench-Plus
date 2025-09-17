@@ -1,0 +1,134 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These tests add 10 regression tests focused on AlterField.reduce and the
+  optimizer interactions with consecutive AlterField operations, RenameField
+  interactions (with and without db_column), case-insensitivity of model/field
+  names, and interactions with CreateModel and RemoveField. They make direct
+  assertions about the optimizer output or the reduced operations so they
+  detect whether AlterField collisions are correctly collapsed (the bug fixed
+  by the provided patch).
+test_code: |
+  from django.db import migrations, models
+  from django.db.migrations import operations
+  from django.db.migrations.operations.fields import AlterField, RemoveField, RenameField
+  from django.db.migrations.optimizer import MigrationOptimizer
+  from django.test import SimpleTestCase
+  
+  class AlterFieldReduceRegressionTests(SimpleTestCase):
+      def optimize(self, operations, app_label=None):
+          optimizer = MigrationOptimizer()
+          return optimizer.optimize(operations, app_label or "migrations")
+  
+      def serialize(self, obj):
+          # Helper to compare operations using the same serializer approach
+          from django.db.migrations.serializer import serializer_factory
+          return serializer_factory(obj).serialize()[0]
+  
+      def test_two_consecutive_alterfields_collapsed(self):
+          """
+          Two AlterField operations on the same model.field should collapse to only the latter.
+          """
+          a1 = migrations.AlterField("Book", "title", models.CharField(max_length=256))
+          a2 = migrations.AlterField("Book", "title", models.CharField(max_length=128))
+          result = self.optimize([a1, a2])
+          # Expect only the latter AlterField to remain
+          self.assertEqual([self.serialize(a2)], [self.serialize(op) for op in result])
+  
+      def test_three_alterfields_collapsed_to_last(self):
+          """
+          A chain of three AlterField operations on the same field should collapse to the final AlterField.
+          """
+          a1 = migrations.AlterField("Book", "title", models.CharField(max_length=256))
+          a2 = migrations.AlterField("Book", "title", models.CharField(max_length=200))
+          a3 = migrations.AlterField("Book", "title", models.CharField(max_length=128))
+          result = self.optimize([a1, a2, a3])
+          self.assertEqual([self.serialize(a3)], [self.serialize(op) for op in result])
+  
+      def test_alterfields_with_createmodel_integrated(self):
+          """
+          AlterField operations after a CreateModel should result in the CreateModel
+          having the final field state (optimizer should fold the final AlterField into CreateModel).
+          """
+          create = migrations.CreateModel("Book", fields=[("title", models.CharField(max_length=255))])
+          a1 = migrations.AlterField("Book", "title", models.CharField(max_length=200))
+          a2 = migrations.AlterField("Book", "title", models.CharField(max_length=128))
+          result = self.optimize([create, a1, a2])
+          # The optimizer serializes the resulting CreateModel; ensure the field is the final one.
+          self.assertEqual(1, len(result))
+          created = result[0]
+          # Inspect serialized form for the field type/args (simple check: max_length should be 128)
+          s = self.serialize(created)
+          self.assertIn("max_length", str(s))
+          self.assertIn("128", str(s))
+  
+      def test_alterfield_then_rename_adds_alter_when_db_column_none(self):
+          """
+          If the AlterField has db_column=None, altering and then renaming the field
+          should produce [RenameField, AlterField(new_name, same field)].
+          """
+          f = models.CharField(max_length=50)  # db_column is None by default
+          alter = migrations.AlterField("Book", "title", f)
+          rename = migrations.RenameField("Book", "title", "headline")
+          result = self.optimize([alter, rename])
+          # Expect two operations: RenameField and AlterField (with name 'headline')
+          self.assertEqual(2, len(result))
+          self.assertEqual(self.serialize(rename), self.serialize(result[0]))
+          # The second operation should be an AlterField with name 'headline'
+          self.assertIsInstance(result[1], migrations.AlterField)
+          self.assertEqual("headline", result[1].name)
+  
+      def test_alterfield_then_rename_does_not_add_alter_when_db_column_set(self):
+          """
+          If the AlterField has db_column set to a non-None value, renaming should not
+          cause an extra AlterField to be produced for the new name.
+          """
+          f = models.CharField(max_length=50)
+          # Simulate db_column explicitly set (non-None)
+          f.db_column = "custom_col"
+          alter = migrations.AlterField("Book", "title", f)
+          rename = migrations.RenameField("Book", "title", "headline")
+          result = self.optimize([alter, rename])
+          # Ensure the resulting operations do not include an AlterField with name 'headline'.
+          names = [getattr(op, "name", None) for op in result]
+          self.assertNotIn("headline", names)
+  
+      def test_case_insensitive_field_names_collapse(self):
+          """
+          Field name case-insensitivity: AlterField('Title') and AlterField('title')
+          on the same model should collapse to the latter.
+          """
+          a1 = migrations.AlterField("Book", "Title", models.CharField(max_length=300))
+          a2 = migrations.AlterField("book", "title", models.CharField(max_length=150))
+          result = self.optimize([a1, a2], app_label="books")
+          self.assertEqual([self.serialize(a2)], [self.serialize(op) for op in result])
+  
+      def test_case_insensitive_model_names_collapse(self):
+          """
+          Model name case-insensitivity: AlterField on 'Book' vs 'book' should be treated the same.
+          """
+          a1 = migrations.AlterField("Book", "title", models.CharField(max_length=300))
+          a2 = migrations.AlterField("book", "title", models.CharField(max_length=150))
+          result = self.optimize([a1, a2], app_label="books")
+          self.assertEqual([self.serialize(a2)], [self.serialize(op) for op in result])
+  
+      def test_alterfield_followed_by_removefield_leaves_remove(self):
+          """
+          AlterField followed by RemoveField on the same field should result in only RemoveField.
+          """
+          a1 = migrations.AlterField("Book", "title", models.CharField(max_length=300))
+          rem = migrations.RemoveField("Book", "title")
+          result = self.optimize([a1, rem])
+          self.assertEqual([self.serialize(rem)], [self.serialize(op) for op in result])
+  
+      def test_alterfields_on_different_models_do_not_collapse(self):
+          """
+          AlterField on different models should not be collapsed together.
+          """
+          a1 = migrations.AlterField("Book", "title", models.CharField(max_length=200))
+          a2 = migrations.AlterField("Author", "title", models.CharField(max_length=100))
+          result = self.optimize([a1, a2])
+          # Both should remain
+          self.assertEqual([self.serialize(a1), self.serialize(a2)], [self.serialize(op) for op in result])
+new_imports_code: |
+  # No new imports required beyond what's already present in the test module.

@@ -1,0 +1,182 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise ManifestFilesMixin/HashedFilesMixin post-processing and manifest behaviors, including edge-cases around max_post_process_passes=0 (no loop iterations), circular references, manifest_strict behavior, fragment preservation in hashed names, manifest saving, and clean_name normalization. They assert correct exceptions or outcomes and avoid relying on implementation details beyond the public API.
+test_code: |
+  import os
+  import shutil
+  import tempfile
+  import unittest
+  from io import BytesIO
+  from django.core.files.base import ContentFile
+  from django.contrib.staticfiles.storage import ManifestStaticFilesStorage, HashedFilesMixin
+  from django.core.files.storage import FileSystemStorage
+  
+  class PostProcessTests(unittest.TestCase):
+      def setUp(self):
+          # Create a temporary directory for storage location
+          self.tempdir = tempfile.mkdtemp()
+  
+      def tearDown(self):
+          shutil.rmtree(self.tempdir)
+  
+      def _make_storage(self, storage_cls=ManifestStaticFilesStorage, **kwargs):
+          # Instantiate storage pointing at the temporary directory
+          kwargs.setdefault('location', self.tempdir)
+          kwargs.setdefault('base_url', '/static/')
+          return storage_cls(**kwargs)
+  
+      def _save(self, storage, name, content_bytes):
+          # Save a file into the storage using its internal API so that manifest/save logic is coherent
+          return storage._save(name, ContentFile(content_bytes))
+  
+      def test_post_process_no_adjustable_paths_no_unboundlocal(self):
+          """
+          If there are no adjustable files, post_process should not raise and should process files normally.
+          This covers the code path where the substitutions variable could be referenced outside the loop.
+          """
+          storage = self._make_storage()
+          # create a non-adjustable file (e.g., .txt)
+          self._save(storage, 'plain.txt', b'plain content')
+          paths = {'plain.txt': (storage, 'plain.txt')}
+          # Should be iterable and not raise
+          results = list(storage.post_process(paths, dry_run=False))
+          # The single file should have been processed (moved/copied) and appear in hashed_files
+          self.assertIn(storage.clean_name('plain.txt'), storage.hashed_files.values())
+  
+      def test_post_process_zero_max_passes_looping_files_produces_runtime_error_marker(self):
+          """
+          With max_post_process_passes = 0 and files that cause substitutions to remain True
+          (e.g., circular CSS imports), post_process should yield the special 'All' result with
+          a RuntimeError (Max post-process passes exceeded).
+          This ensures the code doesn't produce an UnboundLocalError and signals the expected RuntimeError.
+          """
+          storage = self._make_storage()
+          # Create two CSS files that reference each other to cause repeated substitutions
+          a_content = b'url("b.css")'
+          b_content = b'url("a.css")'
+          self._save(storage, 'a.css', a_content)
+          self._save(storage, 'b.css', b_content)
+          paths = {
+              'a.css': (storage, 'a.css'),
+              'b.css': (storage, 'b.css'),
+          }
+          storage.max_post_process_passes = 0
+          found_all = False
+          for name, hashed_name, processed in storage.post_process(paths, dry_run=False):
+              # The pre-pass yields processed files; we look specifically for the 'All' sentinel if substitutions remained.
+              if name == 'All' and isinstance(processed, RuntimeError):
+                  found_all = True
+          self.assertTrue(found_all, "Expected 'All' RuntimeError sentinel when max_post_process_passes = 0 and substitutions remain.")
+  
+      def test_post_process_single_pass_resolves_nonlooping_reference(self):
+          """
+          With max_post_process_passes = 1, a simple single-level substitution should be resolved.
+          """
+          storage = self._make_storage()
+          # b.css references image.png; a.css references b.css (but not circular)
+          self._save(storage, 'image.png', b'IMG')
+          self._save(storage, 'b.css', b'url("image.png")')
+          self._save(storage, 'a.css', b'url("b.css")')
+          paths = {
+              'a.css': (storage, 'a.css'),
+              'b.css': (storage, 'b.css'),
+              'image.png': (storage, 'image.png'),
+          }
+          storage.max_post_process_passes = 1
+          results = list(storage.post_process(paths, dry_run=False))
+          # All files involved should have entries in hashed_files after processing
+          keys = set(storage.hashed_files.values())
+          self.assertTrue(any('a.' in p and p.endswith('.css') for p in keys))
+          self.assertTrue(any('b.' in p and p.endswith('.css') for p in keys))
+          self.assertTrue(any('image.' in p and p.endswith('.png') for p in keys))
+  
+      def test_manifest_strict_missing_entry_raises_value_error(self):
+          """
+          ManifestStaticFilesStorage.stored_name should raise ValueError when manifest_strict is True
+          and the requested name is missing from the manifest.
+          """
+          storage = self._make_storage()
+          # Ensure manifest is empty
+          storage.hashed_files = {}
+          storage.manifest_strict = True
+          with self.assertRaises(ValueError):
+              storage.stored_name('missing.css')
+  
+      def test_manifest_non_strict_computes_name_when_file_exists(self):
+          """
+          When manifest_strict is False, stored_name should compute the hashed name
+          using hashed_name even if the manifest entry is absent, provided the file exists.
+          """
+          storage = self._make_storage()
+          storage.hashed_files = {}
+          storage.manifest_strict = False
+          # Create the file on disk so hashed_name can open it
+          self._save(storage, 'exists.css', b'body { color: red; }')
+          # This should not raise
+          hashed = storage.stored_name('exists.css')
+          self.assertIn('.css', hashed)
+  
+      def test_save_manifest_creates_manifest_file(self):
+          """
+          After post_process with dry_run=False, the manifest file should be saved to storage.
+          """
+          storage = self._make_storage()
+          # Create one file to trigger manifest creation
+          self._save(storage, 'one.css', b'url("two.png")')
+          self._save(storage, 'two.png', b'data')
+          paths = {'one.css': (storage, 'one.css'), 'two.png': (storage, 'two.png')}
+          # Ensure a fresh in-memory map
+          storage.hashed_files = {}
+          # Execute post_process which should call save_manifest for ManifestStaticFilesStorage
+          list(storage.post_process(paths, dry_run=False))
+          # Manifest file should exist in the storage location
+          manifest_path = os.path.join(self.tempdir, storage.manifest_name)
+          self.assertTrue(os.path.exists(manifest_path))
+          # And it should be valid JSON with 'paths' key
+          import json
+          with open(manifest_path, 'rb') as fh:
+              data = json.load(fh)
+          self.assertIn('paths', data)
+  
+      def test_hashed_name_preserves_question_fragment_for_fonthack(self):
+          """
+          Ensure hashed_name preserves the special '?#' font-face hack by inserting
+          the '?' when appropriate.
+          """
+          storage = self._make_storage(storage_cls=HashedFilesMixin)
+          # Use HashedFilesMixin directly via a FileSystemStorage subclass to test hashed_name logic
+          class TmpStorage(HashedFilesMixin, FileSystemStorage):
+              pass
+          tmp = TmpStorage(location=self.tempdir, base_url='/static/')
+          # Create a font file and compute hashed name including the fragment token
+          tmp._save('fonts/font.eot', ContentFile(b'fontdata'))
+          # Simulate input name with the font-face hack
+          result = tmp.hashed_name('fonts/font.eot?#iefix')
+          # It should include a '?' before the fragment in the returned path
+          self.assertIn('?', result)
+  
+      def test_stored_name_preserves_query_marker_for_font_face(self):
+          """
+          ManifestFilesMixin.stored_name should preserve the '?#' hack marker when returning stored names.
+          """
+          storage = self._make_storage()
+          # Create a sample file and populate the manifest mapping
+          self._save(storage, 'fonts/font.eot', b'fontdata')
+          # Compute hashed name and put it into manifest map
+          hashed = storage.hashed_name('fonts/font.eot', content=ContentFile(b'fontdata'))
+          storage.hashed_files = {storage.hash_key('fonts/font.eot'): storage.clean_name(hashed)}
+          # Now call stored_name with original name including '?#' and expect '?' preserved
+          stored = storage.stored_name('fonts/font.eot?#iefix')
+          self.assertIn('?', stored)
+  
+      def test_clean_name_replaces_backslashes(self):
+          storage = self._make_storage()
+          result = storage.clean_name(r'path\\to\\file.css')
+          self.assertNotIn('\\', result)
+          self.assertIn('/', result)
+  
+  if __name__ == '__main__':
+      unittest.main()
+new_imports_code: |
+  from django.conf import settings
+  from django.test import override_settings

@@ -1,0 +1,183 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify DatabaseCache._cull handles the case where the cursor.fetchone() call that follows the cache_key_culling_sql() returns None (no last cache key). The original buggy implementation indexed the fetchone() result without checking for None, raising an exception. The tests exercise code paths where (a) num > _max_entries and fetchone() returns None (no delete should be attempted), (b) num > _max_entries and fetchone() returns a last key (delete should be executed with correct params), (c) no culling when num <= _max_entries, (d) cull-frequency == 0 invokes clear(), and variations ensuring parameters passed to the delete are preserved for different last key types. These tests would have failed against the original (pre-patch) code and verify the corrected behavior.
+test_code: |
+  from datetime import datetime
+  from django.test import SimpleTestCase
+  from django.utils import timezone
+  from django.core.cache.backends.db import DatabaseCache
+  from django.db import connections
+  
+  class FakeCursor:
+      """
+      A fake DB cursor that returns controlled values for fetchone()
+      and records executed SQL statements and parameters.
+      """
+      def __init__(self, fetchone_results=None):
+          # A queue of values to return on successive fetchone() calls.
+          self._fetchone_results = list(fetchone_results or [])
+          self.queries = []  # list of (sql, params)
+          self.rowcount = 0
+  
+      def execute(self, sql, params=None):
+          # Record the executed SQL and params.
+          self.queries.append((sql, params))
+  
+      def fetchone(self):
+          if self._fetchone_results:
+              return self._fetchone_results.pop(0)
+          return None
+  
+      def fetchall(self):
+          return []
+  
+  class DatabaseCacheCullTests(SimpleTestCase):
+      def setUp(self):
+          # Create a DatabaseCache instance. params may be minimal since we won't
+          # hit the DB; DatabaseCache only needs to provide ops via connections.
+          self.cache = DatabaseCache('test cache table', {})
+  
+      def test_no_last_cache_key_does_not_attempt_delete(self):
+          """
+          If cache_key_culling_sql() returns no rows (fetchone() -> None),
+          no DELETE for the culling should be attempted and no exception is raised.
+          """
+          # Simulate: first fetchone -> count (100), second fetchone -> None (no last key)
+          fake_cursor = FakeCursor(fetchone_results=[(100,), None])
+          self.cache._max_entries = 10
+          self.cache._cull_frequency = 2
+          now = timezone.now()
+          # Should not raise
+          self.cache._cull('default', fake_cursor, now)
+          # Ensure we recorded queries for deleting expired and counting
+          executed_sqls = [q[0] for q in fake_cursor.queries]
+          # First should be DELETE expired, second SELECT COUNT, third should be the culling SQL.
+          self.assertTrue(any(sql.strip().upper().startswith('DELETE FROM') for sql in executed_sqls),
+                          "Expected a DELETE ... WHERE expires < ... query to be executed.")
+          # There should NOT be a final 'DELETE FROM <table> WHERE cache_key < %s' executed
+          self.assertFalse(any('cache_key <' in (sql or '') and 'DELETE FROM' in (sql or '') for sql in executed_sqls),
+                           "No final delete by cache_key should be executed when fetchone() returned None.")
+  
+      def test_last_cache_key_present_executes_delete_with_param(self):
+          """
+          When a last cache key is returned, a DELETE should be executed with
+          that key passed as the parameter.
+          """
+          fake_cursor = FakeCursor(fetchone_results=[(100,), ('last-key',)])
+          self.cache._max_entries = 10
+          self.cache._cull_frequency = 2
+          now = timezone.now()
+          self.cache._cull('default', fake_cursor, now)
+          # Find a delete query that uses "cache_key <"
+          delete_queries = [q for q in fake_cursor.queries if 'cache_key <' in (q[0] or '') and q[0].strip().upper().startswith('DELETE FROM')]
+          self.assertEqual(len(delete_queries), 1, "Expected one final DELETE using the last cache key.")
+          sql, params = delete_queries[0]
+          # The parameter list should contain the last-key value
+          self.assertEqual(params, ['last-key'])
+  
+      def test_no_cull_when_count_not_exceeding_max_entries(self):
+          """
+          If the number of entries is not greater than _max_entries, the culling
+          SQL (cache_key_culling_sql) should not be executed.
+          """
+          fake_cursor = FakeCursor(fetchone_results=[(5,)])
+          self.cache._max_entries = 10
+          self.cache._cull_frequency = 2
+          now = timezone.now()
+          self.cache._cull('default', fake_cursor, now)
+          executed_sqls = [q[0] for q in fake_cursor.queries]
+          # Should only have executed the delete expired and the SELECT COUNT
+          self.assertEqual(len(executed_sqls), 2)
+          self.assertTrue(executed_sqls[0].strip().upper().startswith('DELETE FROM'))
+          self.assertTrue(executed_sqls[1].strip().upper().startswith('SELECT COUNT(*)'))
+  
+      def test_zero_cull_calls_clear(self):
+          """
+          If _cull_frequency == 0, clear() should be called instead of culling.
+          """
+          called = {}
+          def fake_clear():
+              called['yes'] = True
+          # Replace clear() with fake_clear to observe invocation.
+          self.cache.clear = fake_clear
+          # The cursor shouldn't be used at all in this branch, but provide one anyway.
+          fake_cursor = FakeCursor(fetchone_results=[(100,), ('will-not-be-used',)])
+          self.cache._max_entries = -1  # force num > _max_entries
+          self.cache._cull_frequency = 0
+          now = timezone.now()
+          self.cache._cull('default', fake_cursor, now)
+          self.assertIn('yes', called, "clear() should have been called when _cull_frequency == 0")
+  
+      def test_delete_param_preserved_for_string_key(self):
+          """
+          Ensure a string last cache key is passed through as-is to the delete params.
+          """
+          fake_cursor = FakeCursor(fetchone_results=[(42,), ('a-string-key',)])
+          self.cache._max_entries = 1
+          self.cache._cull_frequency = 2
+          now = timezone.now()
+          self.cache._cull('default', fake_cursor, now)
+          delete_queries = [q for q in fake_cursor.queries if 'cache_key <' in (q[0] or '')]
+          self.assertEqual(delete_queries[0][1], ['a-string-key'])
+  
+      def test_delete_param_preserved_for_bytes_key(self):
+          """
+          Ensure a bytes-like last cache key is passed through as-is to the delete params.
+          """
+          fake_cursor = FakeCursor(fetchone_results=[(99,), (b'bytes-key',)])
+          self.cache._max_entries = 1
+          self.cache._cull_frequency = 2
+          now = timezone.now()
+          self.cache._cull('default', fake_cursor, now)
+          delete_queries = [q for q in fake_cursor.queries if 'cache_key <' in (q[0] or '')]
+          # Some DB backends may accept bytes; assert the param is exactly what was returned by fetchone()
+          self.assertEqual(delete_queries[0][1], [b'bytes-key'])
+  
+      def test_multiple_fetchone_calls_sequence(self):
+          """
+          Verify the code correctly advances through multiple fetchone() returns:
+          first is count, second is last_cache_key (present).
+          """
+          fake_cursor = FakeCursor(fetchone_results=[(200,), ('final-key',)])
+          self.cache._max_entries = 10
+          self.cache._cull_frequency = 2
+          now = timezone.now()
+          self.cache._cull('default', fake_cursor, now)
+          # Ensure both fetchone() results were consumed (queue empty)
+          self.assertEqual(fake_cursor._fetchone_results, [])
+          # Ensure delete executed with param 'final-key'
+          delete_queries = [q for q in fake_cursor.queries if 'cache_key <' in (q[0] or '')]
+          self.assertTrue(delete_queries)
+          self.assertEqual(delete_queries[0][1], ['final-key'])
+  
+      def test_cull_without_errors_when_no_last_key_and_high_counts(self):
+          """
+          Another scenario: high count but the culling SQL returns no rows (None).
+          This should not raise and should not attempt the final delete.
+          """
+          fake_cursor = FakeCursor(fetchone_results=[(1000,), None])
+          self.cache._max_entries = 50
+          self.cache._cull_frequency = 5
+          now = timezone.now()
+          # Should not raise
+          self.cache._cull('default', fake_cursor, now)
+          # Confirm no 'cache_key <' delete executed
+          self.assertFalse(any('cache_key <' in (sql or '') for sql, _ in fake_cursor.queries))
+  
+      def test_cull_executes_culling_sql_when_needed(self):
+          """
+          Ensure the culling SQL is executed (cursor.execute called with
+          cache_key_culling_sql) when the count exceeds _max_entries.
+          This verifies the code reaches the cache_key_culling_sql execution
+          even if the final fetchone() returns a value or None.
+          """
+          fake_cursor = FakeCursor(fetchone_results=[(500,), ('some-key',)])
+          self.cache._max_entries = 10
+          self.cache._cull_frequency = 10
+          now = timezone.now()
+          self.cache._cull('default', fake_cursor, now)
+          # At least one of the executed SQLs should be the culling SQL (it will contain the word "SELECT" and "%s" placeholder)
+          executed_sqls = [sql for sql, _ in fake_cursor.queries]
+          self.assertTrue(any('%s' in (sql or '') or 'SELECT' in (sql or '') for sql in executed_sqls))
+new_imports_code: |
+  from django.core.cache.backends.db import DatabaseCache

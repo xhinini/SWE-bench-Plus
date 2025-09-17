@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 validators.tests_llm.HiddenContains.__contains__ validators.tests_llm.URLValidatorHiddenContainsTests.setUp validators.tests_llm.URLValidatorHiddenContainsTests.test_reject_carriage_return_in_domain_hidden_contains validators.tests_llm.URLValidatorHiddenContainsTests.test_reject_newline_at_end_hidden_contains validators.tests_llm.URLValidatorHiddenContainsTests.test_reject_newline_in_ipv6_hidden_contains validators.tests_llm.URLValidatorHiddenContainsTests.test_reject_newline_in_label_hidden_contains validators.tests_llm.URLValidatorHiddenContainsTests.test_reject_newline_in_port_hidden_contains validators.tests_llm.URLValidatorHiddenContainsTests.test_reject_newline_in_username_hidden_contains validators.tests_llm.URLValidatorHiddenContainsTests.test_reject_tab_before_host_hidden_contains validators.tests_llm.URLValidatorHiddenContainsTests.test_reject_tab_in_path_hidden_contains validators.tests_llm.URLValidatorHiddenContainsTests.test_unsafe_chars_attribute_present
+coverage json -o coverage.json
+: '>>>>> End Test Output'

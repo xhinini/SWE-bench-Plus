@@ -1,0 +1,178 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that the changelist bulk-edit path (list_editable) uses transaction.atomic() with the correct database alias as returned by router.db_for_write(self.model). They ensure that transaction.atomic is called with the using=... argument in different scenarios (default DB, non-default alias, no changes, exceptions during saving, ordering parameter, follow redirect). The tests would fail against the candidate patch (which calls transaction.atomic() without the using argument), and pass against the gold patch.
+new_imports_code: |
+  from django.db import router
+test_code: |
+  from django.db import DatabaseError
+  from django.test import skipUnlessDBFeature
+
+  @skipUnlessDBFeature("supports_transactions")
+  class TransactionAtomicDBAliasTests(TestCase):
+      def setUp(self):
+          # create superuser used for posting to admin changelist
+          self.superuser = User.objects.create_superuser(
+              username="txadmin", email="tx@admin", password="pwd"
+          )
+
+      def _post_swallow_changelist(self, data, follow=False, extra_args=None):
+          """Helper to post to the swallow changelist."""
+          self.client.force_login(self.superuser)
+          changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+          if follow:
+              return self.client.post(changelist_url, data, follow=True, **(extra_args or {}))
+          return self.client.post(changelist_url, data, **(extra_args or {}))
+
+      def _base_post_data(self):
+          # two existing swallows required for saving
+          a = Swallow.objects.create(origin="Swallow A", load=4, speed=1)
+          b = Swallow.objects.create(origin="Swallow B", load=2, speed=2)
+          data = {
+              "form-TOTAL_FORMS": "2",
+              "form-INITIAL_FORMS": "2",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(a.pk),
+              "form-1-uuid": str(b.pk),
+              "form-0-load": "9.0",
+              "form-0-speed": "3.0",
+              "form-1-load": "5.0",
+              "form-1-speed": "1.0",
+              "_save": "Save",
+          }
+          return data
+
+      def test_atomic_called_with_router_db_for_write_default(self):
+          """
+          Ensure transaction.atomic is called with using=router.db_for_write(self.model)
+          for the Swallow model when the router returns the default alias.
+          """
+          data = self._base_post_data()
+          with mock.patch("django.db.transaction.atomic") as atomic_cm:
+              response = self._post_swallow_changelist(data)
+              # atomic should be called with the DB alias chosen by the router
+              atomic_cm.assert_called_with(using=router.db_for_write(Swallow))
+
+      def test_atomic_called_with_router_db_for_write_non_default(self):
+          """
+          If router.db_for_write returns a non-default alias, atomic must be
+          invoked with that alias.
+          """
+          data = self._base_post_data()
+          with mock.patch("django.db.router.db_for_write", return_value="other_db"):
+              with mock.patch("django.db.transaction.atomic") as atomic_cm:
+                  response = self._post_swallow_changelist(data)
+                  atomic_cm.assert_called_with(using="other_db")
+
+      def test_atomic_called_even_when_no_forms_changed(self):
+          """
+          atomic should still be used even if none of the forms report changes.
+          """
+          # create objects and post identical values (no changes)
+          a = Swallow.objects.create(origin="Swallow C", load=1, speed=1)
+          b = Swallow.objects.create(origin="Swallow D", load=2, speed=2)
+          data = {
+              "form-TOTAL_FORMS": "2",
+              "form-INITIAL_FORMS": "2",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(a.pk),
+              "form-1-uuid": str(b.pk),
+              "form-0-load": str(a.load),
+              "form-0-speed": str(a.speed),
+              "form-1-load": str(b.load),
+              "form-1-speed": str(b.speed),
+              "_save": "Save",
+          }
+          with mock.patch("django.db.transaction.atomic") as atomic_cm:
+              response = self._post_swallow_changelist(data)
+              atomic_cm.assert_called_with(using=router.db_for_write(Swallow))
+
+      def test_atomic_called_when_log_change_raises_first(self):
+          """
+          If log_change raises on the first changed form, atomic must have been
+          entered with the correct using argument and the exception propagated.
+          """
+          data = self._base_post_data()
+          with mock.patch("django.contrib.admin.ModelAdmin.log_change", side_effect=DatabaseError):
+              with mock.patch("django.db.transaction.atomic") as atomic_cm:
+                  with self.assertRaises(DatabaseError):
+                      self._post_swallow_changelist(data)
+                  atomic_cm.assert_called_with(using=router.db_for_write(Swallow))
+
+      def test_atomic_called_when_log_change_raises_second(self):
+          """
+          If log_change raises on the second changed form, atomic must have been
+          entered with the correct using argument and the exception propagated.
+          """
+          data = self._base_post_data()
+          # First call ok, second call raises
+          with mock.patch(
+              "django.contrib.admin.ModelAdmin.log_change", side_effect=[None, DatabaseError]
+          ):
+              with mock.patch("django.db.transaction.atomic") as atomic_cm:
+                  with self.assertRaises(DatabaseError):
+                      self._post_swallow_changelist(data)
+                  atomic_cm.assert_called_with(using=router.db_for_write(Swallow))
+
+      def test_atomic_called_with_ordering_param_present(self):
+          """
+          When posting list_editable with ordering present (follow redirect scenario),
+          atomic must be called with the router-chosen DB alias.
+          """
+          data = self._base_post_data()
+          with mock.patch("django.db.transaction.atomic") as atomic_cm:
+              # emulate the earlier multiuser test which posts with follow and extra args
+              response = self._post_swallow_changelist(data, follow=True, extra_args={"extra": {}})
+              atomic_cm.assert_called_with(using=router.db_for_write(Swallow))
+
+      def test_atomic_called_multiple_changed_forms(self):
+          """
+          Ensure atomic is called when multiple forms have changed.
+          """
+          # create three objects and change two of them
+          a = Swallow.objects.create(origin="Swallow E", load=7, speed=7)
+          b = Swallow.objects.create(origin="Swallow F", load=8, speed=8)
+          c = Swallow.objects.create(origin="Swallow G", load=9, speed=9)
+          data = {
+              "form-TOTAL_FORMS": "3",
+              "form-INITIAL_FORMS": "3",
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "form-0-uuid": str(a.pk),
+              "form-1-uuid": str(b.pk),
+              "form-2-uuid": str(c.pk),
+              "form-0-load": "10.0",
+              "form-0-speed": "10.0",
+              "form-1-load": "8.0",
+              "form-1-speed": "8.0",
+              "form-2-load": "9.0",
+              "form-2-speed": "9.0",
+              "_save": "Save",
+          }
+          with mock.patch("django.db.transaction.atomic") as atomic_cm:
+              response = self.client.post(reverse("admin:admin_changelist_swallow_changelist"), data)
+              atomic_cm.assert_called_with(using=router.db_for_write(Swallow))
+
+      def test_atomic_called_when_router_returns_none(self):
+          """
+          If router.db_for_write returns None, atomic must be called with using=None.
+          """
+          data = self._base_post_data()
+          with mock.patch("django.db.router.db_for_write", return_value=None):
+              with mock.patch("django.db.transaction.atomic") as atomic_cm:
+                  response = self._post_swallow_changelist(data)
+                  atomic_cm.assert_called_with(using=None)
+
+      def test_atomic_called_with_db_for_write_after_multiple_posts(self):
+          """
+          Atomic should be called each time a changelist bulk-edit POST is performed.
+          """
+          data = self._base_post_data()
+          with mock.patch("django.db.transaction.atomic") as atomic_cm:
+              # 1st post
+              response1 = self._post_swallow_changelist(data)
+              # 2nd post (repeat)
+              response2 = self._post_swallow_changelist(data)
+              # atomic should have been called at least once with expected using
+              atomic_cm.assert_called_with(using=router.db_for_write(Swallow))

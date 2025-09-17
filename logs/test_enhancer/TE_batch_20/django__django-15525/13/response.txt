@@ -1,0 +1,234 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise build_instance()'s handling of Model.natural_key() invocation when the natural key implementation depends on instance state (obj._state.db) or on related fields being pre-populated from the provided data. The gold patch ensures an instance is constructed with its _state.db set before calling natural_key(), and sets all fields (including relation fields) by using Model(**data). The candidate patch either fails to set _state.db or avoids setting relation fields on the temporary instance, causing natural_key() to raise AttributeError (or otherwise behave differently) and preventing the primary key from being filled in from the manager. Each test asserts that build_instance populates the primary key from the manager's get_by_natural_key() result; under the candidate patch these assertions fail, while they pass with the gold patch.
+test_code: |
+  from types import SimpleNamespace
+  from django.test import SimpleTestCase
+  from django.core.serializers.base import build_instance
+
+  class FakePK:
+      def __init__(self, attname="id", to_python=lambda x: x):
+          self.attname = attname
+          self._to_python = to_python
+          self.called_with = None
+
+      def to_python(self, value):
+          self.called_with = value
+          return self._to_python(value)
+
+  class FakeManager:
+      def __init__(self, pk_value, record_args=None):
+          self._pk_value = pk_value
+          self._db_passed = None
+          self.record_args = record_args
+
+      def db_manager(self, db):
+          # return an object with get_by_natural_key
+          self._db_passed = db
+          return self
+
+      def get_by_natural_key(self, *args):
+          if self.record_args is not None:
+              # allow tests to assert the natural_key args passed
+              self.record_args.append(args)
+          # Return a simple object with "pk" attribute
+          return SimpleNamespace(pk=self._pk_value)
+
+  def make_meta(pk_attname="id", pk_converter=lambda x: x, default_manager=None, remote_fields=None):
+      # remote_fields: dict mapping field_name -> bool (True means remote_field exists)
+      remote_fields = {} if remote_fields is None else remote_fields
+
+      pk = FakePK(attname=pk_attname, to_python=pk_converter)
+
+      def get_field(name):
+          # Return a simple field-like object with attribute remote_field
+          # remote_field is truthy for relation fields, None otherwise.
+          return SimpleNamespace(remote_field=(True if remote_fields.get(name) else None))
+
+      return SimpleNamespace(pk=pk, default_manager=default_manager, get_field=get_field)
+
+  def make_model_class(natural_key_callable):
+      """
+      Build a lightweight pseudo-Model class compatible with build_instance().
+      The class accepts kwargs in its __init__ and stores them as attributes;
+      it also creates a _state object to mimic Django model state behavior.
+      """
+      class Model:
+          DoesNotExist = Exception
+
+          def __init__(self, **kwargs):
+              # set attributes from kwargs (mimicking Model(**data))
+              for k, v in kwargs.items():
+                  setattr(self, k, v)
+              # create state (without a db attribute initially)
+              self._state = SimpleNamespace()
+
+          def natural_key(self):
+              return natural_key_callable(self)
+
+      return Model
+
+  class BuildInstanceTests(SimpleTestCase):
+      def test_natural_key_uses__state_db(self):
+          # natural_key references self._state.db
+          recorded = []
+          manager = FakeManager(pk_value="42", record_args=recorded)
+          meta = make_meta(pk_attname="id", pk_converter=int, default_manager=manager)
+          def natural_key(obj):
+              # This should succeed only if _state.db has been set before calling natural_key.
+              return (obj._state.db,)
+          Model = make_model_class(natural_key)
+          Model._meta = meta
+
+          data = {}  # no pk provided
+          result = build_instance(Model, data, db="other_db")
+          # The manager should have been called with ("other_db",)
+          self.assertIn(("other_db",), recorded[0])
+          # build_instance should have set the pk in the returned instance via data injection and conversion
+          self.assertEqual(getattr(result, "id"), 42)
+
+      def test_natural_key_relies_on_related_field_value_set_by_Model_init(self):
+          # natural_key references a relation attribute 'ref'; Model(**data) should set it.
+          recorded = []
+          manager = FakeManager(pk_value=101, record_args=recorded)
+          meta = make_meta(pk_attname="pk", pk_converter=int, default_manager=manager, remote_fields={"ref": True})
+          # natural_key will access self.ref (expected to be set by Model(**data))
+          def natural_key(obj):
+              return (obj.ref,)
+          Model = make_model_class(natural_key)
+          Model._meta = meta
+
+          data = {"ref": "rel_x"}  # relation field value provided in data
+          result = build_instance(Model, data, db="unused_db")
+          self.assertEqual(getattr(result, "pk"), 101)
+
+      def test_natural_key_accesses_related_object_attribute(self):
+          # natural_key uses self.ref.name; the ref object must be set by Model(**data)
+          manager = FakeManager(pk_value=202)
+          meta = make_meta(pk_attname="id", pk_converter=int, default_manager=manager, remote_fields={"ref": True})
+          def natural_key(obj):
+              return (obj.ref.name,)
+          Model = make_model_class(natural_key)
+          Model._meta = meta
+
+          # supply a ref object with attribute 'name' via the data dict
+          ref_obj = SimpleNamespace(name="RelName")
+          data = {"ref": ref_obj}
+          result = build_instance(Model, data, db="db")
+          self.assertEqual(getattr(result, "id"), 202)
+
+      def test_natural_key_uses_state_and_related_field(self):
+          # natural_key uses combination of self._state.db and a related field; both must be present.
+          recorded = []
+          manager = FakeManager(pk_value="7", record_args=recorded)
+          meta = make_meta(pk_attname="pk", pk_converter=int, default_manager=manager, remote_fields={"related": True})
+          def natural_key(obj):
+              return (obj._state.db, obj.related)
+          Model = make_model_class(natural_key)
+          Model._meta = meta
+
+          data = {"related": "R1"}
+          result = build_instance(Model, data, db="special_db")
+          # manager should be called with ("special_db", "R1")
+          self.assertIn(("special_db", "R1"), recorded[0])
+          self.assertEqual(getattr(result, "pk"), 7)
+
+      def test_to_python_called_on_pk_value(self):
+          # Ensure the PK's to_python() is invoked with the manager's returned pk
+          manager = FakeManager(pk_value="55")
+          fake_pk = FakePK(attname="id", to_python=lambda v: int(v) + 1)  # convert "55" -> 56
+          meta = make_meta(pk_attname="id", pk_converter=fake_pk._to_python, default_manager=manager)
+          def natural_key(obj):
+              return ("anything",)
+          Model = make_model_class(natural_key)
+          Model._meta = meta
+
+          result = build_instance(Model, {}, db="db")
+          # Expect converted value
+          self.assertEqual(getattr(result, "id"), 56)
+
+      def test_missing_natural_key_manager_attribute_does_nothing(self):
+          # If the manager lacks get_by_natural_key, build_instance should not try to fetch PK.
+          class NoNatManager:
+              pass
+          manager = NoNatManager()
+          meta = make_meta(pk_attname="id", pk_converter=int, default_manager=manager)
+          def natural_key(obj):
+              # If this were called it would raise; ensure it is not used.
+              raise RuntimeError("natural_key should not be called when manager lacks get_by_natural_key")
+          Model = make_model_class(natural_key)
+          Model._meta = meta
+
+          # Provide pk in data already; build_instance should just return an instance using that pk
+          data = {"id": 9}
+          result = build_instance(Model, data, db="db")
+          self.assertEqual(getattr(result, "id"), 9)
+
+      def test_manager_raises_does_not_exist_is_suppressed(self):
+          # If manager.get_by_natural_key raises Model.DoesNotExist, build_instance should proceed gracefully.
+          class ManagerRaise(FakeManager):
+              def get_by_natural_key(self, *args):
+                  raise Model.DoesNotExist()
+
+          manager = ManagerRaise(pk_value=None)
+          meta = make_meta(pk_attname="id", pk_converter=int, default_manager=manager)
+          def natural_key(obj):
+              return ("x",)
+          Model = make_model_class(natural_key)
+          Model._meta = meta
+          Model.DoesNotExist = Exception
+
+          data = {}  # no pk
+          # Should not raise; should return a Model instance (without id)
+          result = build_instance(Model, data, db="db")
+          self.assertFalse(hasattr(result, "id"))
+
+      def test_related_field_missing_in_partial_instance_breaks_natural_key(self):
+          # If natural_key depends on a relation that is not set by the partial instance,
+          # build_instance must still work by using Model(**data) path (gold behavior).
+          recorded = []
+          manager = FakeManager(pk_value=303, record_args=recorded)
+          # remote field 'rel' exists; candidate patch would avoid setting it on the partial instance.
+          meta = make_meta(pk_attname="id", pk_converter=int, default_manager=manager, remote_fields={"rel": True})
+          def natural_key(obj):
+              # expects obj.rel to exist and be a simple string
+              return (obj.rel,)
+          Model = make_model_class(natural_key)
+          Model._meta = meta
+
+          data = {"rel": "R-303"}
+          result = build_instance(Model, data, db="db")
+          self.assertEqual(getattr(result, "id"), 303)
+
+      def test_multiple_fields_in_natural_key_using_relations(self):
+          # natural_key uses multiple fields including relation values
+          recorded = []
+          manager = FakeManager(pk_value=404, record_args=recorded)
+          meta = make_meta(pk_attname="pk", pk_converter=int, default_manager=manager, remote_fields={"a": True, "b": True})
+          def natural_key(obj):
+              return (obj.a, obj.b)
+          Model = make_model_class(natural_key)
+          Model._meta = meta
+
+          data = {"a": "A1", "b": "B2"}
+          result = build_instance(Model, data, db="db")
+          self.assertEqual(getattr(result, "pk"), 404)
+
+      def test_natural_key_uses_nested_related_object_and_state(self):
+          # Complex natural_key: nested related object's attribute plus _state.db
+          recorded = []
+          manager = FakeManager(pk_value="9", record_args=recorded)
+          meta = make_meta(pk_attname="id", pk_converter=int, default_manager=manager, remote_fields={"owner": True})
+          def natural_key(obj):
+              # expects obj.owner to be an object with .username
+              return (obj._state.db, obj.owner.username)
+          Model = make_model_class(natural_key)
+          Model._meta = meta
+
+          owner = SimpleNamespace(username="ownerX")
+          data = {"owner": owner}
+          result = build_instance(Model, data, db="DBX")
+          self.assertIn(("DBX", "ownerX"), recorded[0])
+          self.assertEqual(getattr(result, "id"), 9)
+new_imports_code: |
+  # No extra imports required beyond what's in the test file; build_instance is imported there.

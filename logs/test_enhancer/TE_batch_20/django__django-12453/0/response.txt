@@ -1,0 +1,236 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise deserialize_db_from_string with various forward- and circular-reference scenarios and assert that constraint checks are properly disabled during deserialization and that check_constraints is called afterwards. They will fail if constraint checks are not temporarily disabled (the candidate patch), and pass when constraint disabling and explicit check_constraints() invocation are present (the gold patch).
+new_imports_code: |
+  from unittest import mock
+  from django.db import connection
+  from django.db.utils import IntegrityError
+  from ..models import Object, ObjectReference
+test_code: |
+  class AdditionalDeserializeDbFromStringTests(SimpleTestCase):
+      databases = {'default'}
+
+      def _get_pair_data_obj_then_ref(self):
+          return """
+          [
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              },
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              }
+          ]
+          """
+
+      def _get_pair_data_ref_then_obj(self):
+          return """
+          [
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              },
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              }
+          ]
+          """
+
+      def _get_two_pairs_mixed_order(self):
+          return """
+          [
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              },
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              },
+              {
+                  "model": "backends.objectreference",
+                  "pk": 2,
+                  "fields": {"obj": 2}
+              },
+              {
+                  "model": "backends.object",
+                  "pk": 2,
+                  "fields": {"obj_ref": 2, "related_objects": []}
+              }
+          ]
+          """
+
+      def test_circular_reference_obj_then_ref(self):
+          # Basic circular reference (object references reference object).
+          data = self._get_pair_data_obj_then_ref()
+          connection.creation.deserialize_db_from_string(data)
+          obj = Object.objects.get(pk=1)
+          obj_ref = ObjectReference.objects.get(pk=1)
+          self.assertEqual(obj.obj_ref, obj_ref)
+          self.assertEqual(obj_ref.obj, obj)
+
+      def test_circular_reference_ref_then_obj(self):
+          # Same circular reference, with the order reversed in the data.
+          data = self._get_pair_data_ref_then_obj()
+          connection.creation.deserialize_db_from_string(data)
+          obj = Object.objects.get(pk=1)
+          obj_ref = ObjectReference.objects.get(pk=1)
+          self.assertEqual(obj.obj_ref, obj_ref)
+          self.assertEqual(obj_ref.obj, obj)
+
+      def test_multiple_circular_pairs(self):
+          # Multiple independent circular reference pairs in one deserialize call.
+          data = self._get_two_pairs_mixed_order()
+          connection.creation.deserialize_db_from_string(data)
+          self.assertEqual(Object.objects.count(), 2)
+          self.assertEqual(ObjectReference.objects.count(), 2)
+          # Sanity-check the relations
+          for pk in (1, 2):
+              obj = Object.objects.get(pk=pk)
+              obj_ref = ObjectReference.objects.get(pk=pk)
+              self.assertEqual(obj.obj_ref, obj_ref)
+              self.assertEqual(obj_ref.obj, obj)
+
+      def test_circular_reference_with_related_objects_populated(self):
+          # Ensure many-to-many like field "related_objects" using pks that appear
+          # later in the serialized input doesn't break deserialization.
+          data = """
+          [
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 2, "related_objects": [2]}
+              },
+              {
+                  "model": "backends.object",
+                  "pk": 2,
+                  "fields": {"obj_ref": 1, "related_objects": [1]}
+              }
+          ]
+          """
+          connection.creation.deserialize_db_from_string(data)
+          self.assertEqual(Object.objects.count(), 2)
+          obj1 = Object.objects.get(pk=1)
+          obj2 = Object.objects.get(pk=2)
+          # related_objects is a m2m-like field on the test model; ensure links exist
+          self.assertIn(obj2.pk, [o.pk for o in obj1.related_objects.all()])
+          self.assertIn(obj1.pk, [o.pk for o in obj2.related_objects.all()])
+
+      def test_constraint_checks_disabled_and_check_constraints_called(self):
+          # Ensure we temporarily disable constraint checks and call check_constraints() afterward.
+          data = self._get_pair_data_obj_then_ref()
+          # Make a context manager mock that behaves like a context manager.
+          cm = mock.MagicMock()
+          cm.__enter__ = mock.MagicMock(return_value=None)
+          cm.__exit__ = mock.MagicMock(return_value=None)
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm) as mocked_disabled:
+              with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                  connection.creation.deserialize_db_from_string(data)
+                  # The constraint-disabling context manager should have been requested.
+                  mocked_disabled.assert_called()
+                  # After loading, explicit constraint check should be performed.
+                  mocked_check.assert_called()
+
+      def test_deserialize_rolls_back_on_error_leaving_no_partial_objects(self):
+          # If deserialization raises due to bad data, ensure no partial objects remain.
+          bad_data = """
+          [
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 99, "related_objects": []}
+              },
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              },
+              {
+                  "model": "backends.objectreference",
+                  "pk": 2,
+                  "fields": {"obj": 999999, "extra_field": "this will blow up"}
+              }
+          ]
+          """
+          # We expect an error during deserialization (invalid field or FK).
+          with self.assertRaises(Exception):
+              connection.creation.deserialize_db_from_string(bad_data)
+          # Nothing should have been committed to the DB.
+          self.assertEqual(Object.objects.count(), 0)
+          self.assertEqual(ObjectReference.objects.count(), 0)
+
+      def test_circular_reference_self_reference(self):
+          # Object that references itself via obj_ref should be handled.
+          data = """
+          [
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              }
+          ]
+          """
+          connection.creation.deserialize_db_from_string(data)
+          obj = Object.objects.get(pk=1)
+          self.assertEqual(obj.obj_ref, obj)
+
+      def test_two_objects_cross_reference_each_other(self):
+          # Two objects each pointing to the other's ObjectReference entry.
+          data = """
+          [
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              },
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 2}
+              },
+              {
+                  "model": "backends.object",
+                  "pk": 2,
+                  "fields": {"obj_ref": 2, "related_objects": []}
+              },
+              {
+                  "model": "backends.objectreference",
+                  "pk": 2,
+                  "fields": {"obj": 1}
+              }
+          ]
+          """
+          connection.creation.deserialize_db_from_string(data)
+          obj1 = Object.objects.get(pk=1)
+          obj2 = Object.objects.get(pk=2)
+          ref1 = ObjectReference.objects.get(pk=1)
+          ref2 = ObjectReference.objects.get(pk=2)
+          self.assertEqual(obj1.obj_ref, ref1)
+          self.assertEqual(obj2.obj_ref, ref2)
+          self.assertEqual(ref1.obj, obj2)
+          self.assertEqual(ref2.obj, obj1)
+
+      def test_deserialize_with_forward_references_in_long_list(self):
+          # A longer list where many forward references exist; should still complete.
+          data = """
+          [
+              {"model": "backends.object", "pk": 1, "fields": {"obj_ref": 4, "related_objects": []}},
+              {"model": "backends.object", "pk": 2, "fields": {"obj_ref": 1, "related_objects": []}},
+              {"model": "backends.objectreference", "pk": 1, "fields": {"obj": 2}},
+              {"model": "backends.objectreference", "pk": 2, "fields": {"obj": 3}},
+              {"model": "backends.objectreference", "pk": 3, "fields": {"obj": 4}},
+              {"model": "backends.objectreference", "pk": 4, "fields": {"obj": 1}}
+          ]
+          """
+          connection.creation.deserialize_db_from_string(data)
+          # Ensure the 4 objects and 4 references exist and are linked consistently.
+          self.assertEqual(Object.objects.count(), 4)
+          self.assertEqual(ObjectReference.objects.count(), 4)

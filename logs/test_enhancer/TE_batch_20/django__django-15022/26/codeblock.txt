@@ -1,0 +1,152 @@
+# No additional imports required beyond what is included in the test module.
+from django.test import TestCase, RequestFactory
+from django.contrib import admin
+from django.contrib.auth.models import User
+from django.db import transaction
+
+# Import the models and admin classes from the existing test module
+from .models import Parent, Child, Band, Genre, Group, Member
+from .admin import (
+    ParentAdmin, ParentAdminTwoSearchFields, ChildAdmin, ConcertAdmin
+)
+
+class GetSearchResultsTests(TestCase):
+    def setUp(self):
+        self.factory = RequestFactory()
+        # create a user (permissions are not required for get_search_results)
+        self.user = User.objects.create_user(username='tester', password='x')
+        self.request = self.factory.get('/')
+        self.request.user = self.user
+
+    def test_single_term_local_field(self):
+        # Single-term search on a local field (Child.name)
+        Child.objects.create(name='Alice', age=10)
+        Child.objects.create(name='Bob', age=12)
+        ma = ChildAdmin(Child, admin.site)
+        qs = Child.objects.all()
+        results, may_have_duplicates = ma.get_search_results(self.request, qs, 'Alice')
+        self.assertEqual(list(results.values_list('name', flat=True)), ['Alice'])
+        self.assertFalse(may_have_duplicates)
+
+    def test_multi_term_and_across_fields(self):
+        # Two terms: one matches name, the other matches parent's name.
+        parent1 = Parent.objects.create(name='ParentX')
+        parent2 = Parent.objects.create(name='ParentY')
+        Child.objects.create(name='John', age=20, parent=parent1)
+        Child.objects.create(name='John', age=20, parent=parent2)
+        # Add another child with different name but same parent as first
+        Child.objects.create(name='Alice', age=20, parent=parent1)
+
+        ma = ParentAdminTwoSearchFields(Parent, admin.site)
+        qs = Parent.objects.all()
+        # Search for parent whose child name is John AND child age 20
+        results, may_have_duplicates = ma.get_search_results(self.request, qs, 'John 20')
+        # Both parents have a child with name 'John' and age 20, so both should be returned.
+        self.assertCountEqual(list(results.values_list('pk', flat=True)), [parent1.pk, parent2.pk])
+        self.assertFalse(may_have_duplicates)
+
+    def test_quoted_phrase_treated_as_single_term(self):
+        # Create objects with multi-word names
+        Child.objects.create(name='Big Alice', age=1)
+        Child.objects.create(name='Big Bob', age=2)
+        ma = ChildAdmin(Child, admin.site)
+        qs = Child.objects.all()
+        # Quoted phrase should search for "Big Alice" as one term
+        results, _ = ma.get_search_results(self.request, qs, '"Big Alice"')
+        self.assertEqual(list(results.values_list('name', flat=True)), ['Big Alice'])
+
+    def test_search_related_fk(self):
+        # Searching via related FK field child__name on ParentAdmin
+        p1 = Parent.objects.create(name='P1')
+        p2 = Parent.objects.create(name='P2')
+        Child.objects.create(name='relname', parent=p1)
+        Child.objects.create(name='other', parent=p2)
+        ma = ParentAdmin(Parent, admin.site)
+        qs = Parent.objects.all()
+        results, _ = ma.get_search_results(self.request, qs, 'relname')
+        self.assertEqual(list(results), [p1])
+
+    def test_multi_term_related_and(self):
+        # Ensure multiple terms are ANDed: one term matches child name, other term matches parent name
+        p = Parent.objects.create(name='MatchParent')
+        Child.objects.create(name='MatchChild', parent=p)
+        # Add another parent with only one matching term
+        Parent.objects.create(name='MatchParent')
+        ma = ParentAdminTwoSearchFields(Parent, admin.site)
+        qs = Parent.objects.all()
+        results, _ = ma.get_search_results(self.request, qs, 'MatchChild MatchParent')
+        # Only the parent that has the child with MatchChild and name MatchParent should be returned
+        self.assertEqual(list(results.values_list('pk', flat=True)), [p.pk])
+
+    def test_search_prefix_and_exact_lookups(self):
+        # Test '^' (istartswith) and '=' (iexact) prefixes in search_fields
+        # Use a temporary admin with custom search_fields
+        class LocalAdmin(admin.ModelAdmin):
+            search_fields = ('^name', '=contact_person')
+
+        a1 = Child.objects.create(name='StartHere', contact_person='John')
+        a2 = Child.objects.create(name='Other', contact_person='starthere')
+        la = LocalAdmin(Child, admin.site)
+        qs = Child.objects.all()
+        # '^name' should match StartHere with 'Start'
+        results1, _ = la.get_search_results(self.request, qs, 'Start')
+        self.assertIn(a1.pk, list(results1.values_list('pk', flat=True)))
+        # '=contact_person' should match exact (case-insensitive) 'John'
+        results2, _ = la.get_search_results(self.request, qs, 'John')
+        self.assertIn(a1.pk, list(results2.values_list('pk', flat=True)))
+        # Ensure 'starthere' as contact_person (lowercase) matches = lookup case-insensitively
+        results3, _ = la.get_search_results(self.request, qs, 'starthere')
+        self.assertIn(a2.pk, list(results3.values_list('pk', flat=True)))
+
+    def test_search_with_pk_alias(self):
+        # When search_fields contains 'pk' alias, it should map to the primary key field name
+        class PKAdmin(admin.ModelAdmin):
+            search_fields = ('pk',)
+
+        obj = Child.objects.create(name='Xpk', age=33)
+        pa = PKAdmin(Child, admin.site)
+        qs = Child.objects.all()
+        # Searching by pk numeric string should find the object
+        results, _ = pa.get_search_results(self.request, qs, str(obj.pk))
+        self.assertIn(obj.pk, list(results.values_list('pk', flat=True)))
+
+    def test_many_to_many_may_have_duplicates_flag(self):
+        # Band has ManyToMany genres; searching across M2M should set may_have_duplicates True
+        g1 = Genre.objects.create(name='rock')
+        g2 = Genre.objects.create(name='jazz')
+        b1 = Band.objects.create(name='BandA', nr_of_members=4)
+        b2 = Band.objects.create(name='BandB', nr_of_members=6)
+        b1.genres.add(g1, g2)
+        b2.genres.add(g1)
+        class BandSearchAdmin(admin.ModelAdmin):
+            search_fields = ('genres__name',)
+        ba = BandSearchAdmin(Band, admin.site)
+        qs = Band.objects.all()
+        # Searching for 'rock' (a genre used by multiple bands) may spawn duplicates in joins
+        results, may_have_duplicates = ba.get_search_results(self.request, qs, 'rock')
+        self.assertTrue(may_have_duplicates)
+        # Both bands with genre 'rock' should be present
+        self.assertCountEqual(list(results.values_list('pk', flat=True)), [b1.pk, b2.pk])
+
+    def test_multiple_bits_and_or_behavior_with_m2m_and_fk(self):
+        # Complex case: one search term against M2M (genre), one term against FK (member)
+        # Set up members and groups (Group/Member models used by ConcertAdmin)
+        m1 = Member.objects.create(name='AliceM')
+        m2 = Member.objects.create(name='BobM')
+        grp1 = Group.objects.create(name='G1')
+        grp2 = Group.objects.create(name='G2')
+        grp1.members.add(m1)
+        grp2.members.add(m2)
+        # Create concerts related to groups (Concert model uses group relation)
+        # Reuse ConcertAdmin from admin module which has search_fields = ['group__members__name']
+        ca = ConcertAdmin(admin.site._registry.get(Group).__class__ if admin.site._registry.get(Group) else admin.ModelAdmin, admin.site)
+        # Build a queryset of groups to search via ConcertAdmin-like behavior
+        # We'll instead test by creating a GroupAdmin with the same search_fields
+        class GAdmin(admin.ModelAdmin):
+            search_fields = ('members__name',)
+        ga = GAdmin(Group, admin.site)
+        qs = Group.objects.all()
+        results, may_have_duplicates = ga.get_search_results(self.request, qs, 'AliceM G1')
+        # Term 'AliceM' matches member name, 'G1' matches group name; because search_fields only includes members__name,
+        # the 'G1' term will be attempted against member lookups (no match), so result should be empty (AND behavior).
+        self.assertEqual(list(results), [])

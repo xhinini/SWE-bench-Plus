@@ -1,0 +1,140 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that bulk_create() respects the database backend's maximum batch size (as returned by connection.ops.bulk_batch_size) when an explicit batch_size larger than that maximum is provided. They cover various permutations: all objects without PKs, all objects with PKs set, mixed lists (some with PKs and some without), very large explicit batch_size values, and differing field-lists for the two insertion phases. Each test will fail against the pre-patch implementation (which used the provided batch_size even if larger than the backend maximum) and pass with the patched implementation.
+new_imports_code: |
+  from math import ceil
+  from django.db import connection
+  from django.db.models.fields import AutoField
+  from django.test import TestCase, skipUnlessDBFeature
+  from .models import TwoFields, Country
+test_code: |
+  @skipUnlessDBFeature('has_bulk_insert')
+  class BatchedInsertRespectMaxBatchSizeTests(TestCase):
+      def test_country_batch_size_larger_than_max_is_respected(self):
+          # All objects without PK set (Country.autofield)
+          objs = [Country() for _ in range(1000)]
+          # The fields used for insertion for Country (no explicit PK)
+          fields = ['name', 'iso_two_letter', 'description']
+          max_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
+          # Provide an explicit batch_size larger than the backend allows.
+          explicit_batch_size = max_batch_size + 20
+          expected_queries = ceil(len(objs) / max_batch_size)
+          with self.assertNumQueries(expected_queries):
+              Country.objects.bulk_create(objs, batch_size=explicit_batch_size)
+  
+      def test_twofields_with_pk_set_batch_size_larger_than_max_is_respected(self):
+          # All objects with PK set (id not None) -> first _batched_insert call
+          start_id = 200000
+          objs_with_pk = [TwoFields(id=start_id + i, f1=i, f2=i) for i in range(300)]
+          # fields used when PK is present include the PK field
+          fields_with_pk = [f.name for f in TwoFields._meta.concrete_fields]
+          max_batch_size = max(connection.ops.bulk_batch_size(fields_with_pk, objs_with_pk), 1)
+          explicit_batch_size = max_batch_size + 50
+          expected_queries = ceil(len(objs_with_pk) / max_batch_size)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(objs_with_pk, batch_size=explicit_batch_size)
+  
+      def test_twofields_without_pk_set_batch_size_larger_than_max_is_respected(self):
+          # All objects without PK set -> second _batched_insert call (AutoField excluded)
+          objs_without_pk = [TwoFields(f1=i, f2=i) for i in range(450)]
+          # Exclude AutoField for objs_without_pk insertion fields
+          fields = [f.name for f in TwoFields._meta.concrete_fields if not isinstance(f, AutoField)]
+          max_batch_size = max(connection.ops.bulk_batch_size(fields, objs_without_pk), 1)
+          explicit_batch_size = max_batch_size + 10
+          expected_queries = ceil(len(objs_without_pk) / max_batch_size)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(objs_without_pk, batch_size=explicit_batch_size)
+  
+      def test_mixed_twofields_batch_size_larger_than_max_is_respected_for_both_groups(self):
+          # Mixed list alternating pk set and not set -> bulk_create splits into two groups
+          mixed = []
+          for i in range(600):
+              if i % 2 == 0:
+                  mixed.append(TwoFields(id=500000 + i, f1=i, f2=i))
+              else:
+                  mixed.append(TwoFields(f1=i, f2=i))
+          # Compute per-group expected queries
+          objs_with_pk = [o for o in mixed if o.pk is not None]
+          objs_without_pk = [o for o in mixed if o.pk is None]
+          fields_with_pk = [f.name for f in TwoFields._meta.concrete_fields]
+          fields_without_pk = [f.name for f in TwoFields._meta.concrete_fields if not isinstance(f, AutoField)]
+          max_with_pk = max(connection.ops.bulk_batch_size(fields_with_pk, objs_with_pk), 1)
+          max_without_pk = max(connection.ops.bulk_batch_size(fields_without_pk, objs_without_pk), 1)
+          explicit_batch_size = max(max_with_pk, max_without_pk) + 100
+          expected_queries = ceil(len(objs_with_pk) / max_with_pk) + ceil(len(objs_without_pk) / max_without_pk)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(mixed, batch_size=explicit_batch_size)
+  
+      def test_huge_explicit_batch_size_does_not_collapse_batches_to_one_country(self):
+          # If an enormous explicit batch_size is provided, it must still be capped
+          objs = [Country() for _ in range(1500)]
+          fields = ['name', 'iso_two_letter', 'description']
+          max_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
+          huge_batch_size = len(objs) * 10  # intentionally huge
+          expected_queries = ceil(len(objs) / max_batch_size)
+          with self.assertNumQueries(expected_queries):
+              Country.objects.bulk_create(objs, batch_size=huge_batch_size)
+  
+      def test_batch_size_equal_to_max_uses_exact_batches(self):
+          objs = [Country() for _ in range(250)]
+          fields = ['name', 'iso_two_letter', 'description']
+          max_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
+          explicit_batch_size = max_batch_size
+          expected_queries = ceil(len(objs) / max_batch_size)
+          with self.assertNumQueries(expected_queries):
+              Country.objects.bulk_create(objs, batch_size=explicit_batch_size)
+  
+      def test_small_explicit_batch_size_one_results_in_many_queries(self):
+          objs = [Country() for _ in range(20)]
+          # batch_size == 1 should produce exactly len(objs) queries
+          with self.assertNumQueries(len(objs)):
+              Country.objects.bulk_create(objs, batch_size=1)
+  
+      def test_mixed_groups_with_different_field_lists_respect_respective_maxes(self):
+          # Construct mixed list where PK-present group and PK-absent group have different field lists
+          mixed = []
+          for i in range(400):
+              if i < 150:
+                  # Set PK for first 150
+                  mixed.append(TwoFields(id=400000 + i, f1=i, f2=i))
+              else:
+                  mixed.append(TwoFields(f1=i, f2=i))
+          objs_with_pk = [o for o in mixed if o.pk is not None]
+          objs_without_pk = [o for o in mixed if o.pk is None]
+          fields_with_pk = [f.name for f in TwoFields._meta.concrete_fields]
+          fields_without_pk = [f.name for f in TwoFields._meta.concrete_fields if not isinstance(f, AutoField)]
+          max_with_pk = max(connection.ops.bulk_batch_size(fields_with_pk, objs_with_pk), 1)
+          max_without_pk = max(connection.ops.bulk_batch_size(fields_without_pk, objs_without_pk), 1)
+          explicit_batch_size = max(max_with_pk, max_without_pk) + 999
+          expected_queries = ceil(len(objs_with_pk) / max_with_pk) + ceil(len(objs_without_pk) / max_without_pk)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(mixed, batch_size=explicit_batch_size)
+  
+      def test_explicit_batch_size_respected_for_non_auto_pk_model(self):
+          # Non-auto PK model (use Country by setting PK manually) combined test
+          objs_with_pk = [Country(id=700000 + i, name="A", iso_two_letter="X") for i in range(120)]
+          fields_with_pk = [f.name for f in Country._meta.concrete_fields]
+          max_with_pk = max(connection.ops.bulk_batch_size(fields_with_pk, objs_with_pk), 1)
+          explicit_batch_size = max_with_pk + 5
+          expected_queries = ceil(len(objs_with_pk) / max_with_pk)
+          with self.assertNumQueries(expected_queries):
+              Country.objects.bulk_create(objs_with_pk, batch_size=explicit_batch_size)
+  
+      def test_combined_case_sum_of_batches_for_both_groups(self):
+          # Final combined check with different sizes to ensure total queries sum correctly
+          mixed = []
+          for i in range(350):
+              if i % 3 == 0:
+                  mixed.append(TwoFields(id=800000 + i, f1=i, f2=i))
+              else:
+                  mixed.append(TwoFields(f1=i, f2=i))
+          objs_with_pk = [o for o in mixed if o.pk is not None]
+          objs_without_pk = [o for o in mixed if o.pk is None]
+          fields_with_pk = [f.name for f in TwoFields._meta.concrete_fields]
+          fields_without_pk = [f.name for f in TwoFields._meta.concrete_fields if not isinstance(f, AutoField)]
+          max_with_pk = max(connection.ops.bulk_batch_size(fields_with_pk, objs_with_pk), 1)
+          max_without_pk = max(connection.ops.bulk_batch_size(fields_without_pk, objs_without_pk), 1)
+          explicit_batch_size = max(max_with_pk, max_without_pk) + 50
+          expected_queries = ceil(len(objs_with_pk) / max_with_pk) + ceil(len(objs_without_pk) / max_without_pk)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(mixed, batch_size=explicit_batch_size)

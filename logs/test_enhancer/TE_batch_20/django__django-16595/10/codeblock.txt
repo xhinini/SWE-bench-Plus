@@ -1,0 +1,176 @@
+# No new imports required beyond what is used in the existing test module.
+from django.db import migrations, models
+from django.db.migrations import operations
+from django.db.migrations.optimizer import MigrationOptimizer
+from django.db.migrations.serializer import serializer_factory
+from django.test import SimpleTestCase
+
+from .models import EmptyManager, UnicodeModel
+
+class OptimizerTests(SimpleTestCase):
+    """
+    Tests the migration autodetector.
+    """
+
+    def optimize(self, operations, app_label):
+        """
+        Handy shortcut for getting results + number of loops
+        """
+        optimizer = MigrationOptimizer()
+        return optimizer.optimize(operations, app_label), optimizer._iterations
+
+    def serialize(self, value):
+        return serializer_factory(value).serialize()[0]
+
+    def assertOptimizesTo(
+        self, operations, expected, exact=None, less_than=None, app_label=None
+    ):
+        result, iterations = self.optimize(operations, app_label or "migrations")
+        result = [self.serialize(f) for f in result]
+        expected = [self.serialize(f) for f in expected]
+        self.assertEqual(expected, result)
+        if exact is not None and iterations != exact:
+            raise self.failureException(
+                "Optimization did not take exactly %s iterations (it took %s)"
+                % (exact, iterations)
+            )
+        if less_than is not None and iterations >= less_than:
+            raise self.failureException(
+                "Optimization did not take less than %s iterations (it took %s)"
+                % (less_than, iterations)
+            )
+
+    def assertDoesNotOptimize(self, operations, **kwargs):
+        self.assertOptimizesTo(operations, operations, **kwargs)
+
+    # --- existing tests omitted for brevity in this snippet ---
+
+    # New regression tests for AlterField reduction behavior
+    def test_regression_alterfield_two_consecutive_collapses(self):
+        """
+        Two consecutive AlterField operations on the same model/field should
+        collapse to only the latter AlterField.
+        """
+        ops = [
+            migrations.AlterField("Book", "title", models.CharField(max_length=256)),
+            migrations.AlterField("Book", "title", models.CharField(max_length=128)),
+        ]
+        expected = [migrations.AlterField("Book", "title", models.CharField(max_length=128))]
+        self.assertOptimizesTo(ops, expected)
+
+    def test_regression_alterfield_three_consecutive_collapses(self):
+        """
+        Three consecutive AlterField operations on the same model/field should
+        collapse to only the last AlterField.
+        """
+        ops = [
+            migrations.AlterField("Book", "title", models.CharField(max_length=300)),
+            migrations.AlterField("Book", "title", models.CharField(max_length=256, help_text="h1")),
+            migrations.AlterField("Book", "title", models.CharField(max_length=128, help_text="h2")),
+        ]
+        expected = [migrations.AlterField("Book", "title", models.CharField(max_length=128, help_text="h2"))]
+        self.assertOptimizesTo(ops, expected)
+
+    def test_regression_alterfield_and_remove_field_collapses_to_remove(self):
+        """
+        An AlterField followed by RemoveField on the same field should collapse
+        to just RemoveField (RemoveField absorbs previous AlterField).
+        """
+        ops = [
+            migrations.AlterField("Author", "age", models.IntegerField()),
+            migrations.RemoveField("Author", "age"),
+        ]
+        expected = [migrations.RemoveField("Author", "age")]
+        self.assertOptimizesTo(ops, expected)
+
+    def test_regression_remove_then_alter_keeps_remove(self):
+        """
+        A RemoveField followed by an AlterField for the same field should
+        result in only the RemoveField (the remove should win).
+        """
+        ops = [
+            migrations.RemoveField("Author", "age"),
+            migrations.AlterField("Author", "age", models.IntegerField()),
+        ]
+        expected = [migrations.RemoveField("Author", "age")]
+        self.assertOptimizesTo(ops, expected)
+
+    def test_regression_alterfield_chain_with_different_kwargs(self):
+        """
+        Even if AlterField instances change different kwargs (default, help_text),
+        multiple AlterField operations should collapse to the final one.
+        """
+        ops = [
+            migrations.AlterField("Library", "location", models.CharField(max_length=200, null=True)),
+            migrations.AlterField("Library", "location", models.CharField(max_length=200, null=True, help_text="h")),
+            migrations.AlterField("Library", "location", models.CharField(max_length=100, null=False)),
+        ]
+        expected = [
+            migrations.AlterField("Library", "location", models.CharField(max_length=100, null=False))
+        ]
+        self.assertOptimizesTo(ops, expected)
+
+    def test_regression_alterfield_case_insensitive_names(self):
+        """
+        Model/field names should be treated case-insensitively when
+        determining same-field operations, and collapse accordingly.
+        """
+        ops = [
+            migrations.AlterField("BOOK", "Title", models.CharField(max_length=300)),
+            migrations.AlterField("book", "title", models.CharField(max_length=128)),
+        ]
+        expected = [migrations.AlterField("book", "title", models.CharField(max_length=128))]
+        # Note: expected uses lowercase model/field names format as migrations do normalization
+        self.assertOptimizesTo(ops, expected)
+
+    def test_regression_alterfield_then_rename_with_db_column_none(self):
+        """
+        When an AlterField exists and a subsequent RenameField on the same
+        field occurs and the altered field has db_column is None, the optimizer
+        should produce the RenameField followed by an AlterField on the new name.
+        """
+        # The 'field' used for the AlterField should have db_column None to trigger special case.
+        field = models.CharField(max_length=100)
+        ops = [
+            migrations.AlterField("Book", "title", field),
+            migrations.RenameField("Book", "title", "headline"),
+        ]
+        # According to reduction rules, the RenameField is preserved and an AlterField for the new name is kept.
+        expected = [
+            migrations.RenameField("Book", "title", "headline"),
+            migrations.AlterField("Book", "headline", field),
+        ]
+        self.assertOptimizesTo(ops, expected)
+
+    def test_regression_alterfield_then_rename_with_db_column_set(self):
+        """
+        If the AlterField's field has a db_column set, the special RenameField
+        handling should NOT append an extra AlterField for the new name.
+        """
+        field_with_dbcol = models.CharField(max_length=100)
+        # Simulate a field that maps to a physical DB column by setting db_column.
+        field_with_dbcol.db_column = "custom_col"
+        ops = [
+            migrations.AlterField("Book", "title", field_with_dbcol),
+            migrations.RenameField("Book", "title", "headline"),
+        ]
+        # In this case, only the RenameField should remain (no appended AlterField).
+        expected = [migrations.RenameField("Book", "title", "headline")]
+        self.assertOptimizesTo(ops, expected)
+
+    def test_regression_non_interfering_alterfields_across_models(self):
+        """
+        AlterField operations on different models should not interfere; each
+        model's AlterFields should be reduced independently.
+        """
+        ops = [
+            migrations.AlterField("A", "f", models.IntegerField()),
+            migrations.AlterField("B", "f", models.CharField(max_length=50)),
+            migrations.AlterField("A", "f", models.IntegerField(null=True)),
+            migrations.AlterField("B", "f", models.CharField(max_length=100)),
+        ]
+        expected = [
+            migrations.AlterField("A", "f", models.IntegerField(null=True)),
+            migrations.AlterField("B", "f", models.CharField(max_length=100)),
+        ]
+        self.assertOptimizesTo(ops, expected)

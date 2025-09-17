@@ -1,0 +1,220 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise DatabaseCache._cull() behaviour by mocking a DB cursor to simulate various fetchone() return values and ensure that culling logic (including handling of a missing "last cache key" row) does not raise errors and issues the correct SQL commands. They would have failed on the original buggy implementation (which unconditionally indexed the result of fetchone()) and pass with the fixed implementation. The tests assert that clear() is called when cull frequency is zero, the cache-key-culling SQL is invoked only when appropriate, correct parameters (cull_num) are passed, and the final deletion is performed only when a last cache key is returned.
+new_imports_code: |
+  from unittest import mock
+  from django.utils import timezone
+  from django.test import SimpleTestCase
+  from django.db import connections
+  from django.core.cache.backends.db import DatabaseCache
+test_code: |
+  class DatabaseCacheCullUnitTests(SimpleTestCase):
+      def setUp(self):
+          # Use a stable table name for quoting checks.
+          self.table_name = 'test_table'
+          self.cache = DatabaseCache(self.table_name, params={})
+          # Ensure predictable quoting from DB ops
+          self.connection = connections['default']
+          self.quoted_table = self.connection.ops.quote_name(self.table_name)
+
+      def _make_cursor(self, fetchone_values):
+          """
+          Create a mock cursor with execute() and fetchone() implemented.
+          fetchone_values: list of values to be returned on successive fetchone() calls.
+          """
+          cursor = mock.Mock()
+          fetch_iter = iter(fetchone_values)
+
+          def fetchone():
+              try:
+                  return next(fetch_iter)
+              except StopIteration:
+                  return None
+          cursor.fetchone.side_effect = fetchone
+          return cursor
+
+      def test_cull_frequency_zero_calls_clear(self):
+          # When cull frequency is zero, clear() should be called and no DB calls performed.
+          self.cache._cull_frequency = 0
+          called = {'cleared': False}
+
+          def fake_clear():
+              called['cleared'] = True
+          self.cache.clear = fake_clear
+
+          # cursor shouldn't be used, but provide a dummy anyway
+          cursor = self._make_cursor([None, None])
+          now = timezone.now()
+          # Should not raise
+          self.cache._cull('default', cursor, now)
+          self.assertTrue(called['cleared'], "clear() should be called when _cull_frequency == 0")
+
+      def test_no_cull_when_num_less_than_or_equal_max_entries(self):
+          # If num <= _max_entries, cache_key_culling_sql should not be executed.
+          self.cache._cull_frequency = 10
+          self.cache._max_entries = 100
+          # fetchone sequence: after "SELECT COUNT(*)" -> return (50,)
+          cursor = self._make_cursor([None, (50,)])
+          cursor.execute = mock.Mock()
+          now = timezone.now()
+          self.cache._cull('default', cursor, now)
+          # At least two executes: delete expired and select count
+          self.assertGreaterEqual(cursor.execute.call_count, 2)
+          # Ensure cache_key_culling_sql wasn't used (would be a third execute with that SQL)
+          called_sqls = [call.args[0] for call in cursor.execute.call_args_list]
+          self.assertFalse(
+              any('cache_key_culling' in (sql or '') or 'WHERE cache_key <' in (sql or '') for sql in called_sqls),
+              "No culling SQL should be executed when num <= _max_entries"
+          )
+
+      def test_cull_runs_but_fetchone_returns_none_no_error(self):
+          # num > _max_entries triggers culling SQL, but if fetchone() returns None, no delete should be attempted.
+          self.cache._cull_frequency = 10
+          self.cache._max_entries = 10
+          # Sequence for fetchone():
+          # 1st fetchone isn't used by DELETE expired (that uses execute only), but next relevant:
+          # After SELECT COUNT(*) -> return (50,)
+          # After cache_key_culling_sql -> return None (no row)
+          cursor = self._make_cursor([ (50,), None ])
+          cursor.execute = mock.Mock()
+          now = timezone.now()
+          # Monkeypatch the ops.cache_key_culling_sql to a recognizable string
+          orig_cache_key_culling_sql = self.connection.ops.cache_key_culling_sql
+          self.connection.ops.cache_key_culling_sql = lambda: "%s"  # simple placeholder
+          try:
+              # Should not raise even though fetchone() returns None for last_cache_key
+              self.cache._cull('default', cursor, now)
+          finally:
+              self.connection.ops.cache_key_culling_sql = orig_cache_key_culling_sql
+
+          # Ensure the cache_key_culling_sql was executed (third execute)
+          executed_sqls = [args[0] for args, _ in cursor.execute.call_args_list]
+          # Find any executed SQL that came from cache_key_culling_sql (we formatted with "%s")
+          self.assertTrue(any('%s' in sql for sql in executed_sqls),
+                          "Expected cache_key_culling_sql to be executed when num > _max_entries")
+          # Ensure no final DELETE ... WHERE cache_key < ... call was made (since fetchone returned None)
+          self.assertFalse(any('WHERE cache_key <' in sql for sql in executed_sqls),
+                           "No final delete should be executed when last_cache_key is None")
+
+      def test_final_delete_executes_when_last_cache_key_returned(self):
+          # When cache_key_culling_sql returns a row, a final DELETE should be executed with that key.
+          self.cache._cull_frequency = 5
+          self.cache._max_entries = 10
+          # After SELECT COUNT(*) -> return (50,)
+          # After cache_key_culling_sql -> return ('last-key',)
+          cursor = self._make_cursor([(50,), ('last-key',)])
+          cursor.execute = mock.Mock()
+          now = timezone.now()
+          orig_cache_key_culling_sql = self.connection.ops.cache_key_culling_sql
+          self.connection.ops.cache_key_culling_sql = lambda: "SELECT cache_key FROM %s LIMIT %s"
+          try:
+              self.cache._cull('default', cursor, now)
+          finally:
+              self.connection.ops.cache_key_culling_sql = orig_cache_key_culling_sql
+
+          # Verify final delete command was issued
+          executed_sqls = [args[0] for args, _ in cursor.execute.call_args_list]
+          self.assertTrue(any('WHERE cache_key <' in sql for sql in executed_sqls),
+                          "Expected a final DELETE ... WHERE cache_key < to be executed when last_cache_key is present")
+          # Verify the parameter passed to the final DELETE was the key returned by fetchone()
+          # The last call args contain SQL and parameters
+          last_call_sql, last_call_params = cursor.execute.call_args_list[-1][0], cursor.execute.call_args_list[-1][1] if cursor.execute.call_args_list[-1][1] else ((),)
+          # call_args_list[-1][0] is a tuple where index 0 is SQL, index 1 is params; adapt for Mock API:
+          last_call = cursor.execute.call_args_list[-1]
+          last_sql = last_call[0][0]
+          last_params = last_call[0][1]
+          self.assertIn('WHERE cache_key <', last_sql)
+          self.assertEqual(last_params, ['last-key'])
+
+      def test_cull_uses_computed_cull_num(self):
+          # Validate that cull_num = num // _cull_frequency is passed to cache_key_culling_sql.
+          self.cache._cull_frequency = 7
+          self.cache._max_entries = 10
+          num = 100
+          expected_cull_num = num // self.cache._cull_frequency
+          cursor = self._make_cursor([(num,), ('last',)])
+          cursor.execute = mock.Mock()
+          # Patch cache_key_culling_sql to accept a parameter and record that execute was called with expected params
+          orig_cache_key_culling_sql = self.connection.ops.cache_key_culling_sql
+          self.connection.ops.cache_key_culling_sql = lambda: "SELECT cache_key FROM %s LIMIT %s"
+          try:
+              self.cache._cull('default', cursor, timezone.now())
+          finally:
+              self.connection.ops.cache_key_culling_sql = orig_cache_key_culling_sql
+
+          # The call corresponding to cache_key_culling_sql should have been passed [expected_cull_num]
+          # Find the call which used the culling SQL pattern (it will include %s formatted table)
+          found = False
+          for args, kwargs in cursor.execute.call_args_list:
+              if 'SELECT cache_key' in (args[0] or ''):
+                  # params passed as second argument to execute()
+                  self.assertEqual(args[1], [expected_cull_num])
+                  found = True
+          self.assertTrue(found, "cache_key_culling_sql should have been executed with the computed cull_num")
+
+      def test_no_exception_when_cache_key_culling_sql_returns_empty_sequence(self):
+          # Ensure robust handling when fetchone() returns None after culling SQL
+          self.cache._cull_frequency = 3
+          self.cache._max_entries = 1
+          # SELECT COUNT -> (2,), culling SQL -> None
+          cursor = self._make_cursor([(2,), None])
+          cursor.execute = mock.Mock()
+          orig_cache_key_culling_sql = self.connection.ops.cache_key_culling_sql
+          self.connection.ops.cache_key_culling_sql = lambda: "SELECT cache_key FROM %s"
+          try:
+              # Should complete without raising
+              self.cache._cull('default', cursor, timezone.now())
+          finally:
+              self.connection.ops.cache_key_culling_sql = orig_cache_key_culling_sql
+
+      def test_delete_expired_then_count_called_in_order(self):
+          # Ensure the first delete expired rows and the count select are executed in expected order.
+          self.cache._cull_frequency = 5
+          self.cache._max_entries = 1
+          cursor = self._make_cursor([(2,), ('some',)])
+          cursor.execute = mock.Mock()
+          now = timezone.now()
+          self.cache._cull('default', cursor, now)
+          # First execute should be DELETE FROM <table> WHERE expires < %s
+          first_sql = cursor.execute.call_args_list[0][0][0]
+          self.assertIn('WHERE expires <', first_sql)
+          # Second execute should be SELECT COUNT(*) FROM <table>
+          second_sql = cursor.execute.call_args_list[1][0][0]
+          self.assertIn('SELECT COUNT(*)', second_sql)
+
+      def test_cull_handles_cull_num_zero(self):
+          # When cull_num computes to 0, ensure it is still passed through to cache_key_culling_sql
+          self.cache._cull_frequency = 1000
+          self.cache._max_entries = 1
+          num = 2
+          expected_cull_num = num // self.cache._cull_frequency  # 0
+          cursor = self._make_cursor([(num,), ('k',)])
+          cursor.execute = mock.Mock()
+          orig_cache_key_culling_sql = self.connection.ops.cache_key_culling_sql
+          self.connection.ops.cache_key_culling_sql = lambda: "SELECT cache_key FROM %s"
+          try:
+              self.cache._cull('default', cursor, timezone.now())
+          finally:
+              self.connection.ops.cache_key_culling_sql = orig_cache_key_culling_sql
+
+          # Find cache_key_culling_sql call and assert params [0]
+          found = False
+          for args, kwargs in cursor.execute.call_args_list:
+              if 'SELECT cache_key' in (args[0] or ''):
+                  self.assertEqual(args[1], [expected_cull_num])
+                  found = True
+          self.assertTrue(found, "cache_key_culling_sql should be called and receive cull_num 0 when computed")
+
+      def test_cull_uses_connection_for_table_quoting(self):
+          # Ensure the quoted table name is used in SQL strings passed to execute
+          self.cache._cull_frequency = 2
+          self.cache._max_entries = 1
+          num = 3
+          cursor = self._make_cursor([(num,), ('lastkey',)])
+          cursor.execute = mock.Mock()
+          # Call _cull
+          self.cache._cull('default', cursor, timezone.now())
+          # Ensure one of the executed SQLs contains the quoted table name
+          executed_sqls = [call.args[0] for call in cursor.execute.call_args_list]
+          self.assertTrue(any(self.quoted_table in (sql or '') for sql in executed_sqls),
+                          "The quoted table name should appear in SQL statements issued by _cull()")

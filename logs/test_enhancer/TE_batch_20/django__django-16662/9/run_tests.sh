@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_writer_llm.NonstandardImportPreservationTests._assert_preserved migrations.test_writer_llm.NonstandardImportPreservationTests.test_preserve_nonstandard_import_1 migrations.test_writer_llm.NonstandardImportPreservationTests.test_preserve_nonstandard_import_10 migrations.test_writer_llm.NonstandardImportPreservationTests.test_preserve_nonstandard_import_2 migrations.test_writer_llm.NonstandardImportPreservationTests.test_preserve_nonstandard_import_3 migrations.test_writer_llm.NonstandardImportPreservationTests.test_preserve_nonstandard_import_4 migrations.test_writer_llm.NonstandardImportPreservationTests.test_preserve_nonstandard_import_5 migrations.test_writer_llm.NonstandardImportPreservationTests.test_preserve_nonstandard_import_6 migrations.test_writer_llm.NonstandardImportPreservationTests.test_preserve_nonstandard_import_7 migrations.test_writer_llm.NonstandardImportPreservationTests.test_preserve_nonstandard_import_8 migrations.test_writer_llm.NonstandardImportPreservationTests.test_preserve_nonstandard_import_9
+coverage json -o coverage.json
+: '>>>>> End Test Output'

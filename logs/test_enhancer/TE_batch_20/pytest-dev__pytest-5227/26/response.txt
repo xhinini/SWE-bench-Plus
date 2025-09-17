@@ -1,0 +1,226 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests validate the default log format contains a levelname token (so colored-level formatting can work), the ColoredLevelFormatter mapping/formatting behavior, catching_logs semantics (temporary root level change and handler addition/removal), LogCaptureHandler emit/reset behavior, LogCaptureFixture set_level/at_level behavior and record/message accessors, and LoggingPlugin.set_log_path creating directories and installing a FileHandler. They would have failed when the default format did not include "%(levelname)" (the bug fixed by the patch).
+test_code: |
+  # -*- coding: utf-8 -*-
+  import logging
+  import os
+  import io
+  import contextlib
+  from types import SimpleNamespace
+  import py
+  import pytest
+  import six
+
+  from _pytest import logging as _logging
+  from _pytest.logging import (
+      ColoredLevelFormatter,
+      catching_logs,
+      LogCaptureHandler,
+      LogCaptureFixture,
+      LoggingPlugin,
+      DEFAULT_LOG_FORMAT,
+      DEFAULT_LOG_DATE_FORMAT,
+  )
+
+  def test_default_format_contains_levelname_and_name_and_lineno():
+      # Ensure the default format contains %(levelname) and %(name) and %(lineno)
+      fmt = DEFAULT_LOG_FORMAT
+      assert "%(levelname)" in fmt
+      assert "%(name)" in fmt
+      assert "%(lineno)" in fmt
+
+  def test_colored_level_formatter_builds_mapping_and_formats_levels():
+      class DummyTerminalWriter(object):
+          def markup(self, text, **kwargs):
+              # simple markup representation for assertions
+              opts = ",".join(sorted(kwargs.keys()))
+              return "<" + opts + ">" + text + "</" + opts + ">"
+
+      fmt = DEFAULT_LOG_FORMAT
+      tw = DummyTerminalWriter()
+      f = ColoredLevelFormatter(tw, fmt)
+
+      # mapping should be populated for several standard levels
+      assert logging.INFO in f._level_to_fmt_mapping
+      assert logging.ERROR in f._level_to_fmt_mapping
+
+      # Create a record and ensure the formatted output contains the markup
+      rec_info = logging.LogRecord("mylogger", logging.INFO, __file__, 10, "hello %s", ("world",), None)
+      out = f.format(rec_info)
+      # the marked-up levelname should be present in the formatted output
+      assert "<green>" in out or "<" in out  # fallback check that markup occurred
+      assert "hello world" in out
+
+      rec_err = logging.LogRecord("mylogger", logging.ERROR, __file__, 20, "boom", (), None)
+      out_err = f.format(rec_err)
+      assert "boom" in out_err
+
+  def test_colored_level_formatter_no_mapping_when_no_levelname():
+      # If the format doesn't contain %(levelname) there should be no mapping
+      fmt = "%(message)s"
+      class DummyTerminalWriter(object):
+          def markup(self, text, **kwargs):
+              return "[%s]" % text
+
+      f = ColoredLevelFormatter(DummyTerminalWriter(), fmt)
+      assert f._level_to_fmt_mapping == {}
+      rec = logging.LogRecord("name", logging.WARNING, __file__, 1, "msg", (), None)
+      assert f.format(rec).endswith("msg")
+
+  def test_catching_logs_sets_and_restores_root_level_and_handler_addition():
+      root = logging.getLogger()
+      orig_level = root.level
+
+      handler = logging.StreamHandler(io.StringIO())
+      # ensure handler is not already present
+      if handler in root.handlers:
+          root.removeHandler(handler)
+
+      with catching_logs(handler, level=logging.DEBUG) as h:
+          # root level should be set to min(orig_level, DEBUG)
+          assert logging.getLogger().level == min(orig_level, logging.DEBUG)
+          assert h is handler
+          # handler should be present
+          assert handler in root.handlers
+
+      # after context manager exit things should be restored
+      assert logging.getLogger().level == orig_level
+      assert handler not in root.handlers
+
+  def test_catching_logs_does_not_duplicate_existing_handler():
+      root = logging.getLogger()
+      handler = logging.StreamHandler(io.StringIO())
+      # add handler manually
+      root.addHandler(handler)
+      try:
+          # use the same handler with catching_logs; it should not be added twice
+          with catching_logs(handler, level=logging.INFO) as h:
+              # count occurrences in handlers list
+              assert root.handlers.count(handler) == 1
+      finally:
+          # cleanup: remove handler if present
+          while handler in root.handlers:
+              root.removeHandler(handler)
+
+  def test_logcapturehandler_emit_and_reset():
+      h = LogCaptureHandler()
+      rec = logging.LogRecord("x", logging.INFO, __file__, 1, "the %s", ("message",), None)
+      h.emit(rec)
+      # record appended
+      assert len(h.records) == 1
+      # the stream should contain the formatted message
+      s = h.stream.getvalue()
+      assert "the message" in s
+      # reset should clear records and stream
+      h.reset()
+      assert h.records == []
+      assert h.stream.getvalue() == ""
+
+  def test_logcapturefixture_record_access_and_clear(tmp_path):
+      handler = LogCaptureHandler()
+      # create a fake item that mimics catch_log_handler attributes
+      item = SimpleNamespace()
+      item.catch_log_handler = handler
+      item.catch_log_handlers = {"call": handler}
+
+      fixture = LogCaptureFixture(item)
+      # emit a record
+      rec = logging.LogRecord("mylogger", logging.WARNING, __file__, 55, "a %s", ("b",), None)
+      handler.emit(rec)
+
+      # records property
+      assert fixture.records == handler.records
+      # record_tuples: (logger_name, levelno, message)
+      assert ("mylogger", logging.WARNING, "a b") in fixture.record_tuples
+      # messages property should contain interpolated message
+      assert "a b" in fixture.messages
+
+      # get_records for phases
+      assert fixture.get_records("call") == handler.records
+      assert fixture.get_records("setup") == []
+
+      # clear resets handler
+      fixture.clear()
+      assert fixture.records == []
+      assert fixture.text == ""
+
+  def test_set_level_and_finalize_restores_named_logger_level():
+      # use a named logger so LogCaptureFixture.set_level stores and restores correctly
+      name = "test_regress_logger"
+      logger = logging.getLogger(name)
+      orig = logger.level
+      item = SimpleNamespace()
+      fixture = LogCaptureFixture(item)
+      try:
+          fixture.set_level(logging.DEBUG, logger=name)
+          assert logger.level == logging.DEBUG
+      finally:
+          fixture._finalize()
+      # restored
+      assert logger.level == orig
+
+  def test_at_level_context_manager_restores_level():
+      name = "test_at_level_logger"
+      logger = logging.getLogger(name)
+      orig = logger.level
+      item = SimpleNamespace()
+      fixture = LogCaptureFixture(item)
+      with fixture.at_level(logging.INFO, logger=name):
+          assert logger.level == logging.INFO
+      assert logger.level == orig
+
+  def test_loggingplugin_set_log_path_creates_parent_and_sets_filehandler(tmp_path):
+      # Create a minimal config stub for LoggingPlugin
+      class DummyPluginMgr:
+          def get_plugin(self, name):
+              return None
+
+      class DummyOption:
+          verbose = 0
+          color = "no"
+
+      class DummyConfig:
+          def __init__(self, rootdir):
+              self.option = DummyOption()
+              self.rootdir = py.path.local(rootdir)
+              self.pluginmanager = DummyPluginMgr()
+
+          def getoption(self, name):
+              # do not enable live logging
+              if name in ("--log-cli-level", "log_level", "log_cli_level", "verbose"):
+                  return None
+              return None
+
+          def getini(self, name):
+              if name == "log_format":
+                  return DEFAULT_LOG_FORMAT
+              if name == "log_date_format":
+                  return DEFAULT_LOG_DATE_FORMAT
+              if name == "log_cli":
+                  return False
+              # other inis default to None/False
+              return None
+
+      cfg = DummyConfig(str(tmp_path))
+      plugin = LoggingPlugin(cfg)
+
+      # relative path should be resolved against rootdir and parent dirs created
+      rel = os.path.join("subdir", "nested", "report.log")
+      plugin.set_log_path(rel)
+      # handler must be set
+      assert plugin.log_file_handler is not None
+      # the file should exist (FileHandler opens the file on creation)
+      fname = plugin.log_file_handler.baseFilename
+      assert os.path.isfile(fname)
+      # cleanup
+      plugin.log_file_handler.close()
+      os.remove(fname)
+new_imports_code: |
+  import logging
+  import os
+  import io
+  from types import SimpleNamespace
+  import py
+  import pytest
+  import six

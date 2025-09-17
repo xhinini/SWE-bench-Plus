@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.tests_llm.TransactionAtomicUsageTests._base_post_data admin_changelist.tests_llm.TransactionAtomicUsageTests.setUp admin_changelist.tests_llm.TransactionAtomicUsageTests.test_atomic_called_even_when_log_change_raises_on_first admin_changelist.tests_llm.TransactionAtomicUsageTests.test_atomic_called_even_when_log_change_raises_on_second admin_changelist.tests_llm.TransactionAtomicUsageTests.test_atomic_called_once admin_changelist.tests_llm.TransactionAtomicUsageTests.test_atomic_called_when_no_form_changed admin_changelist.tests_llm.TransactionAtomicUsageTests.test_atomic_called_with_multiple_forms_changed admin_changelist.tests_llm.TransactionAtomicUsageTests.test_atomic_called_with_router_returning_default admin_changelist.tests_llm.TransactionAtomicUsageTests.test_atomic_called_with_router_returning_other admin_changelist.tests_llm.TransactionAtomicUsageTests.test_router_db_for_write_invoked_with_model
+coverage json -o coverage.json
+: '>>>>> End Test Output'

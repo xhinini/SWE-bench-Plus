@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_writer_llm.MigrationWriterImportsTests._make_migration_with_custom_arg migrations.test_writer_llm.MigrationWriterImportsTests.tearDown migrations.test_writer_llm.MigrationWriterImportsTests.test_imports_grouping_imports_before_froms migrations.test_writer_llm.MigrationWriterImportsTests.test_merge_models_with_migrations migrations.test_writer_llm.MigrationWriterImportsTests.test_migration_imports_comment_appended migrations.test_writer_llm.MigrationWriterImportsTests.test_multiple_mixed_imports_full_integration migrations.test_writer_llm.MigrationWriterImportsTests.test_no_models_import_when_unused migrations.test_writer_llm.MigrationWriterImportsTests.test_operation_writer_adds_import_for_custom_operation migrations.test_writer_llm.MigrationWriterImportsTests.test_serializer_provided_from_imports_sorted_after_imports migrations.test_writer_llm.MigrationWriterImportsTests.test_sorting_by_module_name_with_multiple_imports migrations.test_writer_llm.MigrationWriterImportsTests.test_unregister_serializer_cleans_up migrations.test_writer_llm._InjectingSerializer.__init__ migrations.test_writer_llm._InjectingSerializer.serialize
+coverage json -o coverage.json
+: '>>>>> End Test Output'

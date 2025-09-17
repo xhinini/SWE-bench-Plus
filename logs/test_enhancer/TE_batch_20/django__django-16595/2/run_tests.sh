@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_optimizer_llm.test_regression_alter_alter_field_custom_app_label migrations.test_optimizer_llm.test_regression_alter_then_rename_moves_alter_to_new_name_when_db_column_none migrations.test_optimizer_llm.test_regression_alterfields_case_insensitive_names_collapse migrations.test_optimizer_llm.test_regression_alterfields_different_models_do_not_collapse migrations.test_optimizer_llm.test_regression_alterfields_different_names_do_not_collapse migrations.test_optimizer_llm.test_regression_alterfields_preserve_default_false_collapses migrations.test_optimizer_llm.test_regression_alterfields_with_different_defaults_keep_last migrations.test_optimizer_llm.test_regression_multiple_alterfields_with_help_and_default_collapses migrations.test_optimizer_llm.test_regression_three_alterfields_collapses_to_last_custom_app_label migrations.test_optimizer_llm.test_regression_three_alterfields_mixed_case_and_preserve_default
+coverage json -o coverage.json
+: '>>>>> End Test Output'

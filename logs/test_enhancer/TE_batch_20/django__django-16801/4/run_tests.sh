@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 model_fields.test_imagefield_llm.ImageFieldNoDimensionsAdditionalTests.test_assign_file_instance_opens_file model_fields.test_imagefield_llm.ImageFieldNoDimensionsAdditionalTests.test_assign_on_instance_from_db_opens model_fields.test_imagefield_llm.ImageFieldNoDimensionsAdditionalTests.test_assign_then_clear_resets_was_opened model_fields.test_imagefield_llm.ImageFieldNoDimensionsAdditionalTests.test_assignment_opens_file_on_set model_fields.test_imagefield_llm.ImageFieldNoDimensionsAdditionalTests.test_assignment_via_create_and_update_opens model_fields.test_imagefield_llm.ImageFieldNoDimensionsAdditionalTests.test_constructor_opens_file_on_init model_fields.test_imagefield_llm.ImageFieldNoDimensionsAdditionalTests.test_create_opens_file_on_create model_fields.test_imagefield_llm.ImageFieldNoDimensionsAdditionalTests.test_descriptor_behavior_on_set_opens model_fields.test_imagefield_llm.ImageFieldNoDimensionsAdditionalTests.test_multiple_assignments_open_each_time model_fields.test_imagefield_llm.ImageFieldNoDimensionsAdditionalTests.test_reassign_triggers_open
+coverage json -o coverage.json
+: '>>>>> End Test Output'

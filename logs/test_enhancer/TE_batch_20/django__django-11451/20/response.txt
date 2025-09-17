@@ -1,0 +1,203 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that ModelBackend.authenticate short-circuits when credentials are incomplete (username is None and/or password is None). They assert that no database lookups or password-hashing operations occur when credentials are missing, ensure that username lookup via the custom USERNAME_FIELD works, and confirm that empty-string usernames are treated as valid (i.e., not treated as None).
+test_code: |
+  from unittest import mock
+
+  from django.contrib.auth import authenticate, get_user_model
+  from django.contrib.auth.backends import ModelBackend
+  from django.test import TestCase, override_settings
+
+  from .models import CustomUser  # local test models module
+
+  # A counting hasher defined in this module so tests can reference it by path.
+  class CountingMD5PasswordHasher:
+      """
+      Minimal hasher stub compatible with Django's hasher API for counting
+      encode() invocations.
+      """
+      algorithm = "counting-md5"
+      calls = 0
+
+      def salt(self):
+          return "salt"
+
+      def encode(self, password, salt):
+          type(self).calls += 1
+          # Return something that looks like a hashed password.
+          return "%s$%s$%s" % (self.algorithm, salt, password or "")
+
+      def verify(self, password, encoded):
+          return encoded == self.encode(password, self.salt())
+
+      def must_update(self, encoded):
+          return False
+
+      def harden_runtime(self, password, encoded):
+          pass
+
+
+  class AuthenticateIncompleteCredentialsTests(TestCase):
+      def setUp(self):
+          # ensure a normal user exists for positive authentication tests
+          self.UserModel = get_user_model()
+          if hasattr(self.UserModel._default_manager, "create_user"):
+              # username field varies across models; use USERNAME_FIELD
+              kwargs = {
+                  self.UserModel.USERNAME_FIELD: "regression_user",
+                  "password": "secret",
+              }
+              # create_user may accept email/username differently; use manager create_user if available
+              try:
+                  self.user = self.UserModel._default_manager.create_user(**kwargs)
+              except TypeError:
+                  # fallback if signature differs
+                  self.user = self.UserModel._default_manager.create_user("regression_user", None, "secret")
+
+      @override_settings(PASSWORD_HASHERS=['auth_tests.test_auth_backends_regressions.CountingMD5PasswordHasher'])
+      def test_no_credentials_performs_no_db_queries_and_no_hashing(self):
+          """
+          Calling authenticate() with no credentials should do nothing:
+          no DB queries and no hasher calls.
+          """
+          CountingMD5PasswordHasher.calls = 0
+          backend = ModelBackend()
+          with self.assertNumQueries(0):
+              result = backend.authenticate(None)  # no username, no password
+          self.assertIsNone(result)
+          self.assertEqual(CountingMD5PasswordHasher.calls, 0)
+
+      def test_username_none_and_password_none_does_not_lookup_user(self):
+          """
+          If username and password are both None, get_by_natural_key should not be called.
+          """
+          backend = ModelBackend()
+          manager = self.UserModel._default_manager
+          with mock.patch.object(manager, 'get_by_natural_key', side_effect=AssertionError("Lookup should not be called")):
+              # Should not raise
+              result = backend.authenticate(None, username=None, password=None)
+          self.assertIsNone(result)
+
+      def test_username_provided_but_password_none_skips_and_no_hash(self):
+          """
+          If username is provided but password is None, authentication should short-circuit
+          without calling password hashers or doing DB lookups.
+          """
+          CountingMD5PasswordHasher.calls = 0
+          backend = ModelBackend()
+          manager = self.UserModel._default_manager
+          # Ensure lookup is not invoked
+          with mock.patch.object(manager, 'get_by_natural_key', side_effect=AssertionError("Lookup should not be called")):
+              with self.assertNumQueries(0):
+                  result = backend.authenticate(None, username=getattr(self.user, self.UserModel.USERNAME_FIELD), password=None)
+          self.assertIsNone(result)
+          self.assertEqual(CountingMD5PasswordHasher.calls, 0)
+
+      def test_username_none_but_password_provided_skips_and_no_hash(self):
+          """
+          If username is None but password provided, authentication should short-circuit
+          and not perform DB or hasher work.
+          """
+          CountingMD5PasswordHasher.calls = 0
+          backend = ModelBackend()
+          manager = self.UserModel._default_manager
+          with mock.patch.object(manager, 'get_by_natural_key', side_effect=AssertionError("Lookup should not be called")):
+              with self.assertNumQueries(0):
+                  result = backend.authenticate(None, username=None, password="somepass")
+          self.assertIsNone(result)
+          self.assertEqual(CountingMD5PasswordHasher.calls, 0)
+
+      @override_settings(AUTH_USER_MODEL='auth_tests.CustomUser',
+                         PASSWORD_HASHERS=['auth_tests.test_auth_backends_regressions.CountingMD5PasswordHasher'])
+      def test_username_field_in_kwargs_with_missing_password_no_db_or_hash(self):
+          """
+          For a custom user model that uses a different USERNAME_FIELD (e.g. email),
+          passing that field without a password should not trigger DB lookups or hashing.
+          """
+          # Create a user for this custom model.
+          UserModel = get_user_model()
+          email_field = UserModel.USERNAME_FIELD
+          create_kwargs = {email_field: "custo@example.com", "password": "pwd"}
+          UserModel._default_manager.create_user(**create_kwargs)
+
+          CountingMD5PasswordHasher.calls = 0
+          backend = ModelBackend()
+          manager = UserModel._default_manager
+          with mock.patch.object(manager, 'get_by_natural_key', side_effect=AssertionError("Lookup should not be called")):
+              with self.assertNumQueries(0):
+                  # Pass the custom username field but no password
+                  result = backend.authenticate(None, **{email_field: "custo@example.com"}, password=None)
+          self.assertIsNone(result)
+          self.assertEqual(CountingMD5PasswordHasher.calls, 0)
+
+      def test_set_password_not_called_when_credentials_incomplete_and_user_missing(self):
+          """
+          When credentials are incomplete and the backend would otherwise call
+          set_password in the "user does not exist" branch, that should be skipped.
+          """
+          backend = ModelBackend()
+          UserModel = get_user_model()
+          manager = UserModel._default_manager
+
+          # Force get_by_natural_key to not be called by the earlier short-circuit.
+          with mock.patch.object(manager, 'get_by_natural_key', side_effect=AssertionError("Lookup should not be called")):
+              # Also patch set_password on instances to ensure it's not invoked
+              with mock.patch.object(UserModel, 'set_password', side_effect=AssertionError("set_password should not be called")):
+                  result = backend.authenticate(None, username=None, password=None)
+          self.assertIsNone(result)
+
+      def test_empty_string_username_with_password_triggers_lookup(self):
+          """
+          An empty string username is not the same as None and should cause the
+          backend to attempt a lookup (i.e., No short-circuit).
+          """
+          backend = ModelBackend()
+          manager = self.UserModel._default_manager
+          called = {}
+
+          def fake_get_by_natural_key(value):
+              called['value'] = value
+              raise self.UserModel.DoesNotExist
+
+          with mock.patch.object(manager, 'get_by_natural_key', side_effect=fake_get_by_natural_key):
+              # Provide empty-string username but a password, must attempt lookup
+              with self.assertNumQueries(0):
+                  # The lookup is mocked, so no DB queries will occur in practice; we are asserting that
+                  # the function path tries to call get_by_natural_key (captured by our fake).
+                  result = backend.authenticate(None, username='', password='somepass')
+          self.assertEqual(called.get('value'), '')
+          self.assertIsNone(result)
+
+      @override_settings(AUTH_USER_MODEL='auth_tests.CustomUser')
+      def test_authenticate_with_custom_username_field_and_password_returns_user(self):
+          """
+          When the USERNAME_FIELD is provided in kwargs together with a valid password,
+          authenticate should succeed and return the user.
+          """
+          UserModel = get_user_model()
+          username_field = UserModel.USERNAME_FIELD
+          # create a custom user using the model's manager
+          creds = {username_field: "cu@example.com", "password": "pw"}
+          try:
+              user = UserModel._default_manager.create_user(**creds)
+          except TypeError:
+              # fallback positional create_user signature
+              user = UserModel._default_manager.create_user("cu@example.com", None, "pw")
+
+          # Authenticate using the custom field name
+          authenticated = authenticate(**{username_field: creds[username_field], 'password': creds['password']})
+          self.assertEqual(authenticated, user)
+
+      def test_no_username_field_and_password_present_skips_and_no_db(self):
+          """
+          If neither 'username' nor the model USERNAME_FIELD is provided, but a password
+          is present, authenticate should short-circuit (no DB lookups).
+          """
+          backend = ModelBackend()
+          manager = self.UserModel._default_manager
+          with mock.patch.object(manager, 'get_by_natural_key', side_effect=AssertionError("Lookup should not be called")):
+              with self.assertNumQueries(0):
+                  result = backend.authenticate(None, password="pw")
+          self.assertIsNone(result)
+new_imports_code: |
+  # No additional imports required outside of the test module.

@@ -1,0 +1,229 @@
+import json
+from requests.exceptions import TooManyRedirects
+import json
+import types
+from requests.exceptions import TooManyRedirects
+
+import pytest
+
+import sphinx.builders.linkcheck as linkcheck
+
+# Helper response used to simulate requests.Response-ish objects
+class DummyResponse:
+    def __init__(self, url, history=None, content_chunks=None):
+        self.url = url
+        # history expects objects with status_code attribute
+        self.history = history or []
+        self._content = content_chunks or [b'']
+
+    def raise_for_status(self):
+        # do nothing -> means status is OK for our simulated responses
+        return None
+
+    def iter_content(self, chunk_size=4096, decode_unicode=False):
+        for chunk in self._content:
+            if decode_unicode and isinstance(chunk, bytes):
+                yield chunk.decode()
+            else:
+                yield chunk
+
+def _find_row_for_uri(outjson_path, uri_prefix):
+    # output.json may contain multiple JSON lines; return first row whose uri starts with uri_prefix
+    with open(outjson_path, 'r') as fp:
+        for line in fp:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get("uri", "").startswith(uri_prefix):
+                return row
+    return None
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_head_toomanyredirects_falls_back_to_get_and_marks_working(monkeypatch, app):
+    # head raises TooManyRedirects; get returns a working page
+    def head(url, **kwargs):
+        raise TooManyRedirects("too many redirects for HEAD")
+
+    def get(url, **kwargs):
+        return DummyResponse(url)
+
+    monkeypatch.setattr(linkcheck.requests, 'head', head)
+    monkeypatch.setattr(linkcheck.requests, 'get', get)
+
+    app.builder.build_all()
+    row = _find_row_for_uri(app.outdir / 'output.json', 'http://localhost:7777/')
+    assert row is not None
+    assert row['status'] == 'working'
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_head_toomanyredirects_then_get_reports_redirect_code_301(monkeypatch, app):
+    # head raises TooManyRedirects; get follows and ends up at a different url, with history 301
+    def head(url, **kwargs):
+        raise TooManyRedirects("too many redirects for HEAD")
+
+    history_item = types.SimpleNamespace(status_code=301)
+    def get(url, **kwargs):
+        return DummyResponse('http://localhost:7777/?redirected=1', history=[history_item])
+
+    monkeypatch.setattr(linkcheck.requests, 'head', head)
+    monkeypatch.setattr(linkcheck.requests, 'get', get)
+
+    app.builder.build_all()
+    row = _find_row_for_uri(app.outdir / 'output.json', 'http://localhost:7777/')
+    assert row is not None
+    assert row['status'] == 'redirected'
+    assert row['code'] == 301
+    assert row['info'] == 'http://localhost:7777/?redirected=1'
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_head_toomanyredirects_then_get_reports_unknown_redirect_code(monkeypatch, app):
+    # head raises TooManyRedirects; get returns a redirect but with an unknown status code
+    def head(url, **kwargs):
+        raise TooManyRedirects("too many redirects for HEAD")
+
+    history_item = types.SimpleNamespace(status_code=999)
+    def get(url, **kwargs):
+        return DummyResponse('http://localhost:7777/?new', history=[history_item])
+
+    monkeypatch.setattr(linkcheck.requests, 'head', head)
+    monkeypatch.setattr(linkcheck.requests, 'get', get)
+
+    app.builder.build_all()
+    row = _find_row_for_uri(app.outdir / 'output.json', 'http://localhost:7777/')
+    assert row is not None
+    assert row['status'] == 'redirected'
+    # the builder should add a 'text' field for redirected entries
+    assert row.get('text') == 'with unknown code'
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True,
+                   confoverrides={'linkcheck_retries': 2})
+def test_head_first_toomanyredirects_then_get_succeeds_on_retry(monkeypatch, app):
+    # Simulate HEAD raising TooManyRedirects on first call and succeeding on the second attempt.
+    call_count = {'n': 0}
+
+    def head(url, **kwargs):
+        call_count['n'] += 1
+        if call_count['n'] == 1:
+            raise TooManyRedirects("first call too many")
+        return DummyResponse(url)
+
+    def get(url, **kwargs):
+        return DummyResponse(url)
+
+    monkeypatch.setattr(linkcheck.requests, 'head', head)
+    monkeypatch.setattr(linkcheck.requests, 'get', get)
+
+    app.builder.build_all()
+    row = _find_row_for_uri(app.outdir / 'output.json', 'http://localhost:7777/')
+    assert row is not None
+    # eventually should succeed (working)
+    assert row['status'] == 'working'
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True,
+                   confoverrides={'linkcheck_request_headers': {
+                       "http://localhost:7777/": {"X-Test": "1"},
+                   }})
+def test_request_headers_present_when_head_toomanyredirects(monkeypatch, app):
+    # head raises TooManyRedirects, ensure get() receives headers determined by config
+    captured = {}
+    def head(url, **kwargs):
+        raise TooManyRedirects("head too many")
+
+    def get(url, **kwargs):
+        captured['kwargs'] = kwargs
+        return DummyResponse(url)
+
+    monkeypatch.setattr(linkcheck.requests, 'head', head)
+    monkeypatch.setattr(linkcheck.requests, 'get', get)
+
+    app.builder.build_all()
+    assert 'kwargs' in captured
+    # headers should include our custom header and the DEFAULT Accept header
+    headers = captured['kwargs'].get('headers', {})
+    assert headers.get('X-Test') == '1'
+    assert 'Accept' in headers
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_get_called_with_stream_true_after_head_toomanyredirects(monkeypatch, app):
+    # head raises TooManyRedirects; ensure fallback GET is called with stream=True
+    captured = {}
+    def head(url, **kwargs):
+        raise TooManyRedirects("too many")
+
+    def get(url, **kwargs):
+        captured.update(kwargs)
+        return DummyResponse(url)
+
+    monkeypatch.setattr(linkcheck.requests, 'head', head)
+    monkeypatch.setattr(linkcheck.requests, 'get', get)
+
+    app.builder.build_all()
+    assert 'stream' in captured and captured['stream'] is True
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver-https', freshenv=True,
+                   confoverrides={'linkcheck_anchors': True})
+def test_anchor_check_uses_get_even_if_head_would_toomanyredirect(monkeypatch, app):
+    # For URIs with anchors, the builder must use GET and search the document.
+    def head(url, **kwargs):
+        # even if HEAD would fail, anchor checking forces GET
+        raise TooManyRedirects("head too many")
+
+    # provide content including anchor "anchor"
+    def get(url, **kwargs):
+        return DummyResponse(url, content_chunks=[b'<div id="anchor">found</div>'])
+
+    monkeypatch.setattr(linkcheck.requests, 'head', head)
+    monkeypatch.setattr(linkcheck.requests, 'get', get)
+
+    # Use the anchor testroot that includes a link with #anchor
+    # The decorator above selected linkcheck-localserver-https; that root contains an anchor link.
+    # Also disable TLS verification so our monkeypatched get is used without SSL issues.
+    app.config.tls_verify = False
+    app.builder.build_all()
+    # find any entry that has '#anchor' in uri
+    with open(app.outdir / 'output.json') as fp:
+        found = False
+        for line in fp:
+            row = json.loads(line)
+            if '#anchor' in row.get('uri', ''):
+                assert row['status'] == 'working'
+                found = True
+                break
+    assert found, "anchor link row not found in output.json"
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_redirect_with_no_history_has_code_zero_after_head_toomanyredirects(monkeypatch, app):
+    # head raises TooManyRedirects; GET returns a different final URL but no history -> code 0
+    def head(url, **kwargs):
+        raise TooManyRedirects("too many")
+
+    def get(url, **kwargs):
+        return DummyResponse('http://localhost:7777/new-location', history=[])
+
+    monkeypatch.setattr(linkcheck.requests, 'head', head)
+    monkeypatch.setattr(linkcheck.requests, 'get', get)
+
+    app.builder.build_all()
+    row = _find_row_for_uri(app.outdir / 'output.json', 'http://localhost:7777/')
+    assert row is not None
+    assert row['status'] == 'redirected'
+    assert row['code'] == 0
+    assert row['info'] == 'http://localhost:7777/new-location'
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True,
+                   confoverrides={'linkcheck_auth': [(r'^http://localhost:7777/', ('u','p'))]})
+def test_auth_info_passed_to_get_after_head_toomanyredirects(monkeypatch, app):
+    # head raises TooManyRedirects; ensure auth tuple is passed through to GET
+    captured = {}
+    def head(url, **kwargs):
+        raise TooManyRedirects("head too many")
+
+    def get(url, **kwargs):
+        captured['auth'] = kwargs.get('auth')
+        return DummyResponse(url)
+
+    monkeypatch.setattr(linkcheck.requests, 'head', head)
+    monkeypatch.setattr(linkcheck.requests, 'get', get)
+
+    app.builder.build_all()
+    assert captured.get('auth') == ('u', 'p')

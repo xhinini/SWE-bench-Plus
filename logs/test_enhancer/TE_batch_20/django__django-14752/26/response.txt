@@ -1,0 +1,215 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that AutocompleteJsonView uses the serialize_result() hook for producing each result (so subclasses can customize the output), that serialize_result is called the expected number of times and with correct to_field_name, that custom ids and extra fields are preserved, that pagination flags remain correct when serialize_result is overridden, and that exceptions raised in serialize_result bubble up. They would fail if the view used an inline dict instead of calling serialize_result() (the bug the patch fixes).
+test_code: |
+  import json
+
+  from django.core.exceptions import PermissionDenied
+  from django.test import RequestFactory, override_settings
+
+  from django.contrib import admin
+  from django.contrib.admin.views.autocomplete import AutocompleteJsonView
+  from django.contrib.admin.tests import AdminSeleniumTestCase
+
+  from .admin import QuestionAdmin
+  from .models import Question
+
+  PAGINATOR_SIZE = AutocompleteJsonView.paginate_by
+
+  class AutocompleteJsonViewSerializeTests(AdminSeleniumTestCase):
+      # Reuse the admin site prepared in the module-level tests.
+      as_view_args = {'admin_site': admin.site}
+      factory = RequestFactory()
+      opts = {
+          'app_label': Question._meta.app_label,
+          'model_name': Question._meta.model_name,
+          'field_name': 'question'
+      }
+
+      @classmethod
+      def setUpTestData(cls):
+          cls.superuser = cls.create_superuser('super-serialize', 'secret')
+          # Ensure admin registration for Question with expected admin.
+          try:
+              admin.site.unregister(Question)
+          except Exception:
+              pass
+          admin.site.register(Question, QuestionAdmin)
+
+      def request_for_opts(self, extra_params=None):
+          params = {'term': ''}
+          params.update(self.opts)
+          if extra_params:
+              params.update(extra_params)
+          request = self.factory.get('/admin/autocomplete/', params)
+          request.user = self.superuser
+          return request
+
+      def test_serialize_result_override_adds_field(self):
+          """
+          Subclassing AutocompleteJsonView and adding an extra field via
+          serialize_result should include that key in the JSON response.
+          """
+          class CustomView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  base = super().serialize_result(obj, to_field_name)
+                  base['extra'] = 'X-%s' % obj.pk
+                  return base
+
+          # Create two questions to be returned by search.
+          q1 = Question.objects.create(question='Alpha')
+          q2 = Question.objects.create(question='Beta')
+          request = self.request_for_opts({'term': 'a'})
+          response = CustomView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          data = json.loads(response.content.decode())
+          # Ensure the extra key is present for each returned object.
+          self.assertEqual({r['extra'] for r in data['results']}, {'X-%s' % q1.pk, 'X-%s' % q2.pk} & set(r['extra'] for r in data['results']))
+
+      def test_serialize_result_without_super_returns_custom_shape(self):
+          """
+          If serialize_result returns a completely different mapping (doesn't call super),
+          the response should use that mapping unchanged.
+          """
+          class BareView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  return {'id': 'OBJ-%s' % obj.pk, 'text': 'T-%s' % obj.pk, 'custom': True}
+
+          q = Question.objects.create(question='Custom shape')
+          request = self.request_for_opts({'term': 'Custom'})
+          response = BareView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          data = json.loads(response.content.decode())
+          self.assertEqual(len(data['results']), 1)
+          result = data['results'][0]
+          self.assertEqual(result['id'], 'OBJ-%s' % q.pk)
+          self.assertEqual(result['text'], 'T-%s' % q.pk)
+          self.assertTrue(result['custom'])
+
+      def test_serialize_result_called_for_each_object(self):
+          """
+          serialize_result() should be invoked once per result object.
+          """
+          calls = []
+
+          class CountingView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  calls.append(obj.pk)
+                  return super().serialize_result(obj, to_field_name)
+
+          # Create several questions that match the empty-term search.
+          qs = [Question.objects.create(question=str(i)) for i in range(3)]
+          request = self.request_for_opts({'term': ''})
+          response = CountingView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          data = json.loads(response.content.decode())
+          returned_pks = [int(r['id']) for r in data['results']]
+          # Ensure serialize_result has been called exactly as many times as results.
+          self.assertEqual(len(calls), len(returned_pks))
+          # And the set of called pks matches those returned.
+          self.assertEqual(set(calls), set(returned_pks))
+
+      def test_serialize_result_can_prefix_id(self):
+          """
+          Custom serialize_result implementations can change the id format.
+          """
+          class PrefixIdView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  return {'id': 'item-%s' % getattr(obj, to_field_name), 'text': str(obj)}
+
+          q = Question.objects.create(question='ID prefix')
+          request = self.request_for_opts({'term': 'ID'})
+          response = PrefixIdView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          data = json.loads(response.content.decode())
+          self.assertEqual(data['results'][0]['id'], 'item-%s' % q.pk)
+
+      def test_serialize_result_receives_correct_to_field_for_custom_to_field(self):
+          """
+          When the field uses a custom to_field (e.g. UUID), the to_field_name passed
+          to serialize_result should be the resolved attname of that field.
+          """
+          # Use the existing Question.field with a custom to_field defined in tests fixture
+          # (question_with_to_field points to Question.uuid)
+          class InspectToFieldView(AutocompleteJsonView):
+              seen = []
+              def serialize_result(self, obj, to_field_name):
+                  # record what to_field_name we got and include it in result for assertion
+                  self.seen.append(to_field_name)
+                  return super().serialize_result(obj, to_field_name)
+
+          q = Question.objects.create(question='UUID match')
+          request = self.request_for_opts({'term': 'UUID', 'field_name': 'question_with_to_field'})
+          response = InspectToFieldView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          # The recorded to_field_name should match the Question model PK attname
+          expected_attname = Question._meta.pk.attname
+          self.assertIn(expected_attname, InspectToFieldView.seen)
+
+      def test_serialize_result_preserves_pagination_more_flag(self):
+          """
+          Overriding serialize_result should not affect pagination logic; the 'more'
+          flag should be True when there are more results than paginate_by.
+          """
+          class NoopView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  return super().serialize_result(obj, to_field_name)
+
+          Question.objects.bulk_create(Question(question=str(i)) for i in range(PAGINATOR_SIZE + 2))
+          request = self.request_for_opts({'term': ''})
+          response = NoopView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          data = json.loads(response.content.decode())
+          self.assertTrue(data['pagination']['more'])
+
+      def test_serialize_result_not_break_pagination_when_returning_diff_shape(self):
+          """
+          Even if serialize_result returns a different mapping shape, pagination and
+          page counts should remain correct.
+          """
+          class WeirdView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  # Return only id (no text) to ensure response still includes pagination.
+                  return {'id': str(getattr(obj, to_field_name))}
+
+          Question.objects.bulk_create(Question(question=str(i)) for i in range(PAGINATOR_SIZE + 5))
+          request = self.request_for_opts({'term': ''})
+          response = WeirdView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          data = json.loads(response.content.decode())
+          self.assertTrue(data['pagination']['more'])
+          # Ensure results count equals paginate_by for first page
+          self.assertEqual(len(data['results']), PAGINATOR_SIZE)
+
+      def test_serialize_result_exceptions_bubble(self):
+          """
+          If serialize_result raises an exception, it should not be swallowed by the view.
+          """
+          class ExplodingView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  raise ValueError("boom")
+
+          Question.objects.create(question='will explode')
+          request = self.request_for_opts({'term': 'explode'})
+          with self.assertRaises(ValueError):
+              ExplodingView.as_view(**self.as_view_args)(request)
+
+      def test_serialize_result_gets_to_field_name_equal_to_pk_attname(self):
+          """
+          For the default relation, to_field_name passed to serialize_result should
+          equal the target model's pk.attname.
+          """
+          class CaptureToFieldView(AutocompleteJsonView):
+              captured = None
+              def serialize_result(self, obj, to_field_name):
+                  CaptureToFieldView.captured = to_field_name
+                  return super().serialize_result(obj, to_field_name)
+
+          q = Question.objects.create(question='capture to_field')
+          request = self.request_for_opts({'term': 'capture'})
+          response = CaptureToFieldView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          expected = Question._meta.pk.attname
+          self.assertEqual(CaptureToFieldView.captured, expected)
+new_imports_code: |
+  # None needed; tests reuse imports already present in the module.

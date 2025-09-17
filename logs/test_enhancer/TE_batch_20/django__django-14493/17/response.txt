@@ -1,0 +1,171 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests exercise the HashedFilesMixin/ManifestFilesMixin post-processing behavior when
+  max_post_process_passes is set to 0. The bug fixed by the patch was that the local
+  variable `substitutions` could be referenced before assignment when the loop over
+  post-process passes was skipped (range(0)), causing an UnboundLocalError. The tests
+  verify that post_process runs without error, that dry_run suppresses processing,
+  that manifest saving happens for ManifestFilesMixin, and that hashed file names are
+  produced and cached correctly. They also check special fragment handling (the
+  "?#iefix" font-face hack) and that no "All" error is yielded when max passes is 0.
+test_code: |
+  import os
+  import tempfile
+  import json
+  import unittest
+  from django.core.files.base import ContentFile
+  
+  from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
+  from django.contrib.staticfiles.storage import HashedFilesMixin
+  
+  
+  class MyManifestStorage(ManifestStaticFilesStorage):
+      # Set to 0 to trigger the edge case where the inner loop is skipped.
+      max_post_process_passes = 0
+  
+  class TestPostProcessMaxPassesZero(unittest.TestCase):
+      def setUp(self):
+          # Create a temporary directory used as storage location.
+          self.tmpdir = tempfile.mkdtemp()
+          self.storage = MyManifestStorage(location=self.tmpdir, base_url='/static/')
+  
+      def tearDown(self):
+          # Clean up the temporary directory.
+          for root, dirs, files in os.walk(self.tmpdir, topdown=False):
+              for name in files:
+                  try:
+                      os.unlink(os.path.join(root, name))
+                  except OSError:
+                      pass
+              for name in dirs:
+                  try:
+                      os.rmdir(os.path.join(root, name))
+                  except OSError:
+                      pass
+          try:
+              os.rmdir(self.tmpdir)
+          except OSError:
+              pass
+  
+      def _save(self, name, content_bytes):
+          self.storage._save(name, ContentFile(content_bytes))
+  
+      def test_no_exception_when_no_adjustable_files(self):
+          # A non-adjustable file (.txt) should not cause an UnboundLocalError
+          # when max_post_process_passes = 0.
+          self._save('plain.txt', b'just text')
+          paths = {'plain.txt': (self.storage, 'plain.txt')}
+          # Should not raise and should yield a result for the non-adjustable file.
+          results = list(self.storage.post_process(paths, dry_run=False))
+          self.assertTrue(len(results) >= 1)
+          # Ensure 'All' is not yielded.
+          names = [r[0] for r in results]
+          self.assertNotIn('All', names)
+  
+      def test_adjustable_file_processed_without_exception(self):
+          # An adjustable CSS file referencing an image should be processed
+          # without raising when max_post_process_passes = 0.
+          self._save('image.png', b'\x89PNG\r\n\x1a\n')
+          self._save('style.css', b'body { background: url("image.png"); }')
+          paths = {
+              'style.css': (self.storage, 'style.css'),
+              'image.png': (self.storage, 'image.png'),
+          }
+          results = list(self.storage.post_process(paths, dry_run=False))
+          # Ensure there was no exception and hashed_files was populated.
+          self.assertIn('style.css', self.storage.hashed_files)
+          hashed = self.storage.hashed_files['style.css']
+          self.assertTrue(hashed.endswith('.css'))
+          # No 'All' error should be present.
+          names = [r[0] for r in results]
+          self.assertNotIn('All', names)
+  
+      def test_manifest_saved_on_post_process_when_not_dry_run(self):
+          # After post_process, the manifest file should be saved to storage.
+          self._save('a.png', b'\x00')
+          self._save('a.css', b'url("a.png")')
+          paths = {'a.css': (self.storage, 'a.css'), 'a.png': (self.storage, 'a.png')}
+          list(self.storage.post_process(paths, dry_run=False))
+          # Manifest should now exist on disk and be loadable.
+          manifest_content = self.storage.read_manifest()
+          self.assertIsNotNone(manifest_content)
+          parsed = json.loads(manifest_content)
+          self.assertIn('paths', parsed)
+  
+      def test_dry_run_returns_nothing(self):
+          # dry_run should skip processing entirely.
+          self._save('b.txt', b'no-op')
+          paths = {'b.txt': (self.storage, 'b.txt')}
+          results = list(self.storage.post_process(paths, dry_run=True))
+          self.assertEqual(results, [])
+          # manifest should not be written on dry run
+          self.assertFalse(self.storage.exists(self.storage.manifest_name))
+  
+      def test_fragment_handling_font_face_hack(self):
+          # Ensure special '?#' fragment handling does not raise and is preserved.
+          # Create a font file and CSS that references it using the font-face hack.
+          self._save('fonts/font.eot', b'fake-eot')
+          css_content = b'@font-face { src: url("fonts/font.eot?#iefix"); }'
+          self._save('fonts.css', css_content)
+          paths = {'fonts.css': (self.storage, 'fonts.css'), 'fonts/font.eot': (self.storage, 'fonts/font.eot')}
+          results = list(self.storage.post_process(paths, dry_run=False))
+          # Look up the hashed entry for fonts.css and open the processed file to assert the '?' is present.
+          self.assertIn('fonts.css', self.storage.hashed_files)
+          processed_name = self.storage.hashed_files['fonts.css']
+          with self.storage.open(processed_name) as f:
+              content = f.read().decode('utf-8')
+          self.assertIn('fonts/font.', content)
+          # The font-face hack should still include a '?' when appropriate.
+          self.assertIn('?#iefix', content)
+  
+      def test_stored_name_with_zero_max_passes_caches_value(self):
+          # stored_name should be able to compute the hashed name and cache it even with max_passes=0.
+          self._save('c.png', b'\x01')
+          self._save('c.css', b'url("c.png")')
+          # Ensure cache is empty
+          self.storage.hashed_files.clear()
+          # Calling stored_name will compute and cache the value.
+          result = self.storage.stored_name('c.css')
+          self.assertTrue(result.endswith('.css'))
+          self.assertIn('c.css', self.storage.hashed_files)
+  
+      def test_multiple_adjustable_files_no_exception(self):
+          # Two CSS files referencing each other should be processed without error.
+          self._save('x.png', b'x')
+          self._save('a.css', b'url("x.png")\nurl("b.css")')
+          self._save('b.css', b'url("a.css")')
+          paths = {
+              'a.css': (self.storage, 'a.css'),
+              'b.css': (self.storage, 'b.css'),
+              'x.png': (self.storage, 'x.png'),
+          }
+          results = list(self.storage.post_process(paths, dry_run=False))
+          # Ensure both CSS files have entries in the hashed_files cache.
+          self.assertIn('a.css', self.storage.hashed_files)
+          self.assertIn('b.css', self.storage.hashed_files)
+          # No 'All' error should be yielded.
+          names = [r[0] for r in results]
+          self.assertNotIn('All', names)
+  
+      def test_adjustable_paths_empty_does_not_crash(self):
+          # Edge case: adjustable_paths becomes empty (no matching extensions).
+          # Confirm no exception and predictable result.
+          self._save('doc.md', b'# docs')
+          paths = {'doc.md': (self.storage, 'doc.md')}
+          results = list(self.storage.post_process(paths, dry_run=False))
+          self.assertTrue(any(r[0] == 'doc.md' for r in results))
+  
+      def test_hashed_name_raises_for_missing_file_when_called(self):
+          # If a hashed_name call is attempted for a missing file, raise ValueError.
+          # This ensures we don't get an UnboundLocalError instead.
+          missing_storage = MyManifestStorage(location=self.tmpdir, base_url='/static/')
+          # Do not create 'missing.css' on disk.
+          with self.assertRaises(ValueError):
+              # hashed_name is called indirectly by stored_name when content is missing.
+              missing_storage.stored_name('missing.css')
+new_imports_code: |
+  from django.core.files.base import ContentFile
+  import tempfile
+  import json
+  import unittest

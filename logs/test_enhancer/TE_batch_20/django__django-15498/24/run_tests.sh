@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 view_tests.tests.test_static_llm.StaticMalformedHeaderTests.test_invalid_if_modified_since_leading_semicolon_direct view_tests.tests.test_static_llm.StaticMalformedHeaderTests.test_invalid_if_modified_since_leading_semicolon_subdir_via_view view_tests.tests.test_static_llm.StaticMalformedHeaderTests.test_invalid_if_modified_since_leading_semicolon_via_view view_tests.tests.test_static_llm.StaticMalformedHeaderTests.test_invalid_if_modified_since_semicolon_non_digit_length_via_view view_tests.tests.test_static_llm.StaticMalformedHeaderTests.test_invalid_if_modified_since_semicolon_only_via_view view_tests.tests.test_static_llm.StaticMalformedHeaderTests.test_invalid_if_modified_since_semicolon_with_garbage_via_view view_tests.tests.test_static_llm.StaticUtilsMalformedHeaderTests.test_was_modified_since_leading_semicolon view_tests.tests.test_static_llm.StaticUtilsMalformedHeaderTests.test_was_modified_since_semicolon_non_digit_length view_tests.tests.test_static_llm.StaticUtilsMalformedHeaderTests.test_was_modified_since_semicolon_only view_tests.tests.test_static_llm.StaticUtilsMalformedHeaderTests.test_was_modified_since_semicolon_with_garbage
+coverage json -o coverage.json
+: '>>>>> End Test Output'

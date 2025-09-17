@@ -1,0 +1,117 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that RenameContentType writes to the correct database (the one associated with the provided schema_editor connection) and does not accidentally write to the default database. They cover forward and backward renames, missing content types (no-op), uniqueness-conflict handling (IntegrityError fallback), and whether the ContentType cache is cleared on success but not on conflict.
+test_code: |
+  from django.apps.registry import apps
+  from django.db import connections
+  from django.contrib.contenttypes import management as contenttypes_management
+  from django.contrib.contenttypes.models import ContentType
+  from django.test import TransactionTestCase
+  from unittest import mock
+  
+  
+  class RenameContentTypeDBTests(TransactionTestCase):
+      databases = {'default', 'other'}
+      available_apps = ['django.contrib.contenttypes']
+  
+      def test_rename_updates_other_db_only(self):
+          ContentType.objects.using('other').create(app_label='myapp', model='oldmodel')
+          # Confirm default DB doesn't have the content type initially
+          self.assertFalse(ContentType.objects.using('default').filter(app_label='myapp', model='oldmodel').exists())
+  
+          with connections['other'].schema_editor() as schema_editor:
+              op = contenttypes_management.RenameContentType('myapp', 'oldmodel', 'newmodel')
+              op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+  
+          # other DB must be updated
+          self.assertFalse(ContentType.objects.using('other').filter(app_label='myapp', model='oldmodel').exists())
+          self.assertTrue(ContentType.objects.using('other').filter(app_label='myapp', model='newmodel').exists())
+          # default DB must remain unchanged (no accidental write)
+          self.assertFalse(ContentType.objects.using('default').filter(app_label='myapp', model='newmodel').exists())
+  
+      def test_rename_updates_default_db_only(self):
+          ContentType.objects.using('default').create(app_label='myapp2', model='oldmodel2')
+          with connections['default'].schema_editor() as schema_editor:
+              op = contenttypes_management.RenameContentType('myapp2', 'oldmodel2', 'newmodel2')
+              op._rename(apps, schema_editor, 'oldmodel2', 'newmodel2')
+          self.assertTrue(ContentType.objects.using('default').filter(app_label='myapp2', model='newmodel2').exists())
+          self.assertFalse(ContentType.objects.using('other').filter(app_label='myapp2', model='newmodel2').exists())
+  
+      def test_rename_backward_other_db(self):
+          # Create the "new" model name and run rename_backward to revert it
+          ContentType.objects.using('other').create(app_label='myapp3', model='modelc')
+          with connections['other'].schema_editor() as schema_editor:
+              op = contenttypes_management.RenameContentType('myapp3', 'modelb', 'modelc')
+              op.rename_backward(apps, schema_editor)
+          self.assertTrue(ContentType.objects.using('other').filter(app_label='myapp3', model='modelb').exists())
+          self.assertFalse(ContentType.objects.using('default').filter(app_label='myapp3', model='modelb').exists())
+  
+      def test_rename_backward_default_db(self):
+          ContentType.objects.using('default').create(app_label='myapp4', model='m2')
+          with connections['default'].schema_editor() as schema_editor:
+              op = contenttypes_management.RenameContentType('myapp4', 'm1', 'm2')
+              op.rename_backward(apps, schema_editor)
+          self.assertTrue(ContentType.objects.using('default').filter(app_label='myapp4', model='m1').exists())
+  
+      def test_missing_content_type_other_db_noop(self):
+          # No content type created; operation should be a no-op and not create anything new
+          with connections['other'].schema_editor() as schema_editor:
+              op = contenttypes_management.RenameContentType('missingapp', 'doesnotexist', 'newname')
+              op._rename(apps, schema_editor, 'doesnotexist', 'newname')
+          self.assertFalse(ContentType.objects.using('other').filter(app_label='missingapp').exists())
+          self.assertFalse(ContentType.objects.using('default').filter(app_label='missingapp').exists())
+  
+      def test_missing_content_type_default_db_noop(self):
+          with connections['default'].schema_editor() as schema_editor:
+              op = contenttypes_management.RenameContentType('missingapp2', 'x', 'y')
+              op._rename(apps, schema_editor, 'x', 'y')
+          self.assertFalse(ContentType.objects.using('default').filter(app_label='missingapp2').exists())
+  
+      def test_conflict_other_db_leaves_both_intact(self):
+          # Create both the old and the target model names to force IntegrityError on save
+          ContentType.objects.using('other').create(app_label='conflictapp', model='alpha')
+          ContentType.objects.using('other').create(app_label='conflictapp', model='beta')
+          # Ensure default DB remains empty for this app
+          self.assertFalse(ContentType.objects.using('default').filter(app_label='conflictapp').exists())
+  
+          with connections['other'].schema_editor() as schema_editor:
+              op = contenttypes_management.RenameContentType('conflictapp', 'alpha', 'beta')
+              op._rename(apps, schema_editor, 'alpha', 'beta')
+  
+          # Both should still exist in other DB (rename should have been rolled back)
+          self.assertTrue(ContentType.objects.using('other').filter(app_label='conflictapp', model='alpha').exists())
+          self.assertTrue(ContentType.objects.using('other').filter(app_label='conflictapp', model='beta').exists())
+          # default DB unaffected
+          self.assertFalse(ContentType.objects.using('default').filter(app_label='conflictapp').exists())
+  
+      def test_conflict_default_db_leaves_both_intact(self):
+          ContentType.objects.using('default').create(app_label='conf2', model='a')
+          ContentType.objects.using('default').create(app_label='conf2', model='b')
+          with connections['default'].schema_editor() as schema_editor:
+              op = contenttypes_management.RenameContentType('conf2', 'a', 'b')
+              op._rename(apps, schema_editor, 'a', 'b')
+          self.assertTrue(ContentType.objects.using('default').filter(app_label='conf2', model='a').exists())
+          self.assertTrue(ContentType.objects.using('default').filter(app_label='conf2', model='b').exists())
+  
+      def test_clear_cache_called_on_success_other_db(self):
+          ContentType.objects.using('other').create(app_label='cacheapp', model='orig')
+          with mock.patch.object(ContentType.objects, 'clear_cache') as clear_cache_mock:
+              with connections['other'].schema_editor() as schema_editor:
+                  op = contenttypes_management.RenameContentType('cacheapp', 'orig', 'updated')
+                  op._rename(apps, schema_editor, 'orig', 'updated')
+              clear_cache_mock.assert_called_once()
+  
+      def test_clear_cache_not_called_on_conflict_other_db(self):
+          ContentType.objects.using('other').create(app_label='cacheconflict', model='x')
+          ContentType.objects.using('other').create(app_label='cacheconflict', model='y')
+          with mock.patch.object(ContentType.objects, 'clear_cache') as clear_cache_mock:
+              with connections['other'].schema_editor() as schema_editor:
+                  op = contenttypes_management.RenameContentType('cacheconflict', 'x', 'y')
+                  op._rename(apps, schema_editor, 'x', 'y')
+              clear_cache_mock.assert_not_called()
+new_imports_code: |
+  from django.db import connections
+  from django.contrib.contenttypes.models import ContentType
+  from django.contrib.contenttypes import management as contenttypes_management
+  from django.apps.registry import apps
+  from unittest import mock

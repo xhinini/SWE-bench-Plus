@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_auto_id_false_in_form_kwargs_does_not_override forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_auto_id_not_overridden_by_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_prefix_none_in_form_kwargs_does_not_override forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_prefix_not_overridden_by_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_renderer_none_in_form_kwargs_is_ignored forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_renderer_not_overridden_by_form_kwargs forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_use_required_attribute_false_overrides_form_kwargs_true forms_tests.tests.test_formsets_llm.EmptyFormKwargsRegressionTests.test_use_required_attribute_not_overridden_by_form_kwargs
+coverage json -o coverage.json
+: '>>>>> End Test Output'

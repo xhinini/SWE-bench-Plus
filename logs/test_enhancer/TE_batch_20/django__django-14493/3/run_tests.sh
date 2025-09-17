@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 staticfiles_tests.test_storage_llm.PostProcessMaxPassesZeroTests._make_storage staticfiles_tests.test_storage_llm.PostProcessMaxPassesZeroTests.setUp staticfiles_tests.test_storage_llm.PostProcessMaxPassesZeroTests.tearDown staticfiles_tests.test_storage_llm.PostProcessMaxPassesZeroTests.test_zero_pass_adjustable_css_with_image staticfiles_tests.test_storage_llm.PostProcessMaxPassesZeroTests.test_zero_pass_dry_run_returns_empty staticfiles_tests.test_storage_llm.PostProcessMaxPassesZeroTests.test_zero_pass_font_fragment_name_handled staticfiles_tests.test_storage_llm.PostProcessMaxPassesZeroTests.test_zero_pass_manifest_writes_manifest staticfiles_tests.test_storage_llm.PostProcessMaxPassesZeroTests.test_zero_pass_mixed_files staticfiles_tests.test_storage_llm.PostProcessMaxPassesZeroTests.test_zero_pass_multiple_adjustable_css_files staticfiles_tests.test_storage_llm.PostProcessMaxPassesZeroTests.test_zero_pass_non_adjustable_file_no_unboundlocalerror staticfiles_tests.test_storage_llm.PostProcessMaxPassesZeroTests.test_zero_pass_stored_name_recalculation staticfiles_tests.test_storage_llm.PostProcessMaxPassesZeroTests.test_zero_pass_with_empty_paths
+coverage json -o coverage.json
+: '>>>>> End Test Output'

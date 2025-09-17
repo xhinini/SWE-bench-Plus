@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_widgets.tests_llm.ManyToManyWidgetOverrideRegressionTests._make_explosive_admin admin_widgets.tests_llm.ManyToManyWidgetOverrideRegressionTests.test_formfield_overrides_with_extra_kwargs_prevents_get_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideRegressionTests.test_multiple_field_overrides_only_affect_target_field_and_do_not_call_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideRegressionTests.test_override_combined_with_filter_and_autocomplete_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideRegressionTests.test_override_with_autocomplete_field_attribute_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideRegressionTests.test_override_with_empty_request_and_no_other_flags admin_widgets.tests_llm.ManyToManyWidgetOverrideRegressionTests.test_override_with_filter_horizontal_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideRegressionTests.test_override_with_filter_vertical_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideRegressionTests.test_override_with_raw_id_fields_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideRegressionTests.test_widget_kwarg_direct_call_prevents_get_autocomplete admin_widgets.tests_llm.ManyToManyWidgetOverrideRegressionTests.test_widget_kwarg_with_using_prevents_get_autocomplete admin_widgets.tests_llm._unwrap_widget
+coverage json -o coverage.json
+: '>>>>> End Test Output'

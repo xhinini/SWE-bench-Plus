@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_views.test_adminsite_llm.BuildAppDictTests.setUp admin_views.test_adminsite_llm.BuildAppDictTests.setUpTestData admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_app_url_points_to_app_list admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_excludes_models_with_no_perms admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_exists_and_returns_mapping admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_has_correct_admin_and_add_urls_for_user admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_includes_model_key_for_each_model admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_model_entries_have_expected_keys admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_view_only_flag_when_change_missing admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_with_label_returns_only_that_app admin_views.test_adminsite_llm.BuildAppDictTests.test__build_app_dict_with_unknown_label_returns_none
+coverage json -o coverage.json
+: '>>>>> End Test Output'

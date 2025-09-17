@@ -1,0 +1,220 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests assert that MigrationAutodetector handles fields whose deconstruct() result does not include a 'to' key in the kwargs. Under the buggy implementation that used "del deconstruction[2]['to']" this would raise KeyError. The tests create various ForeignKey subclasses that remove 'to' from deconstruct() and ensure no exception is raised and that sensible migration operations are produced.
+test_code: |
+  from types import SimpleNamespace
+  from django.test import SimpleTestCase
+  from django.db import models
+  from django.db.migrations.autodetector import MigrationAutodetector
+  from django.db.migrations.state import ModelState, ProjectState
+  
+  
+  class NoToForeignKey(models.ForeignKey):
+      """
+      ForeignKey subclass whose deconstruct() removes 'to' from the kwargs.
+      This reproduces the situation that previously caused KeyError in
+      only_relation_agnostic_fields when using 'del'.
+      """
+      def __init__(self, *args, **kwargs):
+          # Provide a dummy target; the string form is fine for migrations.
+          super().__init__('app.DummyTarget', on_delete=models.CASCADE, **kwargs)
+  
+      def deconstruct(self):
+          name, path, args, kwargs = super().deconstruct()
+          # Remove 'to' key to simulate a custom deconstruct that doesn't include it.
+          kwargs.pop('to', None)
+          return name, path, args, kwargs
+  
+  
+  class RegressionOnlyRelationAgnosticFieldsTests(SimpleTestCase):
+      def _detect_changes_for_state(self, before_models, after_models):
+          before = ProjectState()
+          after = ProjectState()
+          for m in before_models:
+              before.add_model(m)
+          for m in after_models:
+              after.add_model(m)
+          autodetector = MigrationAutodetector(before, after)
+          return autodetector._detect_changes()
+  
+      def _ops_names(self, changes, app_label):
+          migrations = changes.get(app_label, [])
+          if not migrations:
+              return []
+          return [op.__class__.__name__ for op in migrations[0].operations]
+  
+      def test_only_relation_agnostic_fields_with_fk_deconstruct_missing_to(self):
+          """
+          Directly use only_relation_agnostic_fields by creating a small
+          autodetector and ensuring it does not raise and removes 'to' if present.
+          """
+          autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+          # Build a simple fields dict with our custom FK instance
+          field = NoToForeignKey()
+          fields = {'fk': field}
+          # Should not raise
+          defs = autodetector.only_relation_agnostic_fields(fields)
+          self.assertEqual(len(defs), 1)
+          # The deconstruction's kwargs should not contain 'to'
+          path, args, kwargs = defs[0]
+          self.assertNotIn('to', kwargs)
+  
+      def test_detect_changes_create_model_with_fk_deconstruct_missing_to(self):
+          """
+          Running the full autodetector change detection with a model that
+          contains a FK whose deconstruct() omits 'to' should produce a
+          migration and not raise.
+          """
+          model = ModelState('app', 'MyModel', [
+              ('id', models.AutoField(primary_key=True)),
+              ('fk', NoToForeignKey()),
+          ])
+          changes = self._detect_changes_for_state([], [model])
+          # There should be a migration for 'app'
+          self.assertIn('app', changes)
+          # The migration should include CreateModel and AddField (related field)
+          ops = self._ops_names(changes, 'app')
+          # The first CreateModel should be present
+          self.assertIn('CreateModel', ops)
+          # There should be at least one AddField for the related FK
+          self.assertIn('AddField', ops)
+  
+      def test_detect_changes_two_related_fields_missing_to(self):
+          """
+          Two related fields both missing 'to' should not raise and should
+          produce multiple AddField operations.
+          """
+          model = ModelState('app', 'TwoFKs', [
+              ('id', models.AutoField(primary_key=True)),
+              ('a', NoToForeignKey()),
+              ('b', NoToForeignKey()),
+          ])
+          changes = self._detect_changes_for_state([], [model])
+          self.assertIn('app', changes)
+          # Expect CreateModel + two AddField operations
+          ops = changes['app'][0].operations
+          op_names = [op.__class__.__name__ for op in ops]
+          self.assertIn('CreateModel', op_names)
+          # Count AddField operations
+          addfield_count = sum(1 for name in op_names if name == 'AddField')
+          self.assertEqual(addfield_count, 2)
+  
+      def test_detect_changes_mixed_fk_with_and_without_to(self):
+          """
+          A mix of a normal ForeignKey and one whose deconstruct omits 'to'
+          should not error and should create the expected operations.
+          """
+          model = ModelState('app', 'MixedFKs', [
+              ('id', models.AutoField(primary_key=True)),
+              ('normal', models.ForeignKey('otherapp.Book', models.CASCADE)),
+              ('custom', NoToForeignKey()),
+          ])
+          changes = self._detect_changes_for_state([], [model])
+          self.assertIn('app', changes)
+          op_names = [op.__class__.__name__ for op in changes['app'][0].operations]
+          # Expect a CreateModel and two AddField operations
+          self.assertIn('CreateModel', op_names)
+          self.assertEqual(op_names.count('AddField'), 2)
+  
+      def test_only_relation_agnostic_fields_preserves_other_kwargs(self):
+          """
+          Ensure that only the 'to' key is removed (if present) and other kwargs
+          survive the processing.
+          """
+          class CustomFK(NoToForeignKey):
+              def deconstruct(self):
+                  name, path, args, kwargs = super(models.ForeignKey, self).deconstruct()
+                  # Insert an extra kwarg and do NOT include 'to'
+                  kwargs['db_column'] = 'custom_col'
+                  kwargs.pop('to', None)
+                  return name, path, args, kwargs
+          autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+          f = CustomFK()
+          defs = autodetector.only_relation_agnostic_fields({'fk': f})
+          self.assertEqual(len(defs), 1)
+          _, _, kwargs = defs[0]
+          self.assertNotIn('to', kwargs)
+          # Other kwargs should still be present
+          self.assertIn('db_column', kwargs)
+  
+      def test_detect_changes_with_through_and_missing_to(self):
+          """
+          If the remote_field has a through attribute, ensure the absence of
+          'to' in the deconstructed kwargs doesn't cause an exception.
+          """
+          class FKWithThrough(NoToForeignKey):
+              def __init__(self):
+                  super().__init__()
+                  # Simulate a through relationship on the remote side
+                  self.remote_field.through = 'app.ThroughModel'
+  
+          model = ModelState('app', 'WithThrough', [
+              ('id', models.AutoField(primary_key=True)),
+              ('rel', FKWithThrough()),
+          ])
+          changes = self._detect_changes_for_state([], [model])
+          self.assertIn('app', changes)
+          op_names = [op.__class__.__name__ for op in changes['app'][0].operations]
+          # There should be a CreateModel and an AddField for the relation
+          self.assertIn('CreateModel', op_names)
+          self.assertIn('AddField', op_names)
+  
+      def test_detect_changes_multiple_apps_fields_missing_to(self):
+          """
+          Multiple apps, each with a field whose deconstruct omits 'to', should
+          all produce migrations without error.
+          """
+          m1 = ModelState('app1', 'M1', [
+              ('id', models.AutoField(primary_key=True)),
+              ('f1', NoToForeignKey()),
+          ])
+          m2 = ModelState('app2', 'M2', [
+              ('id', models.AutoField(primary_key=True)),
+              ('f2', NoToForeignKey()),
+          ])
+          changes = self._detect_changes_for_state([], [m1, m2])
+          self.assertIn('app1', changes)
+          self.assertIn('app2', changes)
+          self.assertTrue(any(op.__class__.__name__ == 'CreateModel' for op in changes['app1'][0].operations))
+          self.assertTrue(any(op.__class__.__name__ == 'CreateModel' for op in changes['app2'][0].operations))
+  
+      def test_field_ordering_does_not_affect_missing_to_handling(self):
+          """
+          Ensure different ordering of fields within the ModelState doesn't
+          affect the ability to handle missing 'to' keys in deconstruct.
+          """
+          m_a = ModelState('app', 'OrderA', [
+              ('id', models.AutoField(primary_key=True)),
+              ('a', NoToForeignKey()),
+              ('b', models.ForeignKey('otherapp.Book', models.CASCADE)),
+          ])
+          m_b = ModelState('app', 'OrderB', [
+              ('id', models.AutoField(primary_key=True)),
+              ('b', models.ForeignKey('otherapp.Book', models.CASCADE)),
+              ('a', NoToForeignKey()),
+          ])
+          # Run both individually, ensure no exception and migration created
+          changes_a = self._detect_changes_for_state([], [m_a])
+          changes_b = self._detect_changes_for_state([], [m_b])
+          self.assertIn('app', changes_a)
+          self.assertIn('app', changes_b)
+          # Both should include AddField for the custom FK
+          self.assertIn('AddField', [op.__class__.__name__ for op in changes_a['app'][0].operations])
+          self.assertIn('AddField', [op.__class__.__name__ for op in changes_b['app'][0].operations])
+  
+      def test_only_relation_agnostic_fields_multiple_calls_stable(self):
+          """
+          Calling only_relation_agnostic_fields multiple times with fields that
+          remove 'to' should be stable and idempotent (no exceptions, same result).
+          """
+          autodetector = MigrationAutodetector(ProjectState(), ProjectState())
+          f = NoToForeignKey()
+          defs1 = autodetector.only_relation_agnostic_fields({'x': f, 'y': NoToForeignKey()})
+          defs2 = autodetector.only_relation_agnostic_fields({'x': f, 'y': NoToForeignKey()})
+          self.assertEqual(len(defs1), 2)
+          self.assertEqual(len(defs2), 2)
+          # Ensure both runs produced deconstructed kwargs without 'to'
+          for dec in defs1 + defs2:
+              self.assertNotIn('to', dec[2])
+new_imports_code: |
+  # No additional imports required beyond the test code block.

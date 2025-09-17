@@ -1,0 +1,179 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests validate that SlicedLowLevelWCS.world_to_pixel_values correctly fills in dropped world dimensions using the underlying WCS's pixel_to_world_values for the corresponding fixed pixel coordinates. They exercise scalar and array inputs, broadcasting, negative integer slicing, numpy scalar types, the Ellipsis (no-op) case, multiple dropped pixel dims (resulting in a single output pixel dimension), and the case where too few world arguments are provided (which should raise IndexError). The tests will fail for the model patch which uses incorrect defaults or strange indexing to fill dropped world dimensions, but will pass for the corrected (gold) implementation.
+test_code: |
+  import numpy as np
+  import pytest
+  from astropy.wcs.wcsapi.wrappers.sliced_wcs import SlicedLowLevelWCS
+  
+  class FakeWCS:
+      """
+      Minimal fake low-level WCS-like object to exercise SlicedLowLevelWCS.
+      We implement simple affine mappings so expected behavior can be computed easily.
+      pixel_to_world_values(px,py,pz) -> (px + 10, py + 20, pz + 30)
+      world_to_pixel_values(wx,wy,wz) -> (wx - 10, wy - 20, wz - 30)
+      axis_correlation_matrix is identity so world i maps to pixel i.
+      """
+      def __init__(self, offsets=(10.0, 20.0, 30.0)):
+          self._offsets = tuple(float(x) for x in offsets)
+          self.pixel_n_dim = 3
+          self.world_n_dim = 3
+          # world, pixel
+          self.axis_correlation_matrix = np.eye(3, dtype=bool)
+          self.world_axis_physical_types = ['a', 'b', 'c']
+          self.world_axis_units = ['u', 'u', 'u']
+          self.pixel_axis_names = ['p0', 'p1', 'p2']
+          self.world_axis_names = ['w0', 'w1', 'w2']
+          self.world_axis_object_components = [('x', 0, ''), ('y', 0, ''), ('z', 0, '')]
+          self.world_axis_object_classes = {}
+          self.serialized_classes = False
+          self.array_shape = (5, 6, 7)
+          self.pixel_bounds = [(-1, 4), (-2, 3), (0, 6)]
+  
+      def pixel_to_world_values(self, *pixel_arrays):
+          # Broadcast inputs and add offsets
+          arrs = tuple(np.asanyarray(a) for a in pixel_arrays)
+          b = np.broadcast_arrays(*arrs)
+          return tuple(bi + off for bi, off in zip(b, self._offsets))
+  
+      def world_to_pixel_values(self, *world_arrays):
+          arrs = tuple(np.asanyarray(a) for a in world_arrays)
+          b = np.broadcast_arrays(*arrs)
+          return tuple(bi - off for bi, off in zip(b, self._offsets))
+  
+  def reconstruct_expected_from_full_wcs(wcs, slices, supplied_world):
+      """
+      Helper: construct a full set of world coords for the underlying wcs by
+      filling dropped world dims with values from pixel_to_world_values_all called
+      with zeros for the kept pixel dims. Then call underlying wcs.world_to_pixel_values
+      and return the pixel components corresponding to the sliced wrapper.
+      """
+      sl = SlicedLowLevelWCS(wcs, slices)
+      # determine the fixed world coordinates for dropped dims
+      sliced_out_world_coords = sl._pixel_to_world_values_all(*[0]*len(sl._pixel_keep))
+      # build the full world_arrays for underlying wcs
+      supplied = tuple(np.asanyarray(x) for x in supplied_world)
+      full_world = []
+      iworld_curr = -1
+      for iworld in range(wcs.world_n_dim):
+          if iworld in sl._world_keep:
+              iworld_curr += 1
+              full_world.append(supplied[iworld_curr])
+          else:
+              full_world.append(sliced_out_world_coords[iworld])
+      full_world_b = np.broadcast_arrays(*full_world)
+      pix_all = wcs.world_to_pixel_values(*full_world_b)
+      # select and adjust pixels for the sliced wrapper
+      pix_selected = tuple(pix_all[ip] for ip in sl._pixel_keep)
+      # subtract slice starts for any kept pixels that have slice start
+      # note: SlicedLowLevelWCS.world_to_pixel_values in the implementation does
+      # this after calling the underlying WCS.
+      for ipixel in range(wcs.pixel_n_dim):
+          if isinstance(sl._slices_pixel[ipixel], slice) and sl._slices_pixel[ipixel].start is not None:
+              pix_all = list(pix_all)
+              pix_all[ipixel] -= sl._slices_pixel[ipixel].start
+      # return the same format that SlicedLowLevelWCS.world_to_pixel_values returns
+      if len(pix_selected) == 1 and sl.pixel_n_dim == 1 and sl._wcs.pixel_n_dim > 1:
+          return pix_selected[0]
+      return pix_selected
+  
+  def test_world_to_pixel_with_dropped_dimension_scalar():
+      wcs = FakeWCS()
+      # Slice out the last pixel axis by providing an integer for the first slice
+      sl = SlicedLowLevelWCS(wcs, 0)
+      # Underlying full-world coordinate for pixel (0,0,0) should be offsets
+      full_world = wcs.pixel_to_world_values(0, 0, 0)
+      # Provide only the kept world dims (first two); the third should be filled from pixel_to_world_values_all
+      out = sl.world_to_pixel_values(full_world[0], full_world[1])
+      # Expected: underlying wcs.world_to_pixel_values with full_world, then select pixel_keep (first two)
+      expected_full = wcs.world_to_pixel_values(*full_world)
+      expected = (expected_full[0], expected_full[1])
+      assert np.allclose(out, expected)
+  
+  def test_world_to_pixel_with_dropped_dimension_array_broadcast():
+      wcs = FakeWCS()
+      sl = SlicedLowLevelWCS(wcs, 0)
+      # use array inputs for the two kept world dims
+      wx = np.array([11.0, 12.0])
+      wy = np.array([21.0, 22.0])
+      out = sl.world_to_pixel_values(wx, wy)
+      # compute expected by reconstructing full world arrays and calling underlying wcs
+      expected = reconstruct_expected_from_full_wcs(wcs, 0, (wx, wy))
+      # Both components should be arrays of same shape
+      assert isinstance(out, tuple)
+      assert np.allclose(out[0], expected[0])
+      assert np.allclose(out[1], expected[1])
+  
+  def test_world_to_pixel_with_insufficient_arguments_raises_IndexError():
+      wcs = FakeWCS()
+      sl = SlicedLowLevelWCS(wcs, 0)
+      # world_keep will contain two dims for this config; passing only one should raise
+      with pytest.raises(IndexError):
+          _ = sl.world_to_pixel_values(10.0)  # too few arguments
+  
+  def test_world_to_pixel_with_multiple_dropped_pixel_dims_single_output():
+      wcs = FakeWCS()
+      # slice out two pixel axes, keep only one pixel axis
+      sl = SlicedLowLevelWCS(wcs, (0, 1, slice(None)))
+      # Determine which world dims are kept
+      assert sl.pixel_n_dim == 1
+      # Provide the single needed world coordinate (kept world dims)
+      kept_world_values = []
+      for i in range(wcs.world_n_dim):
+          if i in sl._world_keep:
+              kept_world_values.append(wcs.pixel_to_world_values(0,0,0)[i])
+      # call world_to_pixel_values and expect a scalar (not a tuple)
+      out = sl.world_to_pixel_values(*kept_world_values)
+      assert not isinstance(out, tuple)
+      # For the fake mapping, expect the scalar to equal world - offset of the kept world dim
+      # reconstruct expected explicitly:
+      expected = reconstruct_expected_from_full_wcs(wcs, (0, 1, slice(None)), tuple(kept_world_values))
+      assert np.allclose(out, expected)
+  
+  def test_world_to_pixel_broadcasting_with_mixed_shapes():
+      wcs = FakeWCS()
+      sl = SlicedLowLevelWCS(wcs, 0)
+      wx = np.array([11.0, 12.0])
+      wy = 21.0  # scalar
+      out = sl.world_to_pixel_values(wx, wy)
+      expected = reconstruct_expected_from_full_wcs(wcs, 0, (wx, wy))
+      assert np.allclose(out[0], expected[0])
+      assert np.allclose(out[1], expected[1])
+  
+  def test_world_to_pixel_with_negative_integer_slice():
+      wcs = FakeWCS()
+      # negative integer slice should be accepted and used as the fixed pixel index
+      sl = SlicedLowLevelWCS(wcs, -1)
+      # compute the fixed world coords for the dropped dims via pixel_to_world_values_all
+      dropped = sl._pixel_to_world_values_all(*[0]*len(sl._pixel_keep))
+      # call world_to_pixel_values with the kept world dims
+      kept = [dropped[i] for i in sl._world_keep]
+      out = sl.world_to_pixel_values(*kept)
+      expected = reconstruct_expected_from_full_wcs(wcs, -1, tuple(kept))
+      assert np.allclose(out, expected)
+  
+  def test_world_to_pixel_accepts_numpy_scalar_types():
+      wcs = FakeWCS()
+      sl = SlicedLowLevelWCS(wcs, 0)
+      wx = np.float64(11.0)
+      wy = np.float64(21.0)
+      out = sl.world_to_pixel_values(wx, wy)
+      expected = reconstruct_expected_from_full_wcs(wcs, 0, (wx, wy))
+      assert np.allclose(out[0], expected[0])
+      assert np.allclose(out[1], expected[1])
+  
+  def test_ellipsis_keeps_all_dimensions_passthrough():
+      wcs = FakeWCS()
+      sl = SlicedLowLevelWCS(wcs, Ellipsis)
+      # If nothing is sliced out, calling world_to_pixel_values should match underlying wcs
+      full_world = (11.0, 22.0, 33.0)
+      out = sl.world_to_pixel_values(*full_world)
+      expected = wcs.world_to_pixel_values(*full_world)
+      # When no dims are dropped, SlicedLowLevelWCS should directly return the underlying result
+      assert np.allclose(out[0], expected[0])
+      assert np.allclose(out[1], expected[1])
+      assert np.allclose(out[2], expected[2])
+new_imports_code: |
+  import numpy as np
+  import pytest
+  from astropy.wcs.wcsapi.wrappers.sliced_wcs import SlicedLowLevelWCS

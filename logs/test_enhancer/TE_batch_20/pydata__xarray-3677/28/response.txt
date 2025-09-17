@@ -1,0 +1,138 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that Dataset.merge correctly recognizes and converts DataArray-like objects using the public xarray.DataArray symbol at runtime (xr.DataArray). They monkeypatch xr.DataArray to a fake/wrapper class that implements to_dataset(), and ensure Dataset.merge (and top-level xr.merge) call to_dataset on such objects. The gold patch (checking isinstance against xr.DataArray) will pass these tests, while the candidate patch (checking isinstance against the DataArray class imported directly from .dataarray) will fail because the fake class is not an instance of that imported class.
+test_code: |
+  import numpy as np
+  import pytest
+  import xarray as xr
+  from xarray.testing import assert_identical
+  from xarray.core import dtypes
+  from .test_dataset import create_test_data
+  from . import raises_regex
+  
+  # Helper fake/wrapper DataArray-like class used to monkeypatch xr.DataArray
+  class FakeDataArray:
+      def __init__(self, data, name=None, dims=()):
+          self._data = data
+          self.name = name
+          # allow dims for convenience but not required for all tests
+          self._dims = tuple(dims) if isinstance(dims, (list, tuple)) else (dims,) if dims else ()
+  
+      def to_dataset(self):
+          # mimic DataArray.to_dataset behaviour: raise if no name
+          if self.name is None:
+              raise ValueError("cannot convert unnamed DataArray into a Dataset without providing an explicit name")
+          # create a real xarray.Dataset for merging
+          if self._dims:
+              return xr.Dataset({self.name: (self._dims, self._data)})
+          else:
+              return xr.Dataset({self.name: self._data})
+  
+  def test_merge_dataset_with_monkeypatched_DataArray_named(monkeypatch):
+      ds = xr.Dataset({"a": 0})
+      # monkeypatch the runtime symbol xr.DataArray to our FakeDataArray
+      monkeypatch.setattr(xr, "DataArray", FakeDataArray, raising=False)
+      fake = FakeDataArray(1, name="b")
+      result = ds.merge(fake)
+      expected = xr.Dataset({"a": 0, "b": 1})
+      assert_identical(result, expected)
+  
+  def test_merge_dataset_with_monkeypatched_DataArray_unnamed_raises(monkeypatch):
+      ds = xr.Dataset({"a": 0})
+      monkeypatch.setattr(xr, "DataArray", FakeDataArray, raising=False)
+      fake = FakeDataArray(2, name=None)
+      with raises_regex(ValueError, "explicit name"):
+          ds.merge(fake)
+  
+  def test_merge_dataset_with_monkeypatched_DataArray_with_coords(monkeypatch):
+      # Fake DataArray with a dimension should be converted to a dataset with coords
+      ds = xr.Dataset({"a": ("x", [10])}, coords={"x": [0]})
+      monkeypatch.setattr(xr, "DataArray", FakeDataArray, raising=False)
+      fake = FakeDataArray([1], name="b", dims=("x",))
+      result = ds.merge(fake)
+      expected = xr.Dataset({"a": ("x", [10]), "b": ("x", [1])}, coords={"x": [0]})
+      assert_identical(result, expected)
+  
+  def test_merge_dataset_with_monkeypatched_DataArray_conflict_raises_merge_error(monkeypatch):
+      # When compat enforces strict equality, conflicting variable should raise MergeError
+      ds = xr.Dataset({"b": 0})
+      monkeypatch.setattr(xr, "DataArray", FakeDataArray, raising=False)
+      # Fake returns a Dataset with variable 'b' but different value
+      fake = FakeDataArray(1, name="b")
+      with pytest.raises(xr.MergeError):
+          ds.merge(fake, compat="equals")
+  
+  def test_merge_dataset_with_monkeypatched_DataArray_no_conflicts_compat_no_conflicts(monkeypatch):
+      # Test combining overlapping NaN locations with compat='no_conflicts'
+      ds1 = xr.Dataset({"a": ("x", [1, np.nan]), "x": [0, 1]})
+      # Fake DataArray produces a dataset with the complementary NaN
+      def to_ds_generator():
+          return xr.Dataset({"a": ("x", [np.nan, 2]), "x": [0, 1]})
+      class FakeDA2(FakeDataArray):
+          def to_dataset(self):
+              return to_ds_generator()
+      monkeypatch.setattr(xr, "DataArray", FakeDA2, raising=False)
+      fake = FakeDA2(None, name="a")
+      res = ds1.merge(fake, compat="no_conflicts")
+      expected = xr.Dataset({"a": ("x", [1, 2]), "x": [0, 1]})
+      assert_identical(res, expected)
+  
+  def test_top_level_merge_with_monkeypatched_DataArray(monkeypatch):
+      # Ensure top-level xr.merge also respects runtime xr.DataArray symbol
+      ds = xr.Dataset({"a": 0})
+      monkeypatch.setattr(xr, "DataArray", FakeDataArray, raising=False)
+      fake = FakeDataArray(5, name="c")
+      res = xr.merge([ds, fake])
+      expected = xr.Dataset({"a": 0, "c": 5})
+      assert_identical(res, expected)
+  
+  def test_merge_with_monkeypatched_DataArray_join_inner(monkeypatch):
+      # joining behavior: only intersecting coordinates retained with join='inner'
+      ds = xr.Dataset({"a": ("x", [1, 2]), "x": [0, 1]})
+      monkeypatch.setattr(xr, "DataArray", FakeDataArray, raising=False)
+      # Fake has x coordinates [1,2]
+      class FakeDA3(FakeDataArray):
+          def to_dataset(self):
+              return xr.Dataset({"b": ("x", [3, 4]), "x": [1, 2]})
+      fake = FakeDA3(None, name="b")
+      res = ds.merge(fake, join="inner")
+      expected = xr.Dataset({"a": ("x", [2]), "b": ("x", [3])}, coords={"x": [1]})
+      assert_identical(res, expected)
+  
+  def test_merge_with_monkeypatched_DataArray_fill_value(monkeypatch):
+      # fill_value should be applied when merging datasets with non-overlapping coords
+      ds1 = xr.Dataset({"a": ("x", [1, 2]), "x": [0, 1]})
+      monkeypatch.setattr(xr, "DataArray", FakeDataArray, raising=False)
+      fake = FakeDataArray(("x", [3, 4]), name="b")  # dims passed through, but to_dataset will handle
+      # Create a Fake that returns appropriate dataset
+      class FakeDA4(FakeDataArray):
+          def to_dataset(self):
+              return xr.Dataset({"b": ("x", [3, 4]), "x": [1, 2]})
+      monkeypatch.setattr(xr, "DataArray", FakeDA4, raising=False)
+      fake2 = FakeDA4(None, name="b")
+      res = ds1.merge(fake2, fill_value=0)
+      expected = xr.Dataset({"a": ("x", [1, 2, 0]), "b": ("x", [0, 3, 4])}, coords={"x": [0, 1, 2]})
+      assert_identical(res, expected)
+  
+  def test_merge_with_monkeypatched_DataArray_preserve_variable_attrs(monkeypatch):
+      # Ensure attributes on variables from the fake to_dataset() are preserved after merge
+      ds = xr.Dataset({"a": 0})
+      class FakeDA5(FakeDataArray):
+          def to_dataset(self):
+              return xr.Dataset({"b": ((), 2, {"units": "m"})})
+      monkeypatch.setattr(xr, "DataArray", FakeDA5, raising=False)
+      fake = FakeDA5(None, name="b")
+      res = ds.merge(fake)
+      assert res["b"].attrs.get("units") == "m"
+  
+  def test_merge_with_monkeypatched_DataArray_multiple_calls_restore_symbol(monkeypatch):
+      # Ensure monkeypatching works and tests are isolated: after patching and merging,
+      # the xr.DataArray symbol can be further patched without persistent side effects.
+      ds = xr.Dataset({"a": 0})
+      monkeypatch.setattr(xr, "DataArray", FakeDataArray, raising=False)
+      fake = FakeDataArray(7, name="d")
+      res = ds.merge(fake)
+      expected = xr.Dataset({"a": 0, "d": 7})
+      assert_identical(res, expected)
+new_imports_code: |
+  # No new top-level imports required; tests use pytest's monkeypatch fixture and existing xarray API.

@@ -1,0 +1,1016 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `django/db/backends/sqlite3/base.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 """
+2 SQLite backend for the sqlite3 module in the standard library.
+3 """
+4 import datetime
+5 import decimal
+6 import functools
+7 import hashlib
+8 import math
+9 import operator
+10 import random
+11 import re
+12 import statistics
+13 import warnings
+14 from itertools import chain
+15 from sqlite3 import dbapi2 as Database
+16 
+17 import pytz
+18 
+19 from django.core.exceptions import ImproperlyConfigured
+20 from django.db import IntegrityError
+21 from django.db.backends import utils as backend_utils
+22 from django.db.backends.base.base import BaseDatabaseWrapper
+23 from django.utils import timezone
+24 from django.utils.asyncio import async_unsafe
+25 from django.utils.dateparse import parse_datetime, parse_time
+26 from django.utils.duration import duration_microseconds
+27 from django.utils.regex_helper import _lazy_re_compile
+28 from django.utils.version import PY38
+29 
+30 from .client import DatabaseClient
+31 from .creation import DatabaseCreation
+32 from .features import DatabaseFeatures
+33 from .introspection import DatabaseIntrospection
+34 from .operations import DatabaseOperations
+35 from .schema import DatabaseSchemaEditor
+36 
+37 
+38 def decoder(conv_func):
+39     """
+40     Convert bytestrings from Python's sqlite3 interface to a regular string.
+41     """
+42     return lambda s: conv_func(s.decode())
+43 
+44 
+45 def none_guard(func):
+46     """
+47     Decorator that returns None if any of the arguments to the decorated
+48     function are None. Many SQL functions return NULL if any of their arguments
+49     are NULL. This decorator simplifies the implementation of this for the
+50     custom functions registered below.
+51     """
+52     @functools.wraps(func)
+53     def wrapper(*args, **kwargs):
+54         return None if None in args else func(*args, **kwargs)
+55     return wrapper
+56 
+57 
+58 def list_aggregate(function):
+59     """
+60     Return an aggregate class that accumulates values in a list and applies
+61     the provided function to the data.
+62     """
+63     return type('ListAggregate', (list,), {'finalize': function, 'step': list.append})
+64 
+65 
+66 def check_sqlite_version():
+67     if Database.sqlite_version_info < (3, 9, 0):
+68         raise ImproperlyConfigured(
+69             'SQLite 3.9.0 or later is required (found %s).' % Database.sqlite_version
+70         )
+71 
+72 
+73 check_sqlite_version()
+74 
+75 Database.register_converter("bool", b'1'.__eq__)
+76 Database.register_converter("time", decoder(parse_time))
+77 Database.register_converter("datetime", decoder(parse_datetime))
+78 Database.register_converter("timestamp", decoder(parse_datetime))
+79 
+80 Database.register_adapter(decimal.Decimal, str)
+81 
+82 
+83 class DatabaseWrapper(BaseDatabaseWrapper):
+84     vendor = 'sqlite'
+85     display_name = 'SQLite'
+86     # SQLite doesn't actually support most of these types, but it "does the right
+87     # thing" given more verbose field definitions, so leave them as is so that
+88     # schema inspection is more useful.
+89     data_types = {
+90         'AutoField': 'integer',
+91         'BigAutoField': 'integer',
+92         'BinaryField': 'BLOB',
+93         'BooleanField': 'bool',
+94         'CharField': 'varchar(%(max_length)s)',
+95         'DateField': 'date',
+96         'DateTimeField': 'datetime',
+97         'DecimalField': 'decimal',
+98         'DurationField': 'bigint',
+99         'FileField': 'varchar(%(max_length)s)',
+100         'FilePathField': 'varchar(%(max_length)s)',
+101         'FloatField': 'real',
+102         'IntegerField': 'integer',
+103         'BigIntegerField': 'bigint',
+104         'IPAddressField': 'char(15)',
+105         'GenericIPAddressField': 'char(39)',
+106         'JSONField': 'text',
+107         'NullBooleanField': 'bool',
+108         'OneToOneField': 'integer',
+109         'PositiveBigIntegerField': 'bigint unsigned',
+110         'PositiveIntegerField': 'integer unsigned',
+111         'PositiveSmallIntegerField': 'smallint unsigned',
+112         'SlugField': 'varchar(%(max_length)s)',
+113         'SmallAutoField': 'integer',
+114         'SmallIntegerField': 'smallint',
+115         'TextField': 'text',
+116         'TimeField': 'time',
+117         'UUIDField': 'char(32)',
+118     }
+119     data_type_check_constraints = {
+120         'PositiveBigIntegerField': '"%(column)s" >= 0',
+121         'JSONField': '(JSON_VALID("%(column)s") OR "%(column)s" IS NULL)',
+122         'PositiveIntegerField': '"%(column)s" >= 0',
+123         'PositiveSmallIntegerField': '"%(column)s" >= 0',
+124     }
+125     data_types_suffix = {
+126         'AutoField': 'AUTOINCREMENT',
+127         'BigAutoField': 'AUTOINCREMENT',
+128         'SmallAutoField': 'AUTOINCREMENT',
+129     }
+130     # SQLite requires LIKE statements to include an ESCAPE clause if the value
+131     # being escaped has a percent or underscore in it.
+132     # See https://www.sqlite.org/lang_expr.html for an explanation.
+133     operators = {
+134         'exact': '= %s',
+135         'iexact': "LIKE %s ESCAPE '\\'",
+136         'contains': "LIKE %s ESCAPE '\\'",
+137         'icontains': "LIKE %s ESCAPE '\\'",
+138         'regex': 'REGEXP %s',
+139         'iregex': "REGEXP '(?i)' || %s",
+140         'gt': '> %s',
+141         'gte': '>= %s',
+142         'lt': '< %s',
+143         'lte': '<= %s',
+144         'startswith': "LIKE %s ESCAPE '\\'",
+145         'endswith': "LIKE %s ESCAPE '\\'",
+146         'istartswith': "LIKE %s ESCAPE '\\'",
+147         'iendswith': "LIKE %s ESCAPE '\\'",
+148     }
+149 
+150     # The patterns below are used to generate SQL pattern lookup clauses when
+151     # the right-hand side of the lookup isn't a raw string (it might be an expression
+152     # or the result of a bilateral transformation).
+153     # In those cases, special characters for LIKE operators (e.g. \, *, _) should be
+154     # escaped on database side.
+155     #
+156     # Note: we use str.format() here for readability as '%' is used as a wildcard for
+157     # the LIKE operator.
+158     pattern_esc = r"REPLACE(REPLACE(REPLACE({}, '\', '\\'), '%%', '\%%'), '_', '\_')"
+159     pattern_ops = {
+160         'contains': r"LIKE '%%' || {} || '%%' ESCAPE '\'",
+161         'icontains': r"LIKE '%%' || UPPER({}) || '%%' ESCAPE '\'",
+162         'startswith': r"LIKE {} || '%%' ESCAPE '\'",
+163         'istartswith': r"LIKE UPPER({}) || '%%' ESCAPE '\'",
+164         'endswith': r"LIKE '%%' || {} ESCAPE '\'",
+165         'iendswith': r"LIKE '%%' || UPPER({}) ESCAPE '\'",
+166     }
+167 
+168     Database = Database
+169     SchemaEditorClass = DatabaseSchemaEditor
+170     # Classes instantiated in __init__().
+171     client_class = DatabaseClient
+172     creation_class = DatabaseCreation
+173     features_class = DatabaseFeatures
+174     introspection_class = DatabaseIntrospection
+175     ops_class = DatabaseOperations
+176 
+177     def get_connection_params(self):
+178         settings_dict = self.settings_dict
+179         if not settings_dict['NAME']:
+180             raise ImproperlyConfigured(
+181                 "settings.DATABASES is improperly configured. "
+182                 "Please supply the NAME value.")
+183         kwargs = {
+184             # TODO: Remove str() when dropping support for PY36.
+185             # https://bugs.python.org/issue33496
+186             'database': str(settings_dict['NAME']),
+187             'detect_types': Database.PARSE_DECLTYPES | Database.PARSE_COLNAMES,
+188             **settings_dict['OPTIONS'],
+189         }
+190         # Always allow the underlying SQLite connection to be shareable
+191         # between multiple threads. The safe-guarding will be handled at a
+192         # higher level by the `BaseDatabaseWrapper.allow_thread_sharing`
+193         # property. This is necessary as the shareability is disabled by
+194         # default in pysqlite and it cannot be changed once a connection is
+195         # opened.
+196         if 'check_same_thread' in kwargs and kwargs['check_same_thread']:
+197             warnings.warn(
+198                 'The `check_same_thread` option was provided and set to '
+199                 'True. It will be overridden with False. Use the '
+200                 '`DatabaseWrapper.allow_thread_sharing` property instead '
+201                 'for controlling thread shareability.',
+202                 RuntimeWarning
+203             )
+204         kwargs.update({'check_same_thread': False, 'uri': True})
+205         return kwargs
+206 
+207     @async_unsafe
+208     def get_new_connection(self, conn_params):
+209         conn = Database.connect(**conn_params)
+210         if PY38:
+211             create_deterministic_function = functools.partial(
+212                 conn.create_function,
+213                 deterministic=True,
+214             )
+215         else:
+216             create_deterministic_function = conn.create_function
+217         create_deterministic_function('django_date_extract', 2, _sqlite_datetime_extract)
+218         create_deterministic_function('django_date_trunc', 4, _sqlite_date_trunc)
+219         create_deterministic_function('django_datetime_cast_date', 3, _sqlite_datetime_cast_date)
+220         create_deterministic_function('django_datetime_cast_time', 3, _sqlite_datetime_cast_time)
+221         create_deterministic_function('django_datetime_extract', 4, _sqlite_datetime_extract)
+222         create_deterministic_function('django_datetime_trunc', 4, _sqlite_datetime_trunc)
+223         create_deterministic_function('django_time_extract', 2, _sqlite_time_extract)
+224         create_deterministic_function('django_time_trunc', 4, _sqlite_time_trunc)
+225         create_deterministic_function('django_time_diff', 2, _sqlite_time_diff)
+226         create_deterministic_function('django_timestamp_diff', 2, _sqlite_timestamp_diff)
+227         create_deterministic_function('django_format_dtdelta', 3, _sqlite_format_dtdelta)
+228         create_deterministic_function('regexp', 2, _sqlite_regexp)
+229         create_deterministic_function('ACOS', 1, none_guard(math.acos))
+230         create_deterministic_function('ASIN', 1, none_guard(math.asin))
+231         create_deterministic_function('ATAN', 1, none_guard(math.atan))
+232         create_deterministic_function('ATAN2', 2, none_guard(math.atan2))
+233         create_deterministic_function('BITXOR', 2, none_guard(operator.xor))
+234         create_deterministic_function('CEILING', 1, none_guard(math.ceil))
+235         create_deterministic_function('COS', 1, none_guard(math.cos))
+236         create_deterministic_function('COT', 1, none_guard(lambda x: 1 / math.tan(x)))
+237         create_deterministic_function('DEGREES', 1, none_guard(math.degrees))
+238         create_deterministic_function('EXP', 1, none_guard(math.exp))
+239         create_deterministic_function('FLOOR', 1, none_guard(math.floor))
+240         create_deterministic_function('LN', 1, none_guard(math.log))
+241         create_deterministic_function('LOG', 2, none_guard(lambda x, y: math.log(y, x)))
+242         create_deterministic_function('LPAD', 3, _sqlite_lpad)
+243         create_deterministic_function('MD5', 1, none_guard(lambda x: hashlib.md5(x.encode()).hexdigest()))
+244         create_deterministic_function('MOD', 2, none_guard(math.fmod))
+245         create_deterministic_function('PI', 0, lambda: math.pi)
+246         create_deterministic_function('POWER', 2, none_guard(operator.pow))
+247         create_deterministic_function('RADIANS', 1, none_guard(math.radians))
+248         create_deterministic_function('REPEAT', 2, none_guard(operator.mul))
+249         create_deterministic_function('REVERSE', 1, none_guard(lambda x: x[::-1]))
+250         create_deterministic_function('RPAD', 3, _sqlite_rpad)
+251         create_deterministic_function('SHA1', 1, none_guard(lambda x: hashlib.sha1(x.encode()).hexdigest()))
+252         create_deterministic_function('SHA224', 1, none_guard(lambda x: hashlib.sha224(x.encode()).hexdigest()))
+253         create_deterministic_function('SHA256', 1, none_guard(lambda x: hashlib.sha256(x.encode()).hexdigest()))
+254         create_deterministic_function('SHA384', 1, none_guard(lambda x: hashlib.sha384(x.encode()).hexdigest()))
+255         create_deterministic_function('SHA512', 1, none_guard(lambda x: hashlib.sha512(x.encode()).hexdigest()))
+256         create_deterministic_function('SIGN', 1, none_guard(lambda x: (x > 0) - (x < 0)))
+257         create_deterministic_function('SIN', 1, none_guard(math.sin))
+258         create_deterministic_function('SQRT', 1, none_guard(math.sqrt))
+259         create_deterministic_function('TAN', 1, none_guard(math.tan))
+260         # Don't use the built-in RANDOM() function because it returns a value
+261         # in the range [2^63, 2^63 - 1] instead of [0, 1).
+262         conn.create_function('RAND', 0, random.random)
+263         conn.create_aggregate('STDDEV_POP', 1, list_aggregate(statistics.pstdev))
+264         conn.create_aggregate('STDDEV_SAMP', 1, list_aggregate(statistics.stdev))
+265         conn.create_aggregate('VAR_POP', 1, list_aggregate(statistics.pvariance))
+266         conn.create_aggregate('VAR_SAMP', 1, list_aggregate(statistics.variance))
+267         conn.execute('PRAGMA foreign_keys = ON')
+268         return conn
+269 
+270     def init_connection_state(self):
+271         pass
+272 
+273     def create_cursor(self, name=None):
+274         return self.connection.cursor(factory=SQLiteCursorWrapper)
+275 
+276     @async_unsafe
+277     def close(self):
+278         self.validate_thread_sharing()
+279         # If database is in memory, closing the connection destroys the
+280         # database. To prevent accidental data loss, ignore close requests on
+281         # an in-memory db.
+282         if not self.is_in_memory_db():
+283             BaseDatabaseWrapper.close(self)
+284 
+285     def _savepoint_allowed(self):
+286         # When 'isolation_level' is not None, sqlite3 commits before each
+287         # savepoint; it's a bug. When it is None, savepoints don't make sense
+288         # because autocommit is enabled. The only exception is inside 'atomic'
+289         # blocks. To work around that bug, on SQLite, 'atomic' starts a
+290         # transaction explicitly rather than simply disable autocommit.
+291         return self.in_atomic_block
+292 
+293     def _set_autocommit(self, autocommit):
+294         if autocommit:
+295             level = None
+296         else:
+297             # sqlite3's internal default is ''. It's different from None.
+298             # See Modules/_sqlite/connection.c.
+299             level = ''
+300         # 'isolation_level' is a misleading API.
+301         # SQLite always runs at the SERIALIZABLE isolation level.
+302         with self.wrap_database_errors:
+303             self.connection.isolation_level = level
+304 
+305     def disable_constraint_checking(self):
+306         with self.cursor() as cursor:
+307             cursor.execute('PRAGMA foreign_keys = OFF')
+308             # Foreign key constraints cannot be turned off while in a multi-
+309             # statement transaction. Fetch the current state of the pragma
+310             # to determine if constraints are effectively disabled.
+311             enabled = cursor.execute('PRAGMA foreign_keys').fetchone()[0]
+312         return not bool(enabled)
+313 
+314     def enable_constraint_checking(self):
+315         with self.cursor() as cursor:
+316             cursor.execute('PRAGMA foreign_keys = ON')
+317 
+318     def check_constraints(self, table_names=None):
+319         """
+320         Check each table name in `table_names` for rows with invalid foreign
+321         key references. This method is intended to be used in conjunction with
+322         `disable_constraint_checking()` and `enable_constraint_checking()`, to
+323         determine if rows with invalid references were entered while constraint
+324         checks were off.
+325         """
+326         if self.features.supports_pragma_foreign_key_check:
+327             with self.cursor() as cursor:
+328                 if table_names is None:
+329                     violations = cursor.execute('PRAGMA foreign_key_check').fetchall()
+330                 else:
+331                     violations = chain.from_iterable(
+332                         cursor.execute(
+333                             'PRAGMA foreign_key_check(%s)'
+334                             % self.ops.quote_name(table_name)
+335                         ).fetchall()
+336                         for table_name in table_names
+337                     )
+338                 # See https://www.sqlite.org/pragma.html#pragma_foreign_key_check
+339                 for table_name, rowid, referenced_table_name, foreign_key_index in violations:
+340                     foreign_key = cursor.execute(
+341                         'PRAGMA foreign_key_list(%s)' % self.ops.quote_name(table_name)
+342                     ).fetchall()[foreign_key_index]
+343                     column_name, referenced_column_name = foreign_key[3:5]
+344                     primary_key_column_name = self.introspection.get_primary_key_column(cursor, table_name)
+345                     primary_key_value, bad_value = cursor.execute(
+346                         'SELECT %s, %s FROM %s WHERE rowid = %%s' % (
+347                             self.ops.quote_name(primary_key_column_name),
+348                             self.ops.quote_name(column_name),
+349                             self.ops.quote_name(table_name),
+350                         ),
+351                         (rowid,),
+352                     ).fetchone()
+353                     raise IntegrityError(
+354                         "The row in table '%s' with primary key '%s' has an "
+355                         "invalid foreign key: %s.%s contains a value '%s' that "
+356                         "does not have a corresponding value in %s.%s." % (
+357                             table_name, primary_key_value, table_name, column_name,
+358                             bad_value, referenced_table_name, referenced_column_name
+359                         )
+360                     )
+361         else:
+362             with self.cursor() as cursor:
+363                 if table_names is None:
+364                     table_names = self.introspection.table_names(cursor)
+365                 for table_name in table_names:
+366                     primary_key_column_name = self.introspection.get_primary_key_column(cursor, table_name)
+367                     if not primary_key_column_name:
+368                         continue
+369                     key_columns = self.introspection.get_key_columns(cursor, table_name)
+370                     for column_name, referenced_table_name, referenced_column_name in key_columns:
+371                         cursor.execute(
+372                             """
+373                             SELECT REFERRING.`%s`, REFERRING.`%s` FROM `%s` as REFERRING
+374                             LEFT JOIN `%s` as REFERRED
+375                             ON (REFERRING.`%s` = REFERRED.`%s`)
+376                             WHERE REFERRING.`%s` IS NOT NULL AND REFERRED.`%s` IS NULL
+377                             """
+378                             % (
+379                                 primary_key_column_name, column_name, table_name,
+380                                 referenced_table_name, column_name, referenced_column_name,
+381                                 column_name, referenced_column_name,
+382                             )
+383                         )
+384                         for bad_row in cursor.fetchall():
+385                             raise IntegrityError(
+386                                 "The row in table '%s' with primary key '%s' has an "
+387                                 "invalid foreign key: %s.%s contains a value '%s' that "
+388                                 "does not have a corresponding value in %s.%s." % (
+389                                     table_name, bad_row[0], table_name, column_name,
+390                                     bad_row[1], referenced_table_name, referenced_column_name,
+391                                 )
+392                             )
+393 
+394     def is_usable(self):
+395         return True
+396 
+397     def _start_transaction_under_autocommit(self):
+398         """
+399         Start a transaction explicitly in autocommit mode.
+400 
+401         Staying in autocommit mode works around a bug of sqlite3 that breaks
+402         savepoints when autocommit is disabled.
+403         """
+404         self.cursor().execute("BEGIN")
+405 
+406     def is_in_memory_db(self):
+407         return self.creation.is_in_memory_db(self.settings_dict['NAME'])
+408 
+409 
+410 FORMAT_QMARK_REGEX = _lazy_re_compile(r'(?<!%)%s')
+411 
+412 
+413 class SQLiteCursorWrapper(Database.Cursor):
+414     """
+415     Django uses "format" style placeholders, but pysqlite2 uses "qmark" style.
+416     This fixes it -- but note that if you want to use a literal "%s" in a query,
+417     you'll need to use "%%s".
+418     """
+419     def execute(self, query, params=None):
+420         if params is None:
+421             return Database.Cursor.execute(self, query)
+422         query = self.convert_query(query)
+423         return Database.Cursor.execute(self, query, params)
+424 
+425     def executemany(self, query, param_list):
+426         query = self.convert_query(query)
+427         return Database.Cursor.executemany(self, query, param_list)
+428 
+429     def convert_query(self, query):
+430         return FORMAT_QMARK_REGEX.sub('?', query).replace('%%', '%')
+431 
+432 
+433 def _sqlite_datetime_parse(dt, tzname=None, conn_tzname=None):
+434     if dt is None:
+435         return None
+436     try:
+437         dt = backend_utils.typecast_timestamp(dt)
+438     except (TypeError, ValueError):
+439         return None
+440     if conn_tzname:
+441         dt = dt.replace(tzinfo=pytz.timezone(conn_tzname))
+442     if tzname is not None and tzname != conn_tzname:
+443         sign_index = tzname.find('+') + tzname.find('-') + 1
+444         if sign_index > -1:
+445             sign = tzname[sign_index]
+446             tzname, offset = tzname.split(sign)
+447             if offset:
+448                 hours, minutes = offset.split(':')
+449                 offset_delta = datetime.timedelta(hours=int(hours), minutes=int(minutes))
+450                 dt += offset_delta if sign == '+' else -offset_delta
+451         dt = timezone.localtime(dt, pytz.timezone(tzname))
+452     return dt
+453 
+454 
+455 def _sqlite_date_trunc(lookup_type, dt, tzname, conn_tzname):
+456     dt = _sqlite_datetime_parse(dt, tzname, conn_tzname)
+457     if dt is None:
+458         return None
+459     if lookup_type == 'year':
+460         return "%i-01-01" % dt.year
+461     elif lookup_type == 'quarter':
+462         month_in_quarter = dt.month - (dt.month - 1) % 3
+463         return '%i-%02i-01' % (dt.year, month_in_quarter)
+464     elif lookup_type == 'month':
+465         return "%i-%02i-01" % (dt.year, dt.month)
+466     elif lookup_type == 'week':
+467         dt = dt - datetime.timedelta(days=dt.weekday())
+468         return "%i-%02i-%02i" % (dt.year, dt.month, dt.day)
+469     elif lookup_type == 'day':
+470         return "%i-%02i-%02i" % (dt.year, dt.month, dt.day)
+471 
+472 
+473 def _sqlite_time_trunc(lookup_type, dt, tzname, conn_tzname):
+474     if dt is None:
+475         return None
+476     dt_parsed = _sqlite_datetime_parse(dt, tzname, conn_tzname)
+477     if dt_parsed is None:
+478         try:
+479             dt = backend_utils.typecast_time(dt)
+480         except (ValueError, TypeError):
+481             return None
+482     else:
+483         dt = dt_parsed
+484     if lookup_type == 'hour':
+485         return "%02i:00:00" % dt.hour
+486     elif lookup_type == 'minute':
+487         return "%02i:%02i:00" % (dt.hour, dt.minute)
+488     elif lookup_type == 'second':
+489         return "%02i:%02i:%02i" % (dt.hour, dt.minute, dt.second)
+490 
+491 
+492 def _sqlite_datetime_cast_date(dt, tzname, conn_tzname):
+493     dt = _sqlite_datetime_parse(dt, tzname, conn_tzname)
+494     if dt is None:
+495         return None
+496     return dt.date().isoformat()
+497 
+498 
+499 def _sqlite_datetime_cast_time(dt, tzname, conn_tzname):
+500     dt = _sqlite_datetime_parse(dt, tzname, conn_tzname)
+501     if dt is None:
+502         return None
+503     return dt.time().isoformat()
+504 
+505 
+506 def _sqlite_datetime_extract(lookup_type, dt, tzname=None, conn_tzname=None):
+507     dt = _sqlite_datetime_parse(dt, tzname, conn_tzname)
+508     if dt is None:
+509         return None
+510     if lookup_type == 'week_day':
+511         return (dt.isoweekday() % 7) + 1
+512     elif lookup_type == 'iso_week_day':
+513         return dt.isoweekday()
+514     elif lookup_type == 'week':
+515         return dt.isocalendar()[1]
+516     elif lookup_type == 'quarter':
+517         return math.ceil(dt.month / 3)
+518     elif lookup_type == 'iso_year':
+519         return dt.isocalendar()[0]
+520     else:
+521         return getattr(dt, lookup_type)
+522 
+523 
+524 def _sqlite_datetime_trunc(lookup_type, dt, tzname, conn_tzname):
+525     dt = _sqlite_datetime_parse(dt, tzname, conn_tzname)
+526     if dt is None:
+527         return None
+528     if lookup_type == 'year':
+529         return "%i-01-01 00:00:00" % dt.year
+530     elif lookup_type == 'quarter':
+531         month_in_quarter = dt.month - (dt.month - 1) % 3
+532         return '%i-%02i-01 00:00:00' % (dt.year, month_in_quarter)
+533     elif lookup_type == 'month':
+534         return "%i-%02i-01 00:00:00" % (dt.year, dt.month)
+535     elif lookup_type == 'week':
+536         dt = dt - datetime.timedelta(days=dt.weekday())
+537         return "%i-%02i-%02i 00:00:00" % (dt.year, dt.month, dt.day)
+538     elif lookup_type == 'day':
+539         return "%i-%02i-%02i 00:00:00" % (dt.year, dt.month, dt.day)
+540     elif lookup_type == 'hour':
+541         return "%i-%02i-%02i %02i:00:00" % (dt.year, dt.month, dt.day, dt.hour)
+542     elif lookup_type == 'minute':
+543         return "%i-%02i-%02i %02i:%02i:00" % (dt.year, dt.month, dt.day, dt.hour, dt.minute)
+544     elif lookup_type == 'second':
+545         return "%i-%02i-%02i %02i:%02i:%02i" % (dt.year, dt.month, dt.day, dt.hour, dt.minute, dt.second)
+546 
+547 
+548 def _sqlite_time_extract(lookup_type, dt):
+549     if dt is None:
+550         return None
+551     try:
+552         dt = backend_utils.typecast_time(dt)
+553     except (ValueError, TypeError):
+554         return None
+555     return getattr(dt, lookup_type)
+556 
+557 
+558 @none_guard
+559 def _sqlite_format_dtdelta(conn, lhs, rhs):
+560     """
+561     LHS and RHS can be either:
+562     - An integer number of microseconds
+563     - A string representing a datetime
+564     """
+565     try:
+566         real_lhs = datetime.timedelta(0, 0, lhs) if isinstance(lhs, int) else backend_utils.typecast_timestamp(lhs)
+567         real_rhs = datetime.timedelta(0, 0, rhs) if isinstance(rhs, int) else backend_utils.typecast_timestamp(rhs)
+568         if conn.strip() == '+':
+569             out = real_lhs + real_rhs
+570         else:
+571             out = real_lhs - real_rhs
+572     except (ValueError, TypeError):
+573         return None
+574     # typecast_timestamp returns a date or a datetime without timezone.
+575     # It will be formatted as "%Y-%m-%d" or "%Y-%m-%d %H:%M:%S[.%f]"
+576     return str(out)
+577 
+578 
+579 @none_guard
+580 def _sqlite_time_diff(lhs, rhs):
+581     left = backend_utils.typecast_time(lhs)
+582     right = backend_utils.typecast_time(rhs)
+583     return (
+584         (left.hour * 60 * 60 * 1000000) +
+585         (left.minute * 60 * 1000000) +
+586         (left.second * 1000000) +
+587         (left.microsecond) -
+588         (right.hour * 60 * 60 * 1000000) -
+589         (right.minute * 60 * 1000000) -
+590         (right.second * 1000000) -
+591         (right.microsecond)
+592     )
+593 
+594 
+595 @none_guard
+596 def _sqlite_timestamp_diff(lhs, rhs):
+597     left = backend_utils.typecast_timestamp(lhs)
+598     right = backend_utils.typecast_timestamp(rhs)
+599     return duration_microseconds(left - right)
+600 
+601 
+602 @none_guard
+603 def _sqlite_regexp(re_pattern, re_string):
+604     return bool(re.search(re_pattern, str(re_string)))
+605 
+606 
+607 @none_guard
+608 def _sqlite_lpad(text, length, fill_text):
+609     if len(text) >= length:
+610         return text[:length]
+611     return (fill_text * length)[:length - len(text)] + text
+612 
+613 
+614 @none_guard
+615 def _sqlite_rpad(text, length, fill_text):
+616     return (text + fill_text * length)[:length]
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `django/db/backends/sqlite3/base.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/django/db/backends/sqlite3/base.py b/django/db/backends/sqlite3/base.py
+--- a/django/db/backends/sqlite3/base.py
++++ b/django/db/backends/sqlite3/base.py
+@@ -64,8 +64,10 @@ def list_aggregate(function):
+ 
+ 
+ def check_sqlite_version():
+-    if Database.sqlite_version_info < (3, 8, 3):
+-        raise ImproperlyConfigured('SQLite 3.8.3 or later is required (found %s).' % Database.sqlite_version)
++    if Database.sqlite_version_info < (3, 9, 0):
++        raise ImproperlyConfigured(
++            'SQLite 3.9.0 or later is required (found %s).' % Database.sqlite_version
++        )
+ 
+ 
+ check_sqlite_version()
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/django/db/backends/sqlite3/base.py b/django/db/backends/sqlite3/base.py
+index ab4ea70492..dcff5534e0 100644
+--- a/django/db/backends/sqlite3/base.py
++++ b/django/db/backends/sqlite3/base.py
+@@ -64,8 +64,8 @@ def list_aggregate(function):
+ 
+ 
+ def check_sqlite_version():
+-    if Database.sqlite_version_info < (3, 8, 3):
+-        raise ImproperlyConfigured('SQLite 3.8.3 or later is required (found %s).' % Database.sqlite_version)
++    if Database.sqlite_version_info < (3, 9, 0):
++        raise ImproperlyConfigured('SQLite 3.9.0 or later is required (found %s).' % Database.sqlite_version)
+ 
+ 
+ check_sqlite_version()
+diff --git a/test_old_sqlite_version.py b/test_old_sqlite_version.py
+new file mode 100644
+index 0000000000..f9867eb300
+--- /dev/null
++++ b/test_old_sqlite_version.py
+@@ -0,0 +1,12 @@
++from sqlite3 import dbapi2 as Database
++from unittest.mock import patch
++
++print("Testing with SQLite 3.8.7...")
++
++# Mock SQLite version to test error handling
++with patch.object(Database, 'sqlite_version', '3.8.7'):
++    with patch.object(Database, 'sqlite_version_info', (3, 8, 7)):
++        try:
++            from django.db.backends.sqlite3.base import DatabaseWrapper
++        except Exception as e:
++            print(f"Got expected error: {e}")
+\ No newline at end of file
+diff --git a/test_sqlite_version.py b/test_sqlite_version.py
+new file mode 100644
+index 0000000000..bf31fcce11
+--- /dev/null
++++ b/test_sqlite_version.py
+@@ -0,0 +1,7 @@
++from sqlite3 import dbapi2 as Database
++
++print(f"SQLite version: {Database.sqlite_version}")
++print(f"SQLite version info: {Database.sqlite_version_info}")
++
++# Import Django's SQLite backend to trigger version check
++from django.db.backends.sqlite3.base import DatabaseWrapper
+\ No newline at end of file
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `tests/backends/sqlite/tests.py` that contains the existing tests.
+-----------------------------------------------------------
+import os
+import re
+import tempfile
+import threading
+import unittest
+from pathlib import Path
+from sqlite3 import dbapi2
+from unittest import mock
+
+from django.core.exceptions import ImproperlyConfigured
+from django.db import NotSupportedError, connection, transaction
+from django.db.models import Aggregate, Avg, CharField, StdDev, Sum, Variance
+from django.db.utils import ConnectionHandler
+from django.test import (
+    TestCase, TransactionTestCase, override_settings, skipIfDBFeature,
+)
+from django.test.utils import isolate_apps
+
+from ..models import Author, Item, Object, Square
+
+try:
+    from django.db.backends.sqlite3.base import check_sqlite_version
+except ImproperlyConfigured:
+    # Ignore "SQLite is too old" when running tests on another database.
+    pass
+
+
+@unittest.skipUnless(connection.vendor == 'sqlite', 'SQLite tests')
+class Tests(TestCase):
+    longMessage = True
+
+    def test_check_sqlite_version(self):
+        msg = 'SQLite 3.9.0 or later is required (found 3.8.11.1).'
+        with mock.patch.object(dbapi2, 'sqlite_version_info', (3, 8, 11, 1)), \
+                mock.patch.object(dbapi2, 'sqlite_version', '3.8.11.1'), \
+                self.assertRaisesMessage(ImproperlyConfigured, msg):
+            check_sqlite_version()
+
+    def test_aggregation(self):
+        """Raise NotSupportedError when aggregating on date/time fields."""
+        for aggregate in (Sum, Avg, Variance, StdDev):
+            with self.assertRaises(NotSupportedError):
+                Item.objects.all().aggregate(aggregate('time'))
+            with self.assertRaises(NotSupportedError):
+                Item.objects.all().aggregate(aggregate('date'))
+            with self.assertRaises(NotSupportedError):
+                Item.objects.all().aggregate(aggregate('last_modified'))
+            with self.assertRaises(NotSupportedError):
+                Item.objects.all().aggregate(
+                    **{'complex': aggregate('last_modified') + aggregate('last_modified')}
+                )
+
+    def test_distinct_aggregation(self):
+        class DistinctAggregate(Aggregate):
+            allow_distinct = True
+        aggregate = DistinctAggregate('first', 'second', distinct=True)
+        msg = (
+            "SQLite doesn't support DISTINCT on aggregate functions accepting "
+            "multiple arguments."
+        )
+        with self.assertRaisesMessage(NotSupportedError, msg):
+            connection.ops.check_expression_support(aggregate)
+
+    def test_distinct_aggregation_multiple_args_no_distinct(self):
+        # Aggregate functions accept multiple arguments when DISTINCT isn't
+        # used, e.g. GROUP_CONCAT().
+        class DistinctAggregate(Aggregate):
+            allow_distinct = True
+
+        aggregate = DistinctAggregate('first', 'second', distinct=False)
+        connection.ops.check_expression_support(aggregate)
+
+    def test_memory_db_test_name(self):
+        """A named in-memory db should be allowed where supported."""
+        from django.db.backends.sqlite3.base import DatabaseWrapper
+        settings_dict = {
+            'TEST': {
+                'NAME': 'file:memorydb_test?mode=memory&cache=shared',
+            }
+        }
+        creation = DatabaseWrapper(settings_dict).creation
+        self.assertEqual(creation._get_test_db_name(), creation.connection.settings_dict['TEST']['NAME'])
+
+    def test_regexp_function(self):
+        tests = (
+            ('test', r'[0-9]+', False),
+            ('test', r'[a-z]+', True),
+            ('test', None, None),
+            (None, r'[a-z]+', None),
+            (None, None, None),
+        )
+        for string, pattern, expected in tests:
+            with self.subTest((string, pattern)):
+                with connection.cursor() as cursor:
+                    cursor.execute('SELECT %s REGEXP %s', [string, pattern])
+                    value = cursor.fetchone()[0]
+                value = bool(value) if value in {0, 1} else value
+                self.assertIs(value, expected)
+
+    def test_pathlib_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings_dict = {
+                'default': {
+                    'ENGINE': 'django.db.backends.sqlite3',
+                    'NAME': Path(tmp) / 'test.db',
+                },
+            }
+            connections = ConnectionHandler(settings_dict)
+            connections['default'].ensure_connection()
+            connections['default'].close()
+            self.assertTrue(os.path.isfile(os.path.join(tmp, 'test.db')))
+
+
+@unittest.skipUnless(connection.vendor == 'sqlite', 'SQLite tests')
+@isolate_apps('backends')
+class SchemaTests(TransactionTestCase):
+
+    available_apps = ['backends']
+
+    def test_autoincrement(self):
+        """
+        auto_increment fields are created with the AUTOINCREMENT keyword
+        in order to be monotonically increasing (#10164).
+        """
+        with connection.schema_editor(collect_sql=True) as editor:
+            editor.create_model(Square)
+            statements = editor.collected_sql
+        match = re.search('"id" ([^,]+),', statements[0])
+        self.assertIsNotNone(match)
+        self.assertEqual(
+            'integer NOT NULL PRIMARY KEY AUTOINCREMENT',
+            match[1],
+            'Wrong SQL used to create an auto-increment column on SQLite'
+        )
+
+    def test_disable_constraint_checking_failure_disallowed(self):
+        """
+        SQLite schema editor is not usable within an outer transaction if
+        foreign key constraint checks are not disabled beforehand.
+        """
+        msg = (
+            'SQLite schema editor cannot be used while foreign key '
+            'constraint checks are enabled. Make sure to disable them '
+            'before entering a transaction.atomic() context because '
+            'SQLite does not support disabling them in the middle of '
+            'a multi-statement transaction.'
+        )
+        with self.assertRaisesMessage(NotSupportedError, msg):
+            with transaction.atomic(), connection.schema_editor(atomic=True):
+                pass
+
+    def test_constraint_checks_disabled_atomic_allowed(self):
+        """
+        SQLite schema editor is usable within an outer transaction as long as
+        foreign key constraints checks are disabled beforehand.
+        """
+        def constraint_checks_enabled():
+            with connection.cursor() as cursor:
+                return bool(cursor.execute('PRAGMA foreign_keys').fetchone()[0])
+        with connection.constraint_checks_disabled(), transaction.atomic():
+            with connection.schema_editor(atomic=True):
+                self.assertFalse(constraint_checks_enabled())
+            self.assertFalse(constraint_checks_enabled())
+        self.assertTrue(constraint_checks_enabled())
+
+    @skipIfDBFeature('supports_atomic_references_rename')
+    def test_field_rename_inside_atomic_block(self):
+        """
+        NotImplementedError is raised when a model field rename is attempted
+        inside an atomic block.
+        """
+        new_field = CharField(max_length=255, unique=True)
+        new_field.set_attributes_from_name('renamed')
+        msg = (
+            "Renaming the 'backends_author'.'name' column while in a "
+            "transaction is not supported on SQLite < 3.26 because it would "
+            "break referential integrity. Try adding `atomic = False` to the "
+            "Migration class."
+        )
+        with self.assertRaisesMessage(NotSupportedError, msg):
+            with connection.schema_editor(atomic=True) as editor:
+                editor.alter_field(Author, Author._meta.get_field('name'), new_field)
+
+    @skipIfDBFeature('supports_atomic_references_rename')
+    def test_table_rename_inside_atomic_block(self):
+        """
+        NotImplementedError is raised when a table rename is attempted inside
+        an atomic block.
+        """
+        msg = (
+            "Renaming the 'backends_author' table while in a transaction is "
+            "not supported on SQLite < 3.26 because it would break referential "
+            "integrity. Try adding `atomic = False` to the Migration class."
+        )
+        with self.assertRaisesMessage(NotSupportedError, msg):
+            with connection.schema_editor(atomic=True) as editor:
+                editor.alter_db_table(Author, "backends_author", "renamed_table")
+
+
+@unittest.skipUnless(connection.vendor == 'sqlite', 'Test only for SQLite')
+@override_settings(DEBUG=True)
+class LastExecutedQueryTest(TestCase):
+
+    def test_no_interpolation(self):
+        # This shouldn't raise an exception (#17158)
+        query = "SELECT strftime('%Y', 'now');"
+        with connection.cursor() as cursor:
+            cursor.execute(query)
+        self.assertEqual(connection.queries[-1]['sql'], query)
+
+    def test_parameter_quoting(self):
+        # The implementation of last_executed_queries isn't optimal. It's
+        # worth testing that parameters are quoted (#14091).
+        query = "SELECT %s"
+        params = ["\"'\\"]
+        with connection.cursor() as cursor:
+            cursor.execute(query, params)
+        # Note that the single quote is repeated
+        substituted = "SELECT '\"''\\'"
+        self.assertEqual(connection.queries[-1]['sql'], substituted)
+
+    def test_large_number_of_parameters(self):
+        # If SQLITE_MAX_VARIABLE_NUMBER (default = 999) has been changed to be
+        # greater than SQLITE_MAX_COLUMN (default = 2000), last_executed_query
+        # can hit the SQLITE_MAX_COLUMN limit (#26063).
+        with connection.cursor() as cursor:
+            sql = "SELECT MAX(%s)" % ", ".join(["%s"] * 2001)
+            params = list(range(2001))
+            # This should not raise an exception.
+            cursor.db.ops.last_executed_query(cursor.cursor, sql, params)
+
+
+@unittest.skipUnless(connection.vendor == 'sqlite', 'SQLite tests')
+class EscapingChecks(TestCase):
+    """
+    All tests in this test case are also run with settings.DEBUG=True in
+    EscapingChecksDebug test case, to also test CursorDebugWrapper.
+    """
+    def test_parameter_escaping(self):
+        # '%s' escaping support for sqlite3 (#13648).
+        with connection.cursor() as cursor:
+            cursor.execute("select strftime('%s', date('now'))")
+            response = cursor.fetchall()[0][0]
+        # response should be an non-zero integer
+        self.assertTrue(int(response))
+
+
+@unittest.skipUnless(connection.vendor == 'sqlite', 'SQLite tests')
+@override_settings(DEBUG=True)
+class EscapingChecksDebug(EscapingChecks):
+    pass
+
+
+@unittest.skipUnless(connection.vendor == 'sqlite', 'SQLite tests')
+class ThreadSharing(TransactionTestCase):
+    available_apps = ['backends']
+
+    def test_database_sharing_in_threads(self):
+        def create_object():
+            Object.objects.create()
+        create_object()
+        thread = threading.Thread(target=create_object)
+        thread.start()
+        thread.join()
+        self.assertEqual(Object.objects.count(), 2)
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""

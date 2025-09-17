@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.TemplateHandlePathNormalizationTests._assert_app_created admin_scripts.tests_llm.TemplateHandlePathNormalizationTests._run_create_app admin_scripts.tests_llm.TemplateHandlePathNormalizationTests.setUp admin_scripts.tests_llm.TemplateHandlePathNormalizationTests.tearDown admin_scripts.tests_llm.TemplateHandlePathNormalizationTests.test_internal_dot_segment admin_scripts.tests_llm.TemplateHandlePathNormalizationTests.test_internal_parent_segment admin_scripts.tests_llm.TemplateHandlePathNormalizationTests.test_mixed_dot_and_separators admin_scripts.tests_llm.TemplateHandlePathNormalizationTests.test_target_is_double_dot admin_scripts.tests_llm.TemplateHandlePathNormalizationTests.test_target_is_single_dot admin_scripts.tests_llm.TemplateHandlePathNormalizationTests.test_target_with_parent_reference admin_scripts.tests_llm.TemplateHandlePathNormalizationTests.test_target_with_subdir_parent_reference admin_scripts.tests_llm.TemplateHandlePathNormalizationTests.test_target_with_subdir_trailing_dot admin_scripts.tests_llm.TemplateHandlePathNormalizationTests.test_target_with_trailing_dot admin_scripts.tests_llm.TemplateHandlePathNormalizationTests.test_target_with_trailing_dot_slash
+coverage json -o coverage.json
+: '>>>>> End Test Output'

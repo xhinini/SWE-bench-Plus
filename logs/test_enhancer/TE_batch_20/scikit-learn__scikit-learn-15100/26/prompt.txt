@@ -1,0 +1,3281 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `sklearn/feature_extraction/text.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 # -*- coding: utf-8 -*-
+2 # Authors: Olivier Grisel <olivier.grisel@ensta.org>
+3 #          Mathieu Blondel <mathieu@mblondel.org>
+4 #          Lars Buitinck
+5 #          Robert Layton <robertlayton@gmail.com>
+6 #          Jochen Wersdörfer <jochen@wersdoerfer.de>
+7 #          Roman Sinayev <roman.sinayev@gmail.com>
+8 #
+9 # License: BSD 3 clause
+10 """
+11 The :mod:`sklearn.feature_extraction.text` submodule gathers utilities to
+12 build feature vectors from text documents.
+13 """
+14 
+15 import array
+16 from collections import defaultdict
+17 from collections.abc import Mapping
+18 from functools import partial
+19 import numbers
+20 from operator import itemgetter
+21 import re
+22 import unicodedata
+23 import warnings
+24 
+25 import numpy as np
+26 import scipy.sparse as sp
+27 
+28 from ..base import BaseEstimator, TransformerMixin
+29 from ..preprocessing import normalize
+30 from .hashing import FeatureHasher
+31 from .stop_words import ENGLISH_STOP_WORDS
+32 from ..utils.validation import check_is_fitted, check_array, FLOAT_DTYPES
+33 from ..utils import _IS_32BIT
+34 from ..utils.fixes import _astype_copy_false
+35 from ..exceptions import ChangedBehaviorWarning, NotFittedError
+36 
+37 
+38 __all__ = ['HashingVectorizer',
+39            'CountVectorizer',
+40            'ENGLISH_STOP_WORDS',
+41            'TfidfTransformer',
+42            'TfidfVectorizer',
+43            'strip_accents_ascii',
+44            'strip_accents_unicode',
+45            'strip_tags']
+46 
+47 
+48 def _preprocess(doc, accent_function=None, lower=False):
+49     """Chain together an optional series of text preprocessing steps to
+50     apply to a document.
+51 
+52     Parameters
+53     ----------
+54     doc: str
+55         The string to preprocess
+56     accent_function: callable
+57         Function for handling accented characters. Common strategies include
+58         normalizing and removing.
+59     lower: bool
+60         Whether to use str.lower to lowercase all fo the text
+61 
+62     Returns
+63     -------
+64     doc: str
+65         preprocessed string
+66     """
+67     if lower:
+68         doc = doc.lower()
+69     if accent_function is not None:
+70         doc = accent_function(doc)
+71     return doc
+72 
+73 
+74 def _analyze(doc, analyzer=None, tokenizer=None, ngrams=None,
+75              preprocessor=None, decoder=None, stop_words=None):
+76     """Chain together an optional series of text processing steps to go from
+77     a single document to ngrams, with or without tokenizing or preprocessing.
+78 
+79     If analyzer is used, only the decoder argument is used, as the analyzer is
+80     intended to replace the preprocessor, tokenizer, and ngrams steps.
+81 
+82     Parameters
+83     ----------
+84     analyzer: callable
+85     tokenizer: callable
+86     ngrams: callable
+87     preprocessor: callable
+88     decoder: callable
+89     stop_words: list
+90 
+91     Returns
+92     -------
+93     ngrams: list
+94         A sequence of tokens, possibly with pairs, triples, etc.
+95     """
+96 
+97     if decoder is not None:
+98         doc = decoder(doc)
+99     if analyzer is not None:
+100         doc = analyzer(doc)
+101     else:
+102         if preprocessor is not None:
+103             doc = preprocessor(doc)
+104         if tokenizer is not None:
+105             doc = tokenizer(doc)
+106         if ngrams is not None:
+107             if stop_words is not None:
+108                 doc = ngrams(doc, stop_words)
+109             else:
+110                 doc = ngrams(doc)
+111     return doc
+112 
+113 
+114 def strip_accents_unicode(s):
+115     """Transform accentuated unicode symbols into their simple counterpart
+116 
+117     Warning: the python-level loop and join operations make this
+118     implementation 20 times slower than the strip_accents_ascii basic
+119     normalization.
+120 
+121     Parameters
+122     ----------
+123     s : string
+124         The string to strip
+125 
+126     See also
+127     --------
+128     strip_accents_ascii
+129         Remove accentuated char for any unicode symbol that has a direct
+130         ASCII equivalent.
+131     """
+132     try:
+133         # If `s` is ASCII-compatible, then it does not contain any accented
+134         # characters and we can avoid an expensive list comprehension
+135         s.encode("ASCII", errors="strict")
+136         return s
+137     except UnicodeEncodeError:
+138         normalized = unicodedata.normalize('NFKD', s)
+139         return ''.join([c for c in normalized if not unicodedata.combining(c)])
+140 
+141 
+142 def strip_accents_ascii(s):
+143     """Transform accentuated unicode symbols into ascii or nothing
+144 
+145     Warning: this solution is only suited for languages that have a direct
+146     transliteration to ASCII symbols.
+147 
+148     Parameters
+149     ----------
+150     s : string
+151         The string to strip
+152 
+153     See also
+154     --------
+155     strip_accents_unicode
+156         Remove accentuated char for any unicode symbol.
+157     """
+158     nkfd_form = unicodedata.normalize('NFKD', s)
+159     return nkfd_form.encode('ASCII', 'ignore').decode('ASCII')
+160 
+161 
+162 def strip_tags(s):
+163     """Basic regexp based HTML / XML tag stripper function
+164 
+165     For serious HTML/XML preprocessing you should rather use an external
+166     library such as lxml or BeautifulSoup.
+167 
+168     Parameters
+169     ----------
+170     s : string
+171         The string to strip
+172     """
+173     return re.compile(r"<([^>]+)>", flags=re.UNICODE).sub(" ", s)
+174 
+175 
+176 def _check_stop_list(stop):
+177     if stop == "english":
+178         return ENGLISH_STOP_WORDS
+179     elif isinstance(stop, str):
+180         raise ValueError("not a built-in stop list: %s" % stop)
+181     elif stop is None:
+182         return None
+183     else:  # assume it's a collection
+184         return frozenset(stop)
+185 
+186 
+187 class VectorizerMixin:
+188     """Provides common code for text vectorizers (tokenization logic)."""
+189 
+190     _white_spaces = re.compile(r"\s\s+")
+191 
+192     def decode(self, doc):
+193         """Decode the input into a string of unicode symbols
+194 
+195         The decoding strategy depends on the vectorizer parameters.
+196 
+197         Parameters
+198         ----------
+199         doc : string
+200             The string to decode
+201         """
+202         if self.input == 'filename':
+203             with open(doc, 'rb') as fh:
+204                 doc = fh.read()
+205 
+206         elif self.input == 'file':
+207             doc = doc.read()
+208 
+209         if isinstance(doc, bytes):
+210             doc = doc.decode(self.encoding, self.decode_error)
+211 
+212         if doc is np.nan:
+213             raise ValueError("np.nan is an invalid document, expected byte or "
+214                              "unicode string.")
+215 
+216         return doc
+217 
+218     def _word_ngrams(self, tokens, stop_words=None):
+219         """Turn tokens into a sequence of n-grams after stop words filtering"""
+220         # handle stop words
+221         if stop_words is not None:
+222             tokens = [w for w in tokens if w not in stop_words]
+223 
+224         # handle token n-grams
+225         min_n, max_n = self.ngram_range
+226         if max_n != 1:
+227             original_tokens = tokens
+228             if min_n == 1:
+229                 # no need to do any slicing for unigrams
+230                 # just iterate through the original tokens
+231                 tokens = list(original_tokens)
+232                 min_n += 1
+233             else:
+234                 tokens = []
+235 
+236             n_original_tokens = len(original_tokens)
+237 
+238             # bind method outside of loop to reduce overhead
+239             tokens_append = tokens.append
+240             space_join = " ".join
+241 
+242             for n in range(min_n,
+243                            min(max_n + 1, n_original_tokens + 1)):
+244                 for i in range(n_original_tokens - n + 1):
+245                     tokens_append(space_join(original_tokens[i: i + n]))
+246 
+247         return tokens
+248 
+249     def _char_ngrams(self, text_document):
+250         """Tokenize text_document into a sequence of character n-grams"""
+251         # normalize white spaces
+252         text_document = self._white_spaces.sub(" ", text_document)
+253 
+254         text_len = len(text_document)
+255         min_n, max_n = self.ngram_range
+256         if min_n == 1:
+257             # no need to do any slicing for unigrams
+258             # iterate through the string
+259             ngrams = list(text_document)
+260             min_n += 1
+261         else:
+262             ngrams = []
+263 
+264         # bind method outside of loop to reduce overhead
+265         ngrams_append = ngrams.append
+266 
+267         for n in range(min_n, min(max_n + 1, text_len + 1)):
+268             for i in range(text_len - n + 1):
+269                 ngrams_append(text_document[i: i + n])
+270         return ngrams
+271 
+272     def _char_wb_ngrams(self, text_document):
+273         """Whitespace sensitive char-n-gram tokenization.
+274 
+275         Tokenize text_document into a sequence of character n-grams
+276         operating only inside word boundaries. n-grams at the edges
+277         of words are padded with space."""
+278         # normalize white spaces
+279         text_document = self._white_spaces.sub(" ", text_document)
+280 
+281         min_n, max_n = self.ngram_range
+282         ngrams = []
+283 
+284         # bind method outside of loop to reduce overhead
+285         ngrams_append = ngrams.append
+286 
+287         for w in text_document.split():
+288             w = ' ' + w + ' '
+289             w_len = len(w)
+290             for n in range(min_n, max_n + 1):
+291                 offset = 0
+292                 ngrams_append(w[offset:offset + n])
+293                 while offset + n < w_len:
+294                     offset += 1
+295                     ngrams_append(w[offset:offset + n])
+296                 if offset == 0:   # count a short word (w_len < n) only once
+297                     break
+298         return ngrams
+299 
+300     def build_preprocessor(self):
+301         """Return a function to preprocess the text before tokenization"""
+302         if self.preprocessor is not None:
+303             return self.preprocessor
+304 
+305         # accent stripping
+306         if not self.strip_accents:
+307             strip_accents = None
+308         elif callable(self.strip_accents):
+309             strip_accents = self.strip_accents
+310         elif self.strip_accents == 'ascii':
+311             strip_accents = strip_accents_ascii
+312         elif self.strip_accents == 'unicode':
+313             strip_accents = strip_accents_unicode
+314         else:
+315             raise ValueError('Invalid value for "strip_accents": %s' %
+316                              self.strip_accents)
+317 
+318         return partial(
+319             _preprocess, accent_function=strip_accents, lower=self.lowercase
+320         )
+321 
+322     def build_tokenizer(self):
+323         """Return a function that splits a string into a sequence of tokens"""
+324         if self.tokenizer is not None:
+325             return self.tokenizer
+326         token_pattern = re.compile(self.token_pattern)
+327         return token_pattern.findall
+328 
+329     def get_stop_words(self):
+330         """Build or fetch the effective stop words list"""
+331         return _check_stop_list(self.stop_words)
+332 
+333     def _check_stop_words_consistency(self, stop_words, preprocess, tokenize):
+334         """Check if stop words are consistent
+335 
+336         Returns
+337         -------
+338         is_consistent : True if stop words are consistent with the preprocessor
+339                         and tokenizer, False if they are not, None if the check
+340                         was previously performed, "error" if it could not be
+341                         performed (e.g. because of the use of a custom
+342                         preprocessor / tokenizer)
+343         """
+344         if id(self.stop_words) == getattr(self, '_stop_words_id', None):
+345             # Stop words are were previously validated
+346             return None
+347 
+348         # NB: stop_words is validated, unlike self.stop_words
+349         try:
+350             inconsistent = set()
+351             for w in stop_words or ():
+352                 tokens = list(tokenize(preprocess(w)))
+353                 for token in tokens:
+354                     if token not in stop_words:
+355                         inconsistent.add(token)
+356             self._stop_words_id = id(self.stop_words)
+357 
+358             if inconsistent:
+359                 warnings.warn('Your stop_words may be inconsistent with '
+360                               'your preprocessing. Tokenizing the stop '
+361                               'words generated tokens %r not in '
+362                               'stop_words.' % sorted(inconsistent))
+363             return not inconsistent
+364         except Exception:
+365             # Failed to check stop words consistency (e.g. because a custom
+366             # preprocessor or tokenizer was used)
+367             self._stop_words_id = id(self.stop_words)
+368             return 'error'
+369 
+370     def _validate_custom_analyzer(self):
+371         # This is to check if the given custom analyzer expects file or a
+372         # filename instead of data.
+373         # Behavior changed in v0.21, function could be removed in v0.23
+374         import tempfile
+375         with tempfile.NamedTemporaryFile() as f:
+376             fname = f.name
+377         # now we're sure fname doesn't exist
+378 
+379         msg = ("Since v0.21, vectorizers pass the data to the custom analyzer "
+380                "and not the file names or the file objects. This warning "
+381                "will be removed in v0.23.")
+382         try:
+383             self.analyzer(fname)
+384         except FileNotFoundError:
+385             warnings.warn(msg, ChangedBehaviorWarning)
+386         except AttributeError as e:
+387             if str(e) == "'str' object has no attribute 'read'":
+388                 warnings.warn(msg, ChangedBehaviorWarning)
+389         except Exception:
+390             pass
+391 
+392     def build_analyzer(self):
+393         """Return a callable that handles preprocessing, tokenization
+394 
+395         and n-grams generation.
+396         """
+397 
+398         if callable(self.analyzer):
+399             if self.input in ['file', 'filename']:
+400                 self._validate_custom_analyzer()
+401             return partial(
+402                 _analyze, analyzer=self.analyzer, decoder=self.decode
+403             )
+404 
+405         preprocess = self.build_preprocessor()
+406 
+407         if self.analyzer == 'char':
+408             return partial(_analyze, ngrams=self._char_ngrams,
+409                            preprocessor=preprocess, decoder=self.decode)
+410 
+411         elif self.analyzer == 'char_wb':
+412 
+413             return partial(_analyze, ngrams=self._char_wb_ngrams,
+414                            preprocessor=preprocess, decoder=self.decode)
+415 
+416         elif self.analyzer == 'word':
+417             stop_words = self.get_stop_words()
+418             tokenize = self.build_tokenizer()
+419             self._check_stop_words_consistency(stop_words, preprocess,
+420                                                tokenize)
+421             return partial(_analyze, ngrams=self._word_ngrams,
+422                            tokenizer=tokenize, preprocessor=preprocess,
+423                            decoder=self.decode, stop_words=stop_words)
+424 
+425         else:
+426             raise ValueError('%s is not a valid tokenization scheme/analyzer' %
+427                              self.analyzer)
+428 
+429     def _validate_vocabulary(self):
+430         vocabulary = self.vocabulary
+431         if vocabulary is not None:
+432             if isinstance(vocabulary, set):
+433                 vocabulary = sorted(vocabulary)
+434             if not isinstance(vocabulary, Mapping):
+435                 vocab = {}
+436                 for i, t in enumerate(vocabulary):
+437                     if vocab.setdefault(t, i) != i:
+438                         msg = "Duplicate term in vocabulary: %r" % t
+439                         raise ValueError(msg)
+440                 vocabulary = vocab
+441             else:
+442                 indices = set(vocabulary.values())
+443                 if len(indices) != len(vocabulary):
+444                     raise ValueError("Vocabulary contains repeated indices.")
+445                 for i in range(len(vocabulary)):
+446                     if i not in indices:
+447                         msg = ("Vocabulary of size %d doesn't contain index "
+448                                "%d." % (len(vocabulary), i))
+449                         raise ValueError(msg)
+450             if not vocabulary:
+451                 raise ValueError("empty vocabulary passed to fit")
+452             self.fixed_vocabulary_ = True
+453             self.vocabulary_ = dict(vocabulary)
+454         else:
+455             self.fixed_vocabulary_ = False
+456 
+457     def _check_vocabulary(self):
+458         """Check if vocabulary is empty or missing (not fitted)"""
+459         if not hasattr(self, 'vocabulary_'):
+460             self._validate_vocabulary()
+461             if not self.fixed_vocabulary_:
+462                 raise NotFittedError("Vocabulary not fitted or provided")
+463 
+464         if len(self.vocabulary_) == 0:
+465             raise ValueError("Vocabulary is empty")
+466 
+467     def _validate_params(self):
+468         """Check validity of ngram_range parameter"""
+469         min_n, max_m = self.ngram_range
+470         if min_n > max_m:
+471             raise ValueError(
+472                 "Invalid value for ngram_range=%s "
+473                 "lower boundary larger than the upper boundary."
+474                 % str(self.ngram_range))
+475 
+476     def _warn_for_unused_params(self):
+477 
+478         if self.tokenizer is not None and self.token_pattern is not None:
+479             warnings.warn("The parameter 'token_pattern' will not be used"
+480                           " since 'tokenizer' is not None'")
+481 
+482         if self.preprocessor is not None and callable(self.analyzer):
+483             warnings.warn("The parameter 'preprocessor' will not be used"
+484                           " since 'analyzer' is callable'")
+485 
+486         if (self.ngram_range != (1, 1) and self.ngram_range is not None
+487                 and callable(self.analyzer)):
+488             warnings.warn("The parameter 'ngram_range' will not be used"
+489                           " since 'analyzer' is callable'")
+490         if self.analyzer != 'word' or callable(self.analyzer):
+491             if self.stop_words is not None:
+492                 warnings.warn("The parameter 'stop_words' will not be used"
+493                               " since 'analyzer' != 'word'")
+494             if self.token_pattern is not None and \
+495                self.token_pattern != r"(?u)\b\w\w+\b":
+496                 warnings.warn("The parameter 'token_pattern' will not be used"
+497                               " since 'analyzer' != 'word'")
+498             if self.tokenizer is not None:
+499                 warnings.warn("The parameter 'tokenizer' will not be used"
+500                               " since 'analyzer' != 'word'")
+501 
+502 
+503 class HashingVectorizer(TransformerMixin, VectorizerMixin, BaseEstimator):
+504     """Convert a collection of text documents to a matrix of token occurrences
+505 
+506     It turns a collection of text documents into a scipy.sparse matrix holding
+507     token occurrence counts (or binary occurrence information), possibly
+508     normalized as token frequencies if norm='l1' or projected on the euclidean
+509     unit sphere if norm='l2'.
+510 
+511     This text vectorizer implementation uses the hashing trick to find the
+512     token string name to feature integer index mapping.
+513 
+514     This strategy has several advantages:
+515 
+516     - it is very low memory scalable to large datasets as there is no need to
+517       store a vocabulary dictionary in memory
+518 
+519     - it is fast to pickle and un-pickle as it holds no state besides the
+520       constructor parameters
+521 
+522     - it can be used in a streaming (partial fit) or parallel pipeline as there
+523       is no state computed during fit.
+524 
+525     There are also a couple of cons (vs using a CountVectorizer with an
+526     in-memory vocabulary):
+527 
+528     - there is no way to compute the inverse transform (from feature indices to
+529       string feature names) which can be a problem when trying to introspect
+530       which features are most important to a model.
+531 
+532     - there can be collisions: distinct tokens can be mapped to the same
+533       feature index. However in practice this is rarely an issue if n_features
+534       is large enough (e.g. 2 ** 18 for text classification problems).
+535 
+536     - no IDF weighting as this would render the transformer stateful.
+537 
+538     The hash function employed is the signed 32-bit version of Murmurhash3.
+539 
+540     Read more in the :ref:`User Guide <text_feature_extraction>`.
+541 
+542     Parameters
+543     ----------
+544 
+545     input : string {'filename', 'file', 'content'}
+546         If 'filename', the sequence passed as an argument to fit is
+547         expected to be a list of filenames that need reading to fetch
+548         the raw content to analyze.
+549 
+550         If 'file', the sequence items must have a 'read' method (file-like
+551         object) that is called to fetch the bytes in memory.
+552 
+553         Otherwise the input is expected to be a sequence of items that
+554         can be of type string or byte.
+555 
+556     encoding : string, default='utf-8'
+557         If bytes or files are given to analyze, this encoding is used to
+558         decode.
+559 
+560     decode_error : {'strict', 'ignore', 'replace'}
+561         Instruction on what to do if a byte sequence is given to analyze that
+562         contains characters not of the given `encoding`. By default, it is
+563         'strict', meaning that a UnicodeDecodeError will be raised. Other
+564         values are 'ignore' and 'replace'.
+565 
+566     strip_accents : {'ascii', 'unicode', None}
+567         Remove accents and perform other character normalization
+568         during the preprocessing step.
+569         'ascii' is a fast method that only works on characters that have
+570         an direct ASCII mapping.
+571         'unicode' is a slightly slower method that works on any characters.
+572         None (default) does nothing.
+573 
+574         Both 'ascii' and 'unicode' use NFKD normalization from
+575         :func:`unicodedata.normalize`.
+576 
+577     lowercase : boolean, default=True
+578         Convert all characters to lowercase before tokenizing.
+579 
+580     preprocessor : callable or None (default)
+581         Override the preprocessing (string transformation) stage while
+582         preserving the tokenizing and n-grams generation steps.
+583         Only applies if ``analyzer is not callable``.
+584 
+585     tokenizer : callable or None (default)
+586         Override the string tokenization step while preserving the
+587         preprocessing and n-grams generation steps.
+588         Only applies if ``analyzer == 'word'``.
+589 
+590     stop_words : string {'english'}, list, or None (default)
+591         If 'english', a built-in stop word list for English is used.
+592         There are several known issues with 'english' and you should
+593         consider an alternative (see :ref:`stop_words`).
+594 
+595         If a list, that list is assumed to contain stop words, all of which
+596         will be removed from the resulting tokens.
+597         Only applies if ``analyzer == 'word'``.
+598 
+599     token_pattern : string
+600         Regular expression denoting what constitutes a "token", only used
+601         if ``analyzer == 'word'``. The default regexp selects tokens of 2
+602         or more alphanumeric characters (punctuation is completely ignored
+603         and always treated as a token separator).
+604 
+605     ngram_range : tuple (min_n, max_n), default=(1, 1)
+606         The lower and upper boundary of the range of n-values for different
+607         n-grams to be extracted. All values of n such that min_n <= n <= max_n
+608         will be used. For example an ``ngram_range`` of ``(1, 1)`` means only
+609         unigrams, ``(1, 2)`` means unigrams and bigrams, and ``(2, 2)`` means
+610         only bigrams.
+611         Only applies if ``analyzer is not callable``.
+612 
+613     analyzer : string, {'word', 'char', 'char_wb'} or callable
+614         Whether the feature should be made of word or character n-grams.
+615         Option 'char_wb' creates character n-grams only from text inside
+616         word boundaries; n-grams at the edges of words are padded with space.
+617 
+618         If a callable is passed it is used to extract the sequence of features
+619         out of the raw, unprocessed input.
+620 
+621         .. versionchanged:: 0.21
+622 
+623         Since v0.21, if ``input`` is ``filename`` or ``file``, the data is
+624         first read from the file and then passed to the given callable
+625         analyzer.
+626 
+627     n_features : integer, default=(2 ** 20)
+628         The number of features (columns) in the output matrices. Small numbers
+629         of features are likely to cause hash collisions, but large numbers
+630         will cause larger coefficient dimensions in linear learners.
+631 
+632     binary : boolean, default=False.
+633         If True, all non zero counts are set to 1. This is useful for discrete
+634         probabilistic models that model binary events rather than integer
+635         counts.
+636 
+637     norm : 'l1', 'l2' or None, optional
+638         Norm used to normalize term vectors. None for no normalization.
+639 
+640     alternate_sign : boolean, optional, default True
+641         When True, an alternating sign is added to the features as to
+642         approximately conserve the inner product in the hashed space even for
+643         small n_features. This approach is similar to sparse random projection.
+644 
+645         .. versionadded:: 0.19
+646 
+647     dtype : type, optional
+648         Type of the matrix returned by fit_transform() or transform().
+649 
+650     Examples
+651     --------
+652     >>> from sklearn.feature_extraction.text import HashingVectorizer
+653     >>> corpus = [
+654     ...     'This is the first document.',
+655     ...     'This document is the second document.',
+656     ...     'And this is the third one.',
+657     ...     'Is this the first document?',
+658     ... ]
+659     >>> vectorizer = HashingVectorizer(n_features=2**4)
+660     >>> X = vectorizer.fit_transform(corpus)
+661     >>> print(X.shape)
+662     (4, 16)
+663 
+664     See also
+665     --------
+666     CountVectorizer, TfidfVectorizer
+667 
+668     """
+669     def __init__(self, input='content', encoding='utf-8',
+670                  decode_error='strict', strip_accents=None,
+671                  lowercase=True, preprocessor=None, tokenizer=None,
+672                  stop_words=None, token_pattern=r"(?u)\b\w\w+\b",
+673                  ngram_range=(1, 1), analyzer='word', n_features=(2 ** 20),
+674                  binary=False, norm='l2', alternate_sign=True,
+675                  dtype=np.float64):
+676         self.input = input
+677         self.encoding = encoding
+678         self.decode_error = decode_error
+679         self.strip_accents = strip_accents
+680         self.preprocessor = preprocessor
+681         self.tokenizer = tokenizer
+682         self.analyzer = analyzer
+683         self.lowercase = lowercase
+684         self.token_pattern = token_pattern
+685         self.stop_words = stop_words
+686         self.n_features = n_features
+687         self.ngram_range = ngram_range
+688         self.binary = binary
+689         self.norm = norm
+690         self.alternate_sign = alternate_sign
+691         self.dtype = dtype
+692 
+693     def partial_fit(self, X, y=None):
+694         """Does nothing: this transformer is stateless.
+695 
+696         This method is just there to mark the fact that this transformer
+697         can work in a streaming setup.
+698 
+699         Parameters
+700         ----------
+701         X : array-like, shape [n_samples, n_features]
+702             Training data.
+703         """
+704         return self
+705 
+706     def fit(self, X, y=None):
+707         """Does nothing: this transformer is stateless.
+708 
+709         Parameters
+710         ----------
+711         X : array-like, shape [n_samples, n_features]
+712             Training data.
+713         """
+714         # triggers a parameter validation
+715         if isinstance(X, str):
+716             raise ValueError(
+717                 "Iterable over raw text documents expected, "
+718                 "string object received.")
+719 
+720         self._warn_for_unused_params()
+721         self._validate_params()
+722 
+723         self._get_hasher().fit(X, y=y)
+724         return self
+725 
+726     def transform(self, X):
+727         """Transform a sequence of documents to a document-term matrix.
+728 
+729         Parameters
+730         ----------
+731         X : iterable over raw text documents, length = n_samples
+732             Samples. Each sample must be a text document (either bytes or
+733             unicode strings, file name or file object depending on the
+734             constructor argument) which will be tokenized and hashed.
+735 
+736         Returns
+737         -------
+738         X : scipy.sparse matrix, shape = (n_samples, self.n_features)
+739             Document-term matrix.
+740         """
+741         if isinstance(X, str):
+742             raise ValueError(
+743                 "Iterable over raw text documents expected, "
+744                 "string object received.")
+745 
+746         self._validate_params()
+747 
+748         analyzer = self.build_analyzer()
+749         X = self._get_hasher().transform(analyzer(doc) for doc in X)
+750         if self.binary:
+751             X.data.fill(1)
+752         if self.norm is not None:
+753             X = normalize(X, norm=self.norm, copy=False)
+754         return X
+755 
+756     def fit_transform(self, X, y=None):
+757         """Transform a sequence of documents to a document-term matrix.
+758 
+759         Parameters
+760         ----------
+761         X : iterable over raw text documents, length = n_samples
+762             Samples. Each sample must be a text document (either bytes or
+763             unicode strings, file name or file object depending on the
+764             constructor argument) which will be tokenized and hashed.
+765         y : any
+766             Ignored. This parameter exists only for compatibility with
+767             sklearn.pipeline.Pipeline.
+768 
+769         Returns
+770         -------
+771         X : scipy.sparse matrix, shape = (n_samples, self.n_features)
+772             Document-term matrix.
+773         """
+774         return self.fit(X, y).transform(X)
+775 
+776     def _get_hasher(self):
+777         return FeatureHasher(n_features=self.n_features,
+778                              input_type='string', dtype=self.dtype,
+779                              alternate_sign=self.alternate_sign)
+780 
+781     def _more_tags(self):
+782         return {'X_types': ['string']}
+783 
+784 
+785 def _document_frequency(X):
+786     """Count the number of non-zero values for each feature in sparse X."""
+787     if sp.isspmatrix_csr(X):
+788         return np.bincount(X.indices, minlength=X.shape[1])
+789     else:
+790         return np.diff(X.indptr)
+791 
+792 
+793 class CountVectorizer(VectorizerMixin, BaseEstimator):
+794     """Convert a collection of text documents to a matrix of token counts
+795 
+796     This implementation produces a sparse representation of the counts using
+797     scipy.sparse.csr_matrix.
+798 
+799     If you do not provide an a-priori dictionary and you do not use an analyzer
+800     that does some kind of feature selection then the number of features will
+801     be equal to the vocabulary size found by analyzing the data.
+802 
+803     Read more in the :ref:`User Guide <text_feature_extraction>`.
+804 
+805     Parameters
+806     ----------
+807     input : string {'filename', 'file', 'content'}
+808         If 'filename', the sequence passed as an argument to fit is
+809         expected to be a list of filenames that need reading to fetch
+810         the raw content to analyze.
+811 
+812         If 'file', the sequence items must have a 'read' method (file-like
+813         object) that is called to fetch the bytes in memory.
+814 
+815         Otherwise the input is expected to be a sequence of items that
+816         can be of type string or byte.
+817 
+818     encoding : string, 'utf-8' by default.
+819         If bytes or files are given to analyze, this encoding is used to
+820         decode.
+821 
+822     decode_error : {'strict', 'ignore', 'replace'}
+823         Instruction on what to do if a byte sequence is given to analyze that
+824         contains characters not of the given `encoding`. By default, it is
+825         'strict', meaning that a UnicodeDecodeError will be raised. Other
+826         values are 'ignore' and 'replace'.
+827 
+828     strip_accents : {'ascii', 'unicode', None}
+829         Remove accents and perform other character normalization
+830         during the preprocessing step.
+831         'ascii' is a fast method that only works on characters that have
+832         an direct ASCII mapping.
+833         'unicode' is a slightly slower method that works on any characters.
+834         None (default) does nothing.
+835 
+836         Both 'ascii' and 'unicode' use NFKD normalization from
+837         :func:`unicodedata.normalize`.
+838 
+839     lowercase : boolean, True by default
+840         Convert all characters to lowercase before tokenizing.
+841 
+842     preprocessor : callable or None (default)
+843         Override the preprocessing (string transformation) stage while
+844         preserving the tokenizing and n-grams generation steps.
+845         Only applies if ``analyzer is not callable``.
+846 
+847     tokenizer : callable or None (default)
+848         Override the string tokenization step while preserving the
+849         preprocessing and n-grams generation steps.
+850         Only applies if ``analyzer == 'word'``.
+851 
+852     stop_words : string {'english'}, list, or None (default)
+853         If 'english', a built-in stop word list for English is used.
+854         There are several known issues with 'english' and you should
+855         consider an alternative (see :ref:`stop_words`).
+856 
+857         If a list, that list is assumed to contain stop words, all of which
+858         will be removed from the resulting tokens.
+859         Only applies if ``analyzer == 'word'``.
+860 
+861         If None, no stop words will be used. max_df can be set to a value
+862         in the range [0.7, 1.0) to automatically detect and filter stop
+863         words based on intra corpus document frequency of terms.
+864 
+865     token_pattern : string
+866         Regular expression denoting what constitutes a "token", only used
+867         if ``analyzer == 'word'``. The default regexp select tokens of 2
+868         or more alphanumeric characters (punctuation is completely ignored
+869         and always treated as a token separator).
+870 
+871     ngram_range : tuple (min_n, max_n), default=(1, 1)
+872         The lower and upper boundary of the range of n-values for different
+873         n-grams to be extracted. All values of n such that min_n <= n <= max_n
+874         will be used. For example an ``ngram_range`` of ``(1, 1)`` means only
+875         unigrams, ``(1, 2)`` means unigrams and bigrams, and ``(2, 2)`` means
+876         only bigrams.
+877         Only applies if ``analyzer is not callable``.
+878 
+879     analyzer : string, {'word', 'char', 'char_wb'} or callable
+880         Whether the feature should be made of word or character n-grams.
+881         Option 'char_wb' creates character n-grams only from text inside
+882         word boundaries; n-grams at the edges of words are padded with space.
+883 
+884         If a callable is passed it is used to extract the sequence of features
+885         out of the raw, unprocessed input.
+886 
+887         .. versionchanged:: 0.21
+888 
+889         Since v0.21, if ``input`` is ``filename`` or ``file``, the data is
+890         first read from the file and then passed to the given callable
+891         analyzer.
+892 
+893     max_df : float in range [0.0, 1.0] or int, default=1.0
+894         When building the vocabulary ignore terms that have a document
+895         frequency strictly higher than the given threshold (corpus-specific
+896         stop words).
+897         If float, the parameter represents a proportion of documents, integer
+898         absolute counts.
+899         This parameter is ignored if vocabulary is not None.
+900 
+901     min_df : float in range [0.0, 1.0] or int, default=1
+902         When building the vocabulary ignore terms that have a document
+903         frequency strictly lower than the given threshold. This value is also
+904         called cut-off in the literature.
+905         If float, the parameter represents a proportion of documents, integer
+906         absolute counts.
+907         This parameter is ignored if vocabulary is not None.
+908 
+909     max_features : int or None, default=None
+910         If not None, build a vocabulary that only consider the top
+911         max_features ordered by term frequency across the corpus.
+912 
+913         This parameter is ignored if vocabulary is not None.
+914 
+915     vocabulary : Mapping or iterable, optional
+916         Either a Mapping (e.g., a dict) where keys are terms and values are
+917         indices in the feature matrix, or an iterable over terms. If not
+918         given, a vocabulary is determined from the input documents. Indices
+919         in the mapping should not be repeated and should not have any gap
+920         between 0 and the largest index.
+921 
+922     binary : boolean, default=False
+923         If True, all non zero counts are set to 1. This is useful for discrete
+924         probabilistic models that model binary events rather than integer
+925         counts.
+926 
+927     dtype : type, optional
+928         Type of the matrix returned by fit_transform() or transform().
+929 
+930     Attributes
+931     ----------
+932     vocabulary_ : dict
+933         A mapping of terms to feature indices.
+934 
+935     fixed_vocabulary_: boolean
+936         True if a fixed vocabulary of term to indices mapping
+937         is provided by the user
+938 
+939     stop_words_ : set
+940         Terms that were ignored because they either:
+941 
+942           - occurred in too many documents (`max_df`)
+943           - occurred in too few documents (`min_df`)
+944           - were cut off by feature selection (`max_features`).
+945 
+946         This is only available if no vocabulary was given.
+947 
+948     Examples
+949     --------
+950     >>> from sklearn.feature_extraction.text import CountVectorizer
+951     >>> corpus = [
+952     ...     'This is the first document.',
+953     ...     'This document is the second document.',
+954     ...     'And this is the third one.',
+955     ...     'Is this the first document?',
+956     ... ]
+957     >>> vectorizer = CountVectorizer()
+958     >>> X = vectorizer.fit_transform(corpus)
+959     >>> print(vectorizer.get_feature_names())
+960     ['and', 'document', 'first', 'is', 'one', 'second', 'the', 'third', 'this']
+961     >>> print(X.toarray())
+962     [[0 1 1 1 0 0 1 0 1]
+963      [0 2 0 1 0 1 1 0 1]
+964      [1 0 0 1 1 0 1 1 1]
+965      [0 1 1 1 0 0 1 0 1]]
+966 
+967     See also
+968     --------
+969     HashingVectorizer, TfidfVectorizer
+970 
+971     Notes
+972     -----
+973     The ``stop_words_`` attribute can get large and increase the model size
+974     when pickling. This attribute is provided only for introspection and can
+975     be safely removed using delattr or set to None before pickling.
+976     """
+977 
+978     def __init__(self, input='content', encoding='utf-8',
+979                  decode_error='strict', strip_accents=None,
+980                  lowercase=True, preprocessor=None, tokenizer=None,
+981                  stop_words=None, token_pattern=r"(?u)\b\w\w+\b",
+982                  ngram_range=(1, 1), analyzer='word',
+983                  max_df=1.0, min_df=1, max_features=None,
+984                  vocabulary=None, binary=False, dtype=np.int64):
+985         self.input = input
+986         self.encoding = encoding
+987         self.decode_error = decode_error
+988         self.strip_accents = strip_accents
+989         self.preprocessor = preprocessor
+990         self.tokenizer = tokenizer
+991         self.analyzer = analyzer
+992         self.lowercase = lowercase
+993         self.token_pattern = token_pattern
+994         self.stop_words = stop_words
+995         self.max_df = max_df
+996         self.min_df = min_df
+997         if max_df < 0 or min_df < 0:
+998             raise ValueError("negative value for max_df or min_df")
+999         self.max_features = max_features
+1000         if max_features is not None:
+1001             if (not isinstance(max_features, numbers.Integral) or
+1002                     max_features <= 0):
+1003                 raise ValueError(
+1004                     "max_features=%r, neither a positive integer nor None"
+1005                     % max_features)
+1006         self.ngram_range = ngram_range
+1007         self.vocabulary = vocabulary
+1008         self.binary = binary
+1009         self.dtype = dtype
+1010 
+1011     def _sort_features(self, X, vocabulary):
+1012         """Sort features by name
+1013 
+1014         Returns a reordered matrix and modifies the vocabulary in place
+1015         """
+1016         sorted_features = sorted(vocabulary.items())
+1017         map_index = np.empty(len(sorted_features), dtype=X.indices.dtype)
+1018         for new_val, (term, old_val) in enumerate(sorted_features):
+1019             vocabulary[term] = new_val
+1020             map_index[old_val] = new_val
+1021 
+1022         X.indices = map_index.take(X.indices, mode='clip')
+1023         return X
+1024 
+1025     def _limit_features(self, X, vocabulary, high=None, low=None,
+1026                         limit=None):
+1027         """Remove too rare or too common features.
+1028 
+1029         Prune features that are non zero in more samples than high or less
+1030         documents than low, modifying the vocabulary, and restricting it to
+1031         at most the limit most frequent.
+1032 
+1033         This does not prune samples with zero features.
+1034         """
+1035         if high is None and low is None and limit is None:
+1036             return X, set()
+1037 
+1038         # Calculate a mask based on document frequencies
+1039         dfs = _document_frequency(X)
+1040         mask = np.ones(len(dfs), dtype=bool)
+1041         if high is not None:
+1042             mask &= dfs <= high
+1043         if low is not None:
+1044             mask &= dfs >= low
+1045         if limit is not None and mask.sum() > limit:
+1046             tfs = np.asarray(X.sum(axis=0)).ravel()
+1047             mask_inds = (-tfs[mask]).argsort()[:limit]
+1048             new_mask = np.zeros(len(dfs), dtype=bool)
+1049             new_mask[np.where(mask)[0][mask_inds]] = True
+1050             mask = new_mask
+1051 
+1052         new_indices = np.cumsum(mask) - 1  # maps old indices to new
+1053         removed_terms = set()
+1054         for term, old_index in list(vocabulary.items()):
+1055             if mask[old_index]:
+1056                 vocabulary[term] = new_indices[old_index]
+1057             else:
+1058                 del vocabulary[term]
+1059                 removed_terms.add(term)
+1060         kept_indices = np.where(mask)[0]
+1061         if len(kept_indices) == 0:
+1062             raise ValueError("After pruning, no terms remain. Try a lower"
+1063                              " min_df or a higher max_df.")
+1064         return X[:, kept_indices], removed_terms
+1065 
+1066     def _count_vocab(self, raw_documents, fixed_vocab):
+1067         """Create sparse feature matrix, and vocabulary where fixed_vocab=False
+1068         """
+1069         if fixed_vocab:
+1070             vocabulary = self.vocabulary_
+1071         else:
+1072             # Add a new value when a new vocabulary item is seen
+1073             vocabulary = defaultdict()
+1074             vocabulary.default_factory = vocabulary.__len__
+1075 
+1076         analyze = self.build_analyzer()
+1077         j_indices = []
+1078         indptr = []
+1079 
+1080         values = _make_int_array()
+1081         indptr.append(0)
+1082         for doc in raw_documents:
+1083             feature_counter = {}
+1084             for feature in analyze(doc):
+1085                 try:
+1086                     feature_idx = vocabulary[feature]
+1087                     if feature_idx not in feature_counter:
+1088                         feature_counter[feature_idx] = 1
+1089                     else:
+1090                         feature_counter[feature_idx] += 1
+1091                 except KeyError:
+1092                     # Ignore out-of-vocabulary items for fixed_vocab=True
+1093                     continue
+1094 
+1095             j_indices.extend(feature_counter.keys())
+1096             values.extend(feature_counter.values())
+1097             indptr.append(len(j_indices))
+1098 
+1099         if not fixed_vocab:
+1100             # disable defaultdict behaviour
+1101             vocabulary = dict(vocabulary)
+1102             if not vocabulary:
+1103                 raise ValueError("empty vocabulary; perhaps the documents only"
+1104                                  " contain stop words")
+1105 
+1106         if indptr[-1] > 2147483648:  # = 2**31 - 1
+1107             if _IS_32BIT:
+1108                 raise ValueError(('sparse CSR array has {} non-zero '
+1109                                   'elements and requires 64 bit indexing, '
+1110                                   'which is unsupported with 32 bit Python.')
+1111                                  .format(indptr[-1]))
+1112             indices_dtype = np.int64
+1113 
+1114         else:
+1115             indices_dtype = np.int32
+1116         j_indices = np.asarray(j_indices, dtype=indices_dtype)
+1117         indptr = np.asarray(indptr, dtype=indices_dtype)
+1118         values = np.frombuffer(values, dtype=np.intc)
+1119 
+1120         X = sp.csr_matrix((values, j_indices, indptr),
+1121                           shape=(len(indptr) - 1, len(vocabulary)),
+1122                           dtype=self.dtype)
+1123         X.sort_indices()
+1124         return vocabulary, X
+1125 
+1126     def fit(self, raw_documents, y=None):
+1127         """Learn a vocabulary dictionary of all tokens in the raw documents.
+1128 
+1129         Parameters
+1130         ----------
+1131         raw_documents : iterable
+1132             An iterable which yields either str, unicode or file objects.
+1133 
+1134         Returns
+1135         -------
+1136         self
+1137         """
+1138         self._warn_for_unused_params()
+1139         self.fit_transform(raw_documents)
+1140         return self
+1141 
+1142     def fit_transform(self, raw_documents, y=None):
+1143         """Learn the vocabulary dictionary and return term-document matrix.
+1144 
+1145         This is equivalent to fit followed by transform, but more efficiently
+1146         implemented.
+1147 
+1148         Parameters
+1149         ----------
+1150         raw_documents : iterable
+1151             An iterable which yields either str, unicode or file objects.
+1152 
+1153         Returns
+1154         -------
+1155         X : array, [n_samples, n_features]
+1156             Document-term matrix.
+1157         """
+1158         # We intentionally don't call the transform method to make
+1159         # fit_transform overridable without unwanted side effects in
+1160         # TfidfVectorizer.
+1161         if isinstance(raw_documents, str):
+1162             raise ValueError(
+1163                 "Iterable over raw text documents expected, "
+1164                 "string object received.")
+1165 
+1166         self._validate_params()
+1167         self._validate_vocabulary()
+1168         max_df = self.max_df
+1169         min_df = self.min_df
+1170         max_features = self.max_features
+1171 
+1172         vocabulary, X = self._count_vocab(raw_documents,
+1173                                           self.fixed_vocabulary_)
+1174 
+1175         if self.binary:
+1176             X.data.fill(1)
+1177 
+1178         if not self.fixed_vocabulary_:
+1179             X = self._sort_features(X, vocabulary)
+1180 
+1181             n_doc = X.shape[0]
+1182             max_doc_count = (max_df
+1183                              if isinstance(max_df, numbers.Integral)
+1184                              else max_df * n_doc)
+1185             min_doc_count = (min_df
+1186                              if isinstance(min_df, numbers.Integral)
+1187                              else min_df * n_doc)
+1188             if max_doc_count < min_doc_count:
+1189                 raise ValueError(
+1190                     "max_df corresponds to < documents than min_df")
+1191             X, self.stop_words_ = self._limit_features(X, vocabulary,
+1192                                                        max_doc_count,
+1193                                                        min_doc_count,
+1194                                                        max_features)
+1195 
+1196             self.vocabulary_ = vocabulary
+1197 
+1198         return X
+1199 
+1200     def transform(self, raw_documents):
+1201         """Transform documents to document-term matrix.
+1202 
+1203         Extract token counts out of raw text documents using the vocabulary
+1204         fitted with fit or the one provided to the constructor.
+1205 
+1206         Parameters
+1207         ----------
+1208         raw_documents : iterable
+1209             An iterable which yields either str, unicode or file objects.
+1210 
+1211         Returns
+1212         -------
+1213         X : sparse matrix, [n_samples, n_features]
+1214             Document-term matrix.
+1215         """
+1216         if isinstance(raw_documents, str):
+1217             raise ValueError(
+1218                 "Iterable over raw text documents expected, "
+1219                 "string object received.")
+1220         self._check_vocabulary()
+1221 
+1222         # use the same matrix-building strategy as fit_transform
+1223         _, X = self._count_vocab(raw_documents, fixed_vocab=True)
+1224         if self.binary:
+1225             X.data.fill(1)
+1226         return X
+1227 
+1228     def inverse_transform(self, X):
+1229         """Return terms per document with nonzero entries in X.
+1230 
+1231         Parameters
+1232         ----------
+1233         X : {array, sparse matrix}, shape = [n_samples, n_features]
+1234 
+1235         Returns
+1236         -------
+1237         X_inv : list of arrays, len = n_samples
+1238             List of arrays of terms.
+1239         """
+1240         self._check_vocabulary()
+1241 
+1242         if sp.issparse(X):
+1243             # We need CSR format for fast row manipulations.
+1244             X = X.tocsr()
+1245         else:
+1246             # We need to convert X to a matrix, so that the indexing
+1247             # returns 2D objects
+1248             X = np.asmatrix(X)
+1249         n_samples = X.shape[0]
+1250 
+1251         terms = np.array(list(self.vocabulary_.keys()))
+1252         indices = np.array(list(self.vocabulary_.values()))
+1253         inverse_vocabulary = terms[np.argsort(indices)]
+1254 
+1255         return [inverse_vocabulary[X[i, :].nonzero()[1]].ravel()
+1256                 for i in range(n_samples)]
+1257 
+1258     def get_feature_names(self):
+1259         """Array mapping from feature integer indices to feature name"""
+1260 
+1261         self._check_vocabulary()
+1262 
+1263         return [t for t, i in sorted(self.vocabulary_.items(),
+1264                                      key=itemgetter(1))]
+1265 
+1266     def _more_tags(self):
+1267         return {'X_types': ['string']}
+1268 
+1269 
+1270 def _make_int_array():
+1271     """Construct an array.array of a type suitable for scipy.sparse indices."""
+1272     return array.array(str("i"))
+1273 
+1274 
+1275 class TfidfTransformer(TransformerMixin, BaseEstimator):
+1276     """Transform a count matrix to a normalized tf or tf-idf representation
+1277 
+1278     Tf means term-frequency while tf-idf means term-frequency times inverse
+1279     document-frequency. This is a common term weighting scheme in information
+1280     retrieval, that has also found good use in document classification.
+1281 
+1282     The goal of using tf-idf instead of the raw frequencies of occurrence of a
+1283     token in a given document is to scale down the impact of tokens that occur
+1284     very frequently in a given corpus and that are hence empirically less
+1285     informative than features that occur in a small fraction of the training
+1286     corpus.
+1287 
+1288     The formula that is used to compute the tf-idf for a term t of a document d
+1289     in a document set is tf-idf(t, d) = tf(t, d) * idf(t), and the idf is
+1290     computed as idf(t) = log [ n / df(t) ] + 1 (if ``smooth_idf=False``), where
+1291     n is the total number of documents in the document set and df(t) is the
+1292     document frequency of t; the document frequency is the number of documents
+1293     in the document set that contain the term t. The effect of adding "1" to
+1294     the idf in the equation above is that terms with zero idf, i.e., terms
+1295     that occur in all documents in a training set, will not be entirely
+1296     ignored.
+1297     (Note that the idf formula above differs from the standard textbook
+1298     notation that defines the idf as
+1299     idf(t) = log [ n / (df(t) + 1) ]).
+1300 
+1301     If ``smooth_idf=True`` (the default), the constant "1" is added to the
+1302     numerator and denominator of the idf as if an extra document was seen
+1303     containing every term in the collection exactly once, which prevents
+1304     zero divisions: idf(d, t) = log [ (1 + n) / (1 + df(d, t)) ] + 1.
+1305 
+1306     Furthermore, the formulas used to compute tf and idf depend
+1307     on parameter settings that correspond to the SMART notation used in IR
+1308     as follows:
+1309 
+1310     Tf is "n" (natural) by default, "l" (logarithmic) when
+1311     ``sublinear_tf=True``.
+1312     Idf is "t" when use_idf is given, "n" (none) otherwise.
+1313     Normalization is "c" (cosine) when ``norm='l2'``, "n" (none)
+1314     when ``norm=None``.
+1315 
+1316     Read more in the :ref:`User Guide <text_feature_extraction>`.
+1317 
+1318     Parameters
+1319     ----------
+1320     norm : 'l1', 'l2' or None, optional (default='l2')
+1321         Each output row will have unit norm, either:
+1322         * 'l2': Sum of squares of vector elements is 1. The cosine
+1323         similarity between two vectors is their dot product when l2 norm has
+1324         been applied.
+1325         * 'l1': Sum of absolute values of vector elements is 1.
+1326         See :func:`preprocessing.normalize`
+1327 
+1328     use_idf : boolean (default=True)
+1329         Enable inverse-document-frequency reweighting.
+1330 
+1331     smooth_idf : boolean (default=True)
+1332         Smooth idf weights by adding one to document frequencies, as if an
+1333         extra document was seen containing every term in the collection
+1334         exactly once. Prevents zero divisions.
+1335 
+1336     sublinear_tf : boolean (default=False)
+1337         Apply sublinear tf scaling, i.e. replace tf with 1 + log(tf).
+1338 
+1339     Attributes
+1340     ----------
+1341     idf_ : array, shape (n_features)
+1342         The inverse document frequency (IDF) vector; only defined
+1343         if  ``use_idf`` is True.
+1344 
+1345     References
+1346     ----------
+1347 
+1348     .. [Yates2011] R. Baeza-Yates and B. Ribeiro-Neto (2011). Modern
+1349                    Information Retrieval. Addison Wesley, pp. 68-74.
+1350 
+1351     .. [MRS2008] C.D. Manning, P. Raghavan and H. Schütze  (2008).
+1352                    Introduction to Information Retrieval. Cambridge University
+1353                    Press, pp. 118-120.
+1354     """
+1355 
+1356     def __init__(self, norm='l2', use_idf=True, smooth_idf=True,
+1357                  sublinear_tf=False):
+1358         self.norm = norm
+1359         self.use_idf = use_idf
+1360         self.smooth_idf = smooth_idf
+1361         self.sublinear_tf = sublinear_tf
+1362 
+1363     def fit(self, X, y=None):
+1364         """Learn the idf vector (global term weights)
+1365 
+1366         Parameters
+1367         ----------
+1368         X : sparse matrix, [n_samples, n_features]
+1369             a matrix of term/token counts
+1370         """
+1371         X = check_array(X, accept_sparse=('csr', 'csc'))
+1372         if not sp.issparse(X):
+1373             X = sp.csr_matrix(X)
+1374         dtype = X.dtype if X.dtype in FLOAT_DTYPES else np.float64
+1375 
+1376         if self.use_idf:
+1377             n_samples, n_features = X.shape
+1378             df = _document_frequency(X)
+1379             df = df.astype(dtype, **_astype_copy_false(df))
+1380 
+1381             # perform idf smoothing if required
+1382             df += int(self.smooth_idf)
+1383             n_samples += int(self.smooth_idf)
+1384 
+1385             # log+1 instead of log makes sure terms with zero idf don't get
+1386             # suppressed entirely.
+1387             idf = np.log(n_samples / df) + 1
+1388             self._idf_diag = sp.diags(idf, offsets=0,
+1389                                       shape=(n_features, n_features),
+1390                                       format='csr',
+1391                                       dtype=dtype)
+1392 
+1393         return self
+1394 
+1395     def transform(self, X, copy=True):
+1396         """Transform a count matrix to a tf or tf-idf representation
+1397 
+1398         Parameters
+1399         ----------
+1400         X : sparse matrix, [n_samples, n_features]
+1401             a matrix of term/token counts
+1402 
+1403         copy : boolean, default True
+1404             Whether to copy X and operate on the copy or perform in-place
+1405             operations.
+1406 
+1407         Returns
+1408         -------
+1409         vectors : sparse matrix, [n_samples, n_features]
+1410         """
+1411         X = check_array(X, accept_sparse='csr', dtype=FLOAT_DTYPES, copy=copy)
+1412         if not sp.issparse(X):
+1413             X = sp.csr_matrix(X, dtype=np.float64)
+1414 
+1415         n_samples, n_features = X.shape
+1416 
+1417         if self.sublinear_tf:
+1418             np.log(X.data, X.data)
+1419             X.data += 1
+1420 
+1421         if self.use_idf:
+1422             check_is_fitted(self, msg='idf vector is not fitted')
+1423 
+1424             expected_n_features = self._idf_diag.shape[0]
+1425             if n_features != expected_n_features:
+1426                 raise ValueError("Input has n_features=%d while the model"
+1427                                  " has been trained with n_features=%d" % (
+1428                                      n_features, expected_n_features))
+1429             # *= doesn't work
+1430             X = X * self._idf_diag
+1431 
+1432         if self.norm:
+1433             X = normalize(X, norm=self.norm, copy=False)
+1434 
+1435         return X
+1436 
+1437     @property
+1438     def idf_(self):
+1439         # if _idf_diag is not set, this will raise an attribute error,
+1440         # which means hasattr(self, "idf_") is False
+1441         return np.ravel(self._idf_diag.sum(axis=0))
+1442 
+1443     @idf_.setter
+1444     def idf_(self, value):
+1445         value = np.asarray(value, dtype=np.float64)
+1446         n_features = value.shape[0]
+1447         self._idf_diag = sp.spdiags(value, diags=0, m=n_features,
+1448                                     n=n_features, format='csr')
+1449 
+1450     def _more_tags(self):
+1451         return {'X_types': 'sparse'}
+1452 
+1453 
+1454 class TfidfVectorizer(CountVectorizer):
+1455     """Convert a collection of raw documents to a matrix of TF-IDF features.
+1456 
+1457     Equivalent to :class:`CountVectorizer` followed by
+1458     :class:`TfidfTransformer`.
+1459 
+1460     Read more in the :ref:`User Guide <text_feature_extraction>`.
+1461 
+1462     Parameters
+1463     ----------
+1464     input : string {'filename', 'file', 'content'}
+1465         If 'filename', the sequence passed as an argument to fit is
+1466         expected to be a list of filenames that need reading to fetch
+1467         the raw content to analyze.
+1468 
+1469         If 'file', the sequence items must have a 'read' method (file-like
+1470         object) that is called to fetch the bytes in memory.
+1471 
+1472         Otherwise the input is expected to be a sequence of items that
+1473         can be of type string or byte.
+1474 
+1475     encoding : string, 'utf-8' by default.
+1476         If bytes or files are given to analyze, this encoding is used to
+1477         decode.
+1478 
+1479     decode_error : {'strict', 'ignore', 'replace'} (default='strict')
+1480         Instruction on what to do if a byte sequence is given to analyze that
+1481         contains characters not of the given `encoding`. By default, it is
+1482         'strict', meaning that a UnicodeDecodeError will be raised. Other
+1483         values are 'ignore' and 'replace'.
+1484 
+1485     strip_accents : {'ascii', 'unicode', None} (default=None)
+1486         Remove accents and perform other character normalization
+1487         during the preprocessing step.
+1488         'ascii' is a fast method that only works on characters that have
+1489         an direct ASCII mapping.
+1490         'unicode' is a slightly slower method that works on any characters.
+1491         None (default) does nothing.
+1492 
+1493         Both 'ascii' and 'unicode' use NFKD normalization from
+1494         :func:`unicodedata.normalize`.
+1495 
+1496     lowercase : boolean (default=True)
+1497         Convert all characters to lowercase before tokenizing.
+1498 
+1499     preprocessor : callable or None (default=None)
+1500         Override the preprocessing (string transformation) stage while
+1501         preserving the tokenizing and n-grams generation steps.
+1502         Only applies if ``analyzer is not callable``.
+1503 
+1504     tokenizer : callable or None (default=None)
+1505         Override the string tokenization step while preserving the
+1506         preprocessing and n-grams generation steps.
+1507         Only applies if ``analyzer == 'word'``.
+1508 
+1509     analyzer : string, {'word', 'char', 'char_wb'} or callable
+1510         Whether the feature should be made of word or character n-grams.
+1511         Option 'char_wb' creates character n-grams only from text inside
+1512         word boundaries; n-grams at the edges of words are padded with space.
+1513 
+1514         If a callable is passed it is used to extract the sequence of features
+1515         out of the raw, unprocessed input.
+1516 
+1517         .. versionchanged:: 0.21
+1518 
+1519         Since v0.21, if ``input`` is ``filename`` or ``file``, the data is
+1520         first read from the file and then passed to the given callable
+1521         analyzer.
+1522 
+1523     stop_words : string {'english'}, list, or None (default=None)
+1524         If a string, it is passed to _check_stop_list and the appropriate stop
+1525         list is returned. 'english' is currently the only supported string
+1526         value.
+1527         There are several known issues with 'english' and you should
+1528         consider an alternative (see :ref:`stop_words`).
+1529 
+1530         If a list, that list is assumed to contain stop words, all of which
+1531         will be removed from the resulting tokens.
+1532         Only applies if ``analyzer == 'word'``.
+1533 
+1534         If None, no stop words will be used. max_df can be set to a value
+1535         in the range [0.7, 1.0) to automatically detect and filter stop
+1536         words based on intra corpus document frequency of terms.
+1537 
+1538     token_pattern : string
+1539         Regular expression denoting what constitutes a "token", only used
+1540         if ``analyzer == 'word'``. The default regexp selects tokens of 2
+1541         or more alphanumeric characters (punctuation is completely ignored
+1542         and always treated as a token separator).
+1543 
+1544     ngram_range : tuple (min_n, max_n), default=(1, 1)
+1545         The lower and upper boundary of the range of n-values for different
+1546         n-grams to be extracted. All values of n such that min_n <= n <= max_n
+1547         will be used. For example an ``ngram_range`` of ``(1, 1)`` means only
+1548         unigrams, ``(1, 2)`` means unigrams and bigrams, and ``(2, 2)`` means
+1549         only bigrams.
+1550         Only applies if ``analyzer is not callable``.
+1551 
+1552     max_df : float in range [0.0, 1.0] or int (default=1.0)
+1553         When building the vocabulary ignore terms that have a document
+1554         frequency strictly higher than the given threshold (corpus-specific
+1555         stop words).
+1556         If float, the parameter represents a proportion of documents, integer
+1557         absolute counts.
+1558         This parameter is ignored if vocabulary is not None.
+1559 
+1560     min_df : float in range [0.0, 1.0] or int (default=1)
+1561         When building the vocabulary ignore terms that have a document
+1562         frequency strictly lower than the given threshold. This value is also
+1563         called cut-off in the literature.
+1564         If float, the parameter represents a proportion of documents, integer
+1565         absolute counts.
+1566         This parameter is ignored if vocabulary is not None.
+1567 
+1568     max_features : int or None (default=None)
+1569         If not None, build a vocabulary that only consider the top
+1570         max_features ordered by term frequency across the corpus.
+1571 
+1572         This parameter is ignored if vocabulary is not None.
+1573 
+1574     vocabulary : Mapping or iterable, optional (default=None)
+1575         Either a Mapping (e.g., a dict) where keys are terms and values are
+1576         indices in the feature matrix, or an iterable over terms. If not
+1577         given, a vocabulary is determined from the input documents.
+1578 
+1579     binary : boolean (default=False)
+1580         If True, all non-zero term counts are set to 1. This does not mean
+1581         outputs will have only 0/1 values, only that the tf term in tf-idf
+1582         is binary. (Set idf and normalization to False to get 0/1 outputs.)
+1583 
+1584     dtype : type, optional (default=float64)
+1585         Type of the matrix returned by fit_transform() or transform().
+1586 
+1587     norm : 'l1', 'l2' or None, optional (default='l2')
+1588         Each output row will have unit norm, either:
+1589         * 'l2': Sum of squares of vector elements is 1. The cosine
+1590         similarity between two vectors is their dot product when l2 norm has
+1591         been applied.
+1592         * 'l1': Sum of absolute values of vector elements is 1.
+1593         See :func:`preprocessing.normalize`
+1594 
+1595     use_idf : boolean (default=True)
+1596         Enable inverse-document-frequency reweighting.
+1597 
+1598     smooth_idf : boolean (default=True)
+1599         Smooth idf weights by adding one to document frequencies, as if an
+1600         extra document was seen containing every term in the collection
+1601         exactly once. Prevents zero divisions.
+1602 
+1603     sublinear_tf : boolean (default=False)
+1604         Apply sublinear tf scaling, i.e. replace tf with 1 + log(tf).
+1605 
+1606     Attributes
+1607     ----------
+1608     vocabulary_ : dict
+1609         A mapping of terms to feature indices.
+1610 
+1611     fixed_vocabulary_: boolean
+1612         True if a fixed vocabulary of term to indices mapping
+1613         is provided by the user
+1614 
+1615     idf_ : array, shape (n_features)
+1616         The inverse document frequency (IDF) vector; only defined
+1617         if ``use_idf`` is True.
+1618 
+1619     stop_words_ : set
+1620         Terms that were ignored because they either:
+1621 
+1622           - occurred in too many documents (`max_df`)
+1623           - occurred in too few documents (`min_df`)
+1624           - were cut off by feature selection (`max_features`).
+1625 
+1626         This is only available if no vocabulary was given.
+1627 
+1628     Examples
+1629     --------
+1630     >>> from sklearn.feature_extraction.text import TfidfVectorizer
+1631     >>> corpus = [
+1632     ...     'This is the first document.',
+1633     ...     'This document is the second document.',
+1634     ...     'And this is the third one.',
+1635     ...     'Is this the first document?',
+1636     ... ]
+1637     >>> vectorizer = TfidfVectorizer()
+1638     >>> X = vectorizer.fit_transform(corpus)
+1639     >>> print(vectorizer.get_feature_names())
+1640     ['and', 'document', 'first', 'is', 'one', 'second', 'the', 'third', 'this']
+1641     >>> print(X.shape)
+1642     (4, 9)
+1643 
+1644     See also
+1645     --------
+1646     CountVectorizer : Transforms text into a sparse matrix of n-gram counts.
+1647 
+1648     TfidfTransformer : Performs the TF-IDF transformation from a provided
+1649         matrix of counts.
+1650 
+1651     Notes
+1652     -----
+1653     The ``stop_words_`` attribute can get large and increase the model size
+1654     when pickling. This attribute is provided only for introspection and can
+1655     be safely removed using delattr or set to None before pickling.
+1656     """
+1657 
+1658     def __init__(self, input='content', encoding='utf-8',
+1659                  decode_error='strict', strip_accents=None, lowercase=True,
+1660                  preprocessor=None, tokenizer=None, analyzer='word',
+1661                  stop_words=None, token_pattern=r"(?u)\b\w\w+\b",
+1662                  ngram_range=(1, 1), max_df=1.0, min_df=1,
+1663                  max_features=None, vocabulary=None, binary=False,
+1664                  dtype=np.float64, norm='l2', use_idf=True, smooth_idf=True,
+1665                  sublinear_tf=False):
+1666 
+1667         super().__init__(
+1668             input=input, encoding=encoding, decode_error=decode_error,
+1669             strip_accents=strip_accents, lowercase=lowercase,
+1670             preprocessor=preprocessor, tokenizer=tokenizer, analyzer=analyzer,
+1671             stop_words=stop_words, token_pattern=token_pattern,
+1672             ngram_range=ngram_range, max_df=max_df, min_df=min_df,
+1673             max_features=max_features, vocabulary=vocabulary, binary=binary,
+1674             dtype=dtype)
+1675 
+1676         self._tfidf = TfidfTransformer(norm=norm, use_idf=use_idf,
+1677                                        smooth_idf=smooth_idf,
+1678                                        sublinear_tf=sublinear_tf)
+1679 
+1680     # Broadcast the TF-IDF parameters to the underlying transformer instance
+1681     # for easy grid search and repr
+1682 
+1683     @property
+1684     def norm(self):
+1685         return self._tfidf.norm
+1686 
+1687     @norm.setter
+1688     def norm(self, value):
+1689         self._tfidf.norm = value
+1690 
+1691     @property
+1692     def use_idf(self):
+1693         return self._tfidf.use_idf
+1694 
+1695     @use_idf.setter
+1696     def use_idf(self, value):
+1697         self._tfidf.use_idf = value
+1698 
+1699     @property
+1700     def smooth_idf(self):
+1701         return self._tfidf.smooth_idf
+1702 
+1703     @smooth_idf.setter
+1704     def smooth_idf(self, value):
+1705         self._tfidf.smooth_idf = value
+1706 
+1707     @property
+1708     def sublinear_tf(self):
+1709         return self._tfidf.sublinear_tf
+1710 
+1711     @sublinear_tf.setter
+1712     def sublinear_tf(self, value):
+1713         self._tfidf.sublinear_tf = value
+1714 
+1715     @property
+1716     def idf_(self):
+1717         return self._tfidf.idf_
+1718 
+1719     @idf_.setter
+1720     def idf_(self, value):
+1721         self._validate_vocabulary()
+1722         if hasattr(self, 'vocabulary_'):
+1723             if len(self.vocabulary_) != len(value):
+1724                 raise ValueError("idf length = %d must be equal "
+1725                                  "to vocabulary size = %d" %
+1726                                  (len(value), len(self.vocabulary)))
+1727         self._tfidf.idf_ = value
+1728 
+1729     def _check_params(self):
+1730         if self.dtype not in FLOAT_DTYPES:
+1731             warnings.warn("Only {} 'dtype' should be used. {} 'dtype' will "
+1732                           "be converted to np.float64."
+1733                           .format(FLOAT_DTYPES, self.dtype),
+1734                           UserWarning)
+1735 
+1736     def fit(self, raw_documents, y=None):
+1737         """Learn vocabulary and idf from training set.
+1738 
+1739         Parameters
+1740         ----------
+1741         raw_documents : iterable
+1742             an iterable which yields either str, unicode or file objects
+1743 
+1744         Returns
+1745         -------
+1746         self : TfidfVectorizer
+1747         """
+1748         self._check_params()
+1749         self._warn_for_unused_params()
+1750         X = super().fit_transform(raw_documents)
+1751         self._tfidf.fit(X)
+1752         return self
+1753 
+1754     def fit_transform(self, raw_documents, y=None):
+1755         """Learn vocabulary and idf, return term-document matrix.
+1756 
+1757         This is equivalent to fit followed by transform, but more efficiently
+1758         implemented.
+1759 
+1760         Parameters
+1761         ----------
+1762         raw_documents : iterable
+1763             an iterable which yields either str, unicode or file objects
+1764 
+1765         Returns
+1766         -------
+1767         X : sparse matrix, [n_samples, n_features]
+1768             Tf-idf-weighted document-term matrix.
+1769         """
+1770         self._check_params()
+1771         X = super().fit_transform(raw_documents)
+1772         self._tfidf.fit(X)
+1773         # X is already a transformed view of raw_documents so
+1774         # we set copy to False
+1775         return self._tfidf.transform(X, copy=False)
+1776 
+1777     def transform(self, raw_documents, copy="deprecated"):
+1778         """Transform documents to document-term matrix.
+1779 
+1780         Uses the vocabulary and document frequencies (df) learned by fit (or
+1781         fit_transform).
+1782 
+1783         Parameters
+1784         ----------
+1785         raw_documents : iterable
+1786             an iterable which yields either str, unicode or file objects
+1787 
+1788         copy : boolean, default True
+1789             Whether to copy X and operate on the copy or perform in-place
+1790             operations.
+1791 
+1792             .. deprecated:: 0.22
+1793                The `copy` parameter is unused and was deprecated in version
+1794                0.22 and will be removed in 0.24. This parameter will be
+1795                ignored.
+1796 
+1797         Returns
+1798         -------
+1799         X : sparse matrix, [n_samples, n_features]
+1800             Tf-idf-weighted document-term matrix.
+1801         """
+1802         check_is_fitted(self, msg='The tfidf vector is not fitted')
+1803 
+1804         # FIXME Remove copy parameter support in 0.24
+1805         if copy != "deprecated":
+1806             msg = ("'copy' param is unused and has been deprecated since "
+1807                    "version 0.22. Backward compatibility for 'copy' will "
+1808                    "be removed in 0.24.")
+1809             warnings.warn(msg, DeprecationWarning)
+1810         X = super().transform(raw_documents)
+1811         return self._tfidf.transform(X, copy=False)
+1812 
+1813     def _more_tags(self):
+1814         return {'X_types': ['string'], '_skip_test': True}
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `sklearn/feature_extraction/text.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/sklearn/feature_extraction/text.py b/sklearn/feature_extraction/text.py
+--- a/sklearn/feature_extraction/text.py
++++ b/sklearn/feature_extraction/text.py
+@@ -129,10 +129,13 @@ def strip_accents_unicode(s):
+         Remove accentuated char for any unicode symbol that has a direct
+         ASCII equivalent.
+     """
+-    normalized = unicodedata.normalize('NFKD', s)
+-    if normalized == s:
++    try:
++        # If `s` is ASCII-compatible, then it does not contain any accented
++        # characters and we can avoid an expensive list comprehension
++        s.encode("ASCII", errors="strict")
+         return s
+-    else:
++    except UnicodeEncodeError:
++        normalized = unicodedata.normalize('NFKD', s)
+         return ''.join([c for c in normalized if not unicodedata.combining(c)])
+ 
+ 
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/sklearn/feature_extraction/text.py b/sklearn/feature_extraction/text.py
+index bb5a9d646..11236d958 100644
+--- a/sklearn/feature_extraction/text.py
++++ b/sklearn/feature_extraction/text.py
+@@ -130,10 +130,7 @@ def strip_accents_unicode(s):
+         ASCII equivalent.
+     """
+     normalized = unicodedata.normalize('NFKD', s)
+-    if normalized == s:
+-        return s
+-    else:
+-        return ''.join([c for c in normalized if not unicodedata.combining(c)])
++    return ''.join([c for c in normalized if not unicodedata.combining(c)])
+ 
+ 
+ def strip_accents_ascii(s):
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `sklearn/feature_extraction/tests/test_text.py` that contains the existing tests.
+-----------------------------------------------------------
+# -*- coding: utf-8 -*-
+from collections.abc import Mapping
+import re
+import warnings
+
+import pytest
+from scipy import sparse
+
+from sklearn.feature_extraction.text import strip_tags
+from sklearn.feature_extraction.text import strip_accents_unicode
+from sklearn.feature_extraction.text import strip_accents_ascii
+
+from sklearn.feature_extraction.text import HashingVectorizer
+from sklearn.feature_extraction.text import CountVectorizer
+from sklearn.feature_extraction.text import TfidfTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+from sklearn.feature_extraction.text import ENGLISH_STOP_WORDS
+
+from sklearn.model_selection import train_test_split
+from sklearn.model_selection import cross_val_score
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.svm import LinearSVC
+
+from sklearn.base import clone
+
+import numpy as np
+from numpy.testing import assert_array_almost_equal
+from numpy.testing import assert_array_equal
+from sklearn.utils import IS_PYPY
+from sklearn.exceptions import ChangedBehaviorWarning
+from sklearn.utils.testing import (assert_almost_equal,
+                                   assert_warns_message, assert_raise_message,
+                                   clean_warning_registry,
+                                   SkipTest, assert_no_warnings,
+                                   fails_if_pypy, assert_allclose_dense_sparse,
+                                   skip_if_32bit)
+from collections import defaultdict
+from functools import partial
+import pickle
+from io import StringIO
+
+JUNK_FOOD_DOCS = (
+    "the pizza pizza beer copyright",
+    "the pizza burger beer copyright",
+    "the the pizza beer beer copyright",
+    "the burger beer beer copyright",
+    "the coke burger coke copyright",
+    "the coke burger burger",
+)
+
+NOTJUNK_FOOD_DOCS = (
+    "the salad celeri copyright",
+    "the salad salad sparkling water copyright",
+    "the the celeri celeri copyright",
+    "the tomato tomato salad water",
+    "the tomato salad water copyright",
+)
+
+ALL_FOOD_DOCS = JUNK_FOOD_DOCS + NOTJUNK_FOOD_DOCS
+
+
+def uppercase(s):
+    return strip_accents_unicode(s).upper()
+
+
+def strip_eacute(s):
+    return s.replace('é', 'e')
+
+
+def split_tokenize(s):
+    return s.split()
+
+
+def lazy_analyze(s):
+    return ['the_ultimate_feature']
+
+
+def test_strip_accents():
+    # check some classical latin accentuated symbols
+    a = 'àáâãäåçèéêë'
+    expected = 'aaaaaaceeee'
+    assert strip_accents_unicode(a) == expected
+
+    a = 'ìíîïñòóôõöùúûüý'
+    expected = 'iiiinooooouuuuy'
+    assert strip_accents_unicode(a) == expected
+
+    # check some arabic
+    a = '\u0625'  # alef with a hamza below: إ
+    expected = '\u0627'  # simple alef: ا
+    assert strip_accents_unicode(a) == expected
+
+    # mix letters accentuated and not
+    a = "this is à test"
+    expected = 'this is a test'
+    assert strip_accents_unicode(a) == expected
+
+    # strings that are already decomposed
+    a = "o\u0308"  # o with diaresis
+    expected = "o"
+    assert strip_accents_unicode(a) == expected
+
+    # combining marks by themselves
+    a = "\u0300\u0301\u0302\u0303"
+    expected = ""
+    assert strip_accents_unicode(a) == expected
+
+    # Multiple combining marks on one character
+    a = "o\u0308\u0304"
+    expected = "o"
+    assert strip_accents_unicode(a) == expected
+
+
+def test_to_ascii():
+    # check some classical latin accentuated symbols
+    a = 'àáâãäåçèéêë'
+    expected = 'aaaaaaceeee'
+    assert strip_accents_ascii(a) == expected
+
+    a = "ìíîïñòóôõöùúûüý"
+    expected = 'iiiinooooouuuuy'
+    assert strip_accents_ascii(a) == expected
+
+    # check some arabic
+    a = '\u0625'  # halef with a hamza below
+    expected = ''  # halef has no direct ascii match
+    assert strip_accents_ascii(a) == expected
+
+    # mix letters accentuated and not
+    a = "this is à test"
+    expected = 'this is a test'
+    assert strip_accents_ascii(a) == expected
+
+
+@pytest.mark.parametrize('Vectorizer', (CountVectorizer, HashingVectorizer))
+def test_word_analyzer_unigrams(Vectorizer):
+    wa = Vectorizer(strip_accents='ascii').build_analyzer()
+    text = ("J'ai mangé du kangourou  ce midi, "
+            "c'était pas très bon.")
+    expected = ['ai', 'mange', 'du', 'kangourou', 'ce', 'midi',
+                'etait', 'pas', 'tres', 'bon']
+    assert wa(text) == expected
+
+    text = "This is a test, really.\n\n I met Harry yesterday."
+    expected = ['this', 'is', 'test', 'really', 'met', 'harry',
+                'yesterday']
+    assert wa(text) == expected
+
+    wa = Vectorizer(input='file').build_analyzer()
+    text = StringIO("This is a test with a file-like object!")
+    expected = ['this', 'is', 'test', 'with', 'file', 'like',
+                'object']
+    assert wa(text) == expected
+
+    # with custom preprocessor
+    wa = Vectorizer(preprocessor=uppercase).build_analyzer()
+    text = ("J'ai mangé du kangourou  ce midi, "
+            " c'était pas très bon.")
+    expected = ['AI', 'MANGE', 'DU', 'KANGOUROU', 'CE', 'MIDI',
+                'ETAIT', 'PAS', 'TRES', 'BON']
+    assert wa(text) == expected
+
+    # with custom tokenizer
+    wa = Vectorizer(tokenizer=split_tokenize,
+                    strip_accents='ascii').build_analyzer()
+    text = ("J'ai mangé du kangourou  ce midi, "
+            "c'était pas très bon.")
+    expected = ["j'ai", 'mange', 'du', 'kangourou', 'ce', 'midi,',
+                "c'etait", 'pas', 'tres', 'bon.']
+    assert wa(text) == expected
+
+
+def test_word_analyzer_unigrams_and_bigrams():
+    wa = CountVectorizer(analyzer="word", strip_accents='unicode',
+                         ngram_range=(1, 2)).build_analyzer()
+
+    text = "J'ai mangé du kangourou  ce midi, c'était pas très bon."
+    expected = ['ai', 'mange', 'du', 'kangourou', 'ce', 'midi',
+                'etait', 'pas', 'tres', 'bon', 'ai mange', 'mange du',
+                'du kangourou', 'kangourou ce', 'ce midi', 'midi etait',
+                'etait pas', 'pas tres', 'tres bon']
+    assert wa(text) == expected
+
+
+def test_unicode_decode_error():
+    # decode_error default to strict, so this should fail
+    # First, encode (as bytes) a unicode string.
+    text = "J'ai mangé du kangourou  ce midi, c'était pas très bon."
+    text_bytes = text.encode('utf-8')
+
+    # Then let the Analyzer try to decode it as ascii. It should fail,
+    # because we have given it an incorrect encoding.
+    wa = CountVectorizer(ngram_range=(1, 2), encoding='ascii').build_analyzer()
+    with pytest.raises(UnicodeDecodeError):
+        wa(text_bytes)
+
+    ca = CountVectorizer(analyzer='char', ngram_range=(3, 6),
+                         encoding='ascii').build_analyzer()
+    with pytest.raises(UnicodeDecodeError):
+        ca(text_bytes)
+
+
+def test_char_ngram_analyzer():
+    cnga = CountVectorizer(analyzer='char', strip_accents='unicode',
+                           ngram_range=(3, 6)).build_analyzer()
+
+    text = "J'ai mangé du kangourou  ce midi, c'était pas très bon"
+    expected = ["j'a", "'ai", 'ai ', 'i m', ' ma']
+    assert cnga(text)[:5] == expected
+    expected = ['s tres', ' tres ', 'tres b', 'res bo', 'es bon']
+    assert cnga(text)[-5:] == expected
+
+    text = "This \n\tis a test, really.\n\n I met Harry yesterday"
+    expected = ['thi', 'his', 'is ', 's i', ' is']
+    assert cnga(text)[:5] == expected
+
+    expected = [' yeste', 'yester', 'esterd', 'sterda', 'terday']
+    assert cnga(text)[-5:] == expected
+
+    cnga = CountVectorizer(input='file', analyzer='char',
+                           ngram_range=(3, 6)).build_analyzer()
+    text = StringIO("This is a test with a file-like object!")
+    expected = ['thi', 'his', 'is ', 's i', ' is']
+    assert cnga(text)[:5] == expected
+
+
+def test_char_wb_ngram_analyzer():
+    cnga = CountVectorizer(analyzer='char_wb', strip_accents='unicode',
+                           ngram_range=(3, 6)).build_analyzer()
+
+    text = "This \n\tis a test, really.\n\n I met Harry yesterday"
+    expected = [' th', 'thi', 'his', 'is ', ' thi']
+    assert cnga(text)[:5] == expected
+
+    expected = ['yester', 'esterd', 'sterda', 'terday', 'erday ']
+    assert cnga(text)[-5:] == expected
+
+    cnga = CountVectorizer(input='file', analyzer='char_wb',
+                           ngram_range=(3, 6)).build_analyzer()
+    text = StringIO("A test with a file-like object!")
+    expected = [' a ', ' te', 'tes', 'est', 'st ', ' tes']
+    assert cnga(text)[:6] == expected
+
+
+def test_word_ngram_analyzer():
+    cnga = CountVectorizer(analyzer='word', strip_accents='unicode',
+                           ngram_range=(3, 6)).build_analyzer()
+
+    text = "This \n\tis a test, really.\n\n I met Harry yesterday"
+    expected = ['this is test', 'is test really', 'test really met']
+    assert cnga(text)[:3] == expected
+
+    expected = ['test really met harry yesterday',
+                'this is test really met harry',
+                'is test really met harry yesterday']
+    assert cnga(text)[-3:] == expected
+
+    cnga_file = CountVectorizer(input='file', analyzer='word',
+                                ngram_range=(3, 6)).build_analyzer()
+    file = StringIO(text)
+    assert cnga_file(file) == cnga(text)
+
+
+def test_countvectorizer_custom_vocabulary():
+    vocab = {"pizza": 0, "beer": 1}
+    terms = set(vocab.keys())
+
+    # Try a few of the supported types.
+    for typ in [dict, list, iter, partial(defaultdict, int)]:
+        v = typ(vocab)
+        vect = CountVectorizer(vocabulary=v)
+        vect.fit(JUNK_FOOD_DOCS)
+        if isinstance(v, Mapping):
+            assert vect.vocabulary_ == vocab
+        else:
+            assert set(vect.vocabulary_) == terms
+        X = vect.transform(JUNK_FOOD_DOCS)
+        assert X.shape[1] == len(terms)
+        v = typ(vocab)
+        vect = CountVectorizer(vocabulary=v)
+        inv = vect.inverse_transform(X)
+        assert len(inv) == X.shape[0]
+
+
+def test_countvectorizer_custom_vocabulary_pipeline():
+    what_we_like = ["pizza", "beer"]
+    pipe = Pipeline([
+        ('count', CountVectorizer(vocabulary=what_we_like)),
+        ('tfidf', TfidfTransformer())])
+    X = pipe.fit_transform(ALL_FOOD_DOCS)
+    assert (set(pipe.named_steps['count'].vocabulary_) ==
+            set(what_we_like))
+    assert X.shape[1] == len(what_we_like)
+
+
+def test_countvectorizer_custom_vocabulary_repeated_indices():
+    vocab = {"pizza": 0, "beer": 0}
+    try:
+        CountVectorizer(vocabulary=vocab)
+    except ValueError as e:
+        assert "vocabulary contains repeated indices" in str(e).lower()
+
+
+def test_countvectorizer_custom_vocabulary_gap_index():
+    vocab = {"pizza": 1, "beer": 2}
+    try:
+        CountVectorizer(vocabulary=vocab)
+    except ValueError as e:
+        assert "doesn't contain index" in str(e).lower()
+
+
+def test_countvectorizer_stop_words():
+    cv = CountVectorizer()
+    cv.set_params(stop_words='english')
+    assert cv.get_stop_words() == ENGLISH_STOP_WORDS
+    cv.set_params(stop_words='_bad_str_stop_')
+    with pytest.raises(ValueError):
+        cv.get_stop_words()
+    cv.set_params(stop_words='_bad_unicode_stop_')
+    with pytest.raises(ValueError):
+        cv.get_stop_words()
+    stoplist = ['some', 'other', 'words']
+    cv.set_params(stop_words=stoplist)
+    assert cv.get_stop_words() == set(stoplist)
+
+
+def test_countvectorizer_empty_vocabulary():
+    try:
+        vect = CountVectorizer(vocabulary=[])
+        vect.fit(["foo"])
+        assert False, "we shouldn't get here"
+    except ValueError as e:
+        assert "empty vocabulary" in str(e).lower()
+
+    try:
+        v = CountVectorizer(max_df=1.0, stop_words="english")
+        # fit on stopwords only
+        v.fit(["to be or not to be", "and me too", "and so do you"])
+        assert False, "we shouldn't get here"
+    except ValueError as e:
+        assert "empty vocabulary" in str(e).lower()
+
+
+def test_fit_countvectorizer_twice():
+    cv = CountVectorizer()
+    X1 = cv.fit_transform(ALL_FOOD_DOCS[:5])
+    X2 = cv.fit_transform(ALL_FOOD_DOCS[5:])
+    assert X1.shape[1] != X2.shape[1]
+
+
+def test_tf_idf_smoothing():
+    X = [[1, 1, 1],
+         [1, 1, 0],
+         [1, 0, 0]]
+    tr = TfidfTransformer(smooth_idf=True, norm='l2')
+    tfidf = tr.fit_transform(X).toarray()
+    assert (tfidf >= 0).all()
+
+    # check normalization
+    assert_array_almost_equal((tfidf ** 2).sum(axis=1), [1., 1., 1.])
+
+    # this is robust to features with only zeros
+    X = [[1, 1, 0],
+         [1, 1, 0],
+         [1, 0, 0]]
+    tr = TfidfTransformer(smooth_idf=True, norm='l2')
+    tfidf = tr.fit_transform(X).toarray()
+    assert (tfidf >= 0).all()
+
+
+def test_tfidf_no_smoothing():
+    X = [[1, 1, 1],
+         [1, 1, 0],
+         [1, 0, 0]]
+    tr = TfidfTransformer(smooth_idf=False, norm='l2')
+    tfidf = tr.fit_transform(X).toarray()
+    assert (tfidf >= 0).all()
+
+    # check normalization
+    assert_array_almost_equal((tfidf ** 2).sum(axis=1), [1., 1., 1.])
+
+    # the lack of smoothing make IDF fragile in the presence of feature with
+    # only zeros
+    X = [[1, 1, 0],
+         [1, 1, 0],
+         [1, 0, 0]]
+    tr = TfidfTransformer(smooth_idf=False, norm='l2')
+
+    clean_warning_registry()
+    with warnings.catch_warnings(record=True) as w:
+        1. / np.array([0.])
+        numpy_provides_div0_warning = len(w) == 1
+
+    in_warning_message = 'divide by zero'
+    tfidf = assert_warns_message(RuntimeWarning, in_warning_message,
+                                 tr.fit_transform, X).toarray()
+    if not numpy_provides_div0_warning:
+        raise SkipTest("Numpy does not provide div 0 warnings.")
+
+
+def test_sublinear_tf():
+    X = [[1], [2], [3]]
+    tr = TfidfTransformer(sublinear_tf=True, use_idf=False, norm=None)
+    tfidf = tr.fit_transform(X).toarray()
+    assert tfidf[0] == 1
+    assert tfidf[1] > tfidf[0]
+    assert tfidf[2] > tfidf[1]
+    assert tfidf[1] < 2
+    assert tfidf[2] < 3
+
+
+def test_vectorizer():
+    # raw documents as an iterator
+    train_data = iter(ALL_FOOD_DOCS[:-1])
+    test_data = [ALL_FOOD_DOCS[-1]]
+    n_train = len(ALL_FOOD_DOCS) - 1
+
+    # test without vocabulary
+    v1 = CountVectorizer(max_df=0.5)
+    counts_train = v1.fit_transform(train_data)
+    if hasattr(counts_train, 'tocsr'):
+        counts_train = counts_train.tocsr()
+    assert counts_train[0, v1.vocabulary_["pizza"]] == 2
+
+    # build a vectorizer v1 with the same vocabulary as the one fitted by v1
+    v2 = CountVectorizer(vocabulary=v1.vocabulary_)
+
+    # compare that the two vectorizer give the same output on the test sample
+    for v in (v1, v2):
+        counts_test = v.transform(test_data)
+        if hasattr(counts_test, 'tocsr'):
+            counts_test = counts_test.tocsr()
+
+        vocabulary = v.vocabulary_
+        assert counts_test[0, vocabulary["salad"]] == 1
+        assert counts_test[0, vocabulary["tomato"]] == 1
+        assert counts_test[0, vocabulary["water"]] == 1
+
+        # stop word from the fixed list
+        assert "the" not in vocabulary
+
+        # stop word found automatically by the vectorizer DF thresholding
+        # words that are high frequent across the complete corpus are likely
+        # to be not informative (either real stop words of extraction
+        # artifacts)
+        assert "copyright" not in vocabulary
+
+        # not present in the sample
+        assert counts_test[0, vocabulary["coke"]] == 0
+        assert counts_test[0, vocabulary["burger"]] == 0
+        assert counts_test[0, vocabulary["beer"]] == 0
+        assert counts_test[0, vocabulary["pizza"]] == 0
+
+    # test tf-idf
+    t1 = TfidfTransformer(norm='l1')
+    tfidf = t1.fit(counts_train).transform(counts_train).toarray()
+    assert len(t1.idf_) == len(v1.vocabulary_)
+    assert tfidf.shape == (n_train, len(v1.vocabulary_))
+
+    # test tf-idf with new data
+    tfidf_test = t1.transform(counts_test).toarray()
+    assert tfidf_test.shape == (len(test_data), len(v1.vocabulary_))
+
+    # test tf alone
+    t2 = TfidfTransformer(norm='l1', use_idf=False)
+    tf = t2.fit(counts_train).transform(counts_train).toarray()
+    assert not hasattr(t2, "idf_")
+
+    # test idf transform with unlearned idf vector
+    t3 = TfidfTransformer(use_idf=True)
+    with pytest.raises(ValueError):
+        t3.transform(counts_train)
+
+    # test idf transform with incompatible n_features
+    X = [[1, 1, 5],
+         [1, 1, 0]]
+    t3.fit(X)
+    X_incompt = [[1, 3],
+                 [1, 3]]
+    with pytest.raises(ValueError):
+        t3.transform(X_incompt)
+
+    # L1-normalized term frequencies sum to one
+    assert_array_almost_equal(np.sum(tf, axis=1), [1.0] * n_train)
+
+    # test the direct tfidf vectorizer
+    # (equivalent to term count vectorizer + tfidf transformer)
+    train_data = iter(ALL_FOOD_DOCS[:-1])
+    tv = TfidfVectorizer(norm='l1')
+
+    tv.max_df = v1.max_df
+    tfidf2 = tv.fit_transform(train_data).toarray()
+    assert not tv.fixed_vocabulary_
+    assert_array_almost_equal(tfidf, tfidf2)
+
+    # test the direct tfidf vectorizer with new data
+    tfidf_test2 = tv.transform(test_data).toarray()
+    assert_array_almost_equal(tfidf_test, tfidf_test2)
+
+    # test transform on unfitted vectorizer with empty vocabulary
+    v3 = CountVectorizer(vocabulary=None)
+    with pytest.raises(ValueError):
+        v3.transform(train_data)
+
+    # ascii preprocessor?
+    v3.set_params(strip_accents='ascii', lowercase=False)
+    processor = v3.build_preprocessor()
+    text = ("J'ai mangé du kangourou  ce midi, "
+            "c'était pas très bon.")
+    expected = strip_accents_ascii(text)
+    result = processor(text)
+    assert expected == result
+
+    # error on bad strip_accents param
+    v3.set_params(strip_accents='_gabbledegook_', preprocessor=None)
+    with pytest.raises(ValueError):
+        v3.build_preprocessor()
+
+    # error with bad analyzer type
+    v3.set_params = '_invalid_analyzer_type_'
+    with pytest.raises(ValueError):
+        v3.build_analyzer()
+
+
+def test_tfidf_vectorizer_setters():
+    tv = TfidfVectorizer(norm='l2', use_idf=False, smooth_idf=False,
+                         sublinear_tf=False)
+    tv.norm = 'l1'
+    assert tv._tfidf.norm == 'l1'
+    tv.use_idf = True
+    assert tv._tfidf.use_idf
+    tv.smooth_idf = True
+    assert tv._tfidf.smooth_idf
+    tv.sublinear_tf = True
+    assert tv._tfidf.sublinear_tf
+
+
+# FIXME Remove copy parameter support in 0.24
+def test_tfidf_vectorizer_deprecationwarning():
+    msg = ("'copy' param is unused and has been deprecated since "
+           "version 0.22. Backward compatibility for 'copy' will "
+           "be removed in 0.24.")
+    with pytest.warns(DeprecationWarning, match=msg):
+        tv = TfidfVectorizer()
+        train_data = JUNK_FOOD_DOCS
+        tv.fit(train_data)
+        tv.transform(train_data, copy=True)
+
+
+@fails_if_pypy
+def test_hashing_vectorizer():
+    v = HashingVectorizer()
+    X = v.transform(ALL_FOOD_DOCS)
+    token_nnz = X.nnz
+    assert X.shape == (len(ALL_FOOD_DOCS), v.n_features)
+    assert X.dtype == v.dtype
+
+    # By default the hashed values receive a random sign and l2 normalization
+    # makes the feature values bounded
+    assert np.min(X.data) > -1
+    assert np.min(X.data) < 0
+    assert np.max(X.data) > 0
+    assert np.max(X.data) < 1
+
+    # Check that the rows are normalized
+    for i in range(X.shape[0]):
+        assert_almost_equal(np.linalg.norm(X[0].data, 2), 1.0)
+
+    # Check vectorization with some non-default parameters
+    v = HashingVectorizer(ngram_range=(1, 2), norm='l1')
+    X = v.transform(ALL_FOOD_DOCS)
+    assert X.shape == (len(ALL_FOOD_DOCS), v.n_features)
+    assert X.dtype == v.dtype
+
+    # ngrams generate more non zeros
+    ngrams_nnz = X.nnz
+    assert ngrams_nnz > token_nnz
+    assert ngrams_nnz < 2 * token_nnz
+
+    # makes the feature values bounded
+    assert np.min(X.data) > -1
+    assert np.max(X.data) < 1
+
+    # Check that the rows are normalized
+    for i in range(X.shape[0]):
+        assert_almost_equal(np.linalg.norm(X[0].data, 1), 1.0)
+
+
+def test_feature_names():
+    cv = CountVectorizer(max_df=0.5)
+
+    # test for Value error on unfitted/empty vocabulary
+    with pytest.raises(ValueError):
+        cv.get_feature_names()
+    assert not cv.fixed_vocabulary_
+
+    # test for vocabulary learned from data
+    X = cv.fit_transform(ALL_FOOD_DOCS)
+    n_samples, n_features = X.shape
+    assert len(cv.vocabulary_) == n_features
+
+    feature_names = cv.get_feature_names()
+    assert len(feature_names) == n_features
+    assert_array_equal(['beer', 'burger', 'celeri', 'coke', 'pizza',
+                        'salad', 'sparkling', 'tomato', 'water'],
+                       feature_names)
+
+    for idx, name in enumerate(feature_names):
+        assert idx == cv.vocabulary_.get(name)
+
+    # test for custom vocabulary
+    vocab = ['beer', 'burger', 'celeri', 'coke', 'pizza',
+             'salad', 'sparkling', 'tomato', 'water']
+
+    cv = CountVectorizer(vocabulary=vocab)
+    feature_names = cv.get_feature_names()
+    assert_array_equal(['beer', 'burger', 'celeri', 'coke', 'pizza', 'salad',
+                        'sparkling', 'tomato', 'water'], feature_names)
+    assert cv.fixed_vocabulary_
+
+    for idx, name in enumerate(feature_names):
+        assert idx == cv.vocabulary_.get(name)
+
+
+@pytest.mark.parametrize('Vectorizer', (CountVectorizer, TfidfVectorizer))
+def test_vectorizer_max_features(Vectorizer):
+    expected_vocabulary = {'burger', 'beer', 'salad', 'pizza'}
+    expected_stop_words = {'celeri', 'tomato', 'copyright', 'coke',
+                           'sparkling', 'water', 'the'}
+
+    # test bounded number of extracted features
+    vectorizer = Vectorizer(max_df=0.6, max_features=4)
+    vectorizer.fit(ALL_FOOD_DOCS)
+    assert set(vectorizer.vocabulary_) == expected_vocabulary
+    assert vectorizer.stop_words_ == expected_stop_words
+
+
+def test_count_vectorizer_max_features():
+    # Regression test: max_features didn't work correctly in 0.14.
+
+    cv_1 = CountVectorizer(max_features=1)
+    cv_3 = CountVectorizer(max_features=3)
+    cv_None = CountVectorizer(max_features=None)
+
+    counts_1 = cv_1.fit_transform(JUNK_FOOD_DOCS).sum(axis=0)
+    counts_3 = cv_3.fit_transform(JUNK_FOOD_DOCS).sum(axis=0)
+    counts_None = cv_None.fit_transform(JUNK_FOOD_DOCS).sum(axis=0)
+
+    features_1 = cv_1.get_feature_names()
+    features_3 = cv_3.get_feature_names()
+    features_None = cv_None.get_feature_names()
+
+    # The most common feature is "the", with frequency 7.
+    assert 7 == counts_1.max()
+    assert 7 == counts_3.max()
+    assert 7 == counts_None.max()
+
+    # The most common feature should be the same
+    assert "the" == features_1[np.argmax(counts_1)]
+    assert "the" == features_3[np.argmax(counts_3)]
+    assert "the" == features_None[np.argmax(counts_None)]
+
+
+def test_vectorizer_max_df():
+    test_data = ['abc', 'dea', 'eat']
+    vect = CountVectorizer(analyzer='char', max_df=1.0)
+    vect.fit(test_data)
+    assert 'a' in vect.vocabulary_.keys()
+    assert len(vect.vocabulary_.keys()) == 6
+    assert len(vect.stop_words_) == 0
+
+    vect.max_df = 0.5  # 0.5 * 3 documents -> max_doc_count == 1.5
+    vect.fit(test_data)
+    assert 'a' not in vect.vocabulary_.keys()  # {ae} ignored
+    assert len(vect.vocabulary_.keys()) == 4    # {bcdt} remain
+    assert 'a' in vect.stop_words_
+    assert len(vect.stop_words_) == 2
+
+    vect.max_df = 1
+    vect.fit(test_data)
+    assert 'a' not in vect.vocabulary_.keys()  # {ae} ignored
+    assert len(vect.vocabulary_.keys()) == 4    # {bcdt} remain
+    assert 'a' in vect.stop_words_
+    assert len(vect.stop_words_) == 2
+
+
+def test_vectorizer_min_df():
+    test_data = ['abc', 'dea', 'eat']
+    vect = CountVectorizer(analyzer='char', min_df=1)
+    vect.fit(test_data)
+    assert 'a' in vect.vocabulary_.keys()
+    assert len(vect.vocabulary_.keys()) == 6
+    assert len(vect.stop_words_) == 0
+
+    vect.min_df = 2
+    vect.fit(test_data)
+    assert 'c' not in vect.vocabulary_.keys()  # {bcdt} ignored
+    assert len(vect.vocabulary_.keys()) == 2    # {ae} remain
+    assert 'c' in vect.stop_words_
+    assert len(vect.stop_words_) == 4
+
+    vect.min_df = 0.8  # 0.8 * 3 documents -> min_doc_count == 2.4
+    vect.fit(test_data)
+    assert 'c' not in vect.vocabulary_.keys()  # {bcdet} ignored
+    assert len(vect.vocabulary_.keys()) == 1    # {a} remains
+    assert 'c' in vect.stop_words_
+    assert len(vect.stop_words_) == 5
+
+
+def test_count_binary_occurrences():
+    # by default multiple occurrences are counted as longs
+    test_data = ['aaabc', 'abbde']
+    vect = CountVectorizer(analyzer='char', max_df=1.0)
+    X = vect.fit_transform(test_data).toarray()
+    assert_array_equal(['a', 'b', 'c', 'd', 'e'], vect.get_feature_names())
+    assert_array_equal([[3, 1, 1, 0, 0],
+                        [1, 2, 0, 1, 1]], X)
+
+    # using boolean features, we can fetch the binary occurrence info
+    # instead.
+    vect = CountVectorizer(analyzer='char', max_df=1.0, binary=True)
+    X = vect.fit_transform(test_data).toarray()
+    assert_array_equal([[1, 1, 1, 0, 0],
+                        [1, 1, 0, 1, 1]], X)
+
+    # check the ability to change the dtype
+    vect = CountVectorizer(analyzer='char', max_df=1.0,
+                           binary=True, dtype=np.float32)
+    X_sparse = vect.fit_transform(test_data)
+    assert X_sparse.dtype == np.float32
+
+
+@fails_if_pypy
+def test_hashed_binary_occurrences():
+    # by default multiple occurrences are counted as longs
+    test_data = ['aaabc', 'abbde']
+    vect = HashingVectorizer(alternate_sign=False, analyzer='char', norm=None)
+    X = vect.transform(test_data)
+    assert np.max(X[0:1].data) == 3
+    assert np.max(X[1:2].data) == 2
+    assert X.dtype == np.float64
+
+    # using boolean features, we can fetch the binary occurrence info
+    # instead.
+    vect = HashingVectorizer(analyzer='char', alternate_sign=False,
+                             binary=True, norm=None)
+    X = vect.transform(test_data)
+    assert np.max(X.data) == 1
+    assert X.dtype == np.float64
+
+    # check the ability to change the dtype
+    vect = HashingVectorizer(analyzer='char', alternate_sign=False,
+                             binary=True, norm=None, dtype=np.float64)
+    X = vect.transform(test_data)
+    assert X.dtype == np.float64
+
+
+@pytest.mark.parametrize('Vectorizer', (CountVectorizer, TfidfVectorizer))
+def test_vectorizer_inverse_transform(Vectorizer):
+    # raw documents
+    data = ALL_FOOD_DOCS
+    vectorizer = Vectorizer()
+    transformed_data = vectorizer.fit_transform(data)
+    inversed_data = vectorizer.inverse_transform(transformed_data)
+    analyze = vectorizer.build_analyzer()
+    for doc, inversed_terms in zip(data, inversed_data):
+        terms = np.sort(np.unique(analyze(doc)))
+        inversed_terms = np.sort(np.unique(inversed_terms))
+        assert_array_equal(terms, inversed_terms)
+
+    # Test that inverse_transform also works with numpy arrays
+    transformed_data = transformed_data.toarray()
+    inversed_data2 = vectorizer.inverse_transform(transformed_data)
+    for terms, terms2 in zip(inversed_data, inversed_data2):
+        assert_array_equal(np.sort(terms), np.sort(terms2))
+
+
+def test_count_vectorizer_pipeline_grid_selection():
+    # raw documents
+    data = JUNK_FOOD_DOCS + NOTJUNK_FOOD_DOCS
+
+    # label junk food as -1, the others as +1
+    target = [-1] * len(JUNK_FOOD_DOCS) + [1] * len(NOTJUNK_FOOD_DOCS)
+
+    # split the dataset for model development and final evaluation
+    train_data, test_data, target_train, target_test = train_test_split(
+        data, target, test_size=.2, random_state=0)
+
+    pipeline = Pipeline([('vect', CountVectorizer()),
+                         ('svc', LinearSVC())])
+
+    parameters = {
+        'vect__ngram_range': [(1, 1), (1, 2)],
+        'svc__loss': ('hinge', 'squared_hinge')
+    }
+
+    # find the best parameters for both the feature extraction and the
+    # classifier
+    grid_search = GridSearchCV(pipeline, parameters, n_jobs=1, cv=3)
+
+    # Check that the best model found by grid search is 100% correct on the
+    # held out evaluation set.
+    pred = grid_search.fit(train_data, target_train).predict(test_data)
+    assert_array_equal(pred, target_test)
+
+    # on this toy dataset bigram representation which is used in the last of
+    # the grid_search is considered the best estimator since they all converge
+    # to 100% accuracy models
+    assert grid_search.best_score_ == 1.0
+    best_vectorizer = grid_search.best_estimator_.named_steps['vect']
+    assert best_vectorizer.ngram_range == (1, 1)
+
+
+def test_vectorizer_pipeline_grid_selection():
+    # raw documents
+    data = JUNK_FOOD_DOCS + NOTJUNK_FOOD_DOCS
+
+    # label junk food as -1, the others as +1
+    target = [-1] * len(JUNK_FOOD_DOCS) + [1] * len(NOTJUNK_FOOD_DOCS)
+
+    # split the dataset for model development and final evaluation
+    train_data, test_data, target_train, target_test = train_test_split(
+        data, target, test_size=.1, random_state=0)
+
+    pipeline = Pipeline([('vect', TfidfVectorizer()),
+                         ('svc', LinearSVC())])
+
+    parameters = {
+        'vect__ngram_range': [(1, 1), (1, 2)],
+        'vect__norm': ('l1', 'l2'),
+        'svc__loss': ('hinge', 'squared_hinge'),
+    }
+
+    # find the best parameters for both the feature extraction and the
+    # classifier
+    grid_search = GridSearchCV(pipeline, parameters, n_jobs=1)
+
+    # Check that the best model found by grid search is 100% correct on the
+    # held out evaluation set.
+    pred = grid_search.fit(train_data, target_train).predict(test_data)
+    assert_array_equal(pred, target_test)
+
+    # on this toy dataset bigram representation which is used in the last of
+    # the grid_search is considered the best estimator since they all converge
+    # to 100% accuracy models
+    assert grid_search.best_score_ == 1.0
+    best_vectorizer = grid_search.best_estimator_.named_steps['vect']
+    assert best_vectorizer.ngram_range == (1, 1)
+    assert best_vectorizer.norm == 'l2'
+    assert not best_vectorizer.fixed_vocabulary_
+
+
+def test_vectorizer_pipeline_cross_validation():
+    # raw documents
+    data = JUNK_FOOD_DOCS + NOTJUNK_FOOD_DOCS
+
+    # label junk food as -1, the others as +1
+    target = [-1] * len(JUNK_FOOD_DOCS) + [1] * len(NOTJUNK_FOOD_DOCS)
+
+    pipeline = Pipeline([('vect', TfidfVectorizer()),
+                         ('svc', LinearSVC())])
+
+    cv_scores = cross_val_score(pipeline, data, target, cv=3)
+    assert_array_equal(cv_scores, [1., 1., 1.])
+
+
+@fails_if_pypy
+def test_vectorizer_unicode():
+    # tests that the count vectorizer works with cyrillic.
+    document = (
+        "Машинное обучение — обширный подраздел искусственного "
+        "интеллекта, изучающий методы построения алгоритмов, "
+        "способных обучаться."
+        )
+
+    vect = CountVectorizer()
+    X_counted = vect.fit_transform([document])
+    assert X_counted.shape == (1, 12)
+
+    vect = HashingVectorizer(norm=None, alternate_sign=False)
+    X_hashed = vect.transform([document])
+    assert X_hashed.shape == (1, 2 ** 20)
+
+    # No collisions on such a small dataset
+    assert X_counted.nnz == X_hashed.nnz
+
+    # When norm is None and not alternate_sign, the tokens are counted up to
+    # collisions
+    assert_array_equal(np.sort(X_counted.data), np.sort(X_hashed.data))
+
+
+def test_tfidf_vectorizer_with_fixed_vocabulary():
+    # non regression smoke test for inheritance issues
+    vocabulary = ['pizza', 'celeri']
+    vect = TfidfVectorizer(vocabulary=vocabulary)
+    X_1 = vect.fit_transform(ALL_FOOD_DOCS)
+    X_2 = vect.transform(ALL_FOOD_DOCS)
+    assert_array_almost_equal(X_1.toarray(), X_2.toarray())
+    assert vect.fixed_vocabulary_
+
+
+def test_pickling_vectorizer():
+    instances = [
+        HashingVectorizer(),
+        HashingVectorizer(norm='l1'),
+        HashingVectorizer(binary=True),
+        HashingVectorizer(ngram_range=(1, 2)),
+        CountVectorizer(),
+        CountVectorizer(preprocessor=strip_tags),
+        CountVectorizer(analyzer=lazy_analyze),
+        CountVectorizer(preprocessor=strip_tags).fit(JUNK_FOOD_DOCS),
+        CountVectorizer(strip_accents=strip_eacute).fit(JUNK_FOOD_DOCS),
+        TfidfVectorizer(),
+        TfidfVectorizer(analyzer=lazy_analyze),
+        TfidfVectorizer().fit(JUNK_FOOD_DOCS),
+    ]
+
+    for orig in instances:
+        s = pickle.dumps(orig)
+        copy = pickle.loads(s)
+        assert type(copy) == orig.__class__
+        assert copy.get_params() == orig.get_params()
+        if IS_PYPY and isinstance(orig, HashingVectorizer):
+            continue
+        else:
+            assert_array_equal(
+                copy.fit_transform(JUNK_FOOD_DOCS).toarray(),
+                orig.fit_transform(JUNK_FOOD_DOCS).toarray())
+
+
+@pytest.mark.parametrize('factory', [
+    CountVectorizer.build_analyzer,
+    CountVectorizer.build_preprocessor,
+    CountVectorizer.build_tokenizer,
+])
+def test_pickling_built_processors(factory):
+    """Tokenizers cannot be pickled
+    https://github.com/scikit-learn/scikit-learn/issues/12833
+    """
+    vec = CountVectorizer()
+    function = factory(vec)
+    text = ("J'ai mangé du kangourou  ce midi, "
+            "c'était pas très bon.")
+    roundtripped_function = pickle.loads(pickle.dumps(function))
+    expected = function(text)
+    result = roundtripped_function(text)
+    assert result == expected
+
+
+def test_countvectorizer_vocab_sets_when_pickling():
+    # ensure that vocabulary of type set is coerced to a list to
+    # preserve iteration ordering after deserialization
+    rng = np.random.RandomState(0)
+    vocab_words = np.array(['beer', 'burger', 'celeri', 'coke', 'pizza',
+                            'salad', 'sparkling', 'tomato', 'water'])
+    for x in range(0, 100):
+        vocab_set = set(rng.choice(vocab_words, size=5, replace=False))
+        cv = CountVectorizer(vocabulary=vocab_set)
+        unpickled_cv = pickle.loads(pickle.dumps(cv))
+        cv.fit(ALL_FOOD_DOCS)
+        unpickled_cv.fit(ALL_FOOD_DOCS)
+        assert cv.get_feature_names() == unpickled_cv.get_feature_names()
+
+
+def test_countvectorizer_vocab_dicts_when_pickling():
+    rng = np.random.RandomState(0)
+    vocab_words = np.array(['beer', 'burger', 'celeri', 'coke', 'pizza',
+                            'salad', 'sparkling', 'tomato', 'water'])
+    for x in range(0, 100):
+        vocab_dict = dict()
+        words = rng.choice(vocab_words, size=5, replace=False)
+        for y in range(0, 5):
+            vocab_dict[words[y]] = y
+        cv = CountVectorizer(vocabulary=vocab_dict)
+        unpickled_cv = pickle.loads(pickle.dumps(cv))
+        cv.fit(ALL_FOOD_DOCS)
+        unpickled_cv.fit(ALL_FOOD_DOCS)
+        assert cv.get_feature_names() == unpickled_cv.get_feature_names()
+
+
+def test_stop_words_removal():
+    # Ensure that deleting the stop_words_ attribute doesn't affect transform
+
+    fitted_vectorizers = (
+        TfidfVectorizer().fit(JUNK_FOOD_DOCS),
+        CountVectorizer(preprocessor=strip_tags).fit(JUNK_FOOD_DOCS),
+        CountVectorizer(strip_accents=strip_eacute).fit(JUNK_FOOD_DOCS)
+    )
+
+    for vect in fitted_vectorizers:
+        vect_transform = vect.transform(JUNK_FOOD_DOCS).toarray()
+
+        vect.stop_words_ = None
+        stop_None_transform = vect.transform(JUNK_FOOD_DOCS).toarray()
+
+        delattr(vect, 'stop_words_')
+        stop_del_transform = vect.transform(JUNK_FOOD_DOCS).toarray()
+
+        assert_array_equal(stop_None_transform, vect_transform)
+        assert_array_equal(stop_del_transform, vect_transform)
+
+
+def test_pickling_transformer():
+    X = CountVectorizer().fit_transform(JUNK_FOOD_DOCS)
+    orig = TfidfTransformer().fit(X)
+    s = pickle.dumps(orig)
+    copy = pickle.loads(s)
+    assert type(copy) == orig.__class__
+    assert_array_equal(
+        copy.fit_transform(X).toarray(),
+        orig.fit_transform(X).toarray())
+
+
+def test_transformer_idf_setter():
+    X = CountVectorizer().fit_transform(JUNK_FOOD_DOCS)
+    orig = TfidfTransformer().fit(X)
+    copy = TfidfTransformer()
+    copy.idf_ = orig.idf_
+    assert_array_equal(
+        copy.transform(X).toarray(),
+        orig.transform(X).toarray())
+
+
+def test_tfidf_vectorizer_setter():
+    orig = TfidfVectorizer(use_idf=True)
+    orig.fit(JUNK_FOOD_DOCS)
+    copy = TfidfVectorizer(vocabulary=orig.vocabulary_, use_idf=True)
+    copy.idf_ = orig.idf_
+    assert_array_equal(
+        copy.transform(JUNK_FOOD_DOCS).toarray(),
+        orig.transform(JUNK_FOOD_DOCS).toarray())
+
+
+def test_tfidfvectorizer_invalid_idf_attr():
+    vect = TfidfVectorizer(use_idf=True)
+    vect.fit(JUNK_FOOD_DOCS)
+    copy = TfidfVectorizer(vocabulary=vect.vocabulary_, use_idf=True)
+    expected_idf_len = len(vect.idf_)
+    invalid_idf = [1.0] * (expected_idf_len + 1)
+    with pytest.raises(ValueError):
+        setattr(copy, 'idf_', invalid_idf)
+
+
+def test_non_unique_vocab():
+    vocab = ['a', 'b', 'c', 'a', 'a']
+    vect = CountVectorizer(vocabulary=vocab)
+    with pytest.raises(ValueError):
+        vect.fit([])
+
+
+@fails_if_pypy
+def test_hashingvectorizer_nan_in_docs():
+    # np.nan can appear when using pandas to load text fields from a csv file
+    # with missing values.
+    message = "np.nan is an invalid document, expected byte or unicode string."
+    exception = ValueError
+
+    def func():
+        hv = HashingVectorizer()
+        hv.fit_transform(['hello world', np.nan, 'hello hello'])
+
+    assert_raise_message(exception, message, func)
+
+
+def test_tfidfvectorizer_binary():
+    # Non-regression test: TfidfVectorizer used to ignore its "binary" param.
+    v = TfidfVectorizer(binary=True, use_idf=False, norm=None)
+    assert v.binary
+
+    X = v.fit_transform(['hello world', 'hello hello']).toarray()
+    assert_array_equal(X.ravel(), [1, 1, 1, 0])
+    X2 = v.transform(['hello world', 'hello hello']).toarray()
+    assert_array_equal(X2.ravel(), [1, 1, 1, 0])
+
+
+def test_tfidfvectorizer_export_idf():
+    vect = TfidfVectorizer(use_idf=True)
+    vect.fit(JUNK_FOOD_DOCS)
+    assert_array_almost_equal(vect.idf_, vect._tfidf.idf_)
+
+
+def test_vectorizer_vocab_clone():
+    vect_vocab = TfidfVectorizer(vocabulary=["the"])
+    vect_vocab_clone = clone(vect_vocab)
+    vect_vocab.fit(ALL_FOOD_DOCS)
+    vect_vocab_clone.fit(ALL_FOOD_DOCS)
+    assert vect_vocab_clone.vocabulary_ == vect_vocab.vocabulary_
+
+
+@pytest.mark.parametrize('Vectorizer',
+                         (CountVectorizer, TfidfVectorizer, HashingVectorizer))
+def test_vectorizer_string_object_as_input(Vectorizer):
+    message = ("Iterable over raw text documents expected, "
+               "string object received.")
+    vec = Vectorizer()
+    assert_raise_message(
+            ValueError, message, vec.fit_transform, "hello world!")
+    assert_raise_message(ValueError, message, vec.fit, "hello world!")
+    assert_raise_message(ValueError, message, vec.transform, "hello world!")
+
+
+@pytest.mark.parametrize("X_dtype", [np.float32, np.float64])
+def test_tfidf_transformer_type(X_dtype):
+    X = sparse.rand(10, 20000, dtype=X_dtype, random_state=42)
+    X_trans = TfidfTransformer().fit_transform(X)
+    assert X_trans.dtype == X.dtype
+
+
+def test_tfidf_transformer_sparse():
+    X = sparse.rand(10, 20000, dtype=np.float64, random_state=42)
+    X_csc = sparse.csc_matrix(X)
+    X_csr = sparse.csr_matrix(X)
+
+    X_trans_csc = TfidfTransformer().fit_transform(X_csc)
+    X_trans_csr = TfidfTransformer().fit_transform(X_csr)
+    assert_allclose_dense_sparse(X_trans_csc, X_trans_csr)
+    assert X_trans_csc.format == X_trans_csr.format
+
+
+@pytest.mark.parametrize(
+    "vectorizer_dtype, output_dtype, warning_expected",
+    [(np.int32, np.float64, True),
+     (np.int64, np.float64, True),
+     (np.float32, np.float32, False),
+     (np.float64, np.float64, False)]
+)
+def test_tfidf_vectorizer_type(vectorizer_dtype, output_dtype,
+                               warning_expected):
+    X = np.array(["numpy", "scipy", "sklearn"])
+    vectorizer = TfidfVectorizer(dtype=vectorizer_dtype)
+
+    warning_msg_match = "'dtype' should be used."
+    warning_cls = UserWarning
+    expected_warning_cls = warning_cls if warning_expected else None
+    with pytest.warns(expected_warning_cls,
+                      match=warning_msg_match) as record:
+        X_idf = vectorizer.fit_transform(X)
+    if expected_warning_cls is None:
+        relevant_warnings = [w for w in record
+                             if isinstance(w, warning_cls)]
+        assert len(relevant_warnings) == 0
+    assert X_idf.dtype == output_dtype
+
+
+@pytest.mark.parametrize("vec", [
+        HashingVectorizer(ngram_range=(2, 1)),
+        CountVectorizer(ngram_range=(2, 1)),
+        TfidfVectorizer(ngram_range=(2, 1))
+    ])
+def test_vectorizers_invalid_ngram_range(vec):
+    # vectorizers could be initialized with invalid ngram range
+    # test for raising error message
+    invalid_range = vec.ngram_range
+    message = ("Invalid value for ngram_range=%s "
+               "lower boundary larger than the upper boundary."
+               % str(invalid_range))
+    if isinstance(vec, HashingVectorizer):
+        pytest.xfail(reason='HashingVectorizer is not supported on PyPy')
+
+    assert_raise_message(
+        ValueError, message, vec.fit, ["good news everyone"])
+    assert_raise_message(
+        ValueError, message, vec.fit_transform, ["good news everyone"])
+
+    if isinstance(vec, HashingVectorizer):
+        assert_raise_message(
+            ValueError, message, vec.transform, ["good news everyone"])
+
+
+def _check_stop_words_consistency(estimator):
+    stop_words = estimator.get_stop_words()
+    tokenize = estimator.build_tokenizer()
+    preprocess = estimator.build_preprocessor()
+    return estimator._check_stop_words_consistency(stop_words, preprocess,
+                                                   tokenize)
+
+
+@fails_if_pypy
+def test_vectorizer_stop_words_inconsistent():
+    lstr = "['and', 'll', 've']"
+    message = ('Your stop_words may be inconsistent with your '
+               'preprocessing. Tokenizing the stop words generated '
+               'tokens %s not in stop_words.' % lstr)
+    for vec in [CountVectorizer(),
+                TfidfVectorizer(), HashingVectorizer()]:
+        vec.set_params(stop_words=["you've", "you", "you'll", 'AND'])
+        assert_warns_message(UserWarning, message, vec.fit_transform,
+                             ['hello world'])
+        # reset stop word validation
+        del vec._stop_words_id
+        assert _check_stop_words_consistency(vec) is False
+
+    # Only one warning per stop list
+    assert_no_warnings(vec.fit_transform, ['hello world'])
+    assert _check_stop_words_consistency(vec) is None
+
+    # Test caching of inconsistency assessment
+    vec.set_params(stop_words=["you've", "you", "you'll", 'blah', 'AND'])
+    assert_warns_message(UserWarning, message, vec.fit_transform,
+                         ['hello world'])
+
+
+@skip_if_32bit
+def test_countvectorizer_sort_features_64bit_sparse_indices():
+    """
+    Check that CountVectorizer._sort_features preserves the dtype of its sparse
+    feature matrix.
+
+    This test is skipped on 32bit platforms, see:
+        https://github.com/scikit-learn/scikit-learn/pull/11295
+    for more details.
+    """
+
+    X = sparse.csr_matrix((5, 5), dtype=np.int64)
+
+    # force indices and indptr to int64.
+    INDICES_DTYPE = np.int64
+    X.indices = X.indices.astype(INDICES_DTYPE)
+    X.indptr = X.indptr.astype(INDICES_DTYPE)
+
+    vocabulary = {
+            "scikit-learn": 0,
+            "is": 1,
+            "great!": 2
+            }
+
+    Xs = CountVectorizer()._sort_features(X, vocabulary)
+
+    assert INDICES_DTYPE == Xs.indices.dtype
+
+
+@fails_if_pypy
+@pytest.mark.parametrize('Estimator',
+                         [CountVectorizer, TfidfVectorizer, HashingVectorizer])
+def test_stop_word_validation_custom_preprocessor(Estimator):
+    data = [{'text': 'some text'}]
+
+    vec = Estimator()
+    assert _check_stop_words_consistency(vec) is True
+
+    vec = Estimator(preprocessor=lambda x: x['text'],
+                    stop_words=['and'])
+    assert _check_stop_words_consistency(vec) == 'error'
+    # checks are cached
+    assert _check_stop_words_consistency(vec) is None
+    vec.fit_transform(data)
+
+    class CustomEstimator(Estimator):
+        def build_preprocessor(self):
+            return lambda x: x['text']
+
+    vec = CustomEstimator(stop_words=['and'])
+    assert _check_stop_words_consistency(vec) == 'error'
+
+    vec = Estimator(tokenizer=lambda doc: re.compile(r'\w{1,}')
+                                            .findall(doc),
+                    stop_words=['and'])
+    assert _check_stop_words_consistency(vec) is True
+
+
+@pytest.mark.parametrize(
+    'Estimator',
+    [CountVectorizer,
+     TfidfVectorizer,
+     HashingVectorizer]
+)
+@pytest.mark.parametrize(
+    'input_type, err_type, err_msg',
+    [('filename', FileNotFoundError, ''),
+     ('file', AttributeError, "'str' object has no attribute 'read'")]
+)
+def test_callable_analyzer_error(Estimator, input_type, err_type, err_msg):
+    if issubclass(Estimator, HashingVectorizer):
+        pytest.xfail('HashingVectorizer is not supported on PyPy')
+    data = ['this is text, not file or filename']
+    with pytest.raises(err_type, match=err_msg):
+        Estimator(analyzer=lambda x: x.split(),
+                  input=input_type).fit_transform(data)
+
+
+@pytest.mark.parametrize(
+    'Estimator',
+    [CountVectorizer,
+     TfidfVectorizer,
+     pytest.param(HashingVectorizer, marks=fails_if_pypy)]
+)
+@pytest.mark.parametrize(
+    'analyzer', [lambda doc: open(doc, 'r'), lambda doc: doc.read()]
+)
+@pytest.mark.parametrize('input_type', ['file', 'filename'])
+def test_callable_analyzer_change_behavior(Estimator, analyzer, input_type):
+    data = ['this is text, not file or filename']
+    warn_msg = 'Since v0.21, vectorizer'
+    with pytest.raises((FileNotFoundError, AttributeError)):
+        with pytest.warns(ChangedBehaviorWarning, match=warn_msg) as records:
+            Estimator(analyzer=analyzer, input=input_type).fit_transform(data)
+    assert len(records) == 1
+    assert warn_msg in str(records[0])
+
+
+@pytest.mark.parametrize(
+    'Estimator',
+    [CountVectorizer,
+     TfidfVectorizer,
+     HashingVectorizer]
+)
+def test_callable_analyzer_reraise_error(tmpdir, Estimator):
+    # check if a custom exception from the analyzer is shown to the user
+    def analyzer(doc):
+        raise Exception("testing")
+
+    if issubclass(Estimator, HashingVectorizer):
+        pytest.xfail('HashingVectorizer is not supported on PyPy')
+
+    f = tmpdir.join("file.txt")
+    f.write("sample content\n")
+
+    with pytest.raises(Exception, match="testing"):
+        Estimator(analyzer=analyzer, input='file').fit_transform([f])
+
+
+@pytest.mark.parametrize(
+    'Vectorizer',
+    [CountVectorizer, HashingVectorizer, TfidfVectorizer]
+)
+@pytest.mark.parametrize(
+    'stop_words, tokenizer, preprocessor, ngram_range, token_pattern,'
+    'analyzer, unused_name, ovrd_name, ovrd_msg',
+    [(["you've", "you'll"], None, None, (1, 1), None, 'char',
+     "'stop_words'", "'analyzer'", "!= 'word'"),
+     (None, lambda s: s.split(), None, (1, 1), None, 'char',
+     "'tokenizer'", "'analyzer'", "!= 'word'"),
+     (None, lambda s: s.split(), None, (1, 1), r'\w+', 'word',
+      "'token_pattern'", "'tokenizer'", "is not None"),
+     (None, None, lambda s:s.upper(), (1, 1), r'\w+', lambda s:s.upper(),
+      "'preprocessor'", "'analyzer'", "is callable"),
+     (None, None, None, (1, 2), None, lambda s:s.upper(),
+      "'ngram_range'", "'analyzer'", "is callable"),
+     (None, None, None, (1, 1), r'\w+', 'char',
+      "'token_pattern'", "'analyzer'", "!= 'word'")]
+)
+def test_unused_parameters_warn(Vectorizer, stop_words,
+                                tokenizer, preprocessor,
+                                ngram_range, token_pattern,
+                                analyzer, unused_name, ovrd_name,
+                                ovrd_msg):
+
+    train_data = JUNK_FOOD_DOCS
+    # setting parameter and checking for corresponding warning messages
+    vect = Vectorizer()
+    vect.set_params(stop_words=stop_words, tokenizer=tokenizer,
+                    preprocessor=preprocessor, ngram_range=ngram_range,
+                    token_pattern=token_pattern, analyzer=analyzer)
+    msg = ("The parameter %s will not be used"
+           " since %s %s" % (unused_name, ovrd_name, ovrd_msg)
+           )
+    with pytest.warns(UserWarning, match=msg):
+        vect.fit(train_data)
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""

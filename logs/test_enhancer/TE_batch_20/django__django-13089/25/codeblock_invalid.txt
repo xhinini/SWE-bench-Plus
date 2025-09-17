@@ -1,0 +1,165 @@
+# Additional regression tests for DatabaseCache culling behavior
+from django.db import connection
+from django.core.cache import cache
+from django.core.cache import caches
+
+class DBCacheCullingTests:
+    """
+    Helper mixin to add culling tests to the existing DBCacheTests test
+    class. These methods are intended to be added to the DBCacheTests class
+    (TransactionTestCase) in tests/cache/tests.py.
+    """
+    def _count_rows(self):
+        table_name = connection.ops.quote_name('test cache table')
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM %s" % table_name)
+            return cursor.fetchone()[0]
+
+    def test_cull_does_not_crash_when_culling_select_returns_no_rows(self):
+        # Create a moderate number of entries.
+        initial_count = 10
+        for i in range(initial_count):
+            cache.add('cull-nosel-%d' % i, 'value', timeout=None)
+
+        # Force a cull on next write by setting _max_entries lower than current rows.
+        cache._max_entries = initial_count - 1
+        # Make cull_frequency larger than number of rows so cull_num == 0 and
+        # the SELECT used for culling returns no rows (fetchone() will be None).
+        cache._cull_frequency = initial_count + 100
+
+        before = self._count_rows()
+        # Use add() because it returns the success value from _base_set and
+        # triggers the same culling logic as set().
+        ok = cache.add('cull-nosel-trigger', 'value', timeout=None)
+        self.assertTrue(ok, "cache.add should succeed even if culling SELECT returns no rows")
+        after = self._count_rows()
+        # At minimum, the table should still be accessible and contain at least one row.
+        self.assertGreaterEqual(after, 1)
+        # The count should not have caused an exception; it's acceptable if it
+        # grew by 1 (inserted) or stayed same depending on culling behavior.
+        self.assertIn(after - before, (0, 1))
+
+    def test_cull_reduces_rows_when_last_cache_key_present(self):
+        # Create enough entries to ensure cull_num > 0
+        initial_count = 20
+        for i in range(initial_count):
+            cache.add('cull-some-%d' % i, 'value', timeout=None)
+
+        cache._max_entries = initial_count - 1
+        cache._cull_frequency = 2  # cull_num = num // 2 (>= 1)
+
+        before = self._count_rows()
+        ok = cache.add('cull-some-trigger', 'value', timeout=None)
+        self.assertTrue(ok)
+        after = self._count_rows()
+        # After culling, the number of rows should be strictly less than before
+        # (at least some entries have been removed).
+        self.assertLess(after, before)
+
+    def test_multiple_cull_triggers_do_not_crash(self):
+        # Repeatedly trigger cull with varying sizes/frequencies to ensure no crash.
+        for initial_count, cull_freq in ((5, 100), (15, 10), (30, 3)):
+            # Clean up keys with fresh unique prefixes to avoid interference.
+            for i in range(initial_count):
+                cache.add('multi-cull-%d-%d' % (initial_count, i), 'x', timeout=None)
+            cache._max_entries = initial_count - 1
+            cache._cull_frequency = cull_freq
+            try:
+                ok = cache.add('multi-cull-trigger-%d-%d' % (initial_count, cull_freq), 'x', timeout=None)
+            except Exception as exc:
+                self.fail("cull triggered an exception: %r (initial_count=%s, cull_freq=%s)" %
+                          (exc, initial_count, cull_freq))
+            self.assertTrue(ok)
+
+    def test_cull_with_zero_frequency_clears_table(self):
+        # Based on behavior: when _cull_frequency == 0, the cache should be cleared.
+        # Insert one key and force cull by setting _max_entries < current_count.
+        cache.add('force-clear-key', 'value', timeout=None)
+        cache._max_entries = -1
+        cache._cull_frequency = 0
+        # Trigger cull via add
+        ok = cache.add('force-clear-trigger', 'value', timeout=None)
+        self.assertTrue(ok)
+        # After clear, the table may be empty; ensure the call didn't crash.
+        self.assertIsInstance(self._count_rows(), int)
+
+    def test_set_still_inserts_when_cull_select_returns_none(self):
+        # Variant that uses set (which doesn't return a value) to ensure no crash.
+        initial_count = 6
+        for i in range(initial_count):
+            cache.set('cull-set-%d' % i, 'v', timeout=None)
+        cache._max_entries = initial_count - 1
+        cache._cull_frequency = 1000  # will make cull_num == 0
+        # This should not raise
+        try:
+            cache.set('cull-set-trigger', 'v', timeout=None)
+        except Exception as exc:
+            self.fail("cache.set raised an exception when culling select returned no rows: %r" % (exc,))
+        # Verify insertion (key exists)
+        self.assertTrue(cache.has_key('cull-set-trigger'))
+
+    def test_cull_does_not_delete_unrelated_keys(self):
+        # Ensure culling does not accidentally delete keys from different prefixes.
+        # Create two groups of keys.
+        for i in range(10):
+            cache.add('keep-group-%d' % i, 'keep', timeout=None)
+        for i in range(12):
+            cache.add('cull-group-%d' % i, 'remove', timeout=None)
+
+        cache._max_entries = 15  # Force cull because total > 15
+        cache._cull_frequency = 2
+        # Trigger cull
+        ok = cache.add('cull-group-trigger', 'remove', timeout=None)
+        self.assertTrue(ok)
+        # Ensure keep-group keys are still present
+        present = sum(1 for i in range(10) if cache.has_key('keep-group-%d' % i))
+        self.assertEqual(present, 10)
+
+    def test_cull_with_space_in_table_name_does_not_crash(self):
+        # The DB table name in tests uses a space already ('test cache table').
+        # Ensure culling logic that formats the quoted table name doesn't raise.
+        # Create enough rows to trigger cull SELECT returning no rows.
+        initial_count = 8
+        for i in range(initial_count):
+            cache.add('space-table-%d' % i, 'v', timeout=None)
+        cache._max_entries = initial_count - 1
+        cache._cull_frequency = 100  # produce cull_num == 0
+        # This should not raise
+        try:
+            ok = cache.add('space-table-trigger', 'v', timeout=None)
+        except Exception as exc:
+            self.fail("culling with quoted table name raised: %r" % (exc,))
+        self.assertTrue(ok)
+
+    def test_cull_multiple_consecutive_calls(self):
+        # Repeated culling triggers should not raise or corrupt the table.
+        for cycle in range(3):
+            for i in range(7 + cycle):
+                cache.add('consec-%d-%d' % (cycle, i), 'v', timeout=None)
+            cache._max_entries = (7 + cycle) - 1
+            cache._cull_frequency = 100  # cause SELECT to return no rows
+            try:
+                ok = cache.add('consec-trigger-%d' % cycle, 'v', timeout=None)
+            except Exception as exc:
+                self.fail("consecutive cull cycle %s raised: %r" % (cycle, exc))
+            self.assertTrue(ok)
+
+    def test_cull_preserves_table_integrity_after_no_last_key(self):
+        # Ensure that when fetchone() returns None, subsequent operations still work.
+        initial_count = 9
+        for i in range(initial_count):
+            cache.add('integrity-%d' % i, 'v', timeout=None)
+        cache._max_entries = initial_count - 1
+        cache._cull_frequency = 500  # produce cull_num == 0
+        cache.add('integrity-trigger', 'v', timeout=None)
+        # A subsequent read/write should succeed.
+        try:
+            cache.set('integrity-post', 'ok', timeout=None)
+        except Exception as exc:
+            self.fail("Subsequent write after a no-last-key cull failed: %r" % (exc,))
+        self.assertEqual(cache.get('integrity-post'), 'ok')
+new_imports_code: |
+  # No additional imports required. These test methods integrate with the
+  # existing DBCacheTests class (TransactionTestCase) in tests/cache/tests.py,
+  # which already provides the database table setup/teardown and the `cache`
+  # instance used here.

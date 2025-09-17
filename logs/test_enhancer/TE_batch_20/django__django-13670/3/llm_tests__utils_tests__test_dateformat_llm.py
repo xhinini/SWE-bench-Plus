@@ -1,0 +1,30 @@
+def test_y_single_digit_year(self):
+    self.assertEqual(dateformat.format(datetime(7, 9, 8, 5, 0), 'y'), '07')
+
+def test_y_year_100_returns_00(self):
+    self.assertEqual(dateformat.format(datetime(100, 1, 1, 0, 0), 'y'), '00')
+
+def test_y_year_2000_returns_00(self):
+    self.assertEqual(dateformat.format(datetime(2000, 6, 15, 12, 0), 'y'), '00')
+
+def test_y_year_1999_returns_99(self):
+    self.assertEqual(dateformat.format(datetime(1999, 12, 31, 23, 59), 'y'), '99')
+
+def test_y_year_123_returns_23(self):
+    self.assertEqual(dateformat.format(datetime(123, 4, 5, 6, 7), 'y'), '23')
+
+def test_y_date_object_returns_two_digits(self):
+    self.assertEqual(dateformat.format(date(2001, 1, 1), 'y'), '01')
+
+def test_y_using_dateformat_class_directly(self):
+    df = dateformat.DateFormat(datetime(9, 2, 3, 4, 5))
+    self.assertEqual(df.format('y'), '09')
+
+def test_y_combined_with_Y(self):
+    self.assertEqual(dateformat.format(datetime(100, 10, 10, 0, 0), 'Y y'), '100 00')
+
+def test_y_max_year_9999(self):
+    self.assertEqual(dateformat.format(datetime(9999, 1, 1, 0, 0), 'y'), '99')
+
+def test_y_two_digit_year_99(self):
+    self.assertEqual(dateformat.format(datetime(99, 3, 3, 0, 0), 'y'), '99')

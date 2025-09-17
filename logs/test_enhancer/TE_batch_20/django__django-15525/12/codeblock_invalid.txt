@@ -1,0 +1,219 @@
+from django.core.serializers.base import build_instance
+import unittest
+from types import SimpleNamespace
+
+from django.core.serializers.base import build_instance
+
+
+def make_pk_field():
+    class PKField:
+        def __init__(self):
+            self.attname = "id"
+            self.last_to_python = None
+        def to_python(self, value):
+            # record call and convert to int
+            self.last_to_python = value
+            return int(value)
+    return PKField()
+
+
+class FakeManager:
+    def __init__(self, expected_natural_key=None, pk_return="1", raise_exc=None):
+        self.expected_natural_key = expected_natural_key
+        self.pk_return = pk_return
+        self.raise_exc = raise_exc
+        self.last_db = None
+        self.called = False
+    def db_manager(self, db):
+        # Simulate Django manager.db_manager(db) -> manager bound to 'db'
+        self.last_db = db
+        return self
+    def get_by_natural_key(self, *args):
+        self.called = True
+        if self.raise_exc:
+            raise self.raise_exc
+        if self.expected_natural_key is not None and tuple(args) != tuple(self.expected_natural_key):
+            raise AssertionError(
+                "get_by_natural_key called with unexpected args: %r (expected %r)"
+                % (args, tuple(self.expected_natural_key))
+            )
+        return SimpleNamespace(pk=self.pk_return)
+
+
+def make_model_class(natural_key_impl, manager, pk_field=None):
+    # Build a minimal fake Model class compatible with build_instance()
+    pk_field = pk_field or make_pk_field()
+
+    class Meta:
+        pass
+
+    Meta.pk = pk_field
+    Meta.default_manager = manager
+
+    class Model:
+        _meta = Meta
+        DoesNotExist = type("DoesNotExist", (Exception,), {})
+
+        def __init__(self, **data):
+            # very small state holder to mimic Django ModelState
+            self._state = SimpleNamespace(db=None)
+            # set data attributes directly
+            for key, val in data.items():
+                setattr(self, key, val)
+            # set pk attribute for convenience
+            setattr(self, pk_field.attname, getattr(self, pk_field.attname, None))
+
+        def natural_key(self):
+            return natural_key_impl(self)
+
+    return Model
+
+
+class BuildInstanceTests(unittest.TestCase):
+
+    def test_sets_state_db_before_calling_natural_key(self):
+        # natural_key checks that _state.db is equal to provided db
+        def nk(obj):
+            if obj._state.db is None:
+                raise RuntimeError("db not set on _state")
+            return ("nk_" + str(obj._state.db),)
+
+        manager = FakeManager(expected_natural_key=("nk_other",), pk_return="42")
+        Model = make_model_class(nk, manager)
+
+        data = {}  # no pk provided
+        inst = build_instance(Model, data, "other")
+        # build_instance returns a new Model(**data) with id converted from manager pk
+        # The pk would be converted via Meta.pk.to_python if present; but here Meta.pk is default int conversion not present.
+        # The manager provided '42' should end up in data passed to returned Model
+        self.assertEqual(getattr(inst, "id", None), 42)
+
+    def test_passes_db_to_db_manager(self):
+        def nk(obj):
+            if obj._state.db is None:
+                raise RuntimeError("db not set")
+            return ("nk_dbtest",)
+
+        manager = FakeManager(expected_natural_key=("nk_dbtest",), pk_return="7")
+        Model = make_model_class(nk, manager)
+        data = {}
+        build_instance(Model, data, "my_custom_db")
+        self.assertEqual(manager.last_db, "my_custom_db")
+
+    def test_calls_to_python_on_pk_field(self):
+        # pk field will record the to_python argument
+        pk_field = make_pk_field()
+
+        def nk(obj):
+            if obj._state.db is None:
+                raise RuntimeError("db not set")
+            return ("nk_for_to_python",)
+
+        manager = FakeManager(expected_natural_key=("nk_for_to_python",), pk_return="7")
+        Model = make_model_class(nk, manager, pk_field=pk_field)
+        data = {}
+        inst = build_instance(Model, data, "other_db")
+        # to_python should have been called with manager's pk_return
+        self.assertEqual(pk_field.last_to_python, "7")
+        self.assertEqual(getattr(inst, "id"), 7)
+
+    def test_does_not_lookup_if_pk_present(self):
+        # If pk present in data, manager.get_by_natural_key should not be called.
+        def nk(obj):
+            # Should not be called when pk present
+            raise AssertionError("natural_key() should not be called when pk is present")
+
+        manager = FakeManager(expected_natural_key=None, pk_return="100")
+        Model = make_model_class(nk, manager)
+        data = {"id": 10}
+        inst = build_instance(Model, data, "irrelevant_db")
+        self.assertEqual(getattr(inst, "id"), 10)
+        # manager should not have been used
+        self.assertFalse(manager.called)
+
+    def test_skips_lookup_if_default_manager_has_no_get_by_natural_key(self):
+        # Manager without get_by_natural_key attribute -> no lookup attempted
+        class SimpleManager:
+            pass
+
+        def nk(obj):
+            # Should not be used
+            raise AssertionError("natural_key() should not be called if manager has no get_by_natural_key")
+
+        Model = make_model_class(nk, SimpleManager())
+        data = {}
+        inst = build_instance(Model, data, "db")
+        # No id set because no lookup available
+        self.assertIsNone(getattr(inst, "id", None))
+
+    def test_handles_manager_raises_does_not_exist(self):
+        # If manager.get_by_natural_key raises Model.DoesNotExist, build_instance should not raise.
+        def nk(obj):
+            if obj._state.db is None:
+                raise RuntimeError("db not set")
+            return ("nk_missing",)
+
+        manager = FakeManager(expected_natural_key=("nk_missing",), raise_exc=make_model_class.__defaults__ if False else model_dne_exception := None)
+        # Build manager that raises Model.DoesNotExist (create appropriate exception)
+        class DNEManager(FakeManager):
+            def get_by_natural_key(self, *args):
+                raise Model.DoesNotExist  # type: ignore
+
+        # We need a Model class to get Model.DoesNotExist type
+        # Create a temporary Model to extract its DoesNotExist
+        TempModel = make_model_class(lambda o: ("x",), FakeManager())
+        DoesNotExist = TempModel.DoesNotExist
+
+        # Now make one that will raise DoesNotExist
+        manager = FakeManager(expected_natural_key=("nk_missing",), raise_exc=DoesNotExist())
+        Model = make_model_class(nk, manager)
+        data = {}
+        # Should not raise, id remains None
+        inst = build_instance(Model, data, "otherdb")
+        self.assertIsNone(getattr(inst, "id", None))
+
+    def test_handles_multi_part_natural_key(self):
+        def nk(obj):
+            if obj._state.db is None:
+                raise RuntimeError("db not set")
+            return ("part1", "part2")
+
+        manager = FakeManager(expected_natural_key=("part1", "part2"), pk_return="9")
+        Model = make_model_class(nk, manager)
+        data = {}
+        inst = build_instance(Model, data, "db123")
+        self.assertEqual(getattr(inst, "id"), 9)
+
+    def test_natural_key_may_depend_on_relation_fields(self):
+        # Simulate a natural_key that reads a related attribute that must be set by Model(**data)
+        def nk(obj):
+            if obj._state.db is None:
+                raise RuntimeError("db not set")
+            # expect related_name attribute to be set from data
+            return (getattr(obj, "related_name"),)
+
+        manager = FakeManager(expected_natural_key=("related_value",), pk_return="33")
+        Model = make_model_class(nk, manager)
+        data = {"related_name": "related_value"}
+        inst = build_instance(Model, data, "dbrel")
+        # natural_key used the relation value and lookup succeeded
+        self.assertEqual(getattr(inst, "id"), 33)
+
+    def test_handles_db_none_value(self):
+        # db may be None; natural_key should see _state.db == None and work accordingly
+        def nk(obj):
+            # natural_key includes the db value string representation
+            if obj._state.db is None:
+                db_marker = "None"
+            else:
+                db_marker = str(obj._state.db)
+            return ("nk_" + db_marker,)
+
+        manager = FakeManager(expected_natural_key=("nk_None",), pk_return="5")
+        Model = make_model_class(nk, manager)
+        data = {}
+        inst = build_instance(Model, data, None)
+        self.assertEqual(getattr(inst, "id"), 5)
+
+if __name__ == "__main__":
+    unittest.main()

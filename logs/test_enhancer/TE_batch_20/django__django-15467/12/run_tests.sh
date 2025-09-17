@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_widgets.tests_llm.AdminForeignKeyEmptyLabelTests.test_preserves_empty_string_from_formfield_overrides_horizontal admin_widgets.tests_llm.AdminForeignKeyEmptyLabelTests.test_preserves_empty_string_from_formfield_overrides_vertical admin_widgets.tests_llm.AdminForeignKeyEmptyLabelTests.test_preserves_empty_string_passed_as_kwarg_horizontal admin_widgets.tests_llm.AdminForeignKeyEmptyLabelTests.test_preserves_empty_string_passed_as_kwarg_vertical admin_widgets.tests_llm.AdminForeignKeyEmptyLabelTests.test_preserves_false_from_formfield_overrides_vertical admin_widgets.tests_llm.AdminForeignKeyEmptyLabelTests.test_preserves_none_from_formfield_overrides_vertical admin_widgets.tests_llm.AdminForeignKeyEmptyLabelTests.test_preserves_none_passed_as_kwarg_vertical admin_widgets.tests_llm.AdminForeignKeyEmptyLabelTests.test_required_field_ignores_empty_label_override
+coverage json -o coverage.json
+: '>>>>> End Test Output'

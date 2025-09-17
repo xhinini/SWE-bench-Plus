@@ -1,0 +1,143 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that bulk_create batching respects the database backend's max batch size (as returned by connection.ops.bulk_batch_size) when an explicit batch_size larger than the max is provided, that a zero batch_size raises an assertion, and that edge cases such as ops.bulk_batch_size returning 0 are handled by defaulting to at least 1. The tests are written in the same style as the existing tests and use assertNumQueries to validate the number of SQL executions.
+new_imports_code: |
+  from django.db.models import AutoField
+test_code: |
+  from math import ceil
+  from operator import attrgetter
+
+  from django.db import IntegrityError, NotSupportedError, connection
+  from django.db.models import FileField, Value, AutoField
+  from django.db.models.functions import Lower
+  from django.test import (
+      TestCase, override_settings, skipIfDBFeature, skipUnlessDBFeature,
+  )
+
+  from .models import (
+      Country, NoFields, NullableFields, Pizzeria, ProxyCountry,
+      ProxyMultiCountry, ProxyMultiProxyCountry, ProxyProxyCountry, Restaurant,
+      State, TwoFields,
+  )
+
+
+  class BulkCreateTests(TestCase):
+      def setUp(self):
+          self.data = [
+              Country(name="United States of America", iso_two_letter="US"),
+              Country(name="The Netherlands", iso_two_letter="NL"),
+              Country(name="Germany", iso_two_letter="DE"),
+              Country(name="Czech Republic", iso_two_letter="CZ")
+          ]
+
+      # ... existing tests omitted for brevity ...
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batch_size_none_uses_max_batch_size(self):
+          # When batch_size is None the backend max should be used.
+          objs = [Country() for _ in range(120)]
+          fields = ['name', 'iso_two_letter', 'description']
+          max_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
+          expected_queries = ceil(len(objs) / max_batch_size)
+          with self.assertNumQueries(expected_queries):
+              Country.objects.bulk_create(objs, batch_size=None)
+
+      def test_batch_size_zero_raises_assertion(self):
+          # batch_size of zero is invalid and should raise AssertionError.
+          objs = [TwoFields(f1=1, f2=1)]
+          with self.assertRaises(AssertionError):
+              TwoFields.objects.bulk_create(objs, batch_size=0)
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_explicit_batch_size_larger_than_max_respected_twofields(self):
+          # Passing a batch_size larger than the backend's max must be capped.
+          objs = [TwoFields(f1=i, f2=i) for i in range(300)]
+          opts = TwoFields._meta
+          # ops.bulk_batch_size accepts field objects as the real code does.
+          max_batch_size = max(connection.ops.bulk_batch_size(opts.concrete_fields, objs), 1)
+          provided_batch_size = max_batch_size + 10
+          expected_queries = ceil(len(objs) / max_batch_size)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(objs, batch_size=provided_batch_size)
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_mixed_pk_bulk_create_respects_individual_max_batch_sizes(self):
+          # Mixed set where some objs have PK and others do not. Each group
+          # uses its own fields list and thus its own max batch size.
+          objs = [
+              TwoFields(id=i if i % 2 == 0 else None, f1=i, f2=i + 1)
+              for i in range(200)
+          ]
+          objs_with_pk = [o for o in objs if o.id is not None]
+          objs_without_pk = [o for o in objs if o.id is None]
+
+          opts = TwoFields._meta
+          fields_with_pk = opts.concrete_fields
+          fields_without_pk = [f for f in opts.concrete_fields if not isinstance(f, AutoField)]
+
+          max1 = max(connection.ops.bulk_batch_size(fields_with_pk, objs_with_pk), 1)
+          max2 = max(connection.ops.bulk_batch_size(fields_without_pk, objs_without_pk), 1)
+          provided_batch_size = max(max1, max2) + 20
+          expected_queries = ceil(len(objs_with_pk) / max1) + ceil(len(objs_without_pk) / max2)
+
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(objs, batch_size=provided_batch_size)
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batch_size_larger_than_max_single_field_restaurant(self):
+          # Test with a single-field table to ensure the capping logic works there too.
+          objs = [Restaurant() for _ in range(260)]
+          # For Restaurant (single field), pass a representative fields list.
+          fields = ['name']
+          max_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
+          provided_batch_size = max_batch_size + 50
+          expected_queries = ceil(len(objs) / max_batch_size)
+          with self.assertNumQueries(expected_queries):
+              Restaurant.objects.bulk_create(objs, batch_size=provided_batch_size)
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_ops_bulk_batch_size_zero_defaults_to_one(self):
+          # If ops.bulk_batch_size erroneously returns 0, ensure we treat it as at least 1.
+          objs = [TwoFields(f1=i, f2=i) for i in range(5)]
+          orig = connection.ops.bulk_batch_size
+          try:
+              connection.ops.bulk_batch_size = lambda fields, objs: 0
+              # Confirm our patched ops returns 0, but the code should use max(..., 1).
+              max_batch_size = max(connection.ops.bulk_batch_size(None, objs), 1)
+              expected_queries = ceil(len(objs) / max_batch_size)
+              with self.assertNumQueries(expected_queries):
+                  TwoFields.objects.bulk_create(objs, batch_size=None)
+          finally:
+              connection.ops.bulk_batch_size = orig
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batch_size_equals_max_uses_it(self):
+          # If batch_size equals the backend max, the provided size should be used.
+          objs = [Country() for _ in range(250)]
+          fields = ['name', 'iso_two_letter', 'description']
+          max_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
+          provided_batch_size = max_batch_size
+          expected_queries = ceil(len(objs) / provided_batch_size)
+          with self.assertNumQueries(expected_queries):
+              Country.objects.bulk_create(objs, batch_size=provided_batch_size)
+
+      @skipUnlessDBFeature('has_bulk_insert')
+      def test_batch_size_smaller_than_max_uses_provided(self):
+          # If batch_size is smaller than backend max, use the provided value.
+          objs = [TwoFields(f1=i, f2=i) for i in range(20)]
+          provided_batch_size = 1
+          expected_queries = ceil(len(objs) / provided_batch_size)
+          with self.assertNumQueries(expected_queries):
+              TwoFields.objects.bulk_create(objs, batch_size=provided_batch_size)
+
+      @skipUnlessDBFeature('can_return_rows_from_bulk_insert')
+      def test_explicit_batch_size_respects_max_with_returning_rows(self):
+          # When the backend can return rows from bulk insert, batching should still
+          # respect the max batch size.
+          objs = [Country(name=f"Country {i}", iso_two_letter="XX") for i in range(180)]
+          fields = ['name', 'iso_two_letter', 'description']
+          max_batch_size = max(connection.ops.bulk_batch_size(fields, objs), 1)
+          provided_batch_size = max_batch_size + 30
+          expected_queries = ceil(len(objs) / max_batch_size)
+          with self.assertNumQueries(expected_queries):
+              Country.objects.bulk_create(objs, batch_size=provided_batch_size)

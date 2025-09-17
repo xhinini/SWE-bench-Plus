@@ -1,0 +1,239 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests validate logging behavior related to the default log format, colored
+  formatting of the level name, level resolution from configuration, handler/context
+  management (catching_logs), LogCaptureHandler behavior, LogCaptureFixture level
+  management, _LiveLoggingStreamHandler behavior, and LoggingPlugin's set_log_path
+  implementation. They exercise the public API and ensure the default format contains
+  a levelname token, that ColoredLevelFormatter colorizes the levelname if present,
+  that levels are parsed/validated correctly, and that handlers/contextmanagers
+  add/remove handlers and restore logger levels properly.
+test_code: |
+  # -*- coding: utf-8 -*-
+  import logging
+  import io
+  import os
+  import contextlib
+  import pytest
+  
+  from _pytest.logging import (
+      ColoredLevelFormatter,
+      DEFAULT_LOG_FORMAT,
+      get_actual_log_level,
+      catching_logs,
+      LogCaptureHandler,
+      LogCaptureFixture,
+      _LiveLoggingStreamHandler,
+      LoggingPlugin,
+  )
+  
+  class DummyPluginManager:
+      def __init__(self, plugins=None):
+          self._plugins = plugins or {}
+  
+      def get_plugin(self, name):
+          return self._plugins.get(name)
+  
+  class DummyConfig:
+      def __init__(self, rootdir=None, option_color="yes", verbose=0, plugins=None):
+          self.rootdir = rootdir
+          self.option = type("opt", (), {"color": option_color, "verbose": verbose})
+          self._pm = DummyPluginManager(plugins)
+  
+      @property
+      def pluginmanager(self):
+          return self._pm
+  
+      def getoption(self, name):
+          return None
+  
+      def getini(self, name):
+          # default values: mimic real getini behavior used by LoggingPlugin
+          if name == "log_cli":
+              return False
+          return None
+  
+  def test_default_log_format_constant_contains_levelname_and_name():
+      # Ensure the default format contains the levelname directive and logger name
+      assert "%(levelname)" in DEFAULT_LOG_FORMAT
+      assert "%(name)" in DEFAULT_LOG_FORMAT
+      assert "%(filename)" in DEFAULT_LOG_FORMAT
+      assert "%(lineno)" in DEFAULT_LOG_FORMAT
+  
+  def test_loggingplugin_uses_default_log_format_when_none_provided(tmp_path):
+      cfg = DummyConfig(rootdir=tmp_path)
+      plugin = LoggingPlugin(cfg)
+      # The plugin's formatter should use the DEFAULT_LOG_FORMAT
+      assert plugin.formatter._style._fmt == DEFAULT_LOG_FORMAT
+  
+  def test_colored_level_formatter_colorizes_levelname_when_present():
+      # Terminal writer stub that "marks up" by surrounding with markers for test asserts
+      class TerminalWriterStub:
+          def markup(self, text, **kwargs):
+              # include an indicator of the color options to ensure mapping per-level works
+              opts = ",".join(sorted(kwargs.keys()))
+              return "<%s:%s>" % (opts or "none", text)
+  
+      fmt = "%(levelname)-8s %(message)s"
+      tw = TerminalWriterStub()
+      fmtter = ColoredLevelFormatter(tw, fmt)
+  
+      # create a LogRecord for ERROR level
+      record = logging.LogRecord("mymod", logging.ERROR, __file__, 123, "an error", (), None)
+      formatted = fmtter.format(record)
+      # Ensure the returned string contains the markup output from TerminalWriterStub
+      assert "<red,bold:ERROR" in formatted or "<red:ERROR" in formatted
+  
+  def test_colored_level_formatter_no_levelname_leaves_format_untouched():
+      class TerminalWriterFailIfCalled:
+          def __init__(self):
+              self.called = False
+  
+          def markup(self, text, **kwargs):
+              self.called = True
+              return text
+  
+      tw = TerminalWriterFailIfCalled()
+      fmt = "%(message)s"  # no levelname token
+      fmtter = ColoredLevelFormatter(tw, fmt)
+      record = logging.LogRecord("mymod", logging.INFO, __file__, 1, "hello", (), None)
+      formatted = fmtter.format(record)
+      assert formatted == "hello"
+      assert tw.called is False
+  
+  def test_get_actual_log_level_resolves_names_and_raises_on_invalid():
+      class Cfg:
+          def __init__(self, option=None, ini=None):
+              self._option = option
+              self._ini = ini
+          def getoption(self, name):
+              return self._option
+          def getini(self, name):
+              return self._ini
+  
+      # name (case-insensitive)
+      cfg = Cfg(option=None, ini="warning")
+      assert get_actual_log_level(cfg, "log_level") == logging.WARNING
+      # numeric string should be accepted as numeric (logging handles it)
+      cfg = Cfg(option=None, ini="10")  # DEBUG numeric
+      assert get_actual_log_level(cfg, "log_level") == 10
+      # integer passed through getoption directly
+      cfg = Cfg(option=20, ini=None)
+      assert get_actual_log_level(cfg, "log_level") == 20
+      # invalid name causes pytest.UsageError
+      cfg = Cfg(option=None, ini="NOT_A_LEVEL")
+      with pytest.raises(pytest.UsageError):
+          get_actual_log_level(cfg, "log_level")
+  
+  def test_catching_logs_adds_and_removes_handler_and_restores_level():
+      root = logging.getLogger()
+      orig_level = root.level
+      handler = LogCaptureHandler()
+      try:
+          with catching_logs(handler, level=logging.INFO) as h:
+              # handler should be attached
+              assert h in root.handlers
+              # root level should be adjusted to at most INFO
+              assert root.level <= logging.INFO
+          # after context manager, handler removed and level restored
+          assert handler not in root.handlers
+          assert root.level == orig_level
+      finally:
+          # ensure no leftover handler
+          if handler in root.handlers:
+              root.removeHandler(handler)
+  
+  def test_logcapturehandler_emit_and_reset_records(tmp_path):
+      handler = LogCaptureHandler()
+      logger = logging.getLogger("test_emit")
+      # ensure clean state
+      for h in list(logger.handlers):
+          logger.removeHandler(h)
+      logger.addHandler(handler)
+      try:
+          logger.setLevel(logging.DEBUG)
+          logger.debug("first")
+          assert len(handler.records) >= 1
+          assert any(r.getMessage() == "first" for r in handler.records)
+          handler.reset()
+          assert handler.records == []
+          # stream should be reset and empty
+          assert handler.stream.getvalue() == ""
+      finally:
+          logger.removeHandler(handler)
+  
+  def test_logcapturefixture_set_level_and_at_level_restoration(tmp_path):
+      # use dummy item (LogCaptureFixture does not require special fields for set_level/at_level)
+      item = object()
+      fixture = LogCaptureFixture(item)
+      test_logger_name = "test_logger_for_fixture"
+      logger = logging.getLogger(test_logger_name)
+      orig_level = logger.level
+      try:
+          fixture.set_level(logging.DEBUG, logger=test_logger_name)
+          assert logging.getLogger(test_logger_name).level == logging.DEBUG
+          # finalize should restore
+          fixture._finalize()
+          assert logging.getLogger(test_logger_name).level == orig_level
+          # test at_level context manager restores
+          logger.setLevel(orig_level)
+          with fixture.at_level(logging.ERROR, logger=test_logger_name):
+              assert logging.getLogger(test_logger_name).level == logging.ERROR
+          assert logging.getLogger(test_logger_name).level == orig_level
+      finally:
+          logger.setLevel(orig_level)
+  
+  def test_live_logging_stream_handler_writes_newlines_and_suspends_capture(request):
+      # Dummy terminal that also supports section()
+      class DummyTerminal(io.StringIO):
+          def section(self, *args, **kwargs):
+              # mimic TerminalReporter.section behavior by writing a simple header
+              self.write("SECTION:%s\n" % (args[0] if args else ""))
+  
+      class MockCaptureManager:
+          def __init__(self):
+              self.calls = []
+          @contextlib.contextmanager
+          def global_and_fixture_disabled(self):
+              self.calls.append("enter")
+              try:
+                  yield
+              finally:
+                  self.calls.append("exit")
+  
+      out = DummyTerminal()
+      cm = MockCaptureManager()
+      handler = _LiveLoggingStreamHandler(out, cm)
+      handler.set_when("call")
+      logger = logging.getLogger("test_live_handler")
+      # ensure clean state
+      for h in list(logger.handlers):
+          logger.removeHandler(h)
+      logger.addHandler(handler)
+      try:
+          logger.critical("hey there")
+          # capture manager should have been used
+          assert cm.calls == ["enter", "exit"]
+          # the output should start with a newline and contain the message and newline
+          val = out.getvalue()
+          assert val.startswith("\n")
+          assert "hey there" in val
+      finally:
+          logger.removeHandler(handler)
+  
+  def test_loggingplugin_set_log_path_creates_parent_and_sets_filehandler(tmp_path):
+      cfg = DummyConfig(rootdir=tmp_path)
+      plugin = LoggingPlugin(cfg)
+      # choose a relative nested path
+      rel_path = os.path.join("some", "nested", "logfile.txt")
+      plugin.set_log_path(rel_path)
+      # file should be created in rootdir/some/nested/logfile.txt
+      expected = os.path.join(str(tmp_path), rel_path)
+      assert os.path.isfile(expected)
+      # the plugin should have a FileHandler
+      assert plugin.log_file_handler is not None
+      # cleanup
+      plugin.log_file_handler.close()
+new_imports_code: |
+  # no additional imports required beyond the test module above

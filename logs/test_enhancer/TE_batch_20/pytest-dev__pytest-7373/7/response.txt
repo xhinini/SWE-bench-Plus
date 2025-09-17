@@ -1,0 +1,164 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that the mark evaluation implementation:
+  - does not expose stale caching symbols (evalcache_key/cached_eval) removed by the patch,
+  - uses compiled_eval for string conditions,
+  - correctly evaluates expressions with per-item globals (no cross-item caching),
+  - handles boolean conditions with explicit reason,
+  - and exposes expected helper behaviors (getexplanation, invalidraise, __bool__, short-circuiting when result already set).
+test_code: |
+  import importlib
+  import types
+  import pytest
+  
+  evaluate = importlib.import_module("_pytest.mark.evaluate")
+  
+  
+  class DummyMark:
+      def __init__(self, name="dummy", args=(), kwargs=None):
+          self.name = name
+          self.args = tuple(args)
+          self.kwargs = dict(kwargs or {})
+  
+  
+  class DummyItem:
+      def __init__(self, marks, config=None, obj=None):
+          # marks: sequence of DummyMark
+          self._marks = list(marks)
+          self.config = config or object()
+          if obj is not None:
+              self.obj = obj
+          # provide a nodeid just for nicer debugging if needed
+          self.nodeid = getattr(obj, "__name__", "dummy_item")
+  
+      def iter_markers(self, name=None):
+          for m in self._marks:
+              if name is None or m.name == name:
+                  yield m
+  
+  
+  def test_no_evalcache_or_cached_eval_exposed():
+      """
+      The old (buggy) implementation exposed cached evaluate storage names.
+      The fixed code should not expose evalcache_key or cached_eval at module level.
+      """
+      assert not hasattr(evaluate, "evalcache_key"), "evalcache_key must not be present"
+      assert not hasattr(evaluate, "cached_eval"), "cached_eval must not be present"
+  
+  
+  def test_compiled_eval_basic_arithmetic():
+      # sanity check that compiled_eval evaluates simple expressions
+      assert evaluate.compiled_eval("1 + 2", {}) == 3
+      assert evaluate.compiled_eval("len([1,2,3])", {}) == 3
+  
+  
+  def test_mark_evaluator_uses_compiled_eval_for_string_conditions(monkeypatch):
+      called = []
+  
+      def fake_compiled_eval(expr, d):
+          called.append((expr, dict(d)))
+          return True
+  
+      monkeypatch.setattr(evaluate, "compiled_eval", fake_compiled_eval)
+  
+      m = DummyMark(name="mymark", args=("1 == 1",), kwargs={})
+      item = DummyItem([m])
+      ev = evaluate.MarkEvaluator(item, "mymark")
+      assert ev.istrue() is True
+      assert called and called[0][0] == "1 == 1"
+  
+  
+  def test_mark_evaluator_boolean_condition_with_reason():
+      # boolean conditions must have an explicit reason when not a string
+      m = DummyMark(name="mybool", args=(True,), kwargs={"reason": "because"})
+      item = DummyItem([m])
+      ev = evaluate.MarkEvaluator(item, "mybool")
+      assert ev.istrue() is True
+      assert getattr(ev, "reason") == "because"
+  
+  def test_getexplanation_returns_reason_or_condition():
+      m = DummyMark(name="m", args=("x",), kwargs={"reason": "r"})
+      item = DummyItem([m])
+      ev = evaluate.MarkEvaluator(item, "m")
+      # If reason is present on mark but not yet selected as current mark,
+      # getexplanation should pick it up from the mark via get()
+      # Simulate that by setting _mark to the mark.
+      ev._mark = m
+      assert ev.getexplanation() == "r"
+  
+      # If no reason anywhere, but expr attribute exists, explanation should
+      # start with "condition: "
+      ev2 = evaluate.MarkEvaluator(item, "m")
+      ev2.expr = "someexpr"
+      assert ev2.getexplanation() == "condition: someexpr"
+  
+      # If nothing exists, should return empty string
+      ev3 = evaluate.MarkEvaluator(item, "m")
+      assert ev3.getexplanation() == ""
+  
+  
+  def test_invalidraise_behavior():
+      # When 'raises' isn't provided, invalidraise should return None
+      m = DummyMark(name="m", args=("x",), kwargs={})
+      item = DummyItem([m])
+      ev = evaluate.MarkEvaluator(item, "m")
+      assert ev.invalidraise(ValueError()) is None
+  
+      # When 'raises' is provided, invalidraise returns True if exc is not instance
+      m2 = DummyMark(name="m", args=("x",), kwargs={"raises": ValueError})
+      item2 = DummyItem([m2])
+      ev2 = evaluate.MarkEvaluator(item2, "m")
+      assert ev2.invalidraise(TypeError()) is True
+      assert ev2.invalidraise(ValueError()) is False
+  
+  
+  def test_bool_of_mark_evaluator_reflects_presence_of_marks():
+      m = DummyMark(name="present", args=("1",), kwargs={})
+      item_with = DummyItem([m])
+      item_without = DummyItem([])
+      ev_with = evaluate.MarkEvaluator(item_with, "present")
+      ev_without = evaluate.MarkEvaluator(item_without, "present")
+      assert bool(ev_with) is True
+      assert bool(ev_without) is False
+  
+  
+  def test__istrue_respects_cached_result_attribute_and_avoids_recompute(monkeypatch):
+      # If result attribute already present, _istrue should just return it
+      m = DummyMark(name="m", args=("1==0",), kwargs={})
+      item = DummyItem([m])
+      ev = evaluate.MarkEvaluator(item, "m")
+      ev.result = True
+      # monkeypatch compiled_eval to raise if called (should not be called)
+      def should_not_be_called(expr, d):
+          raise AssertionError("compiled_eval was called despite cached result")
+      monkeypatch.setattr(evaluate, "compiled_eval", should_not_be_called)
+      assert ev._istrue() is True
+  
+  
+  def test_evaluations_use_item_globals_not_shared_cache():
+      """
+      Ensure evaluation of identical expression strings uses per-item globals
+      rather than a shared cache keyed only by expression text (the original bug).
+      """
+      # two marks that evaluate same expression "flag" but with different globals
+      m = DummyMark(name="x", args=("flag",), kwargs={})
+  
+      # First item has flag = True
+      class ModuleA:
+          pass
+      ModuleA.__globals__ = {"flag": True}
+      item_a = DummyItem([m], obj=ModuleA)
+      ev_a = evaluate.MarkEvaluator(item_a, "x")
+      res_a = ev_a.istrue()
+  
+      # Second item has flag = False (different module)
+      class ModuleB:
+          pass
+      ModuleB.__globals__ = {"flag": False}
+      item_b = DummyItem([m], obj=ModuleB)
+      ev_b = evaluate.MarkEvaluator(item_b, "x")
+      res_b = ev_b.istrue()
+  
+      assert res_a is True
+      assert res_b is False
+new_imports_code: ""

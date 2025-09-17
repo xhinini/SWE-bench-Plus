@@ -1,0 +1,140 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests ensure iter_modules_and_files gracefully handles Path.resolve raising ValueError (e.g. from network filesystems returning null bytes or other Path.resolve issues). They assert that such ValueErrors are ignored (the problematic paths are skipped) and that valid files are still returned. The tests would fail for the candidate patch that re-raises ValueError for messages other than 'embedded null byte', but pass with the gold patch which swallows ValueError and continues.
+test_code: |
+  from pathlib import Path
+  import tempfile
+  import shutil
+  import os
+  from unittest import mock
+  from django.test import SimpleTestCase
+  from django.utils import autoreload
+  
+  # Keep original resolve implementation for use in side_effects.
+  _orig_resolve = Path.resolve
+  
+  class IterModulesAndFilesValueErrorTests(SimpleTestCase):
+      def setUp(self):
+          # Ensure cache doesn't interfere between tests.
+          try:
+              autoreload.iter_modules_and_files.cache_clear()
+          except AttributeError:
+              pass
+          # Create a temporary directory and a valid file to use in tests.
+          self.tmpdir = tempfile.mkdtemp()
+          self.addCleanup(shutil.rmtree, self.tmpdir)
+          self.valid_file = Path(self.tmpdir) / 'valid.py'
+          self.valid_file.parent.mkdir(parents=True, exist_ok=True)
+          self.valid_file.write_text("# test")
+  
+      def tearDown(self):
+          # Ensure cache cleared for subsequent tests.
+          try:
+              autoreload.iter_modules_and_files.cache_clear()
+          except AttributeError:
+              pass
+  
+      def _patch_resolve_for(self, bad_path_str, exc):
+          """
+          Return a context manager patching Path.resolve so that resolving the
+          given bad_path_str raises exc, while other paths use the original.
+          """
+          def side_effect(self, *args, **kwargs):
+              # str(self) is stable and used to identify the target path.
+              if str(self) == bad_path_str:
+                  raise exc
+              return _orig_resolve(self, *args, **kwargs)
+          return mock.patch.object(Path, 'resolve', side_effect=side_effect)
+  
+      def test_handles_value_error_with_arbitrary_message_string_path(self):
+          bad = os.path.join(self.tmpdir, 'bad_random.py')
+          # Raise a ValueError with a generic message.
+          with self._patch_resolve_for(bad, ValueError("some random error")):
+              # Should not raise; the bad path should be skipped.
+              result = autoreload.iter_modules_and_files((), frozenset([bad]))
+          self.assertEqual(result, frozenset())
+  
+      def test_handles_value_error_with_arbitrary_message_path_object(self):
+          bad = Path(os.path.join(self.tmpdir, 'bad_obj.py'))
+          with self._patch_resolve_for(str(bad), ValueError("another message")):
+              result = autoreload.iter_modules_and_files((), frozenset([bad]))
+          self.assertEqual(result, frozenset())
+  
+      def test_handles_value_error_with_empty_message(self):
+          bad = os.path.join(self.tmpdir, 'bad_empty.py')
+          with self._patch_resolve_for(bad, ValueError("")):
+              result = autoreload.iter_modules_and_files((), frozenset([bad]))
+          self.assertEqual(result, frozenset())
+  
+      def test_handles_value_error_with_null_char_in_message(self):
+          bad = os.path.join(self.tmpdir, 'bad_nullchar.py')
+          # Message contains an explicit null char.
+          with self._patch_resolve_for(bad, ValueError("contains\0null")):
+              result = autoreload.iter_modules_and_files((), frozenset([bad]))
+          self.assertEqual(result, frozenset())
+  
+      def test_handles_value_error_with_unicode_message(self):
+          bad = os.path.join(self.tmpdir, 'bad_unicode.py')
+          with self._patch_resolve_for(bad, ValueError("Δerror")):
+              result = autoreload.iter_modules_and_files((), frozenset([bad]))
+          self.assertEqual(result, frozenset())
+  
+      def test_handles_embedded_null_byte_message(self):
+          # This is the specific 'embedded null byte' message that some logic
+          # special-cases. Both gold and candidate patches allow this case to be
+          # skipped; include it to ensure it's ignored as well.
+          bad = os.path.join(self.tmpdir, 'bad_embedded.py')
+          with self._patch_resolve_for(bad, ValueError("embedded null byte")):
+              result = autoreload.iter_modules_and_files((), frozenset([bad]))
+          self.assertEqual(result, frozenset())
+  
+      def test_valid_and_bad_files_together_only_valid_returned(self):
+          bad = os.path.join(self.tmpdir, 'bad_mixed.py')
+          valid = str(self.valid_file)
+          with self._patch_resolve_for(bad, ValueError("mixed error")):
+              result = autoreload.iter_modules_and_files((), frozenset([bad, valid]))
+          # The valid file should be present in the results; the bad one is skipped.
+          self.assertIn(self.valid_file.resolve(), result)
+  
+      def test_iter_all_python_module_files_uses_error_files_safely(self):
+          # Put the bad path into autoreload._error_files so iter_all_python_module_files
+          # passes it through to iter_modules_and_files.
+          bad = os.path.join(self.tmpdir, 'bad_errorfiles.py')
+          with self._patch_resolve_for(bad, ValueError("errorfiles error")):
+              with mock.patch.object(autoreload, '_error_files', [bad]):
+                  # Should not raise
+                  result = list(autoreload.iter_all_python_module_files())
+          # Should not include the problematic path.
+          self.assertNotIn(Path(bad).resolve() if Path(bad).exists() else Path(bad), result)
+  
+      def test_resolve_called_with_strict_true(self):
+          bad = os.path.join(self.tmpdir, 'bad_strict.py')
+          # Verify that resolve is invoked with the strict keyword by asserting
+          # kwargs passed in the side_effect. If strict isn't passed, the test fails.
+          def side_effect(self, *args, **kwargs):
+              if str(self) == bad:
+                  # Ensure strict is True as expected by the implementation.
+                  self.assertIn('strict', kwargs)
+                  self.assertTrue(kwargs.get('strict'))
+                  raise ValueError("strict check")
+              return _orig_resolve(self, *args, **kwargs)
+  
+          with mock.patch.object(Path, 'resolve', side_effect=side_effect):
+              result = autoreload.iter_modules_and_files((), frozenset([bad]))
+          self.assertEqual(result, frozenset())
+  
+      def test_cache_cleared_between_calls_allows_new_errors_to_be_handled(self):
+          bad1 = os.path.join(self.tmpdir, 'bad_cache1.py')
+          bad2 = os.path.join(self.tmpdir, 'bad_cache2.py')
+          # First, make bad1 raise; call to build potential cache state.
+          with self._patch_resolve_for(bad1, ValueError("cache1")):
+              r1 = autoreload.iter_modules_and_files((), frozenset([bad1]))
+          self.assertEqual(r1, frozenset())
+          # Clear cache and ensure a different bad path is also handled.
+          autoreload.iter_modules_and_files.cache_clear()
+          with self._patch_resolve_for(bad2, ValueError("cache2")):
+              r2 = autoreload.iter_modules_and_files((), frozenset([bad2]))
+          self.assertEqual(r2, frozenset())
+new_imports_code: |
+  from pathlib import Path
+  from unittest import mock

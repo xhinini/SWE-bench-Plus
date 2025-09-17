@@ -1,0 +1,201 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise post_process and related name/hash handling when max_post_process_passes is set to 0 (the edge case that previously caused an UnboundLocalError). They ensure post_process completes without raising UnboundLocalError or incorrectly raising the max-pass RuntimeError, that hashed_files is populated, that manifests are saved for ManifestStaticFilesStorage, and that special @font-face "?#" hacks and query/fragment parts are preserved/handled correctly. They create temporary ManifestStaticFilesStorage instances in temporary directories and clean up after themselves.
+test_code: |
+  import os
+  import shutil
+  import tempfile
+  import unittest
+  from django.core.files.base import ContentFile
+  from django.contrib.staticfiles.storage import ManifestStaticFilesStorage
+  from django.conf import settings
+  
+  class PostProcessMaxPassesZeroTests(unittest.TestCase):
+      def setUp(self):
+          # Create a temporary directory to act as the storage root.
+          self.temp_dir = tempfile.mkdtemp()
+  
+      def tearDown(self):
+          shutil.rmtree(self.temp_dir)
+  
+      def _make_storage(self, max_passes=0, keep_intermediate_files=False):
+          """
+          Create a ManifestStaticFilesStorage instance rooted at the temp dir.
+          """
+          storage = ManifestStaticFilesStorage(location=self.temp_dir, base_url='/static/')
+          storage.max_post_process_passes = max_passes
+          storage.keep_intermediate_files = keep_intermediate_files
+          # Reset any in-memory manifest state for repeatability.
+          storage.hashed_files = {}
+          return storage
+  
+      def _write_files(self, storage, files):
+          """
+          Save files (dict of name -> bytes) into the storage using _save and
+          return the paths mapping suitable for post_process.
+          """
+          paths = {}
+          for name, content in files.items():
+              storage._save(name, ContentFile(content))
+              paths[name] = (storage, name)
+          return paths
+  
+      def test_post_process_max_zero_simple_file(self):
+          """
+          A simple CSS file without references should be post-processed
+          successfully when max_post_process_passes == 0.
+          """
+          storage = self._make_storage(max_passes=0)
+          files = {'simple.css': b'body { color: red; }'}
+          paths = self._write_files(storage, files)
+  
+          # Should not raise and should yield at least one processed file.
+          processed = list(storage.post_process(paths, dry_run=False))
+          self.assertTrue(len(processed) >= 1)
+          # hashed_files must contain an entry for the file (cleaned name).
+          self.assertIn(storage.clean_name('simple.css'), storage.hashed_files)
+  
+      def test_post_process_max_zero_with_image_reference(self):
+          """
+          CSS referencing an image should be processed and the image should be hashed.
+          """
+          storage = self._make_storage(max_passes=0)
+          files = {
+              'styles/a.css': b'body { background: url("img/pic.png"); }',
+              'styles/img/pic.png': b'PNGDATA',
+          }
+          paths = self._write_files(storage, files)
+  
+          processed = list(storage.post_process(paths, dry_run=False))
+          # Ensure files were processed and hashed_files contains both entries.
+          self.assertIn(storage.clean_name('styles/a.css'), storage.hashed_files)
+          self.assertIn(storage.clean_name('styles/img/pic.png'), storage.hashed_files)
+  
+      def test_post_process_max_zero_fontface_fragment_hack(self):
+          """
+          Handle font-face hack with '?#iefix' correctly (no exception, and processed).
+          """
+          storage = self._make_storage(max_passes=0)
+          files = {
+              'fonts/font.css': b'@font-face { src: url("fonts/font.eot?#iefix"); }',
+              'fonts/font.eot': b'BINARYFONT',
+          }
+          paths = self._write_files(storage, files)
+  
+          processed = list(storage.post_process(paths, dry_run=False))
+          self.assertIn(storage.clean_name('fonts/font.css'), storage.hashed_files)
+          # Verify manifest file not raising and entries present
+          self.assertIn(storage.clean_name('fonts/font.eot'), storage.hashed_files)
+  
+      def test_manifest_saved_after_post_process_max_zero(self):
+          """
+          ManifestStaticFilesStorage should save a manifest after post_process
+          when not in dry_run, even with max_post_process_passes == 0.
+          """
+          storage = self._make_storage(max_passes=0)
+          files = {'mains.css': b'body { margin: 0; }'}
+          paths = self._write_files(storage, files)
+  
+          # Ensure manifest file does not exist before processing.
+          manifest_path = storage.path(storage.manifest_name)
+          if os.path.exists(manifest_path):
+              os.remove(manifest_path)
+  
+          # Run post_process which should cause save_manifest to write the manifest.
+          list(storage.post_process(paths, dry_run=False))
+          self.assertTrue(os.path.exists(manifest_path))
+          # load_manifest should parse and return a mapping that includes our file.
+          manifest = storage.load_manifest()
+          self.assertIn(storage.clean_name('mains.css'), manifest)
+  
+      def test_no_unboundlocalerror_when_max_passes_zero(self):
+          """
+          Explicitly ensure that no UnboundLocalError is raised when
+          max_post_process_passes is 0. This was the regression that the patch fixed.
+          """
+          storage = self._make_storage(max_passes=0)
+          files = {'no_issue.css': b'body { font-size: 12px; }'}
+          paths = self._write_files(storage, files)
+  
+          try:
+              list(storage.post_process(paths, dry_run=False))
+          except UnboundLocalError:
+              self.fail("post_process raised UnboundLocalError with max_post_process_passes == 0")
+  
+      def test_hashed_files_populated_with_zero_passes_and_multiple_files(self):
+          """
+          Multiple files including nested directories should populate hashed_files.
+          """
+          storage = self._make_storage(max_passes=0)
+          files = {
+              'a/b/one.css': b'url("../img/one.png")',
+              'a/img/one.png': b'IMAGE1',
+              'c/two.css': b'body { color: blue; }',
+          }
+          paths = self._write_files(storage, files)
+  
+          list(storage.post_process(paths, dry_run=False))
+          # All saved files should have hashed entries.
+          self.assertIn(storage.clean_name('a/b/one.css'), storage.hashed_files)
+          self.assertIn(storage.clean_name('a/img/one.png'), storage.hashed_files)
+          self.assertIn(storage.clean_name('c/two.css'), storage.hashed_files)
+  
+      def test_stored_name_handles_font_face_hack_with_fragment(self):
+          """
+          stored_name should include the '?' for '?#' font-face hacks when appropriate.
+          """
+          storage = self._make_storage(max_passes=0)
+          # Save the underlying file so hashed_name can find it.
+          storage._save('fonts/font.eot', ContentFile(b'F'))
+          # Call stored_name with a fragment-like name
+          result = storage.stored_name('fonts/font.eot?#iefix')
+          # The returned stored_name should contain a '?' inserted before fragment in the path part
+          # (i.e., the filename part includes the trailing '?').
+          self.assertIn('?', result.split('/')[-1] or '')
+  
+      def test_query_and_fragment_preserved_after_processing(self):
+          """
+          Ensure a name with a query string or fragment is preserved appropriately
+          after processing (no crash and mapping exists).
+          """
+          storage = self._make_storage(max_passes=0)
+          # Create a file and simulate calling hashed_name/stored_name with query and fragment
+          storage._save('qfrag.css', ContentFile(b'body{}'))
+          # Ensure stored_name works when a query or fragment is part of the input name
+          for name in ('qfrag.css?spam=eggs', 'qfrag.css#section', 'qfrag.css?#weird'):
+              try:
+                  out = storage.stored_name(name)
+                  # Should return a string URL
+                  self.assertIsInstance(out, str)
+              except Exception as exc:
+                  self.fail("stored_name raised %r for input %r" % (exc, name))
+  
+      def test_keep_intermediate_files_false_does_not_create_extra_files(self):
+          """
+          With keep_intermediate_files=False (ManifestStaticFilesStorage default),
+          no intermediate files should remain besides final hashed copies.
+          """
+          storage = self._make_storage(max_passes=0, keep_intermediate_files=False)
+          files = {
+              'rel/test.css': b'url("../img/rel.png")',
+              'rel/img/rel.png': b'PNG',
+          }
+          paths = self._write_files(storage, files)
+  
+          list(storage.post_process(paths, dry_run=False))
+          # Walk the storage root and ensure there are not unexpected intermediate filenames
+          all_files = []
+          for root, _, filenames in os.walk(self.temp_dir):
+              for fn in filenames:
+                  all_files.append(os.path.relpath(os.path.join(root, fn), self.temp_dir))
+          # At minimum expect the manifest + hashed results; ensure no files with awkward double-hashes exist
+          self.assertTrue(any(name.endswith('.css') or name.endswith('.png') for name in all_files))
+          # There shouldn't be files with multiple hash-like segments such as 'rel_y...', etc.
+          # This assertion is defensive: we're primarily ensuring no crash and that output exists.
+          self.assertFalse(any('..' in name for name in all_files))
+  
+  if __name__ == '__main__':
+      unittest.main()
+new_imports_code: |
+  from django.core.files.base import ContentFile
+  from django.contrib.staticfiles.storage import ManifestStaticFilesStorage

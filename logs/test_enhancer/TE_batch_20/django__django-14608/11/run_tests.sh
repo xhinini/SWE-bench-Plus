@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_non_form_errors_identity_after_all_valid_call forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_non_form_errors_identity_after_manual_full_clean forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_non_form_errors_identity_on_empty_formset_with_zero_forms forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_non_form_errors_identity_with_can_delete forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_non_form_errors_identity_with_can_order forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_non_form_errors_mutation_after_str_call_still_persists forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_non_form_errors_mutation_is_reflected_on_formset_internal forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_non_form_errors_mutation_persists_across_calls forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_non_form_errors_returns_internal_instance_on_valid_formset forms_tests.tests.test_formsets_llm.NonFormErrorsIdentityTests.test_non_form_errors_str_and_identity
+coverage json -o coverage.json
+: '>>>>> End Test Output'

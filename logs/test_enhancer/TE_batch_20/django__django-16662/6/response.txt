@@ -1,0 +1,223 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise the import-sorting logic in MigrationWriter.as_string(), including grouping "import" statements before "from ... import ..." statements, alphabetical ordering within groups, the special merging of "from django.db import models" into "from django.db import migrations, models", handling of swappable dependencies that require "from django.conf import settings", the manual-porting comment block for migration imports, and stability of the produced import block. They are designed to fail if the import-sorting logic drops import lines that don't start with the exact prefixes or otherwise produces the wrong ordering/grouping (as in the candidate model patch).
+test_code: |
+  from unittest import mock
+
+  import datetime
+  import time
+  import uuid
+
+  from django.conf import settings
+  from django.test import SimpleTestCase
+
+  from django import get_version
+  from django.db import migrations, models
+  from django.db.migrations.writer import MigrationWriter, OperationWriter
+
+  import custom_migration_operations.operations
+
+
+  class ImportSortingTests(SimpleTestCase):
+      def _make_migration(self, operations, dependencies=None, app_label="testapp"):
+          if dependencies is None:
+              dependencies = []
+          migration = type(
+              "Migration",
+              (migrations.Migration,),
+              {
+                  "operations": operations,
+                  "dependencies": dependencies,
+                  "name": "0001_initial",
+                  "app_label": app_label,
+                  "initial": False,
+                  "replaces": None,
+              },
+          )
+          return migration
+
+      def test_imports_grouping_import_before_from(self):
+          # Ensure plain imports are grouped before from-imports.
+          ops = [
+              migrations.AddField(
+                  "mymodel",
+                  "dt",
+                  models.DateTimeField(default=datetime.datetime.now),
+              ),
+              migrations.AddField(
+                  "mymodel",
+                  "t",
+                  models.FloatField(default=time.time),
+              ),
+          ]
+          # Add a swappable dependency to force "from django.conf import settings".
+          deps = [("__setting__", "AUTH_USER_MODEL")]
+          migration = self._make_migration(ops, dependencies=deps)
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          # Expect import lines first (datetime, time) then from django.conf
+          expected = "import datetime\nimport time\nfrom django.conf import settings\nfrom django.db import migrations, models\n"
+          self.assertIn(expected, output)
+
+      def test_imports_alphabetical_within_imports(self):
+          # Multiple import statements should be sorted alphabetically by module.
+          ops = [
+              migrations.AddField(
+                  "mymodel",
+                  "a",
+                  models.DateTimeField(default=datetime.datetime.now),
+              ),
+              migrations.AddField(
+                  "mymodel",
+                  "b",
+                  models.UUIDField(default=uuid.uuid4),
+              ),
+              migrations.AddField(
+                  "mymodel",
+                  "c",
+                  models.FloatField(default=time.time),
+              ),
+          ]
+          migration = self._make_migration(ops)
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          # Expected alphabetical order of imports: datetime, time, uuid
+          self.assertIn("import datetime\nimport time\nimport uuid\n", output)
+
+      def test_from_statements_alphabetical(self):
+          # from-imports should be sorted alphabetically by the module name.
+          # Trigger from django.db import ... (merged with migrations) and
+          # from django.conf import settings via a dependency.
+          ops = [
+              migrations.AddField(
+                  "mymodel",
+                  "dt",
+                  models.DateTimeField(default=datetime.datetime.now),
+              ),
+          ]
+          deps = [("__setting__", "AUTH_USER_MODEL")]
+          migration = self._make_migration(ops, dependencies=deps)
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          # from django.conf should come before from django.db
+          self.assertIn("from django.conf import settings\nfrom django.db import migrations, models\n", output)
+
+      def test_models_merged_with_migrations_and_placement(self):
+          # When models import is required, it should be merged into
+          # "from django.db import migrations, models" and placed after plain imports.
+          ops = [
+              migrations.CreateModel(
+                  "MyModel",
+                  fields=(("name", models.CharField(max_length=10)),),
+              ),
+              migrations.AddField(
+                  "other",
+                  "ts",
+                  models.DateTimeField(default=datetime.datetime.now),
+              ),
+          ]
+          migration = self._make_migration(ops)
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          # Ensure the merged import exists and is present after any "import ..." lines
+          self.assertIn("from django.db import migrations, models\n", output)
+          # There should be at least one plain import (datetime) before the from-import
+          self.assertRegex(output.splitlines()[0], r"^(# Generated by Django|import )")
+
+      def test_combined_import_sorting(self):
+          # Mix of custom module import, builtin imports and from-imports to check full ordering.
+          ops = [
+              custom_migration_operations.operations.TestOperation(),
+              migrations.AddField(
+                  "mymodel",
+                  "dt",
+                  models.DateTimeField(default=datetime.datetime.now),
+              ),
+              migrations.AddField(
+                  "mymodel",
+                  "u",
+                  models.UUIDField(default=uuid.UUID("5c859437-d061-4847-b3f7-e6b78852f8c8")),
+              ),
+              migrations.AddField(
+                  "mymodel",
+                  "t",
+                  models.FloatField(default=time.time),
+              ),
+          ]
+          deps = [("__setting__", "AUTH_USER_MODEL")]
+          migration = self._make_migration(ops, dependencies=deps)
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          # Expected block: imports (custom_migration_operations.operations, datetime, time, uuid)
+          # then from django.conf then from django.db (merged)
+          expected_block = (
+              "import custom_migration_operations.operations\n"
+              "import datetime\n"
+              "import time\n"
+              "import uuid\n"
+              "from django.conf import settings\n"
+              "from django.db import migrations, models\n"
+          )
+          self.assertIn(expected_block, output)
+
+      def test_migration_imports_comment_present(self):
+          # If an import matching migration filename pattern is found, a manual porting
+          # comment block should be appended after the imports.
+          fake_import = "import someapp.migrations.0001_initial"
+          # Patch OperationWriter.serialize to inject that import into the imports set.
+          with mock.patch.object(
+              OperationWriter, "serialize", return_value=("migrations.FakeOp()", {fake_import})
+          ):
+              migration = self._make_migration([migrations.RunPython(lambda x: x)])
+              writer = MigrationWriter(migration)
+              output = writer.as_string()
+              # The manual-copying comment should include the migration module path
+              self.assertIn("# Functions from the following migrations need manual copying.", output)
+              self.assertIn("someapp.migrations.0001_initial", output)
+
+      def test_swappable_dependency_adds_settings_import(self):
+          # Dependencies that are swappable should add "from django.conf import settings"
+          migration = self._make_migration([], dependencies=[("__setting__", "AUTH_USER_MODEL")])
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          self.assertIn("from django.conf import settings\n", output)
+
+      def test_custom_and_builtin_imports_present(self):
+          # Ensure imports produced by custom operations and builtin serializers both appear.
+          ops = [
+              custom_migration_operations.operations.TestOperation(),
+              migrations.AddField(
+                  "mymodel",
+                  "dt",
+                  models.DateTimeField(default=datetime.datetime.now),
+              ),
+          ]
+          migration = self._make_migration(ops)
+          writer = MigrationWriter(migration)
+          output = writer.as_string()
+          self.assertIn("import custom_migration_operations.operations\n", output)
+          self.assertIn("import datetime\n", output)
+          # And the merged db import
+          self.assertIn("from django.db import migrations, models\n", output)
+
+      def test_imports_stable_across_calls(self):
+          # Calling as_string twice should yield the same import ordering.
+          ops = [
+              migrations.AddField(
+                  "mymodel",
+                  "dt",
+                  models.DateTimeField(default=datetime.datetime.now),
+              ),
+              migrations.AddField(
+                  "mymodel",
+                  "t",
+                  models.FloatField(default=time.time),
+              ),
+          ]
+          migration = self._make_migration(ops)
+          writer = MigrationWriter(migration)
+          out1 = writer.as_string()
+          out2 = writer.as_string()
+          self.assertEqual(out1, out2)
+new_imports_code: |
+  # No additional project-level imports required beyond those used in the test code.

@@ -1,0 +1,170 @@
+import asyncio
+import time
+import pytest
+from django.http import Http404
+import importlib
+handlers_mod = importlib.import_module("django.contrib.staticfiles.handlers")
+StaticFilesHandlerMixin = handlers_mod.StaticFilesHandlerMixin
+import asyncio
+import time
+import pytest
+from django.core.handlers.wsgi import WSGIRequest
+from django.http import Http404
+
+import importlib
+handlers_mod = importlib.import_module("django.contrib.staticfiles.handlers")
+StaticFilesHandlerMixin = handlers_mod.StaticFilesHandlerMixin
+
+@pytest.mark.asyncio
+async def test_get_response_async_runs_serve_off_event_loop_and_returns():
+    called_on_loop = []
+    class H(StaticFilesHandlerMixin):
+        def serve(self, request):
+            try:
+                # If this returns, we're running on the event loop -> bad.
+                asyncio.get_running_loop()
+                called_on_loop.append(True)
+            except RuntimeError:
+                # Expected: no running loop when executed in threadpool.
+                called_on_loop.append(False)
+            return "ok"
+
+    h = H()
+    res = await h.get_response_async("request")
+    assert res == "ok"
+    assert called_on_loop == [False]
+
+@pytest.mark.asyncio
+async def test_get_response_async_uses_response_for_exception_off_event_loop_on_http404():
+    # Patch module-level response_for_exception to assert it's called off-loop.
+    orig_rfe = handlers_mod.response_for_exception
+    called_on_loop = []
+
+    def fake_response_for_exception(request, exc):
+        try:
+            asyncio.get_running_loop()
+            called_on_loop.append(True)
+        except RuntimeError:
+            called_on_loop.append(False)
+        return "exc_resp"
+
+    handlers_mod.response_for_exception = fake_response_for_exception
+    try:
+        class H(StaticFilesHandlerMixin):
+            def serve(self, request):
+                raise Http404("not found")
+
+        h = H()
+        res = await h.get_response_async("request")
+        assert res == "exc_resp"
+        assert called_on_loop == [False]
+    finally:
+        handlers_mod.response_for_exception = orig_rfe
+
+@pytest.mark.asyncio
+async def test_get_response_async_propagates_non_http404_exception():
+    class H(StaticFilesHandlerMixin):
+        def serve(self, request):
+            raise ValueError("boom")
+
+    h = H()
+    with pytest.raises(ValueError):
+        await h.get_response_async("request")
+
+@pytest.mark.asyncio
+async def test_get_response_async_does_not_block_event_loop_when_serve_blocks():
+    flag = {"tick": False}
+
+    class H(StaticFilesHandlerMixin):
+        def serve(self, request):
+            # This blocks the thread for a short while.
+            time.sleep(0.2)
+            return "done"
+
+    h = H()
+    task = asyncio.create_task(h.get_response_async("request"))
+    # Give some time to let the task start.
+    await asyncio.sleep(0)
+    # If serve() blocks the event loop, this will not run until after it finishes.
+    await asyncio.sleep(0.05)
+    flag["tick"] = True
+    res = await task
+    assert res == "done"
+    assert flag["tick"] is True
+
+@pytest.mark.asyncio
+async def test_multiple_concurrent_get_response_async_tasks_do_not_block_event_loop():
+    ticks = {"count": 0}
+
+    class H(StaticFilesHandlerMixin):
+        def serve(self, request):
+            time.sleep(0.1)
+            return request + ":ok"
+
+    h = H()
+    tasks = [asyncio.create_task(h.get_response_async(f"req{i}")) for i in range(5)]
+    # While tasks are running, ensure event loop remains responsive.
+    await asyncio.sleep(0.02)
+    ticks["count"] += 1
+    results = await asyncio.gather(*tasks)
+    assert all(r.endswith(":ok") for r in results)
+    assert ticks["count"] >= 1
+
+@pytest.mark.asyncio
+async def test_get_response_async_preserves_request_argument_identity():
+    seen = {}
+    class H(StaticFilesHandlerMixin):
+        def serve(self, request):
+            seen["req"] = request
+            return "ok"
+    request_obj = object()
+    h = H()
+    res = await h.get_response_async(request_obj)
+    assert res == "ok"
+    assert seen["req"] is request_obj
+
+@pytest.mark.asyncio
+async def test_get_response_async_propagates_exception_from_response_for_exception():
+    # If response_for_exception itself raises, it should propagate.
+    orig_rfe = handlers_mod.response_for_exception
+
+    def raising_rfe(request, exc):
+        raise RuntimeError("rfe failed")
+
+    handlers_mod.response_for_exception = raising_rfe
+    try:
+        class H(StaticFilesHandlerMixin):
+            def serve(self, request):
+                raise Http404()
+
+        h = H()
+        with pytest.raises(RuntimeError):
+            await h.get_response_async("request")
+    finally:
+        handlers_mod.response_for_exception = orig_rfe
+
+@pytest.mark.asyncio
+async def test_get_response_async_can_be_called_repeatedly_quickly():
+    class H(StaticFilesHandlerMixin):
+        def serve(self, request):
+            return "ok"
+    h = H()
+    results = await asyncio.gather(*(h.get_response_async(str(i)) for i in range(20)))
+    assert results == ["ok"] * 20
+
+def test_get_response_sync_returns_and_handles_http404():
+    # Ensure sync get_response behaves as expected for completeness.
+    class H(StaticFilesHandlerMixin):
+        def serve(self, request):
+            if request == "good":
+                return "ok"
+            raise Http404()
+
+    orig_rfe = handlers_mod.response_for_exception
+    handlers_mod.response_for_exception = lambda req, exc: "exc"
+    try:
+        h = H()
+        assert h.get_response("good") == "ok"
+        assert h.get_response("bad") == "exc"
+    finally:
+        handlers_mod.response_for_exception = orig_rfe

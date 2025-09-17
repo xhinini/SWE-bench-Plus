@@ -1,0 +1,145 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests validate that KBinsDiscretizer with strategy='kmeans' produces monotonic bin edges (sorted), that transform/inverse_transform are consistent with the computed bin centers, that behavior is stable under patched KMeans returning unsorted centers, and that edge cases (duplicates, outside-range values, constant features, multi-feature inputs, repeated fits, and small-magnitude values) are handled correctly. They are designed to catch the bug fixed by sorting k-means centers before computing bin edges.
+test_code: |
+  import numpy as np
+  import pytest
+  from sklearn.preprocessing import KBinsDiscretizer
+  from sklearn.utils.testing import assert_array_equal
+  import sklearn.cluster as cluster
+  
+  def _is_monotonic_non_decreasing(arr):
+      return np.all(np.diff(arr) >= 0)
+  
+  def test_kmeans_bin_edges_monotonic_single_feature():
+      # Three well-separated clusters should produce monotonic bin edges
+      X = np.array([0.0, 0.1, 0.2, 5.0, 5.1, 5.2, 10.0, 10.1, 10.2]).reshape(-1, 1)
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      edges = est.bin_edges_[0]
+      assert _is_monotonic_non_decreasing(edges), "Bin edges must be non-decreasing"
+      # Transform should assign samples to the nearest center index
+      Xt = est.transform(X).ravel()
+      bin_centers = (edges[1:] + edges[:-1]) * 0.5
+      # For each sample, check that its assigned bin center is the closest center
+      expected = np.argmin(np.abs(X.ravel()[:, None] - bin_centers[None, :]), axis=1)
+      assert_array_equal(expected, Xt)
+  
+  def test_kmeans_monotonic_multiple_features():
+      # Two features with different cluster patterns
+      X = np.vstack([
+          np.concatenate([np.zeros(4), np.ones(4) * 10]),
+          np.concatenate([np.ones(2) * -5, np.ones(6) * 5])
+      ]).T
+      est = KBinsDiscretizer(n_bins=[2, 2], strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      for j in range(X.shape[1]):
+          edges = est.bin_edges_[j]
+          assert _is_monotonic_non_decreasing(edges), f"Feature {j} edges not monotonic"
+  
+  def test_kmeans_inverse_transform_centers_match():
+      X = np.array([0.0, 0.1, 0.2, 5.0, 5.1, 5.2, 10.0, 10.1, 10.2]).reshape(-1, 1)
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      Xt = est.fit_transform(X)
+      Xinv = est.inverse_transform(Xt)
+      edges = est.bin_edges_[0]
+      centers = (edges[1:] + edges[:-1]) * 0.5
+      # Xinv should be exactly the bin centers corresponding to the bin ids in Xt
+      assert_array_equal(Xinv.ravel(), centers[Xt.ravel().astype(np.int_)])
+  
+  def test_kmeans_with_custom_kmeans_returning_unsorted_centers(monkeypatch):
+      # Simulate a KMeans implementation that returns centers in an unsorted order.
+      class FakeKMeans:
+          def __init__(self, n_clusters, init=None, n_init=None):
+              self.n_clusters = n_clusters
+          def fit(self, X):
+              # Deliberately return centers in a scrambled order (2,0,1)
+              # Shapes need to match cluster_centers_[:, 0] usage in code:
+              # cluster_centers_ must be shape (n_clusters, 1)
+              if self.n_clusters == 3:
+                  self.cluster_centers_ = np.array([[10.0], [0.0], [5.0]])
+              else:
+                  # Generic fallback: return increasing centers but reversed
+                  centers = np.linspace(X.min(), X.max(), self.n_clusters)
+                  self.cluster_centers_ = centers[::-1].reshape(-1, 1)
+              return self
+      # Patch sklearn.cluster.KMeans so that the `from ..cluster import KMeans` inside
+      # KBinsDiscretizer.fit will pick up our FakeKMeans.
+      monkeypatch.setattr(cluster, "KMeans", FakeKMeans)
+  
+      X = np.array([0.0, 0.1, 5.0, 5.1, 10.0, 10.1]).reshape(-1, 1)
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      edges = est.bin_edges_[0]
+      # Even though the underlying KMeans reported unsorted centers, KBinsDiscretizer
+      # must produce non-decreasing bin_edges_ (i.e., must sort centers).
+      assert _is_monotonic_non_decreasing(edges)
+      # Transform must not error and must produce bin indices within range
+      Xt = est.transform(X).ravel()
+      assert Xt.min() >= 0
+      assert Xt.max() <= est.n_bins_[0] - 1
+  
+  def test_kmeans_with_duplicate_centers():
+      # If data has duplicate clusters (two clusters with same center),
+      # bin edges may have equal adjacent values but must still be non-decreasing.
+      X = np.array([0.0, 0.0, 0.0, 5.0, 10.0, 10.0]).reshape(-1, 1)
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      edges = est.bin_edges_[0]
+      assert _is_monotonic_non_decreasing(edges)
+      # Transform and inverse_transform should be consistent
+      Xt = est.transform(X)
+      Xinv = est.inverse_transform(Xt)
+      # After inverse_transform followed by transform, we should recover same bins
+      Xt2 = est.transform(Xinv)
+      assert_array_equal(Xt.ravel().astype(int), Xt2.ravel().astype(int))
+  
+  def test_kmeans_transform_outside_values_clipped():
+      # Values outside the training range should be clipped to [0, n_bins - 1]
+      X_train = np.array([0.0, 1.0, 2.0, 3.0])[:, None]
+      est = KBinsDiscretizer(n_bins=4, strategy='kmeans', encode='ordinal')
+      est.fit(X_train)
+      X_test = np.array([-100.0, 1000.0])[:, None]
+      Xt = est.transform(X_test)
+      # min should be 0 and max should be n_bins - 1
+      assert Xt.min() == 0
+      assert Xt.max() == est.n_bins_[0] - 1
+  
+  def test_kmeans_constant_feature_warns_and_sets_n_bins_one(monkeypatch):
+      # Constant feature should be handled even when strategy='kmeans'
+      X = np.array([[1.0], [1.0], [1.0]])
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      with pytest.warns(UserWarning, match="Feature 0 is constant"):
+          est.fit(X)
+      # n_bins for the constant feature should be set to 1
+      assert est.n_bins_[0] == 1
+      Xt = est.transform(X)
+      assert_array_equal(Xt.ravel(), np.zeros(X.shape[0]))
+  
+  def test_kmeans_repeated_fit_produces_same_bin_edges():
+      rng = np.random.RandomState(0)
+      X = np.vstack([rng.normal(loc, 0.01, size=20) for loc in (0.0, 5.0, 10.0)]).ravel().reshape(-1, 1)
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      edges1 = [e.copy() for e in est.bin_edges_]
+      # Fit again on same data -> stable bin edges
+      est.fit(X)
+      edges2 = est.bin_edges_
+      for e1, e2 in zip(edges1, edges2):
+          assert_array_equal(e1, e2)
+  
+  def test_kmeans_small_magnitude_values_numeric_stability():
+      # Ensure kmeans based discretization works for small magnitudes
+      X_base = np.array([0.0, 1.0, 5.0, 10.0]).reshape(-1, 1)
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      for scale in [1e0, 1e-3, 1e-6, 1e-9]:
+          X = X_base * scale
+          Xt = est.fit_transform(X)
+          # Ensure transform yields integer bins and inverse_transform is consistent
+          Xinv = est.inverse_transform(Xt)
+          Xt2 = est.transform(Xinv)
+          assert_array_equal(Xt.ravel().astype(int), Xt2.ravel().astype(int))
+new_imports_code: |
+  import numpy as np
+  import pytest
+  import sklearn.cluster as cluster

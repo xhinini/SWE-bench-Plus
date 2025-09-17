@@ -1,0 +1,191 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests simulate the sparse libsvm training callback returning no support vectors and assert that the estimator internals and downstream methods behave correctly. They specifically assert the shape and emptiness of dual_coef_, that coef_ and _get_coef() return well-shaped zero coefficients, and that sparse predict/decision_function code paths handle zero support vectors. The tests are designed to fail with the candidate patch (which constructs dual_coef_ with shape (n_class, 0) when there are no support vectors) but pass with the provided gold patch (which sets dual_coef_ to an empty csr_matrix([])).
+test_code: |
+  def _make_fake_train_no_sv(n_features, n_classes):
+      """Return a fake libsvm_sparse_train function that simulates no SVs."""
+      def fake_train(n_features_arg, data, indices, indptr, y, solver_type,
+                     kernel_type, degree, _gamma, coef0, tol, C, class_weight_,
+                     sample_weight, nu, cache_size, epsilon, shrinking,
+                     probability, max_iter, random_seed):
+          # No support vectors
+          support_ = np.array([], dtype=np.int32)
+          support_vectors_ = sparse.csr_matrix((0, n_features))
+          dual_coef_data = np.array([], dtype=np.float64)
+          # intercept for libsvm is still provided (e.g., single zeros)
+          intercept_ = np.array([0.0], dtype=np.float64)
+          # _n_support should be an array with one entry per class (compat)
+          n_support = np.zeros(n_classes, dtype=np.int32)
+          probA = np.array([], dtype=np.float64)
+          probB = np.array([], dtype=np.float64)
+          fit_status = 0
+          return (support_, support_vectors_, dual_coef_data,
+                  intercept_, n_support, probA, probB, fit_status)
+      return fake_train
+  
+  
+  class _FakeSparseEstimator(svm.BaseLibSVM):
+      """Minimal fake estimator to exercise BaseLibSVM._sparse_fit."""
+      def __init__(self, impl='c_svc', kernel='linear', verbose=0):
+          # Do not call super().__init__ (abstract heavy init). Set only used attrs.
+          self._impl = impl
+          self.kernel = kernel
+          self.verbose = verbose
+          # attributes expected by _sparse_fit and other methods
+          self.degree = 3
+          self._gamma = 0.1
+          self.coef0 = 0.0
+          self.tol = 1e-3
+          self.C = 1.0
+          self.class_weight_ = np.empty(0)
+          self.nu = 0.5
+          self.cache_size = 200.0
+          self.epsilon = 0.1
+          self.shrinking = True
+          self.probability = False
+          self.max_iter = -1
+          # mark sparse behavior manually in tests as needed
+          self._sparse = True
+  
+  def _run_sparse_fit_with_no_sv(monkeypatch, n_features, n_classes, impl='c_svc'):
+      """
+      Helper to monkeypatch libsvm_sparse.libsvm_sparse_train to simulate
+      no support vectors and run _sparse_fit on a fake estimator.
+      Returns the estimator after calling _sparse_fit.
+      """
+      fake_train = _make_fake_train_no_sv(n_features, n_classes)
+      # Monkeypatch the libsvm_sparse_train function used by BaseLibSVM._sparse_fit
+      monkeypatch.setattr(svm.libsvm_sparse, 'libsvm_sparse_train', fake_train)
+  
+      # Create sparse X of shape (n_samples, n_features)
+      X = sparse.csr_matrix(np.zeros((3, n_features), dtype=np.float64))
+      y = np.array([0.0, 1.0, 2.0])  # labels; value not used by fake_train
+      est = _FakeSparseEstimator(impl=impl, kernel='linear')
+      # set classes_ on estimator to simulate a fitted classifier (affects n_class)
+      # n_classes is the length of classes_, matching our fake_train expectation
+      est.classes_ = np.arange(n_classes)
+      # Now call the sparse fit routine directly
+      solver_type = LIBSVM_IMPL.index(est._impl)
+      est._sparse_fit(X, y, sample_weight=np.asarray([]), solver_type=solver_type,
+                      kernel='linear', random_seed=0)
+      return est, X
+  
+  def test_sparse_fit_no_sv_dual_coef_empty_and_shape_multiclass(monkeypatch):
+      # For multiclass cases (classes_ length > 2), when there are no support
+      # vectors, ensure dual_coef_.data is empty and shape[0] == 1 (handled
+      # as the empty representation expected by the gold patch).
+      est, X = _run_sparse_fit_with_no_sv(monkeypatch, n_features=5, n_classes=3,
+                                          impl='c_svc')
+      assert est.support_vectors_.shape[0] == 0
+      # data (values) should be empty
+      assert est.dual_coef_.data.size == 0
+      # The gold patch sets dual_coef_ to an empty csr_matrix([]) which behaves
+      # like a single-row empty matrix for subsequent code paths (shape[0] == 1).
+      assert est.dual_coef_.shape[0] == 1
+  
+  def test_sparse_fit_no_sv_dual_coef_empty_for_higher_classes(monkeypatch):
+      # Same test but for 4 classes to exercise larger n_class
+      est, X = _run_sparse_fit_with_no_sv(monkeypatch, n_features=4, n_classes=4,
+                                          impl='c_svc')
+      assert est.support_vectors_.shape[0] == 0
+      assert est.dual_coef_.data.size == 0
+      assert est.dual_coef_.shape[0] == 1
+  
+  def test_get_coef_returns_correct_shape_with_no_sv(monkeypatch):
+      # Ensure _get_coef returns a (1, n_features) shaped array when there
+      # are no support vectors and a linear kernel is used.
+      est, X = _run_sparse_fit_with_no_sv(monkeypatch, n_features=6, n_classes=3,
+                                          impl='c_svc')
+      # Simulate linear kernel access path
+      est.kernel = 'linear'
+      coef = est._get_coef()
+      # Should be a 2D ndarray of zeros with shape (1, n_features)
+      assert isinstance(coef, np.ndarray)
+      assert coef.shape == (1, X.shape[1])
+      assert np.all(coef == 0)
+  
+  def test_coef_property_is_immutable_and_well_shaped_with_no_sv(monkeypatch):
+      # Accessing the coef_ property should not raise and should return an
+      # array with writeable flag set to False.
+      est, X = _run_sparse_fit_with_no_sv(monkeypatch, n_features=3, n_classes=3,
+                                          impl='c_svc')
+      est.kernel = 'linear'
+      c = est.coef_
+      # property returns numpy array and is marked read-only
+      assert isinstance(c, np.ndarray)
+      assert c.shape == (1, X.shape[1])
+      assert not c.flags.writeable
+  
+  def test_sparse_predict_with_no_sv_uses_libsvm_sparse_predict(monkeypatch):
+      # Ensure that _sparse_predict can be called and returns values from the
+      # underlying libsvm_sparse predict wrapper even when there are no SVs.
+      est, X = _run_sparse_fit_with_no_sv(monkeypatch, n_features=2, n_classes=2,
+                                          impl='c_svc')
+      # Monkeypatch libsvm_sparse_predict to return deterministic labels
+      def fake_predict(x_data, x_indices, x_indptr,
+                       sv_data, sv_indices, sv_indptr,
+                       dual_data, intercept, impl_idx, kernel_type,
+                       degree, gamma, coef0, tol, C, class_weight,
+                       nu, epsilon, shrinking, probability, n_support,
+                       probA, probB):
+          # return zeros for each input sample
+          n_samples = len(x_indptr) - 1
+          return np.zeros(n_samples, dtype=np.int32)
+  
+      monkeypatch.setattr(svm.libsvm_sparse, 'libsvm_sparse_predict', fake_predict)
+      # Build a tiny test matrix (2 samples)
+      X_test = sparse.csr_matrix(np.zeros((2, X.shape[1]), dtype=np.float64))
+      res = est._sparse_predict(X_test)
+      assert res.shape[0] == 2
+      assert np.all(res == 0)
+  
+  def test_sparse_decision_function_with_no_sv_returns_array(monkeypatch):
+      # Ensure the sparse decision function works with empty SVs by
+      # delegating to libsvm_sparse_decision_function (monkeypatched).
+      est, X = _run_sparse_fit_with_no_sv(monkeypatch, n_features=2, n_classes=2,
+                                          impl='c_svc')
+      def fake_decision(x_data, x_indices, x_indptr,
+                        sv_data, sv_indices, sv_indptr,
+                        dual_data, intercept, impl_idx, kernel_type,
+                        degree, gamma, coef0, tol, C, class_weight,
+                        nu, epsilon, shrinking, probability, n_support,
+                        probA, probB):
+          n_samples = len(x_indptr) - 1
+          # produce shape (n_samples,) decision values
+          return np.zeros(n_samples, dtype=np.float64)
+      monkeypatch.setattr(svm.libsvm_sparse, 'libsvm_sparse_decision_function', fake_decision)
+      X_test = sparse.csr_matrix(np.zeros((3, X.shape[1]), dtype=np.float64))
+      res = est._sparse_decision_function(X_test)
+      assert res.shape[0] == 3
+      assert np.all(res == 0)
+  
+  def test_get_coef_multiclass_no_exception_with_more_classes(monkeypatch):
+      # For higher number of classes (e.g. 5 classes) ensure _get_coef does not
+      # raise and returns a shaped coefficient array.
+      est, X = _run_sparse_fit_with_no_sv(monkeypatch, n_features=7, n_classes=5,
+                                          impl='c_svc')
+      est.kernel = 'linear'
+      coef = est._get_coef()  # should not raise
+      assert isinstance(coef, np.ndarray)
+      assert coef.shape == (1, X.shape[1])
+  
+  def test_regression_sparse_fit_no_sv_dual_coef_shape(monkeypatch):
+      # For regression (no classes_), n_class should be treated as 1 and the
+      # dual_coef_ representation should be empty and 1x0-like.
+      # Use impl for epsilon_svr (regression)
+      fake_train = _make_fake_train_no_sv(n_features=4, n_classes=1)
+      monkeypatch.setattr(svm.libsvm_sparse, 'libsvm_sparse_train', fake_train)
+      X = sparse.csr_matrix(np.zeros((2, 4), dtype=np.float64))
+      y = np.array([0.1, 0.2])
+      est = _FakeSparseEstimator(impl='epsilon_svr', kernel='linear')
+      # No classes_ attribute set for regression
+      solver_type = LIBSVM_IMPL.index(est._impl)
+      est._sparse_fit(X, y, sample_weight=np.asarray([]), solver_type=solver_type,
+                      kernel='linear', random_seed=0)
+      assert est.support_vectors_.shape[0] == 0
+      assert est.dual_coef_.data.size == 0
+      # For regression we expect a 1-row representation (shape[0] == 1)
+      assert est.dual_coef_.shape[0] == 1
+new_imports_code: |
+  # No new top-level imports required. Tests use existing imports in the test module:
+  # numpy as np, scipy.sparse as sparse, pytest, and sklearn.svm as svm.

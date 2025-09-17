@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_do_not_mutate_custom_error_class_when_non_empty forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_empty_errorlist_set_manually_preserved forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_identity_after_full_clean_empty forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_identity_after_full_clean_with_errors forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_plain_empty_list_returned_unchanged forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_plain_list_returned_unchanged forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_preserve_arbitrary_object_identity_and_attrs forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_preserve_custom_error_class_string forms_tests.tests.test_formsets_llm.NonFormErrorsRegressionTests.test_preserve_custom_errorlist_subclass_instance
+coverage json -o coverage.json
+: '>>>>> End Test Output'

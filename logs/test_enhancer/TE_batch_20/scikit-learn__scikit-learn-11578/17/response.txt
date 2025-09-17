@@ -1,0 +1,257 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These tests validate that _log_reg_scoring_path uses the proper
+  LogisticRegression.multi_class handling when building an estimator
+  to compute scores for each C. They compare the scores returned by
+  _log_reg_scoring_path with the scores obtained by manually creating
+  a LogisticRegression configured with multi_class=multi_class and
+  assigning the coefficients/intercepts as _log_reg_scoring_path does.
+  The tests cover multinomial and ovr modes, fit_intercept True/False,
+  sparse/dense X, sample weights, class_weight handling, and both
+  string and callable scorers. These are regression tests for the bug
+  where the temporary estimator inside _log_reg_scoring_path didn't have
+  the correct multi_class setting.
+test_code: |
+  import numpy as np
+  import scipy.sparse as sp
+  import pytest
+  from sklearn.utils import check_random_state
+  from sklearn.metrics import get_scorer
+  from sklearn.model_selection import StratifiedKFold
+  from sklearn.datasets import make_classification
+  from sklearn.linear_model.logistic import _log_reg_scoring_path
+  from sklearn.linear_model import LogisticRegression
+  from sklearn.preprocessing import LabelEncoder
+  from sklearn.utils.testing import assert_allclose, assert_array_almost_equal
+
+  RNG = check_random_state(0)
+
+  def _manual_score_from_coefs(X, y, coefs, fit_intercept, multi_class, scorer):
+      """Helper that mirrors what _log_reg_scoring_path does to build
+      a temporary LogisticRegression, and returns the score for each C."""
+      scores = []
+      # _log_reg_scoring_path returns coefs for each C in `coefs`
+      for w in coefs:
+          # If ovr, they expect a 2D array with an extra axis
+          if multi_class == 'ovr':
+              w = w[np.newaxis, :]
+          if fit_intercept:
+              lr = LogisticRegression(multi_class=multi_class)
+              lr.coef_ = w[:, :-1]
+              # intercept may be shape (n_classes,)
+              lr.intercept_ = w[:, -1]
+          else:
+              lr = LogisticRegression(multi_class=multi_class)
+              lr.coef_ = w
+              lr.intercept_ = 0.0
+          # classes_ must be set by the caller of _log_reg_scoring_path;
+          # the helper's caller should set it accordingly before calling scorer.
+          scores.append(scorer(lr, X, y))
+      return np.array(scores)
+
+  def test_multinomial_fit_intercept_true_neg_log_loss():
+      # multinomial, fit_intercept=True, string scorer 'neg_log_loss'
+      X, y = make_classification(n_samples=100, n_features=8, n_classes=3,
+                                 n_informative=5, random_state=RNG)
+      train = np.arange(80)
+      test = np.arange(80, 100)
+      scorer = 'neg_log_loss'
+      coefs, Cs, scores, _ = _log_reg_scoring_path(X, y, train, test,
+                                                   Cs=[1.], scoring=scorer,
+                                                   fit_intercept=True,
+                                                   multi_class='multinomial')
+      # Build scorer callable and manual scorer comparator
+      scorer_callable = get_scorer(scorer)
+      # Manual score: set classes_ as the function would do
+      y_train = np.array(y)[train]
+      classes = np.unique(y_train)
+      manual_scores = []
+      for w in coefs:
+          # For multinomial, w is already shaped (n_classes, n_features+1)
+          lr = LogisticRegression(multi_class='multinomial')
+          lr.classes_ = classes
+          lr.coef_ = w[:, :-1]
+          lr.intercept_ = w[:, -1]
+          manual_scores.append(scorer_callable(lr, X[test], np.array(y)[test]))
+      assert_allclose(scores, np.array(manual_scores))
+
+  def test_multinomial_fit_intercept_false_callable_scorer():
+      # multinomial with fit_intercept=False and callable scorer
+      X, y = make_classification(n_samples=70, n_features=6, n_classes=3,
+                                 n_informative=4, random_state=RNG)
+      train = np.arange(50)
+      test = np.arange(50, 70)
+      scorer_callable = get_scorer('neg_log_loss')
+      coefs, Cs, scores, _ = _log_reg_scoring_path(X, y, train, test,
+                                                   Cs=[0.5, 1.0],
+                                                   scoring=scorer_callable,
+                                                   fit_intercept=False,
+                                                   multi_class='multinomial')
+      # manual comparison
+      y_train = np.array(y)[train]
+      classes = np.unique(y_train)
+      manual = []
+      for w in coefs:
+          lr = LogisticRegression(multi_class='multinomial')
+          lr.classes_ = classes
+          lr.coef_ = w
+          lr.intercept_ = 0.0
+          manual.append(scorer_callable(lr, X[test], np.array(y)[test]))
+      assert_allclose(scores, np.array(manual))
+
+  def test_ovr_accuracy_with_pos_class():
+      # ovr scoring with pos_class specified should match manual scoring
+      X, y = make_classification(n_samples=60, n_features=5, n_classes=3,
+                                 n_informative=3, random_state=RNG)
+      # pick one class as positive for OVR
+      pos_class = 2
+      train = np.arange(40)
+      test = np.arange(40, 60)
+      coefs, Cs, scores, _ = _log_reg_scoring_path(X, y, train, test,
+                                                   pos_class=pos_class,
+                                                   Cs=[1.], scoring='accuracy',
+                                                   fit_intercept=True,
+                                                   multi_class='ovr')
+      # Manual scoring uses binary labels as the function does
+      y_test = np.array(y)[test].copy()
+      mask = (y_test == pos_class)
+      y_test_bin = np.ones(y_test.shape, dtype=np.float64)
+      y_test_bin[~mask] = -1.
+      scorer_callable = get_scorer('accuracy')
+      manual = []
+      for w in coefs:
+          # in _log_reg_scoring_path for ovr they do w = w[np.newaxis, :]
+          w2 = w[np.newaxis, :]
+          lr = LogisticRegression(multi_class='ovr')
+          lr.classes_ = np.array([-1, 1])
+          lr.coef_ = w2[:, :-1]
+          lr.intercept_ = w2[:, -1]
+          manual.append(scorer_callable(lr, X[test], y_test_bin))
+      assert_allclose(scores, np.array(manual))
+
+  def test_multinomial_with_sample_weight_and_sparse_X():
+      # multinomial scoring should work with sample weights and sparse X
+      X, y = make_classification(n_samples=80, n_features=10, n_classes=3,
+                                 n_informative=6, random_state=RNG)
+      # make sparse
+      X[X < 0.5] = 0.0
+      Xsp = sp.csr_matrix(X)
+      train = np.arange(60)
+      test = np.arange(60, 80)
+      sample_weight = np.ones(len(train))
+      sample_weight[:10] = 2.0
+      scorer_callable = get_scorer('neg_log_loss')
+      coefs, Cs, scores, _ = _log_reg_scoring_path(Xsp, y, train, test,
+                                                   Cs=[1.], scoring=scorer_callable,
+                                                   fit_intercept=True,
+                                                   multi_class='multinomial',
+                                                   sample_weight=sample_weight)
+      # manual check
+      y_train = np.array(y)[train]
+      classes = np.unique(y_train)
+      manual = []
+      for w in coefs:
+          lr = LogisticRegression(multi_class='multinomial')
+          lr.classes_ = classes
+          lr.coef_ = w[:, :-1]
+          lr.intercept_ = w[:, -1]
+          manual.append(scorer_callable(lr, Xsp[test], np.array(y)[test]))
+      assert_allclose(scores, np.array(manual))
+
+  def test_multinomial_with_class_weight_balanced():
+      # Passing class_weight='balanced' through the path should produce the same
+      # scoring as a manual log_reg with multi_class set appropriately.
+      X, y = make_classification(n_samples=120, n_features=6, n_classes=3,
+                                 n_informative=4, random_state=RNG)
+      train = np.arange(90)
+      test = np.arange(90, 120)
+      scorer_callable = get_scorer('neg_log_loss')
+      coefs, Cs, scores, _ = _log_reg_scoring_path(X, y, train, test,
+                                                   Cs=[1.], scoring=scorer_callable,
+                                                   fit_intercept=True,
+                                                   multi_class='multinomial',
+                                                   class_weight='balanced')
+      # manual comparison: classes computed inside function are based on y_train
+      classes = np.unique(np.array(y)[train])
+      manual = []
+      for w in coefs:
+          lr = LogisticRegression(multi_class='multinomial')
+          lr.classes_ = classes
+          lr.coef_ = w[:, :-1]
+          lr.intercept_ = w[:, -1]
+          manual.append(scorer_callable(lr, X[test], np.array(y)[test]))
+      assert_allclose(scores, np.array(manual))
+
+  def test_ovr_with_class_weight_dict_and_callable_scorer():
+      # ovr with user provided class_weight dict
+      X, y = make_classification(n_samples=50, n_features=6, n_classes=3,
+                                 n_informative=4, random_state=RNG)
+      train = np.arange(35)
+      test = np.arange(35, 50)
+      class_weight = {0: 1.0, 1: 2.0, 2: 0.5}
+      scorer_callable = get_scorer('accuracy')
+      coefs, Cs, scores, _ = _log_reg_scoring_path(X, y, train, test,
+                                                   Cs=[1.], scoring=scorer_callable,
+                                                   fit_intercept=False,
+                                                   multi_class='ovr',
+                                                   class_weight=class_weight)
+      # Manual compare
+      manual = []
+      for w in coefs:
+          w2 = w[np.newaxis, :]
+          lr = LogisticRegression(multi_class='ovr')
+          lr.classes_ = np.array([-1, 1])
+          lr.coef_ = w2[:, :-1]
+          lr.intercept_ = w2[:, -1]
+          manual.append(scorer_callable(lr, X[test], np.array(y)[test]))
+      assert_allclose(scores, np.array(manual))
+
+  def test_multinomial_binary_case_consistency():
+      # multinomial on a binary problem: ensure scores match manual evaluator
+      X, y = make_classification(n_samples=60, n_features=5, n_classes=2,
+                                 n_informative=3, random_state=RNG)
+      train = np.arange(40)
+      test = np.arange(40, 60)
+      scorer_callable = get_scorer('neg_log_loss')
+      coefs, Cs, scores, _ = _log_reg_scoring_path(X, y, train, test,
+                                                   Cs=[1.], scoring=scorer_callable,
+                                                   fit_intercept=True,
+                                                   multi_class='multinomial')
+      # Manual: note for binary multinomial sklearn returns coef_ shape (1, n_features)
+      classes = np.unique(np.array(y)[train])
+      manual = []
+      for w in coefs:
+          lr = LogisticRegression(multi_class='multinomial')
+          lr.classes_ = classes
+          lr.coef_ = w[:, :-1]
+          lr.intercept_ = w[:, -1]
+          manual.append(scorer_callable(lr, X[test], np.array(y)[test]))
+      assert_allclose(scores, np.array(manual))
+
+  def test_multinomial_scoring_matches_LogisticRegression_predict_proba():
+      # Cross-check that the score from _log_reg_scoring_path equals the
+      # same scorer applied to a LogisticRegression that uses predict_proba
+      # (sanity check across a couple of Cs)
+      X, y = make_classification(n_samples=80, n_features=8, n_classes=3,
+                                 n_informative=5, random_state=RNG)
+      train = np.arange(60)
+      test = np.arange(60, 80)
+      scorer_callable = get_scorer('neg_log_loss')
+      coefs, Cs, scores, _ = _log_reg_scoring_path(X, y, train, test,
+                                                   Cs=[0.1, 1.0, 10.0],
+                                                   scoring=scorer_callable,
+                                                   fit_intercept=True,
+                                                   multi_class='multinomial')
+      y_train = np.array(y)[train]
+      classes = np.unique(y_train)
+      manual = []
+      for w in coefs:
+          lr = LogisticRegression(multi_class='multinomial')
+          lr.classes_ = classes
+          lr.coef_ = w[:, :-1]
+          lr.intercept_ = w[:, -1]
+          manual.append(scorer_callable(lr, X[test], np.array(y)[test]))
+      assert_allclose(scores, np.array(manual))
+new_imports_code: |
+  # no additional imports beyond those included in test_code

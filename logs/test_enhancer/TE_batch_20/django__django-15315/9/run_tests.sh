@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 model_fields.tests_llm.HashImmutabilityExtraTests.test_copy_has_same_hash_and_is_equal model_fields.tests_llm.HashImmutabilityExtraTests.test_deepcopy_preserves_hash_and_equality model_fields.tests_llm.HashImmutabilityExtraTests.test_dict_lookup_with_copy_before_and_after_contribute model_fields.tests_llm.HashImmutabilityExtraTests.test_field_stays_dict_key_after_contribute_to_class model_fields.tests_llm.HashImmutabilityExtraTests.test_field_stays_member_of_set_after_contribute_to_class model_fields.tests_llm.HashImmutabilityExtraTests.test_hash_stability_after_contribute_and_manual_model_clearing model_fields.tests_llm.HashImmutabilityExtraTests.test_hash_unchanged_on_contribute_to_class model_fields.tests_llm.HashImmutabilityExtraTests.test_hash_unchanged_when_setting_model_attribute_directly model_fields.tests_llm.HashImmutabilityExtraTests.test_hash_uniqueness_for_different_fields model_fields.tests_llm.HashImmutabilityExtraTests.test_set_membership_with_copy_before_and_after_contribute
+coverage json -o coverage.json
+: '>>>>> End Test Output'

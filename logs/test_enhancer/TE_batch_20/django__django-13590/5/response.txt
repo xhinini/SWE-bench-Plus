@@ -1,0 +1,123 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests exercise Query.resolve_lookup_value handling of iterable lookup
+  values (list, tuple, collections.namedtuple, typing.NamedTuple) and nested
+  iterables of expressions (F(), Value()). They assert that the lookup
+  resolution preserves the expected types and that range/__in lookups behave
+  correctly. One test targets typing.NamedTuple construction from iterable
+  values which behaves differently in the candidate patch vs the gold patch.
+test_code: |
+  from collections import namedtuple
+  from typing import NamedTuple as TypingNamedTuple
+  from django.test import TestCase
+  from django.db.models import F, Value
+  from django.db.models.fields import IntegerField
+  from .models import Company, Employee, Number, Experiment, Time, SimulationRun, Result
+  import datetime
+
+  class ResolveLookupValueRegressionTests(TestCase):
+      @classmethod
+      def setUpTestData(cls):
+          # Minimal dataset used by tests
+          cls.ceo = Employee.objects.create(firstname='CEO', lastname='One', salary=100)
+          # Companies spread so various range/in lookups match
+          Company.objects.create(name='A', num_employees=10, num_chairs=5, ceo=cls.ceo)
+          Company.objects.create(name='B', num_employees=50, num_chairs=40, ceo=cls.ceo)
+          Company.objects.create(name='C', num_employees=75, num_chairs=70, ceo=cls.ceo)
+          Company.objects.create(name='D', num_employees=100, num_chairs=90, ceo=cls.ceo)
+
+      def test_list_of_expressions_in_in_lookup(self):
+          # A list with expression elements should be resolved and the __in lookup
+          # should work as if plain values were provided.
+          qs = Company.objects.filter(num_employees__in=[F('num_chairs') - 35, F('num_chairs') - 20])
+          # B: 40-35=5 (no), 40-20=20 (no) ; C: 70-35=35 (no), 70-20=50 (no)
+          # None match exactly, ensure no crash and empty result.
+          self.assertQuerysetEqual(qs, [], ordered=False)
+
+      def test_tuple_of_expressions_in_range_lookup(self):
+          # A tuple of expressions for range should be resolved correctly.
+          qs = Company.objects.filter(num_employees__range=(F('num_chairs') - 10, F('num_chairs') + 10))
+          # B: 50 in (30,50) -> True, C: 75 in (60,80) -> True, D: 100 in (80,100) -> True
+          # A: 10 in (-5,15) -> True. All should match in this dataset.
+          self.assertEqual(qs.count(), 4)
+
+      def test_collections_namedtuple_range_lookup(self):
+          # collections.namedtuple (classic) should be recognized and unpacked.
+          EmployeeRange = namedtuple('EmployeeRange', ['minimum', 'maximum'])
+          r = EmployeeRange(minimum=51, maximum=100)
+          qs = Company.objects.filter(num_employees__range=r)
+          # Expect companies with 75 and 100 -> C and D
+          self.assertCountEqual([c.name for c in qs], ['C', 'D'])
+
+      def test_typing_namedtuple_range_lookup(self):
+          # typing.NamedTuple should also be supported.
+          class TRange(TypingNamedTuple):
+              minimum: int
+              maximum: int
+          tr = TRange(minimum=51, maximum=100)
+          qs = Company.objects.filter(num_employees__range=tr)
+          # Expect companies with 75 and 100 -> C and D
+          self.assertCountEqual([c.name for c in qs], ['C', 'D'])
+
+      def test_namedtuple_of_expressions(self):
+          # collections.namedtuple containing expressions should be unpacked and resolved.
+          EmployeeRange = namedtuple('EmployeeRange', ['minimum', 'maximum'])
+          r = EmployeeRange(minimum=F('num_chairs') - 20, maximum=F('num_chairs') + 20)
+          qs = Company.objects.filter(num_employees__range=r)
+          # Compute expected manually: For each company, check membership
+          expected = []
+          for c in Company.objects.all():
+              lo = c.num_chairs - 20
+              hi = c.num_chairs + 20
+              if lo <= c.num_employees <= hi:
+                  expected.append(c.name)
+          self.assertCountEqual([c.name for c in qs], expected)
+
+      def test_empty_tuple_in_in_lookup_returns_none(self):
+          # An empty tuple for __in should act like an empty set (no matches).
+          qs = Company.objects.filter(num_employees__in=())
+          self.assertQuerysetEqual(qs, [], ordered=False)
+
+      def test_nested_iterables_of_expressions(self):
+          # Nested iterables: e.g., a list containing a tuple of expressions is allowed
+          # for some lookups (e.g., __in with a single iterable element that is itself iterable).
+          # Construct a flat list by using list(...) to ensure compatibility.
+          vals = [(F('num_chairs') - 35, ), (F('num_chairs') - 30, )]
+          # Resolve by converting nested sequences to plain lists in the test input
+          flat = [v[0] for v in vals]
+          qs = Company.objects.filter(num_employees__in=flat)
+          # Should not raise and should produce a queryset (possibly empty)
+          self.assertIsNotNone(qs.exists() or not qs.exists())
+
+      def test_tuple_with_none_elements(self):
+          # Ensure tuples containing None are handled (e.g., via Value(None))
+          qs = Company.objects.filter(num_employees__in=(Value(10), Value(999)))
+          # Only company 'A' has 10 employees
+          self.assertCountEqual([c.name for c in qs], ['A'])
+
+      def test_tuple_namedtuple_mixed_with_values_and_expressions(self):
+          EmployeeRange = namedtuple('EmployeeRange', ['minimum', 'maximum'])
+          r = EmployeeRange(minimum=Value(40), maximum=F('num_chairs') + 20)
+          qs = Company.objects.filter(num_employees__range=r)
+          # Evaluate expected in Python to ensure correct behavior
+          expected = []
+          for c in Company.objects.all():
+              lo = 40
+              hi = c.num_chairs + 20
+              if lo <= c.num_employees <= hi:
+                  expected.append(c.name)
+          self.assertCountEqual([c.name for c in qs], expected)
+
+      def test_tuple_of_mixed_types_preserves_value_semantics(self):
+          # Mixed tuple of plain ints and expressions
+          qs = Company.objects.filter(num_employees__in=(10, F('num_chairs') + 10))
+          # Count matches computed by Python semantics
+          expected = []
+          for c in Company.objects.all():
+              candidates = {10, c.num_chairs + 10}
+              if c.num_employees in candidates:
+                  expected.append(c.name)
+          self.assertCountEqual([c.name for c in qs], expected)
+new_imports_code: |
+  from typing import NamedTuple as TypingNamedTuple

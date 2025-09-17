@@ -1,0 +1,191 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  A set of unit tests that verify that methods copied from a QuerySet to a Manager
+  preserve metadata (name, docstring, module, __wrapped__), have their signatures
+  preserved, respect the queryset_only attribute and "private" naming convention,
+  don't overwrite existing manager methods, and actually call through to the
+  underlying QuerySet implementation. These tests would fail if the wrapper
+  assignment or copying behavior is not applied correctly (for example, if the
+  wrapper does not preserve __wrapped__/__doc__/__name__ or if copying logic
+  incorrectly includes or excludes methods).
+test_code: |
+  from django.test import SimpleTestCase
+  import inspect
+  
+  from django.db.models.manager import BaseManager
+  from django.db.models import QuerySet
+  
+  
+  class ManagerWrapsRegressionTests(SimpleTestCase):
+      def test_wrapped_attributes_preserved_for_common_methods(self):
+          """
+          Ensure wrapper functions copied from QuerySet onto Manager preserve
+          __wrapped__, __name__, __doc__ and __module__ attributes for common methods.
+          """
+          methods = BaseManager._get_queryset_methods(QuerySet)
+          for name in ("filter", "get", "count", "update", "bulk_create"):
+              with self.subTest(name=name):
+                  self.assertIn(name, methods)
+                  wrapper = methods[name]
+                  original = getattr(QuerySet, name)
+                  # The wrapper should expose the original function via __wrapped__
+                  self.assertTrue(hasattr(wrapper, "__wrapped__"))
+                  self.assertIs(wrapper.__wrapped__, original)
+                  # Name and docstring should match the original
+                  self.assertEqual(wrapper.__name__, original.__name__)
+                  self.assertEqual(wrapper.__doc__, original.__doc__)
+                  # Module should match the QuerySet's module
+                  self.assertEqual(wrapper.__module__, original.__module__)
+  
+      def test_signature_preserved_for_bulk_create_and_filter(self):
+          """
+          inspect.signature should show the original QuerySet signature for wrapped
+          manager methods because functools.wraps sets __wrapped__.
+          """
+          methods = BaseManager._get_queryset_methods(QuerySet)
+          for name in ("bulk_create", "filter"):
+              with self.subTest(name=name):
+                  wrapper = methods[name]
+                  self.assertEqual(
+                      str(inspect.signature(wrapper)),
+                      str(inspect.signature(getattr(QuerySet, name))),
+                  )
+  
+      def test_private_methods_are_not_copied_and_queryet_only_flag_respected(self):
+          """
+          Methods starting with '_' should not be copied unless queryset_only is
+          explicitly set. Methods with queryset_only=True must be skipped.
+          """
+          class CustomQS:
+              def _private(self):
+                  "private"
+  
+              def public(self):
+                  "public"
+  
+              def skipped(self):
+                  "skipped"
+  
+              # Emulate the attribute that marks a method as queryset-only.
+              skipped_queryset_only = True
+              skipped.queryset_only = True  # mark to be skipped
+  
+          # Attach proper names so inspect.getmembers behaves predictably.
+          CustomQS.public.__name__ = "public"
+          CustomQS._private.__name__ = "_private"
+  
+          methods = BaseManager._get_queryset_methods(CustomQS)
+          self.assertIn("public", methods)
+          self.assertNotIn("_private", methods)
+          self.assertNotIn("skipped", methods)
+  
+      def test_existing_manager_methods_not_overridden(self):
+          """
+          If the manager class already defines a method with the same name,
+          _get_queryset_methods must not override it.
+          """
+          class Mgr(BaseManager):
+              def filter(self, *args, **kwargs):
+                  # A sentinel implementation to detect overriding.
+                  return "manager-filter"
+  
+          class QS:
+              def filter(self):
+                  return "qs-filter"
+  
+          # _get_queryset_methods uses hasattr(cls, name) to skip methods already on cls
+          methods = Mgr._get_queryset_methods(QS)
+          self.assertNotIn("filter", methods)
+  
+      def test_from_queryset_adds_methods_to_manager_class(self):
+          """
+          BaseManager.from_queryset should create a new manager subclass containing
+          methods copied from the provided queryset class.
+          """
+          class QS:
+              def custom_action(self, x):
+                  "custom action doc"
+                  return x * 2
+  
+          NewManager = BaseManager.from_queryset(QS, class_name="XFromQS")
+          # The class should have a callable attribute 'custom_action'
+          self.assertTrue(hasattr(NewManager, "custom_action"))
+          m = NewManager()
+          # The method on the manager should be callable and carry the docstring
+          self.assertEqual(getattr(NewManager, "custom_action").__doc__, QS.custom_action.__doc__)
+  
+      def test_manager_method_calls_underlying_queryset(self):
+          """
+          The generated manager method should delegate to self.get_queryset().<method>.
+          This test creates a small DummyQS that records calls.
+          """
+          class DummyQS:
+              def __init__(self, model=None, using=None, hints=None):
+                  self._constructed_with = (model, using, hints)
+  
+              def mark(self, value):
+                  return ("called", value, self._constructed_with)
+  
+          # Create a manager class from DummyQS
+          ManagerCls = BaseManager.from_queryset(DummyQS, class_name="MFromDummyQS")
+          mgr = ManagerCls()
+          # Populate the minimal attributes expected by get_queryset
+          mgr.model = object()
+          mgr._db = "using-db"
+          mgr._hints = {"hint": "x"}
+  
+          # Call through the manager method and verify delegation and parameters
+          result = mgr.mark(123)
+          self.assertEqual(result[0], "called")
+          self.assertEqual(result[1], 123)
+          # Ensure the queryset was constructed with the manager's model, db and hints
+          self.assertEqual(result[2], (mgr.model, mgr._db, mgr._hints))
+  
+      def test_wrappers_are_regular_functions_and_inspectable(self):
+          """
+          Ensure that the methods produced are recognized as functions by inspect
+          (not e.g. functools.partial) and are inspect.signature friendly.
+          """
+          methods = BaseManager._get_queryset_methods(QuerySet)
+          for name in ("get", "count", "bulk_create"):
+              with self.subTest(name=name):
+                  wrapper = methods[name]
+                  self.assertTrue(inspect.isfunction(wrapper))
+                  # inspect.signature should not raise and should reflect the wrapped signature
+                  sig = inspect.signature(wrapper)
+                  self.assertEqual(str(sig), str(inspect.signature(getattr(QuerySet, name))))
+  
+      def test_multiple_custom_methods_kept(self):
+          """
+          When multiple methods are present on the QuerySet they should all be copied,
+          preserving their metadata.
+          """
+          class ManyQS:
+              def a(self): "a"
+              def b(self): "b"
+              def c(self): "c"
+  
+          methods = BaseManager._get_queryset_methods(ManyQS)
+          self.assertCountEqual(sorted(methods.keys()), ["a", "b", "c"])
+  
+      def test_queryset_only_attribute_on_a_real_method_blocks_copy(self):
+          """
+          Create a function and set queryset_only=True on it; _get_queryset_methods
+          should not copy it.
+          """
+          def special(self):
+              "special"
+  
+          special.queryset_only = True
+  
+          class QSWithSpecial:
+              pass
+  
+          # bind function to class so inspect.getmembers finds it as a function
+          setattr(QSWithSpecial, "special", special)
+  
+          methods = BaseManager._get_queryset_methods(QSWithSpecial)
+          self.assertNotIn("special", methods)
+new_imports_code: |
+  # No external imports required beyond the test file itself.

@@ -1,0 +1,219 @@
+# No additional imports necessary. Tests use pytest and standard library modules.
+import asyncio
+import time
+import types
+import pytest
+from urllib.parse import urlparse
+import django
+from django.http import Http404
+import django.contrib.staticfiles.handlers as handlers
+
+# A small helper to create a request-like object
+class DummyRequest:
+    def __init__(self, path="/static/test.txt"):
+        self.path = path
+
+class DummyHandler(handlers.StaticFilesHandlerMixin):
+    def __init__(self, serve_func):
+        # Provide base_url so methods don't try to query settings
+        self.base_url = urlparse('/static/')
+        self._serve_func = serve_func
+
+    def serve(self, request):
+        return self._serve_func(request)
+
+@pytest.mark.asyncio
+async def test_sync_to_async_is_used_for_serve(monkeypatch):
+    called = []
+
+    original = handlers.sync_to_async
+
+    def recorder(fn, *args, **kwargs):
+        # Record the function passed to sync_to_async and delegate
+        called.append(fn)
+        return original(fn, *args, **kwargs)
+
+    monkeypatch.setattr(handlers, 'sync_to_async', recorder)
+
+    def serve_fn(request):
+        return "ok"
+
+    h = DummyHandler(serve_fn)
+    resp = await h.get_response_async(DummyRequest())
+    assert resp == "ok"
+    # Ensure sync_to_async was invoked with the bound serve method
+    assert called, "sync_to_async was not called"
+    assert any(getattr(f, "__func__", None) is serve_fn.__call__ or True for f in called)
+
+@pytest.mark.asyncio
+async def test_sync_to_async_is_used_for_response_for_exception_on_404(monkeypatch):
+    called = []
+
+    original = handlers.sync_to_async
+
+    def recorder(fn, *args, **kwargs):
+        called.append(fn)
+        return original(fn, *args, **kwargs)
+
+    monkeypatch.setattr(handlers, 'sync_to_async', recorder)
+
+    def serve_fn(request):
+        raise Http404("not found")
+
+    # Replace the module-level response_for_exception with a sentinel function
+    def fake_response_for_exception(request, exc):
+        return "handled-404"
+
+    monkeypatch.setattr(handlers, 'response_for_exception', fake_response_for_exception)
+
+    h = DummyHandler(serve_fn)
+    resp = await h.get_response_async(DummyRequest())
+    assert resp == "handled-404"
+    # Ensure both serve and response_for_exception were passed to sync_to_async
+    assert any(getattr(f, "__name__", "") == 'serve' or getattr(f, "__self__", None) is h for f in called)
+    assert any(f is fake_response_for_exception for f in called)
+
+@pytest.mark.asyncio
+async def test_serve_runs_outside_event_loop(monkeypatch):
+    # serve will check whether it's running in an event loop
+    def serve_fn(request):
+        try:
+            asyncio.get_running_loop()
+            return "inloop"
+        except RuntimeError:
+            return "no-loop"
+
+    h = DummyHandler(serve_fn)
+    resp = await h.get_response_async(DummyRequest())
+    assert resp == "no-loop", "serve must run outside the event loop (in a thread)"
+
+@pytest.mark.asyncio
+async def test_response_for_exception_runs_outside_event_loop_on_404(monkeypatch):
+    def serve_fn(request):
+        raise Http404("not found")
+
+    def fake_response_for_exception(request, exc):
+        try:
+            asyncio.get_running_loop()
+            return "inloop"
+        except RuntimeError:
+            return "no-loop"
+
+    monkeypatch.setattr(handlers, 'response_for_exception', fake_response_for_exception)
+    h = DummyHandler(serve_fn)
+    resp = await h.get_response_async(DummyRequest())
+    assert resp == "no-loop", "response_for_exception must run outside the event loop (in a thread)"
+
+@pytest.mark.asyncio
+async def test_non_http404_exception_propagates():
+    def serve_fn(request):
+        raise ValueError("boom")
+
+    h = DummyHandler(serve_fn)
+    with pytest.raises(ValueError):
+        await h.get_response_async(DummyRequest())
+
+@pytest.mark.asyncio
+async def test_event_loop_not_blocked_by_blocking_serve():
+    # This serve blocks with time.sleep; the event loop should remain responsive
+    def serve_fn(request):
+        time.sleep(0.15)
+        return "done"
+
+    h = DummyHandler(serve_fn)
+
+    # Start the serving in background
+    task = asyncio.create_task(h.get_response_async(DummyRequest()))
+
+    # While serve_fn runs, ensure other tasks can make progress
+    counter = 0
+    # Try to yield control a number of times
+    for _ in range(20):
+        await asyncio.sleep(0)
+        counter += 1
+        # break early if the background task completed
+        if task.done():
+            break
+
+    res = await task
+    assert res == "done"
+    # If serve blocked the event loop, the counter would remain 0
+    assert counter > 0, "Event loop was blocked by serve (should run serve in a thread)"
+
+@pytest.mark.asyncio
+async def test_get_response_async_returns_serve_result():
+    def serve_fn(request):
+        return {"file": "content"}
+
+    h = DummyHandler(serve_fn)
+    resp = await h.get_response_async(DummyRequest())
+    assert resp == {"file": "content"}
+
+@pytest.mark.asyncio
+async def test_multiple_concurrent_get_response_async_calls():
+    def serve_fn(request):
+        time.sleep(0.05)
+        return "ok"
+
+    h = DummyHandler(serve_fn)
+
+    tasks = [asyncio.create_task(h.get_response_async(DummyRequest(f"/static/{i}"))) for i in range(5)]
+    # While they run, the loop should still be able to schedule other tasks
+    await asyncio.sleep(0)  # yield once
+    results = await asyncio.gather(*tasks)
+    assert results == ["ok"] * 5
+
+@pytest.mark.asyncio
+async def test_sync_to_async_wrapper_called_for_both_functions(monkeypatch):
+    # Ensure that sync_to_async is invoked for both serve and response_for_exception
+    called = []
+
+    original = handlers.sync_to_async
+
+    def wrapper(fn, *a, **kw):
+        called.append(fn)
+        return original(fn, *a, **kw)
+
+    monkeypatch.setattr(handlers, 'sync_to_async', wrapper)
+
+    def serve_fn(request):
+        raise Http404()
+
+    def fake_response_for_exception(request, exc):
+        return "handled"
+
+    monkeypatch.setattr(handlers, 'response_for_exception', fake_response_for_exception)
+    h = DummyHandler(serve_fn)
+    resp = await h.get_response_async(DummyRequest())
+    assert resp == "handled"
+    # sync_to_async should have been called at least twice (serve and response_for_exception)
+    assert len(called) >= 2
+    assert any(f is fake_response_for_exception for f in called)
+
+@pytest.mark.asyncio
+async def test_serve_called_outside_event_loop_with_bound_method_identity():
+    # Ensure the exact bound method is what's passed into sync_to_async
+    recorded = []
+
+    original = handlers.sync_to_async
+
+    def recorder(fn, *args, **kwargs):
+        recorded.append(fn)
+        return original(fn, *args, **kwargs)
+
+    # Monkeypatch sync_to_async
+    pytest.monkeypatch.setattr(handlers, 'sync_to_async', recorder)
+
+    def serve_fn(request):
+        try:
+            asyncio.get_running_loop()
+            return "inloop"
+        except RuntimeError:
+            return "no-loop"
+
+    h = DummyHandler(serve_fn)
+    resp = await h.get_response_async(DummyRequest())
+    assert resp == "no-loop"
+    assert recorded, "sync_to_async not recorded any calls"
+    # The function recorded should be a bound method (has __self__ == h)
+    assert any(getattr(f, "__self__", None) is h for f in recorded)

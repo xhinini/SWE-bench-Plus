@@ -1,0 +1,196 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise build_instance() behavior when resolving natural keys, ensuring the instance _state.db is set before calling natural_key (so natural_key uses the intended DB), that exceptions are propagated correctly, and that pk conversion and conditional paths behave as expected. They will fail for the candidate patch (which doesn't set _state.db and swallows AttributeError), but pass for the gold patch.
+test_code: |
+  import unittest
+  from types import SimpleNamespace
+  from django.core.serializers.base import build_instance
+  
+  class RecordingManager:
+      def __init__(self, pk_to_return='42', raise_exc=None):
+          self.pk_to_return = pk_to_return
+          self.raise_exc = raise_exc
+          self.db_calls = []
+          self.get_calls = []
+  
+      def db_manager(self, db):
+          # record which DB was requested
+          self.db_calls.append(db)
+          return self
+  
+      def get_by_natural_key(self, *args):
+          self.get_calls.append(args)
+          if self.raise_exc:
+              raise self.raise_exc
+          return SimpleNamespace(pk=self.pk_to_return)
+  
+  
+  class DummyDoesNotExist(Exception):
+      pass
+  
+  
+  def make_model(manager, pk_to_python=lambda x: int(x)):
+      """
+      Build a minimal Model-like class usable by build_instance.
+      """
+      class Model:
+          # attach DoesNotExist to class, as real models do
+          DoesNotExist = DummyDoesNotExist
+  
+      # minimal _meta with default_manager and pk description
+      Model._meta = SimpleNamespace(
+          default_manager=manager,
+          pk=SimpleNamespace(attname='id', to_python=pk_to_python),
+      )
+  
+      def __init__(self, **kwargs):
+          # set attributes from kwargs
+          for k, v in kwargs.items():
+              setattr(self, k, v)
+          # state object with db attribute
+          self._state = SimpleNamespace(db=None)
+  
+      Model.__init__ = __init__
+      return Model
+  
+  
+  class BuildInstanceTests(unittest.TestCase):
+      def test_state_db_used_in_natural_key_and_lookup(self):
+          manager = RecordingManager(pk_to_return='42')
+          Model = make_model(manager)
+  
+          # natural_key implementation uses self._state.db to pick manager/db
+          def natural_key(self):
+              # natural_key inspects the instance state to drive a DB lookup
+              manager = self._meta.default_manager
+              # this call should receive the same db passed to build_instance
+              manager.db_manager(self._state.db).get_by_natural_key('nk')
+              return ('nk',)
+  
+          Model.natural_key = natural_key
+          data = {}
+          returned = build_instance(Model, data, db='other-db')
+  
+          # natural_key should have invoked db_manager with the provided db,
+          # and build_instance should also perform the lookup with the same db.
+          self.assertEqual(manager.db_calls[0], 'other-db')
+          self.assertEqual(manager.db_calls[1], 'other-db')
+          # pk should be converted to int by to_python and set on the returned instance
+          self.assertEqual(getattr(returned, 'id'), 42)
+  
+      def test_when_pk_present_no_natural_key_resolution(self):
+          manager = RecordingManager(pk_to_return='99')
+          Model = make_model(manager)
+  
+          def natural_key(self):
+              # If this were called, it would record a db call
+              self._meta.default_manager.db_manager(self._state.db).get_by_natural_key('nk')
+              return ('nk',)
+  
+          Model.natural_key = natural_key
+          data = {'id': '5'}
+          returned = build_instance(Model, data, db='the-db')
+  
+          # Since pk is present, the manager should not be called at all
+          self.assertEqual(manager.db_calls, [])
+          self.assertEqual(getattr(returned, 'id'), '5')
+  
+      def test_no_get_by_natural_key_on_default_manager(self):
+          # manager without get_by_natural_key attribute -> skip natural key resolution
+          manager = SimpleNamespace()
+          Model = make_model(manager)
+  
+          # attach a natural_key on the class, but it should not be used because
+          # default_manager doesn't have get_by_natural_key
+          def natural_key(self):
+              raise AssertionError("natural_key should not be called when manager lacks get_by_natural_key")
+  
+          Model.natural_key = natural_key
+          data = {}
+          returned = build_instance(Model, data, db='anydb')
+  
+          # no id set
+          self.assertIsNone(getattr(returned, 'id', None))
+  
+      def test_to_python_conversion_applied_to_resolved_pk(self):
+          manager = RecordingManager(pk_to_return='7')
+          Model = make_model(manager, pk_to_python=lambda x: int(x) + 0)  # ensure int conversion
+          def natural_key(self):
+              self._meta.default_manager.db_manager(self._state.db).get_by_natural_key('nk')
+              return ('nk',)
+          Model.natural_key = natural_key
+          returned = build_instance(Model, {}, db='dbX')
+          self.assertEqual(getattr(returned, 'id'), 7)
+  
+      def test_natural_key_attribute_error_propagates(self):
+          manager = RecordingManager(pk_to_return='1')
+          Model = make_model(manager)
+  
+          def natural_key(self):
+              # Raise AttributeError intentionally; build_instance should not swallow this.
+              raise AttributeError("intentional bad attribute access in natural_key")
+  
+          Model.natural_key = natural_key
+          with self.assertRaises(AttributeError):
+              build_instance(Model, {}, db='somedb')
+  
+      def test_multiple_different_dbs_are_used(self):
+          for dbname in ('db1', 'db2'):
+              manager = RecordingManager(pk_to_return='3')
+              Model = make_model(manager)
+  
+              def natural_key(self):
+                  self._meta.default_manager.db_manager(self._state.db).get_by_natural_key('nk')
+                  return ('nk',)
+  
+              Model.natural_key = natural_key
+              returned = build_instance(Model, {}, db=dbname)
+              # first call (inside natural_key) should use the provided db name
+              self.assertEqual(manager.db_calls[0], dbname)
+              self.assertEqual(getattr(returned, 'id'), 3)
+  
+      def test_does_not_exist_from_manager_is_ignored(self):
+          manager = RecordingManager(raise_exc=DummyDoesNotExist())
+          Model = make_model(manager)
+  
+          def natural_key(self):
+              # natural_key should run and request DB-specific manager
+              self._meta.default_manager.db_manager(self._state.db)
+              return ('nk',)
+  
+          Model.natural_key = natural_key
+          # Should not raise; DoesNotExist is swallowed by build_instance
+          returned = build_instance(Model, {}, db='db-where-missing')
+          self.assertIsNone(getattr(returned, 'id', None))
+  
+      def test_no_natural_key_on_model_skips_resolution(self):
+          # default_manager has the method, but class lacks natural_key
+          manager = RecordingManager(pk_to_return='11')
+          Model = make_model(manager)
+          # Ensure no natural_key attribute on class
+          if hasattr(Model, 'natural_key'):
+              delattr(Model, 'natural_key')
+          returned = build_instance(Model, {}, db='dbz')
+          # Manager should not be called
+          self.assertEqual(manager.db_calls, [])
+          self.assertIsNone(getattr(returned, 'id', None))
+  
+      def test_returned_object_is_model_instance_with_resolved_pk(self):
+          manager = RecordingManager(pk_to_return='55')
+          Model = make_model(manager)
+  
+          def natural_key(self):
+              self._meta.default_manager.db_manager(self._state.db).get_by_natural_key('nk')
+              return ('nk',)
+  
+          Model.natural_key = natural_key
+          returned = build_instance(Model, {}, db='somedb')
+          # The object returned should be an instance of the same class
+          self.assertIsInstance(returned, Model)
+          self.assertEqual(getattr(returned, 'id'), 55)
+  
+  if __name__ == "__main__":
+      unittest.main()
+new_imports_code: |
+  from types import SimpleNamespace
+  from types import SimpleNamespace as _SimpleNamespace

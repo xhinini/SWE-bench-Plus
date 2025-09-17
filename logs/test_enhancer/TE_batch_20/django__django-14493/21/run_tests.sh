@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 staticfiles_tests.test_storage_llm.PostProcessExtraTests._postprocess staticfiles_tests.test_storage_llm.PostProcessExtraTests._write staticfiles_tests.test_storage_llm.PostProcessExtraTests.setUp staticfiles_tests.test_storage_llm.PostProcessExtraTests.tearDown staticfiles_tests.test_storage_llm.PostProcessExtraTests.test_circular_substitution_detected_raises_runtime staticfiles_tests.test_storage_llm.PostProcessExtraTests.test_clean_name_backslashes_converted staticfiles_tests.test_storage_llm.PostProcessExtraTests.test_font_face_fragment_preserved staticfiles_tests.test_storage_llm.PostProcessExtraTests.test_hashed_files_saved_and_stored_name_consistent staticfiles_tests.test_storage_llm.PostProcessExtraTests.test_hashed_name_missing_file_raises_value_error staticfiles_tests.test_storage_llm.PostProcessExtraTests.test_max_post_process_passes_zero_adjustable_no_error staticfiles_tests.test_storage_llm.PostProcessExtraTests.test_max_post_process_passes_zero_no_unboundlocal staticfiles_tests.test_storage_llm.PostProcessExtraTests.test_post_process_keeps_intermediate_files_flag_respected
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,313 @@
+from functools import partial
+import types
+from django.test import SimpleTestCase
+from django.apps import apps
+from functools import partial
+
+
+class FakeMeta:
+    def __init__(self, app_label, model_name, swappable=None, swapped=None):
+        self.app_label = app_label
+        self.model_name = model_name
+        self.label_lower = f"{app_label}.{model_name}".lower()
+        self.swappable = swappable
+        self.swapped = swapped
+        # hook that can be set by tests to run custom logic in _expire_cache
+        self._on_expire = None
+
+    def _expire_cache(self):
+        if self._on_expire:
+            self._on_expire()
+
+
+class FakeModel:
+    def __init__(self, meta):
+        self._meta = meta
+
+    def __repr__(self):
+        return f"<FakeModel {self._meta.app_label}.{self._meta.model_name}>"
+
+
+class FakeAppConfig:
+    def __init__(self, name, label, models):
+        # models: list of FakeModel
+        self.name = name
+        self.label = label
+        self._models = models
+
+    # clear_cache() calls get_models(include_auto_created=True) on app_config objects
+    def get_models(self, include_auto_created=False, include_swapped=False):
+        return list(self._models)
+
+
+class ClearCacheSwappableTests(SimpleTestCase):
+    def setUp(self):
+        # Save global state to restore later
+        self._orig_app_configs = apps.app_configs
+        self._orig_ready = apps.ready
+        self._orig_models_ready = apps.models_ready
+        # Ensure starting with clean caches
+        try:
+            apps.get_swappable_settings_name.cache_clear()
+        except AttributeError:
+            pass
+        try:
+            apps.get_models.cache_clear()
+        except AttributeError:
+            pass
+
+    def tearDown(self):
+        # Restore global state and clear caches to avoid cross-test pollution
+        apps.app_configs = self._orig_app_configs
+        apps.ready = self._orig_ready
+        apps.models_ready = self._orig_models_ready
+        try:
+            apps.get_swappable_settings_name.cache_clear()
+        except AttributeError:
+            pass
+        try:
+            apps.get_models.cache_clear()
+        except AttributeError:
+            pass
+
+    def _run_scenario_and_assert_cache_cleared(self, app_configs, prepopulate_key):
+        """
+        Replace apps.app_configs with provided dict (label -> FakeAppConfig),
+        prepopulate get_swappable_settings_name cache with prepopulate_key,
+        call clear_cache(), and assert the swappable cache is empty afterwards.
+        """
+        # Install our fake app configs and mark apps as ready so clear_cache will
+        # call _expire_cache() on models.
+        apps.app_configs = app_configs
+        apps.ready = True
+        apps.models_ready = True
+
+        # Ensure caches start clean
+        apps.get_swappable_settings_name.cache_clear()
+        apps.get_models.cache_clear()
+
+        # Prepopulate the swappable cache by calling with requested key.
+        # This ensures there is something to clear.
+        # Surround in try/except in case the function returns None; the goal is to
+        # populate the cache data structure rather than assert the return.
+        try:
+            apps.get_swappable_settings_name(prepopulate_key)
+        except Exception:
+            # ignore errors from lookup; cache may still be populated
+            pass
+        # Confirm cache has been populated at least once
+        sw_cache_info = apps.get_swappable_settings_name.cache_info()
+        self.assertGreater(sw_cache_info.currsize, 0, "Precondition: swappable cache not populated")
+
+        # run clear_cache which, during the expire step, may call get_swappable_settings_name again
+        apps.clear_cache()
+
+        # After clear_cache, the swappable cache must be empty (currsize == 0).
+        sw_cache_info_after = apps.get_swappable_settings_name.cache_info()
+        self.assertEqual(
+            sw_cache_info_after.currsize,
+            0,
+            "get_swappable_settings_name cache must be cleared after clear_cache()",
+        )
+        # Also ensure get_models cache is cleared.
+        models_cache_info_after = apps.get_models.cache_info()
+        self.assertEqual(models_cache_info_after.currsize, 0)
+
+    def test_single_model_expire_repopulates_swappable_cache(self):
+        """Single app, single model whose _expire_cache calls get_swappable_settings_name."""
+        fired = {"count": 0}
+
+        def on_expire():
+            fired["count"] += 1
+            # Repopulate swappable cache during clear_cache
+            try:
+                apps.get_swappable_settings_name("fakeapp.FakeModel")
+            except Exception:
+                pass
+
+        meta = FakeMeta("fakeapp", "FakeModel", swappable="fakeapp.FakeModel")
+        meta._on_expire = on_expire
+        model = FakeModel(meta)
+        app_config = FakeAppConfig("fakeapp", "fakeapp", [model])
+        self._run_scenario_and_assert_cache_cleared({"fakeapp": app_config}, "fakeapp.FakeModel")
+        # Ensure expire was indeed called
+        self.assertGreater(fired["count"], 0)
+
+    def test_two_models_in_one_app_each_expire(self):
+        """Two models in a single app, both call get_swappable_settings_name during expire."""
+        fired = {"count": 0}
+
+        def make_on_expire(name):
+            def _inner():
+                fired["count"] += 1
+                try:
+                    apps.get_swappable_settings_name(name)
+                except Exception:
+                    pass
+            return _inner
+
+        meta1 = FakeMeta("fakeapp", "One", swappable="fakeapp.One")
+        meta1._on_expire = make_on_expire("fakeapp.One")
+        meta2 = FakeMeta("fakeapp", "Two", swappable="fakeapp.Two")
+        meta2._on_expire = make_on_expire("fakeapp.Two")
+        model1 = FakeModel(meta1)
+        model2 = FakeModel(meta2)
+        app_config = FakeAppConfig("fakeapp", "fakeapp", [model1, model2])
+        self._run_scenario_and_assert_cache_cleared({"fakeapp": app_config}, "fakeapp.One")
+        self.assertEqual(fired["count"], 2)
+
+    def test_multiple_apps_each_with_models_that_expire(self):
+        """Multiple app configs, each with a model whose expire repopulates the cache."""
+        fired = {"count": 0}
+
+        def make_on_expire(name):
+            def _inner():
+                fired["count"] += 1
+                try:
+                    apps.get_swappable_settings_name(name)
+                except Exception:
+                    pass
+            return _inner
+
+        meta_a = FakeMeta("app_a", "A", swappable="app_a.A")
+        meta_a._on_expire = make_on_expire("app_a.A")
+        meta_b = FakeMeta("app_b", "B", swappable="app_b.B")
+        meta_b._on_expire = make_on_expire("app_b.B")
+        app_a = FakeAppConfig("app_a", "app_a", [FakeModel(meta_a)])
+        app_b = FakeAppConfig("app_b", "app_b", [FakeModel(meta_b)])
+        self._run_scenario_and_assert_cache_cleared({"app_a": app_a, "app_b": app_b}, "app_a.A")
+        self.assertEqual(fired["count"], 2)
+
+    def test_expire_does_not_call_swappable_but_cache_still_cleared(self):
+        """If expire does not call get_swappable_settings_name, cache is still cleared."""
+        meta = FakeMeta("no_repop", "Model")
+        # no _on_expire set
+        model = FakeModel(meta)
+        app_config = FakeAppConfig("no_repop", "no_repop", [model])
+        self._run_scenario_and_assert_cache_cleared({"no_repop": app_config}, "no_repop.Model")
+
+    def test_clear_cache_with_many_repopulations(self):
+        """_many repopulations during expire still results in an empty cache afterwards."""
+        fired = {"count": 0}
+
+        def on_expire_many():
+            # call get_swappable_settings_name multiple times
+            for i in range(5):
+                fired["count"] += 1
+                try:
+                    apps.get_swappable_settings_name(f"many.Model{i}")
+                except Exception:
+                    pass
+
+        metas = []
+        models = []
+        for i in range(3):
+            m = FakeMeta("many", f"Model{i}", swappable=f"many.Model{i}")
+            m._on_expire = on_expire_many
+            metas.append(m)
+            models.append(FakeModel(m))
+        app_config = FakeAppConfig("many", "many", models)
+        self._run_scenario_and_assert_cache_cleared({"many": app_config}, "many.Model0")
+        self.assertGreaterEqual(fired["count"], 15)
+
+    def test_clear_cache_when_not_ready_does_not_run_expire_but_clears_cache(self):
+        """When apps.ready is False, _expire_cache is not run but caches are still cleared."""
+        meta = FakeMeta("late", "Model", swappable="late.Model")
+        called = {"flag": False}
+        def on_expire():
+            called["flag"] = True
+            try:
+                apps.get_swappable_settings_name("late.Model")
+            except Exception:
+                pass
+        meta._on_expire = on_expire
+        model = FakeModel(meta)
+        app_config = FakeAppConfig("late", "late", [model])
+
+        # install app_configs but mark not ready so clear_cache won't call _expire_cache
+        apps.app_configs = {"late": app_config}
+        apps.ready = False
+        apps.models_ready = True
+        apps.get_swappable_settings_name.cache_clear()
+        apps.get_models.cache_clear()
+        try:
+            # prepopulate
+            try:
+                apps.get_swappable_settings_name("late.Model")
+            except Exception:
+                pass
+            self.assertGreater(apps.get_swappable_settings_name.cache_info().currsize, 0)
+            apps.clear_cache()
+            self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+            self.assertFalse(called["flag"], "expire should not have been called when apps.ready is False")
+        finally:
+            # restore ready state in tearDown
+            pass
+
+    def test_clear_cache_with_mixed_behaviors(self):
+        """Mix of models that do and do not repopulate the swappable cache."""
+        fired = {"count": 0}
+
+        def on_expire_repop():
+            fired["count"] += 1
+            try:
+                apps.get_swappable_settings_name("mix.R")
+            except Exception:
+                pass
+
+        meta_r = FakeMeta("mix", "R", swappable="mix.R")
+        meta_r._on_expire = on_expire_repop
+        meta_nr = FakeMeta("mix", "NR", swappable=None)
+        # no _on_expire on non-repop model
+        app_config = FakeAppConfig("mix", "mix", [FakeModel(meta_r), FakeModel(meta_nr)])
+        self._run_scenario_and_assert_cache_cleared({"mix": app_config}, "mix.R")
+        self.assertEqual(fired["count"], 1)
+
+    def test_clear_cache_repopulated_with_different_keys(self):
+        """
+        expire calls may repopulate the cache with keys different from the one
+        initially cached. The final cache must still be empty.
+        """
+        def on_expire_other():
+            try:
+                apps.get_swappable_settings_name("other.X")
+            except Exception:
+                pass
+
+        meta = FakeMeta("other", "X", swappable="other.X")
+        meta._on_expire = on_expire_other
+        model = FakeModel(meta)
+        app_config = FakeAppConfig("other", "other", [model])
+        # prepopulate with a different key than the ones expire will call
+        self._run_scenario_and_assert_cache_cleared({"other": app_config}, "different.Key")
+
+    def test_clear_cache_idempotence_when_called_multiple_times(self):
+        """Calling clear_cache multiple times in a row leaves the swappable cache empty."""
+        meta = FakeMeta("iter", "M", swappable="iter.M")
+        called = {"count": 0}
+        def on_expire():
+            called["count"] += 1
+            try:
+                apps.get_swappable_settings_name("iter.M")
+            except Exception:
+                pass
+        meta._on_expire = on_expire
+        app_config = FakeAppConfig("iter", "iter", [FakeModel(meta)])
+        apps.app_configs = {"iter": app_config}
+        apps.ready = True
+        apps.models_ready = True
+        # prepopulate
+        apps.get_swappable_settings_name.cache_clear()
+        apps.get_models.cache_clear()
+        try:
+            try:
+                apps.get_swappable_settings_name("iter.M")
+            except Exception:
+                pass
+            self.assertGreater(apps.get_swappable_settings_name.cache_info().currsize, 0)
+            # call clear_cache twice
+            apps.clear_cache()
+            apps.clear_cache()
+            self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+        finally:
+            pass

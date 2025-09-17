@@ -1,0 +1,171 @@
+from types import SimpleNamespace
+
+import pytest
+from unittest import mock
+import sphinx.builders.linkcheck as linkcheck
+from types import SimpleNamespace
+
+# Helper to create a mock response object similar to requests.Response
+class MockResponse:
+    def __init__(self, url, content=b"", status_code=200, headers=None, method='GET', history=None):
+        self.url = url
+        self._content = content
+        self.status_code = status_code
+        self.headers = headers or {}
+        self.request = SimpleNamespace(method=method)
+        self.history = history or []
+
+    def raise_for_status(self):
+        # like requests.Response.raise_for_status()
+        if 400 <= self.status_code < 600:
+            # create an object with response attribute like requests.HTTPError
+            exc = linkcheck.HTTPError(f"{self.status_code} Error", response=self)
+            raise exc
+
+    def iter_content(self, chunk_size=4096, decode_unicode=False):
+        # yield bytes or str depending on decode_unicode flag
+        if decode_unicode:
+            # ensure we yield strings
+            yield self._content.decode() if isinstance(self._content, bytes) else str(self._content)
+        else:
+            yield self._content if isinstance(self._content, bytes) else self._content.encode()
+
+# We'll target two anchor-containing URLs present in the testroot:
+URL_A = "https://www.google.com/#top"
+URL_B = "http://www.sphinx-doc.org/en/1.7/intro.html#does-not-exist"
+
+# Generate variations of non-HTML content-types to test
+NON_HTML_CONTENT_TYPES = [
+    "application/octet-stream",
+    "application/pdf",
+    "text/plain",
+    "image/png",
+    "",  # Missing content-type header
+]
+
+def _make_head_and_get_mocks(target_url, content_type, body=b"<html><body>No anchor here</body></html>", head_status=200, get_status=200):
+    """
+    Returns (head_mock, get_mock) pair that emulate:
+    - HEAD to target_url returns a response with given content_type and status.
+    - GET to target_url returns a response with the given body and status.
+    For any other URL, the original functions are called.
+    """
+    orig_get = linkcheck.requests.get
+    orig_head = linkcheck.requests.head
+
+    def head_mock(url, *args, **kwargs):
+        if target_url.split('#', 1)[0] in url:
+            headers = {}
+            if content_type:
+                headers['content-type'] = content_type
+            return MockResponse(url=url, content=b"", status_code=head_status, headers=headers, method='HEAD', history=[])
+        return orig_head(url, *args, **kwargs)
+
+    def get_mock(url, *args, **kwargs):
+        if target_url.split('#', 1)[0] in url:
+            headers = {}
+            if content_type:
+                headers['content-type'] = content_type
+            return MockResponse(url=url, content=body, status_code=get_status, headers=headers, method='GET', history=[])
+        return orig_get(url, *args, **kwargs)
+
+    return head_mock, get_mock
+
+@pytest.mark.parametrize("ctype", NON_HTML_CONTENT_TYPES)
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_on_non_html_url_a_reports_missing_anchor(app, status, warning, ctype):
+    """
+    For URL_A, simulate a HEAD response reporting a non-HTML content-type.
+    The builder should still perform the GET and check for the anchor; since
+    the mocked body does not contain the anchor, it must report "Anchor 'top' not found".
+    The candidate model patch that skips anchor checks based on HEAD content-type
+    would mark this link as working, causing this test to fail.
+    """
+    head_mock, get_mock = _make_head_and_get_mocks(URL_A, ctype,
+                                                  body=b"<html><body>no top anchor here</body></html>")
+    with mock.patch('sphinx.builders.linkcheck.requests.head', side_effect=head_mock), \
+         mock.patch('sphinx.builders.linkcheck.requests.get', side_effect=get_mock):
+        app.builder.build_all()
+
+    content = (app.outdir / 'output.txt').read_text()
+    assert "Anchor 'top' not found" in content
+
+@pytest.mark.parametrize("ctype", NON_HTML_CONTENT_TYPES)
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_on_non_html_url_b_reports_missing_anchor(app, status, warning, ctype):
+    """
+    For URL_B, simulate a HEAD response reporting a non-HTML content-type.
+    The builder should still perform the GET and check for the anchor; since
+    the mocked body does not contain the anchor, it must report "Anchor 'does-not-exist' not found".
+    """
+    head_mock, get_mock = _make_head_and_get_mocks(URL_B, ctype,
+                                                  body=b"<html><body>no anchor present</body></html>")
+    with mock.patch('sphinx.builders.linkcheck.requests.head', side_effect=head_mock), \
+         mock.patch('sphinx.builders.linkcheck.requests.get', side_effect=get_mock):
+        app.builder.build_all()
+
+    content = (app.outdir / 'output.txt').read_text()
+    assert "Anchor 'does-not-exist' not found" in content
+
+# Now add a couple of tests where HEAD returns 200 but GET returns 404.
+# The behavior should be to treat the link as broken. Candidate patches that
+# don't call raise_for_status() appropriately could mishandle this.
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_head_ok_but_get_404_reports_broken_for_url_a(app, status, warning):
+    head_mock, get_mock = _make_head_and_get_mocks(URL_A, "application/octet-stream",
+                                                  body=b"irrelevant", head_status=200, get_status=404)
+    # modify get_mock to return 404 for GET
+    def get_404(url, *args, **kwargs):
+        if URL_A.split('#', 1)[0] in url:
+            return MockResponse(url=url, content=b"", status_code=404, headers={'content-type': 'application/octet-stream'}, method='GET')
+        return linkcheck.requests.get(url, *args, **kwargs)
+
+    with mock.patch('sphinx.builders.linkcheck.requests.head', side_effect=head_mock), \
+         mock.patch('sphinx.builders.linkcheck.requests.get', side_effect=get_404):
+        app.builder.build_all()
+
+    content = (app.outdir / 'output.txt').read_text()
+    # Should show a 404-like error for the URL (anchor check can't succeed on 404)
+    assert "Not Found" in content or "404" in content or "Anchor 'top' not found" in content
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_head_ok_but_get_404_reports_broken_for_url_b(app, status, warning):
+    head_mock, get_mock = _make_head_and_get_mocks(URL_B, "application/pdf",
+                                                  body=b"irrelevant", head_status=200, get_status=404)
+    def get_404(url, *args, **kwargs):
+        if URL_B.split('#', 1)[0] in url:
+            return MockResponse(url=url, content=b"", status_code=404, headers={'content-type': 'application/pdf'}, method='GET')
+        return linkcheck.requests.get(url, *args, **kwargs)
+
+    with mock.patch('sphinx.builders.linkcheck.requests.head', side_effect=head_mock), \
+         mock.patch('sphinx.builders.linkcheck.requests.get', side_effect=get_404):
+        app.builder.build_all()
+
+    content = (app.outdir / 'output.txt').read_text()
+    assert "Not Found" in content or "404" in content or "Anchor 'does-not-exist' not found" in content
+
+# Tests where the mocked GET actually contains the anchor; these should be reported as working.
+@pytest.mark.parametrize("ctype", NON_HTML_CONTENT_TYPES)
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_present_in_non_html_body_counts_as_working_url_a(app, status, warning, ctype):
+    head_mock, get_mock = _make_head_and_get_mocks(URL_A, ctype,
+                                                  body=b"<html><body id='top'></body></html>")
+    with mock.patch('sphinx.builders.linkcheck.requests.head', side_effect=head_mock), \
+         mock.patch('sphinx.builders.linkcheck.requests.get', side_effect=get_mock):
+        app.builder.build_all()
+
+    content = (app.outdir / 'output.txt').read_text()
+    # If anchor is present, no "Anchor 'top' not found" message should appear.
+    assert "Anchor 'top' not found" not in content
+
+@pytest.mark.parametrize("ctype", NON_HTML_CONTENT_TYPES)
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+def test_anchor_present_in_non_html_body_counts_as_working_url_b(app, status, warning, ctype):
+    head_mock, get_mock = _make_head_and_get_mocks(URL_B, ctype,
+                                                  body=b"<a name='does-not-exist'></a>")
+    with mock.patch('sphinx.builders.linkcheck.requests.head', side_effect=head_mock), \
+         mock.patch('sphinx.builders.linkcheck.requests.get', side_effect=get_mock):
+        app.builder.build_all()
+
+    content = (app.outdir / 'output.txt').read_text()
+    assert "Anchor 'does-not-exist' not found" not in content

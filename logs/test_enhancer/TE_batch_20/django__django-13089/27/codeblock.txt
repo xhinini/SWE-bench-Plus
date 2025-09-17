@@ -1,0 +1,131 @@
+# The test file already imports mock, connections, caches and timezone. No new imports needed.
+from django.utils import timezone
+from django.db import connections
+from django.core.cache import caches
+from unittest import mock
+
+class FakeCursor:
+    """
+    A minimal fake cursor that can be used as a context manager and will
+    return a predetermined sequence of values for fetchone().
+    It records executed SQL and params for assertions.
+    """
+    def __init__(self, fetch_results):
+        # fetch_results is a list of values that fetchone() will return each time.
+        self._fetch_results = list(fetch_results)
+        self.executed = []
+        self.rowcount = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql, params=None):
+        # Record the SQL and params for later inspection.
+        self.executed.append((sql, params))
+
+    def fetchone(self):
+        if self._fetch_results:
+            return self._fetch_results.pop(0)
+        return None
+
+class DBCacheCullingRegressionTests(DBCacheTests):
+    # These tests assume the test table has been created in setUp() of the parent.
+
+    def test_cull_does_not_crash_when_last_cache_key_fetchone_is_none_on_set(self):
+        cull_cache = caches['cull']
+        # Sequence: 1st fetchone -> count in _base_set (trigger cull)
+        #           2nd fetchone -> count in _cull
+        #           3rd fetchone -> result of cache_key_culling_sql (None)
+        fc = FakeCursor([(100,), (100,), None])
+        with mock.patch.object(connections['default'], 'cursor', side_effect=lambda: fc):
+            # set() doesn't return a value (None), but must not raise an exception.
+            self.assertIsNone(cull_cache.set('somekey-set-none', 'value', timeout=1000))
+
+    def test_cull_does_not_crash_when_last_cache_key_fetchone_is_none_on_add(self):
+        cull_cache = caches['cull']
+        # Ensure add() path also doesn't raise when last_cache_key is None.
+        fc = FakeCursor([(100,), (100,), None])
+        with mock.patch.object(connections['default'], 'cursor', side_effect=lambda: fc):
+            # add() returns True/False; ensure it doesn't raise (original bug raised).
+            # It may return True or False depending on branch; just calling it verifies no crash.
+            result = cull_cache.add('somekey-add-none', 'value', timeout=1000)
+            self.assertIn(result, (True, False))
+
+    def test_cull_does_not_crash_when_last_cache_key_fetchone_is_none_on_touch(self):
+        cull_cache = caches['cull']
+        # touch() uses _base_set with mode 'touch', ensure no crash when last_cache_key is None.
+        fc = FakeCursor([(100,), (100,), None])
+        with mock.patch.object(connections['default'], 'cursor', side_effect=lambda: fc):
+            # For nonexistent key, touch() returns False. The important part is no exception.
+            self.assertFalse(cull_cache.touch('nonexistent-touch', timeout=10))
+
+    def test_no_delete_attempted_when_last_cache_key_is_none(self):
+        cull_cache = caches['cull']
+        # Make fetchone return None for last_cache_key; verify no DELETE ... WHERE cache_key < ...
+        fc = FakeCursor([(100,), (100,), None])
+        with mock.patch.object(connections['default'], 'cursor', side_effect=lambda: fc):
+            cull_cache.set('somekey-no-delete', 'value', timeout=1000)
+        # Ensure none of the executed SQL commands attempted to delete by cache_key < ...
+        self.assertFalse(any('cache_key <' in sql for sql, params in fc.executed if sql))
+
+    def test_delete_attempted_when_last_cache_key_present(self):
+        cull_cache = caches['cull']
+        # If the culling SQL returns a last_cache_key, ensure a DELETE with that param is attempted.
+        fc = FakeCursor([(100,), (100,), ('last-key-to-delete',)])
+        with mock.patch.object(connections['default'], 'cursor', side_effect=lambda: fc):
+            cull_cache.set('somekey-delete', 'value', timeout=1000)
+        # Check that a DELETE ... WHERE cache_key < ... was executed and params contained the last key.
+        deletes = [(sql, params) for sql, params in fc.executed if 'cache_key <' in (sql or '')]
+        self.assertTrue(deletes, "Expected a cull DELETE when last_cache_key is present")
+        # The params should include the last-key value as the first param.
+        self.assertIn(['last-key-to-delete'], [params for sql, params in deletes])
+
+    def test_zero_cull_frequency_does_not_crash(self):
+        zero_cache = caches['zero_cull']
+        # zero cull frequency triggers clear() in _cull path; do a simple set with a cursor stub.
+        fc = FakeCursor([])  # No fetchone usage expected for _cull_frequency == 0 path in our scenario.
+        with mock.patch.object(connections['default'], 'cursor', side_effect=lambda: fc):
+            # set() must not raise.
+            self.assertIsNone(zero_cache.set('zc-key', 'v', timeout=1000))
+
+    def test_direct_cull_call_handles_none_last_cache_key(self):
+        cull_cache = caches['cull']
+        # Call _cull directly with a fake cursor whose final fetchone returns None.
+        fc = FakeCursor([None])  # Only the final fetchone in _cull will be used in this direct call.
+        # Call _cull; should not raise even if last_cache_key is None.
+        cull_cache._cull('default', fc, timezone.now())
+        # No DELETE attempted since last_cache_key was None.
+        self.assertFalse(any('cache_key <' in sql for sql, params in fc.executed if sql))
+
+    def test_byte_last_cache_key_is_accepted_and_used_in_delete(self):
+        cull_cache = caches['cull']
+        # Some DBs might return bytes; ensure that a bytes last_cache_key is handled without error.
+        fc = FakeCursor([(100,), (100,), (b'bytes-key',)])
+        with mock.patch.object(connections['default'], 'cursor', side_effect=lambda: fc):
+            cull_cache.set('somekey-bytes', 'value', timeout=1000)
+        deletes = [(sql, params) for sql, params in fc.executed if 'cache_key <' in (sql or '')]
+        self.assertTrue(deletes)
+        # The param should contain the bytes key value.
+        self.assertIn([b'bytes-key'], [params for sql, params in deletes])
+
+    def test_cull_with_multiple_consecutive_calls_does_not_error(self):
+        cull_cache = caches['cull']
+        # Run set() twice; each call uses a new cursor instance via side_effect.
+        def cursor_factory():
+            # For each set invocation, simulate the sequence: count, cull count, last_cache_key None.
+            return FakeCursor([(100,), (100,), None])
+        with mock.patch.object(connections['default'], 'cursor', side_effect=cursor_factory):
+            # Both calls must complete without raising.
+            self.assertIsNone(cull_cache.set('multi1', 'v1', timeout=1000))
+            self.assertIsNone(cull_cache.set('multi2', 'v2', timeout=1000))
+
+    def test_cull_does_not_crash_on_add_even_if_culling_select_returns_none(self):
+        cull_cache = caches['cull']
+        # Ensure add path also handles the None last_cache_key during culling gracefully.
+        fc = FakeCursor([(100,), (100,), None])
+        with mock.patch.object(connections['default'], 'cursor', side_effect=lambda: fc):
+            # No exception should be raised by add().
+            self.assertIn(cull_cache.add('somekey-add-none-2', 'value', timeout=1000), (True, False))

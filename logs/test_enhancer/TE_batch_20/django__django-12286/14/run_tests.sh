@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 check_framework.test_translation_llm.TranslationTransRealMissingTests._restore_trans_real_get_supported check_framework.test_translation_llm.TranslationTransRealMissingTests._unset_trans_real_get_supported check_framework.test_translation_llm.TranslationTransRealMissingTests.test_consistent_exact_language_with_trans_real_missing check_framework.test_translation_llm.TranslationTransRealMissingTests.test_consistent_language_variant_with_trans_real_missing check_framework.test_translation_llm.TranslationTransRealMissingTests.test_consistent_region_tag_with_trans_real_missing check_framework.test_translation_llm.TranslationTransRealMissingTests.test_consistent_script_tag_with_trans_real_missing check_framework.test_translation_llm.TranslationTransRealMissingTests.test_consistent_when_languages_contains_base_language_trans_real_missing check_framework.test_translation_llm.TranslationTransRealMissingTests.test_consistent_when_languages_contains_normalized_code_trans_real_missing check_framework.test_translation_llm.TranslationTransRealMissingTests.test_inconsistent_language_raises_check_error_with_trans_real_missing check_framework.test_translation_llm.TranslationTransRealMissingTests.test_inconsistent_unknown_language_with_trans_real_missing check_framework.test_translation_llm.TranslationTransRealMissingTests.test_inconsistent_when_only_en_in_languages_trans_real_missing check_framework.test_translation_llm.TranslationTransRealMissingTests.test_inconsistent_with_region_code_and_trans_real_missing
+coverage json -o coverage.json
+: '>>>>> End Test Output'

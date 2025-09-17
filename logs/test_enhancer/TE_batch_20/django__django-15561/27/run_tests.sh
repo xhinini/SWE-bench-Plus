@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 schema.tests_llm.FieldNonDbAttrsRegressionTests.test_alter_field_choices_noop_performs_no_queries schema.tests_llm.FieldNonDbAttrsRegressionTests.test_editor_handles_both_old_and_new_non_db_attrs_iter schema.tests_llm.FieldNonDbAttrsRegressionTests.test_field_class_has_non_db_attrs schema.tests_llm.FieldNonDbAttrsRegressionTests.test_field_should_be_altered_returns_false_for_choices_change schema.tests_llm.FieldNonDbAttrsRegressionTests.test_field_should_be_altered_returns_false_for_choices_list_iterable schema.tests_llm.FieldNonDbAttrsRegressionTests.test_field_should_be_altered_returns_false_for_error_messages_change schema.tests_llm.FieldNonDbAttrsRegressionTests.test_field_should_be_altered_returns_false_for_validators_change schema.tests_llm.FieldNonDbAttrsRegressionTests.test_instance_inherits_non_db_attrs schema.tests_llm.FieldNonDbAttrsRegressionTests.test_non_db_attrs_contains_expected_names schema.tests_llm.FieldNonDbAttrsRegressionTests.test_non_db_attrs_elements_are_strings_and_unique
+coverage json -o coverage.json
+: '>>>>> End Test Output'

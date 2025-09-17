@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 schema.tests_llm.SchemaTestsPrimaryKeyAdditionsMixin.test_add_field_primary_key_after_adding_other_field schema.tests_llm.SchemaTestsPrimaryKeyAdditionsMixin.test_add_field_primary_key_autofield schema.tests_llm.SchemaTestsPrimaryKeyAdditionsMixin.test_add_field_primary_key_bigautofield schema.tests_llm.SchemaTestsPrimaryKeyAdditionsMixin.test_add_field_primary_key_charfield schema.tests_llm.SchemaTestsPrimaryKeyAdditionsMixin.test_add_field_primary_key_charfield_and_unique schema.tests_llm.SchemaTestsPrimaryKeyAdditionsMixin.test_add_field_primary_key_integerfield schema.tests_llm.SchemaTestsPrimaryKeyAdditionsMixin.test_add_field_primary_key_replaces_auto_created_pk schema.tests_llm.SchemaTestsPrimaryKeyAdditionsMixin.test_add_field_primary_key_then_create_rows schema.tests_llm.SchemaTestsPrimaryKeyAdditionsMixin.test_add_field_primary_key_without_explicit_model_set
+coverage json -o coverage.json
+: '>>>>> End Test Output'

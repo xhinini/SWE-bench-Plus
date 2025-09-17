@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 schema.tests_llm.RegressionAddFieldTests.test_add_field_does_not_access_one_to_one_on_binaryfield schema.tests_llm.RegressionAddFieldTests.test_add_field_primary_key_after_removing_id_sets_primary_key schema.tests_llm.RegressionAddFieldTests.test_add_field_primary_key_does_not_raise_attribute_error schema.tests_llm.RegressionAddFieldTests.test_add_field_with_default_applies_default_without_error schema.tests_llm.RegressionAddFieldTests.test_add_field_with_default_triggers_remake schema.tests_llm.RegressionAddFieldTests.test_add_nullable_binaryfield_does_not_rebuild_or_raise schema.tests_llm.RegressionAddFieldTests.test_add_nullable_integer_field_does_not_rebuild_or_raise schema.tests_llm.RegressionAddFieldTests.test_add_one_to_one_field_nullable schema.tests_llm.RegressionAddFieldTests.test_add_unique_field_introspects_as_unique schema.tests_llm.RegressionAddFieldTests.test_add_unique_field_remakes_table_and_enforces_uniqueness
+coverage json -o coverage.json
+: '>>>>> End Test Output'

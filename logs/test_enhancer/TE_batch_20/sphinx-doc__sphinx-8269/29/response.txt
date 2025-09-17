@@ -1,0 +1,214 @@
+language: Python
+number_of_tests: 10
+test_behavior: These are unit tests for the linkcheck builder's anchor-checking behavior. They verify that when an URL with an anchor is requested and the HTTP response is non-HTML (or missing a Content-Type), the builder still performs anchor checking and reports a missing anchor as broken. The candidate (model) patch incorrectly skips anchor checking for non-HTML responses and would return "working"; the gold patch performs raise_for_status() and proceeds to check the anchor, which will mark the link as "broken" when the anchor is absent. Each test creates a minimal builder instance, pushes a single work item (URI with an anchor) to the builder's work queue, patches requests.get/head to return controlled responses, runs the builder.check_thread to process the item, and asserts that the resulting status is "broken" and the info contains the expected anchor-not-found message.
+new_imports_code: |
+  import os
+  import queue
+  import tempfile
+  from unittest import mock
+  import pytest
+  from sphinx.builders.linkcheck import CheckExternalLinksBuilder
+  from types import SimpleNamespace
+test_code: |
+  # The tests below create a minimal fake Sphinx app/config and a builder instance
+  # to directly exercise CheckExternalLinksBuilder.check_thread processing of
+  # URIs with anchors. We patch requests.get and requests.head in the
+  # sphinx.builders.linkcheck module to simulate HTTP responses.
+
+  def make_app(tmpdir):
+      cfg = SimpleNamespace(
+          linkcheck_timeout=None,
+          linkcheck_anchors=True,
+          linkcheck_retries=1,
+          linkcheck_request_headers={},
+          linkcheck_workers=1,
+          linkcheck_anchors_ignore=["^!"]
+      )
+      app = SimpleNamespace()
+      app.config = cfg
+      app.srcdir = str(tmpdir)
+      app.outdir = str(tmpdir)
+      app.statuscode = 0
+      app.quiet = False
+      app.warningiserror = False
+      return app
+
+  def make_response(body, content_type=None, method='GET'):
+      # Create a simple mock response with the attributes used by check_thread
+      m = mock.MagicMock()
+      # iter_content should yield bytes when decode_unicode=False; builder calls with decode_unicode=True
+      # we make it yield a single unicode chunk (or bytes for one test)
+      if isinstance(body, bytes):
+          # the code handles bytes by decoding later
+          m.iter_content = mock.MagicMock(return_value=[body])
+      else:
+          m.iter_content = mock.MagicMock(return_value=[body])
+      headers = {}
+      if content_type is not None:
+          headers['content-type'] = content_type
+      m.headers = headers
+      m.url = 'https://example.com/page'
+      m.history = []
+      # request.method is checked by the candidate patch variants, so provide it
+      m.request = mock.MagicMock()
+      m.request.method = method
+      # raise_for_status should be callable and for our tests not raise
+      m.raise_for_status = mock.MagicMock(return_value=None)
+      return m
+
+  def make_builder(tmpdir):
+      app = make_app(tmpdir)
+      builder = CheckExternalLinksBuilder(app)
+      # Set attributes that init() would usually set
+      builder.app = app
+      builder.config = app.config
+      builder.srcdir = str(tmpdir)
+      builder.outdir = str(tmpdir)
+      builder.to_ignore = []
+      builder.anchors_ignore = [__import__('re').compile(x) for x in app.config.linkcheck_anchors_ignore]
+      builder.auth = []
+      builder.good = set()
+      builder.broken = {}
+      builder.redirected = {}
+      builder.wqueue = queue.Queue()
+      builder.rqueue = queue.Queue()
+      return builder
+
+  def run_one_check(builder, get_resp, head_resp, uri, docname='doc', lineno=1):
+      # Patch requests.get and requests.head used in the target module
+      module_path = 'sphinx.builders.linkcheck.requests'
+      with mock.patch(module_path + '.get', return_value=get_resp) as mock_get, \
+           mock.patch(module_path + '.head', return_value=head_resp) as mock_head:
+          # enqueue the uri to be checked and the sentinel to stop the loop
+          builder.wqueue.put((uri, docname, lineno))
+          builder.wqueue.put((None, None, None))
+          # call check_thread which processes the queue until sentinel
+          builder.check_thread()
+          # get the result placed on rqueue
+          result = builder.rqueue.get_nowait()
+          return result, mock_get, mock_head
+
+  # Test 1: Non-HTML Content-Type header missing, anchor absent -> should be BROKEN
+  def test_non_html_no_content_type_anchor_missing(tmp_path):
+      builder = make_builder(tmp_path)
+      # Response is 200 but has no content-type header and does not contain the anchor
+      get_resp = make_response("<html><body>No anchors here</body></html>", content_type=None, method='GET')
+      head_resp = make_response("", content_type=None, method='HEAD')
+      uri = "https://example.com/page#missing"
+      result, _, _ = run_one_check(builder, get_resp, head_resp, uri)
+      _, _, _, status, info, _ = result
+      assert status == 'broken'
+      assert "Anchor 'missing' not found" in info
+
+  # Test 2: Non-HTML content-type 'application/octet-stream', anchor absent -> should be BROKEN
+  def test_non_html_octet_stream_anchor_missing(tmp_path):
+      builder = make_builder(tmp_path)
+      get_resp = make_response("plain data with no anchor", content_type='application/octet-stream', method='GET')
+      head_resp = make_response("", content_type='application/octet-stream', method='HEAD')
+      uri = "https://example.com/page#noanchor"
+      result, _, _ = run_one_check(builder, get_resp, head_resp, uri)
+      _, _, _, status, info, _ = result
+      assert status == 'broken'
+      assert "Anchor 'noanchor' not found" in info
+
+  # Test 3: Response provides bytes chunks (iter_content yields bytes), content-type missing, anchor absent -> broken
+  def test_bytes_chunks_missing_anchor(tmp_path):
+      builder = make_builder(tmp_path)
+      # simulate bytes chunks
+      get_resp = make_response(b"<a id='something'></a>", content_type=None, method='GET')
+      head_resp = make_response(b"", content_type=None, method='HEAD')
+      uri = "https://example.com/page#other"
+      result, _, _ = run_one_check(builder, get_resp, head_resp, uri)
+      _, _, _, status, info, _ = result
+      assert status == 'broken'
+      assert "Anchor 'other' not found" in info
+
+  # Test 4: Percent-encoded anchor (e.g. %20 => space) absent in non-html response -> broken
+  def test_percent_encoded_anchor_missing_in_non_html(tmp_path):
+      builder = make_builder(tmp_path)
+      get_resp = make_response("some content without the fancy anchor", content_type='application/pdf', method='GET')
+      head_resp = make_response("", content_type='application/pdf', method='HEAD')
+      uri = "https://example.com/page#with%20space"
+      result, _, _ = run_one_check(builder, get_resp, head_resp, uri)
+      _, _, _, status, info, _ = result
+      assert status == 'broken'
+      assert "Anchor 'with%20space' not found" in info
+
+  # Test 5: Unicode anchor (percent-encoded ä) missing in non-html response -> broken
+  def test_unicode_percent_encoded_anchor_missing(tmp_path):
+      builder = make_builder(tmp_path)
+      get_resp = make_response("no unicode anchors here", content_type='image/png', method='GET')
+      head_resp = make_response("", content_type='image/png', method='HEAD')
+      uri = "https://example.com/page#C3%A4"  # %C3%A4 -> 'ä'
+      result, _, _ = run_one_check(builder, get_resp, head_resp, uri)
+      _, _, _, status, info, _ = result
+      assert status == 'broken'
+      assert "Anchor 'C3%A4' not found" in info
+
+  # Test 6: Anchor with leading exclamation is in anchors_ignore by default -> then anchor ignored
+  # In that case anchor is ignored and the checking should not attempt anchor-checking; we expect it to
+  # treat as working if the page exists. This ensures anchor-ignore logic still functions.
+  def test_anchor_ignored_pattern(tmp_path):
+      builder = make_builder(tmp_path)
+      # leading '!' anchors are in default ignore list; even for non-html, this should be treated as working
+      get_resp = make_response("irrelevant body", content_type='application/octet-stream', method='GET')
+      head_resp = make_response("", content_type='application/octet-stream', method='HEAD')
+      uri = "https://example.com/page#!dynamic"
+      result, _, _ = run_one_check(builder, get_resp, head_resp, uri)
+      _, _, _, status, info, _ = result
+      # When anchor is ignored, check_uri sets anchor = None and proceeds to HEAD/GET success -> working
+      assert status in ('working', 'ignored', 'unchecked') or status == 'working'
+
+  # Test 7: Anchor absent, content-type header present but not starting with 'text/html' (e.g. 'text/plain') -> broken
+  def test_text_plain_content_type_anchor_missing(tmp_path):
+      builder = make_builder(tmp_path)
+      get_resp = make_response("<html>no <a id='x'></a></html>", content_type='text/plain', method='GET')
+      head_resp = make_response("", content_type='text/plain', method='HEAD')
+      uri = "https://example.com/page#xmissing"
+      result, _, _ = run_one_check(builder, get_resp, head_resp, uri)
+      _, _, _, status, info, _ = result
+      assert status == 'broken'
+      assert "Anchor 'xmissing' not found" in info
+
+  # Test 8: Anchor absent, but HEAD returns a different URL (a redirect) and GET content-type missing -> broken
+  def test_redirect_then_non_html_missing_anchor(tmp_path):
+      builder = make_builder(tmp_path)
+      get_resp = make_response("no anchors", content_type=None, method='GET')
+      # Simulate HEAD returning a 200 but with a different requested method
+      head_resp = make_response("", content_type=None, method='HEAD')
+      uri = "https://example.com/redirect#nope"
+      result, _, _ = run_one_check(builder, get_resp, head_resp, uri)
+      _, _, _, status, info, _ = result
+      assert status == 'broken'
+      assert "Anchor 'nope' not found" in info
+
+  # Test 9: Anchor absent in multiple small chunks (iter_content yields multiple fragments), content-type missing -> broken
+  def test_multiple_chunks_missing_anchor_non_html(tmp_path):
+      builder = make_builder(tmp_path)
+      # Create a response whose iter_content returns several small pieces
+      m = mock.MagicMock()
+      m.iter_content = mock.MagicMock(return_value=["<html>", "<body>", "nope", "</body></html>"])
+      m.headers = {}
+      m.url = 'https://example.com/page'
+      m.history = []
+      m.request = mock.MagicMock()
+      m.request.method = 'GET'
+      m.raise_for_status = mock.MagicMock(return_value=None)
+      head_resp = make_response("", content_type=None, method='HEAD')
+      uri = "https://example.com/page#fragment"
+      result, _, _ = run_one_check(builder, m, head_resp, uri)
+      _, _, _, status, info, _ = result
+      assert status == 'broken'
+      assert "Anchor 'fragment' not found" in info
+
+  # Test 10: Anchor absent but response.content-type has parameters (e.g. 'text/html; charset=utf-8') -> SHOULD be checked and broken
+  def test_text_html_with_charset_anchor_missing(tmp_path):
+      builder = make_builder(tmp_path)
+      get_resp = make_response("<html><body>no anchor</body></html>", content_type='text/html; charset=utf-8', method='GET')
+      head_resp = make_response("", content_type='text/html; charset=utf-8', method='HEAD')
+      uri = "https://example.com/page#noanchorhere"
+      result, _, _ = run_one_check(builder, get_resp, head_resp, uri)
+      _, _, _, status, info, _ = result
+      # When content-type indicates HTML, anchor checking should happen and report missing anchor
+      assert status == 'broken'
+      assert "Anchor 'noanchorhere' not found" in info

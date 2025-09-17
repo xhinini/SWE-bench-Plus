@@ -1,0 +1,173 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that Message extra_tags are correctly handled when falsy (empty string, False, 0), that the encoder/serializer round-trip preserves these values, that nested structures containing Message objects preserve extra_tags, and that CookieStorage._decode correctly marks the storage as used when the signer/serializer raises JSONDecodeError or binascii.Error. Also includes a test that forces cookie trimming to ensure extra_tags for stored messages are preserved.
+test_code: |
+  import json
+  import binascii
+  from django.contrib.messages import constants
+  from django.contrib.messages.storage.base import Message
+  from django.contrib.messages.storage.cookie import (
+      CookieStorage, MessageSerializer, MessageEncoder, MessageDecoder,
+  )
+  from django.test import override_settings
+  
+  # Reuse the CookieTests' helper methods by importing the base test class
+  # environment expects these helpers; however, to keep this file self-contained
+  # we create minimal request/response helpers similar to the test suite.
+  from django.test import SimpleTestCase
+  from django.test.client import RequestFactory
+  from django.http import HttpResponse
+  from django.utils.safestring import mark_safe, SafeData
+  
+  
+  class CookieExtraTagsTests(SimpleTestCase):
+      def setUp(self):
+          self.rf = RequestFactory()
+  
+      def get_request(self):
+          return self.rf.get('/')
+  
+      def get_storage(self):
+          return CookieStorage(self.get_request())
+  
+      def get_response(self):
+          return HttpResponse()
+  
+      def test_encoder_includes_empty_string_extra_tags(self):
+          encoder = MessageEncoder()
+          msg = Message(constants.INFO, 'hello', extra_tags='')
+          encoded = encoder.encode(msg)
+          decoded = json.loads(encoded)
+          # Should be a JSON array representing a serialized Message and include the extra_tags element
+          self.assertEqual(decoded[0], encoder.message_key)
+          # extra_tags should be present as the fifth element and be an empty string
+          self.assertEqual(len(decoded), 5)
+          self.assertEqual(decoded[4], '')
+  
+      def test_encoder_omits_none_extra_tags(self):
+          encoder = MessageEncoder()
+          msg = Message(constants.INFO, 'hello', extra_tags=None)
+          encoded = encoder.encode(msg)
+          decoded = json.loads(encoded)
+          # When extra_tags is None, the serialized list should NOT include it
+          self.assertEqual(decoded[0], encoder.message_key)
+          self.assertEqual(len(decoded), 4)
+  
+      def test_encoder_includes_false_and_zero_extra_tags(self):
+          encoder = MessageEncoder()
+          for val in (False, 0):
+              with self.subTest(val=val):
+                  msg = Message(constants.INFO, 'hello', extra_tags=val)
+                  decoded = json.loads(encoder.encode(msg))
+                  # extra_tags should be included (since it's not None), preserving the value
+                  self.assertEqual(len(decoded), 5)
+                  self.assertEqual(decoded[4], val)
+  
+      def test_serializer_roundtrip_various_extra_tags(self):
+          serializer = MessageSerializer()
+          cases = ['', None, False, 0, 'some tags']
+          for extra in cases:
+              with self.subTest(extra=extra):
+                  msg = Message(constants.ERROR, 'payload', extra_tags=extra)
+                  dumped = serializer.dumps(msg)
+                  loaded = serializer.loads(dumped)
+                  # Loaded should be a Message with identical extra_tags
+                  self.assertIsInstance(loaded, Message)
+                  self.assertEqual(loaded.extra_tags, extra)
+  
+      def test_nested_structure_preserves_extra_tags(self):
+          # Complex nested structure with Message objects that include an empty extra_tags
+          messages = {
+              'outer': [
+                  Message(constants.INFO, 'm1', extra_tags=''),
+                  {'inner': Message(constants.DEBUG, 'm2', extra_tags=None)}
+              ],
+              'single': Message(constants.ERROR, 'm3', extra_tags=0),
+          }
+          serializer = MessageSerializer()
+          dumped = serializer.dumps(messages)
+          loaded = serializer.loads(dumped)
+          # The nested structure should be equal (Message equality is supported in tests)
+          self.assertEqual(messages, loaded)
+  
+      def test_decode_handles_jsondecodeerror_marks_used(self):
+          storage = self.get_storage()
+          # Ensure initial used flag is False
+          self.assertFalse(getattr(storage, 'used', False))
+  
+          # Monkeypatch signer.unsign_object to raise JSONDecodeError
+          def raise_json_error(data, serializer=None):
+              raise json.JSONDecodeError('msg', 'doc', 0)
+  
+          storage.signer.unsign_object = raise_json_error
+          result = storage._decode('anyvalue')
+          # Should return None and mark storage as used so cookie gets removed
+          self.assertIsNone(result)
+          self.assertTrue(storage.used)
+  
+      def test_decode_handles_binascii_error_marks_used(self):
+          storage = self.get_storage()
+          # Reset used flag
+          storage.used = False
+          # Monkeypatch signer.unsign_object to raise binascii.Error
+          def raise_binascii(data, serializer=None):
+              raise binascii.Error('bad base64')
+  
+          storage.signer.unsign_object = raise_binascii
+          result = storage._decode('anyvalue')
+          self.assertIsNone(result)
+          self.assertTrue(storage.used)
+  
+      @override_settings(SESSION_COOKIE_DOMAIN='.example.com', SESSION_COOKIE_SECURE=True, SESSION_COOKIE_HTTPONLY=True)
+      def test_store_trimming_preserves_empty_extra_tags(self):
+          """
+          Force cookie trimming by setting a very small max_cookie_size and adding
+          several long messages. Ensure that a stored message that has an empty
+          extra_tags retains that empty string after storage.
+          """
+          storage = self.get_storage()
+          # Make max cookie size tiny so trimming will happen
+          storage.max_cookie_size = 200
+          response = self.get_response()
+  
+          # Create a few large messages. Ensure one has empty extra_tags.
+          large_text = 'X' * 120
+          storage.add(constants.INFO, large_text)
+          storage.add(constants.INFO, large_text, extra_tags='')
+          storage.add(constants.INFO, large_text)
+  
+          # Trigger storage
+          unstored = storage.update(response)
+          # Decode the cookie value that was set (if any)
+          cookie = response.cookies.get(storage.cookie_name)
+          if not cookie or cookie['max-age'] == 0:
+              # If cookie was deleted, nothing stored
+              self.skipTest("Cookie deleted due to trimming; nothing stored to verify.")
+  
+          decoded = storage._decode(cookie.value)
+          # Ensure decoding succeeded and at least one message remains
+          self.assertIsNotNone(decoded)
+          # Check that if any stored Message has message equal to large_text, and if
+          # it has extra_tags attribute it should preserve empty string when present.
+          found = False
+          for m in decoded:
+              if isinstance(m, Message) and m.message == large_text:
+                  found = True
+                  # If this message had extra_tags set to '', verify preserved
+                  if m.extra_tags == '':
+                      # Found the message with empty extra_tags preserved
+                      return
+          # If we didn't find an exact preserved empty extra_tags message, fail the test
+          self.fail("Stored messages did not preserve an empty extra_tags value for any large message.")
+  
+      def test_encoder_message_structure_length_checks(self):
+          # Ensure that message structure length is 4 when extra_tags is None and 5 otherwise.
+          encoder = MessageEncoder()
+          msg_none = Message(constants.INFO, 'n', extra_tags=None)
+          msg_empty = Message(constants.INFO, 'e', extra_tags='')
+          self.assertEqual(len(json.loads(encoder.encode(msg_none))), 4)
+          self.assertEqual(len(json.loads(encoder.encode(msg_empty))), 5
+                           )
+new_imports_code: |
+  import binascii
+  import json

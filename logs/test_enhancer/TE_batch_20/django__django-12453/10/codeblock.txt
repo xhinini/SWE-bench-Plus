@@ -1,0 +1,193 @@
+# No new imports required; tests reuse imports from the existing test module.
+from unittest import mock
+
+from django.test import SimpleTestCase
+from django.db import connection
+from django.core import serializers
+
+# Helper function to create a simple dummy context manager that records enter/exit.
+class DummyCM:
+    def __init__(self, record, name):
+        self.record = record
+        self.name = name
+
+    def __enter__(self):
+        self.record.append((self.name, 'enter'))
+        return None
+
+    def __exit__(self, exc_type, exc, tb):
+        self.record.append((self.name, 'exit'))
+        # Do not suppress exceptions
+        return False
+
+class TestDeserializeDbRegressions(SimpleTestCase):
+    def setUp(self):
+        # Minimal data for deserialize calls
+        self.empty_data = '[]'
+        self.simple_data = """
+        [
+            {"model": "backends.object", "pk": 1, "fields": {"obj_ref": null, "related_objects": []}}
+        ]
+        """
+        self.circular_data = """
+        [
+            {
+                "model": "backends.object",
+                "pk": 1,
+                "fields": {"obj_ref": 1, "related_objects": []}
+            },
+            {
+                "model": "backends.objectreference",
+                "pk": 1,
+                "fields": {"obj": 1}
+            }
+        ]
+        """
+
+    def test_atomic_called_from_creation_module(self):
+        # Ensure the atomic imported into the creation module is used.
+        calls = []
+        def fake_atomic(*args, **kwargs):
+            calls.append(('called', args, kwargs))
+            return DummyCM(calls, 'atomic')
+
+        with mock.patch('django.db.backends.base.creation.atomic', new=fake_atomic):
+            connection.creation.deserialize_db_from_string(self.empty_data)
+        # atomic must have been called with using=connection.alias
+        self.assertTrue(any(call[0] == 'called' and call[2].get('using') == connection.alias for call in calls))
+
+    def test_constraint_checks_disabled_called_on_empty_data(self):
+        record = []
+        # Patch the connection constraint_checks_disabled and check_constraints
+        with mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM(record, 'constraint')) as mock_ccd, \
+             mock.patch.object(connection, 'check_constraints', autospec=True) as mock_check:
+            connection.creation.deserialize_db_from_string(self.empty_data)
+            mock_ccd.assert_called()
+            mock_check.assert_called_once()
+
+    def test_constraint_checks_disabled_called_on_non_empty_data(self):
+        record = []
+        with mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM(record, 'constraint')) as mock_ccd, \
+             mock.patch.object(connection, 'check_constraints', autospec=True) as mock_check:
+            connection.creation.deserialize_db_from_string(self.simple_data)
+            mock_ccd.assert_called()
+            mock_check.assert_called_once()
+
+    def test_check_constraints_called_after_saving_objects_in_order(self):
+        order = []
+
+        # Create fake objects whose save() appends to the order list
+        class FakeObj:
+            def save(self, *a, **k):
+                order.append('saved')
+
+        fake_objs = [FakeObj()]
+
+        def fake_deserialize(format, stream, using=None):
+            # simulate the deserialize function returning our fake objects iterator
+            order.append(('deserialized_using', using))
+            return iter(fake_objs)
+
+        # Patch serializers.deserialize and connection.constraint_checks_disabled and check_constraints
+        with mock.patch('django.core.serializers.deserialize', new=fake_deserialize), \
+             mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM(order, 'constraint')) as mock_ccd, \
+             mock.patch.object(connection, 'check_constraints', autospec=True) as mock_check:
+            connection.creation.deserialize_db_from_string(self.simple_data)
+
+        # Expected order: enter constraint, deserialized_using recorded (call), saved, exit constraint, check_constraints called
+        # The DummyCM appends enter/exit, and our fake_deserialize appends deserialized_using
+        self.assertIn(('constraint', 'enter'), order)
+        self.assertIn('saved', order)
+        self.assertIn(('constraint', 'exit'), order)
+        mock_check.assert_called_once()
+
+        # Ensure deserialize received the correct using argument
+        self.assertIn(('deserialized_using', connection.alias), order)
+
+    def test_constraint_context_manager_enter_and_exit_even_with_multiple_objects(self):
+        order = []
+        class FakeObj:
+            def __init__(self, idx):
+                self.idx = idx
+            def save(self, *a, **k):
+                order.append(f'saved-{self.idx}')
+
+        fake_objs = [FakeObj(1), FakeObj(2)]
+
+        def fake_deserialize(format, stream, using=None):
+            order.append(('deserialized_using', using))
+            return iter(fake_objs)
+
+        with mock.patch('django.core.serializers.deserialize', new=fake_deserialize), \
+             mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM(order, 'constraint')) as mock_ccd, \
+             mock.patch.object(connection, 'check_constraints', autospec=True) as mock_check:
+            connection.creation.deserialize_db_from_string(self.simple_data)
+
+        self.assertEqual(order[0], ('constraint', 'enter'))
+        # both saves recorded before constraint exit
+        self.assertIn('saved-1', order)
+        self.assertIn('saved-2', order)
+        # constraint exit recorded before check_constraints call
+        self.assertIn(('constraint', 'exit'), order)
+        mock_check.assert_called_once()
+
+    def test_deserialize_passes_using_argument_to_serializers(self):
+        # Verify that the 'using' argument is passed through to serializers.deserialize
+        received = {}
+        def fake_deserialize(format, stream, using=None):
+            received['using'] = using
+            return iter([])
+
+        with mock.patch('django.core.serializers.deserialize', new=fake_deserialize), \
+             mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM([], 'constraint')), \
+             mock.patch.object(connection, 'check_constraints', autospec=True):
+            connection.creation.deserialize_db_from_string(self.simple_data)
+
+        self.assertEqual(received.get('using'), connection.alias)
+
+    def test_constraint_checks_disabled_called_for_circular_reference_data(self):
+        # Ensure the circular data path uses the constraint disabling and check_constraints
+        with mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM([], 'constraint')) as mock_ccd, \
+             mock.patch.object(connection, 'check_constraints', autospec=True) as mock_check:
+            connection.creation.deserialize_db_from_string(self.circular_data)
+            mock_ccd.assert_called()
+            mock_check.assert_called_once()
+
+    def test_atomic_and_constraint_combination_for_simple_object(self):
+        # Patch atomic at module level to ensure the module-level atomic is used,
+        # and also patch constraint manager to ensure it is entered.
+        calls = []
+        def fake_atomic(*args, **kwargs):
+            calls.append(('atomic_called', args, kwargs))
+            return DummyCM(calls, 'atomic')
+
+        with mock.patch('django.db.backends.base.creation.atomic', new=fake_atomic), \
+             mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM(calls, 'constraint')), \
+             mock.patch.object(connection, 'check_constraints', autospec=True):
+            connection.creation.deserialize_db_from_string(self.simple_data)
+
+        # atomic was called
+        self.assertTrue(any(c[0] == 'atomic_called' for c in calls))
+        # constraint enter occurred
+        self.assertIn(('constraint', 'enter'), calls)
+
+    def test_constraint_context_exit_on_exception_during_save(self):
+        # If a save raises an exception, the constraint context manager must still be exited.
+        record = []
+
+        class ExplodingObj:
+            def save(self, *a, **k):
+                raise RuntimeError("boom")
+
+        def fake_deserialize(format, stream, using=None):
+            return iter([ExplodingObj()])
+
+        with mock.patch('django.core.serializers.deserialize', new=fake_deserialize), \
+             mock.patch.object(connection, 'constraint_checks_disabled', return_value=DummyCM(record, 'constraint')), \
+             mock.patch.object(connection, 'check_constraints', autospec=True):
+            with self.assertRaises(RuntimeError):
+                connection.creation.deserialize_db_from_string(self.simple_data)
+
+        # Ensure the constraint context was entered and exited even though save() raised
+        self.assertIn(('constraint', 'enter'), record)
+        self.assertIn(('constraint', 'exit'), record)

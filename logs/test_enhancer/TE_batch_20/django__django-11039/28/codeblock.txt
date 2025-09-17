@@ -1,0 +1,172 @@
+# No additional top-level imports required beyond what is included in the test file.
+from unittest import mock
+import io
+import types
+
+from django.test import TestCase, override_settings
+from django.core.management import call_command, CommandError
+from django.db import connections, DEFAULT_DB_ALIAS
+from django.db.migrations.loader import AmbiguityError
+
+from django.core.management.commands import sqlmigrate as sqlmigrate_module
+from django.core.management.commands.sqlmigrate import Command
+
+class SqlMigrateTransactionFunctionalTests(TestCase):
+    databases = {'default', 'other'}
+
+    @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+    def test_sqlmigrate_default_db_atomic_and_supports_ddl_shows_wrappers(self):
+        out = io.StringIO()
+        # Ensure the connection reports transactional DDL support.
+        with mock.patch.object(connections[DEFAULT_DB_ALIAS].features, 'can_rollback_ddl', True):
+            call_command("sqlmigrate", "migrations", "0001", stdout=out)
+        output = out.getvalue().lower()
+        start_sql = connections[DEFAULT_DB_ALIAS].ops.start_transaction_sql()
+        # Only assert start transaction presence if the backend reports a start SQL.
+        if start_sql:
+            self.assertIn(start_sql.lower(), output)
+        end_sql = connections[DEFAULT_DB_ALIAS].ops.end_transaction_sql()
+        self.assertIn(end_sql.lower(), output)
+
+    @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations"})
+    def test_sqlmigrate_default_db_atomic_but_no_ddl_hides_wrappers(self):
+        out = io.StringIO()
+        with mock.patch.object(connections[DEFAULT_DB_ALIAS].features, 'can_rollback_ddl', False):
+            call_command("sqlmigrate", "migrations", "0001", stdout=out)
+        output = out.getvalue().lower()
+        queries = [q.strip() for q in output.splitlines()]
+        start_sql = connections[DEFAULT_DB_ALIAS].ops.start_transaction_sql()
+        if start_sql:
+            self.assertNotIn(start_sql.lower(), queries)
+        self.assertNotIn(connections[DEFAULT_DB_ALIAS].ops.end_transaction_sql().lower(), queries)
+
+    @override_settings(MIGRATION_MODULES={"migrations": "migrations.test_migrations_non_atomic"})
+    def test_sqlmigrate_non_atomic_no_transaction_even_if_db_supports(self):
+        out = io.StringIO()
+        # Non-atomic migration; even if DB supports rollback DDL, no wrappers should be shown.
+        with mock.patch.object(connections[DEFAULT_DB_ALIAS].features, 'can_rollback_ddl', True):
+            call_command("sqlmigrate", "migrations", "0001", stdout=out)
+        output = out.getvalue().lower()
+        queries = [q.strip() for q in output.splitlines()]
+        start_sql = connections[DEFAULT_DB_ALIAS].ops.start_transaction_sql()
+        if start_sql:
+            self.assertNotIn(start_sql.lower(), queries)
+        self.assertNotIn(connections[DEFAULT_DB_ALIAS].ops.end_transaction_sql().lower(), queries)
+
+
+class SqlMigrateHandleUnitTests(TestCase):
+    """
+    Unit tests that patch MigrationExecutor to check that Command.handle sets
+    output_transaction correctly depending on migration.atomic and the
+    database connection's features.can_rollback_ddl flag.
+    """
+
+    def _make_fake_executor(self, migration_name='0001', atomic=True, sql_statements=None):
+        """
+        Returns a FakeExecutor class (callable) suitable for patching
+        django.core.management.commands.sqlmigrate.MigrationExecutor.
+        """
+        if sql_statements is None:
+            sql_statements = ['-- sample sql']
+
+        class FakeMigration:
+            def __init__(self, name, atomic):
+                self.name = name
+                self.atomic = atomic
+
+        class FakeLoader:
+            def __init__(self, migration):
+                # migrated_apps must include 'migrations' for the command validation
+                self.migrated_apps = {'migrations'}
+                self._migration = migration
+                # graph.nodes must contain key (app_label, migration.name)
+                self.graph = types.SimpleNamespace(nodes={( 'migrations', migration.name): object()})
+
+            def get_migration_by_prefix(self, app_label, migration_name):
+                # emulate exact match behavior
+                if migration_name in migration.name:
+                    return self._migration
+                raise KeyError("not found")
+
+        class FakeExecutor:
+            def __init__(self, connection):
+                self.connection = connection
+                self.loader = FakeLoader(FakeMigration(migration_name, atomic))
+
+            def collect_sql(self, plan):
+                return sql_statements
+
+        return FakeExecutor
+
+    def test_handle_sets_output_transaction_true_when_atomic_and_db_supports(self):
+        fake_conn = types.SimpleNamespace(features=types.SimpleNamespace(can_rollback_ddl=True))
+        fake_sql = ['begin;', '-- op', 'commit;']
+        FakeExecutor = self._make_fake_executor(migration_name='0001', atomic=True, sql_statements=fake_sql)
+        with mock.patch.object(sqlmigrate_module, 'connections', {'other': fake_conn}), \
+             mock.patch.object(sqlmigrate_module, 'MigrationExecutor', FakeExecutor):
+            cmd = Command()
+            result = cmd.handle(app_label='migrations', migration_name='0001', database='other', backwards=False)
+            # The handle function should set output_transaction to True in this case
+            self.assertTrue(cmd.output_transaction)
+            # And return the joined SQL statements
+            self.assertEqual(result, '\n'.join(fake_sql))
+
+    def test_handle_sets_output_transaction_false_when_atomic_but_db_not_support(self):
+        fake_conn = types.SimpleNamespace(features=types.SimpleNamespace(can_rollback_ddl=False))
+        FakeExecutor = self._make_fake_executor(migration_name='0001', atomic=True)
+        with mock.patch.object(sqlmigrate_module, 'connections', {'other': fake_conn}), \
+             mock.patch.object(sqlmigrate_module, 'MigrationExecutor', FakeExecutor):
+            cmd = Command()
+            result = cmd.handle(app_label='migrations', migration_name='0001', database='other', backwards=False)
+            self.assertFalse(cmd.output_transaction)
+            self.assertEqual(result, '-- sample sql')
+
+    def test_handle_sets_output_transaction_false_when_non_atomic_but_db_support(self):
+        fake_conn = types.SimpleNamespace(features=types.SimpleNamespace(can_rollback_ddl=True))
+        FakeExecutor = self._make_fake_executor(migration_name='0001', atomic=False)
+        with mock.patch.object(sqlmigrate_module, 'connections', {'other': fake_conn}), \
+             mock.patch.object(sqlmigrate_module, 'MigrationExecutor', FakeExecutor):
+            cmd = Command()
+            result = cmd.handle(app_label='migrations', migration_name='0001', database='other', backwards=False)
+            # Migration is non-atomic, so output_transaction must be False even if DB supports DDL transactions
+            self.assertFalse(cmd.output_transaction)
+            self.assertEqual(result, '-- sample sql')
+
+    def test_handle_uses_specified_database_connection(self):
+        # Ensure that the connection pulled from connections[...] is the one used by handle.
+        fake_conn_default = types.SimpleNamespace(features=types.SimpleNamespace(can_rollback_ddl=False))
+        fake_conn_other = types.SimpleNamespace(features=types.SimpleNamespace(can_rollback_ddl=True))
+        # Make executor return a distinct SQL so we can assert which connection path was used.
+        FakeExecutor = self._make_fake_executor(migration_name='0001', atomic=True, sql_statements=['from-other-db;'])
+        with mock.patch.object(sqlmigrate_module, 'connections', {'default': fake_conn_default, 'other': fake_conn_other}), \
+             mock.patch.object(sqlmigrate_module, 'MigrationExecutor', FakeExecutor):
+            cmd = Command()
+            res = cmd.handle(app_label='migrations', migration_name='0001', database='other', backwards=False)
+            # Because we specified database='other', the SQL returned should be from the executor invoked with the 'other' connection.
+            self.assertEqual(res, 'from-other-db;')
+
+    def test_handle_raises_command_error_for_ambiguous_migration(self):
+        # Emulate MigrationExecutor.get_migration_by_prefix raising AmbiguityError
+        class AmbiguousExecutor:
+            def __init__(self, connection):
+                self.loader = types.SimpleNamespace(migrated_apps={'migrations'}, get_migration_by_prefix=lambda a,b: (_ for _ in ()).throw(AmbiguityError("ambiguous")))
+        fake_conn = types.SimpleNamespace(features=types.SimpleNamespace(can_rollback_ddl=True))
+        with mock.patch.object(sqlmigrate_module, 'connections', {'other': fake_conn}), \
+             mock.patch.object(sqlmigrate_module, 'MigrationExecutor', AmbiguousExecutor):
+            cmd = Command()
+            with self.assertRaisesMessage(CommandError, "More than one migration matches '0001' in app 'migrations'. Please be more specific."):
+                cmd.handle(app_label='migrations', migration_name='0001', database='other', backwards=False)
+
+    def test_execute_sets_no_color_true_before_super_call(self):
+        # Patch BaseCommand.execute to capture options passed into it.
+        called = {}
+        def fake_base_execute(self, *args, **options):
+            called['options'] = options
+            return "ok"
+        with mock.patch('django.core.management.base.BaseCommand.execute', fake_base_execute):
+            cmd = Command()
+            result = cmd.execute(app_label='migrations', migration_name='0001', database='other')
+            self.assertEqual(result, "ok")
+            # execute should have forced no_color=True
+            self.assertIn('no_color', called['options'])
+            self.assertTrue(called['options']['no_color'])

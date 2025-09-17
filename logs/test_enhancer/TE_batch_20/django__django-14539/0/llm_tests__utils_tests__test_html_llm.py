@@ -1,0 +1,74 @@
+from django.test import SimpleTestCase
+from django.utils.html import urlize
+
+
+class TestUrlizeTrimPunctuation(SimpleTestCase):
+    def test_trim_punctuation_preserves_text_after_entities(self):
+        """
+        These cases ensure that when an HTML entity appears in the URL/path and
+        there is non-punctuation text after the entity (followed by trailing
+        punctuation), that non-punctuation text remains inside the link and
+        only the punctuation is trimmed into the trailing text.
+
+        The candidate patch wrongly chops the URL at the end of the entity,
+        moving subsequent non-punctuation characters out of the link. The
+        expected results below reflect the correct (gold) behavior.
+        """
+        cases = [
+            # 1. Simple &amp; followed by "test" then punctuation.
+            (
+                'Visit example.com/&amp;test?!',
+                'Visit <a href="http://example.com/&amp;test">example.com/&amp;test</a>?!'
+            ),
+            # 2. &amp; between path segments with trailing punctuation.
+            (
+                'Visit example.com/foo&amp;bar?!',
+                'Visit <a href="http://example.com/foo&amp;bar">example.com/foo&amp;bar</a>?!'
+            ),
+            # 3. Multiple entities in path and multiple trailing excalmations.
+            (
+                'Visit example.com/&amp;alpha&amp;beta!!!',
+                'Visit <a href="http://example.com/&amp;alpha&amp;beta">example.com/&amp;alpha&amp;beta</a>!!!'
+            ),
+            # 4. Numeric entity (&#38;) which is &; anchor text preserves numeric entity,
+            #    href uses the unescaped & (escaped for HTML attribute as &amp;).
+            (
+                'Visit example.com/&#38;test?!',
+                'Visit <a href="http://example.com/&amp;test">example.com/&#38;test</a>?!'
+            ),
+            # 5. Unknown named entity (&fake;): should be treated like text and not
+            #    cause the following 'test' to be removed from the link.
+            (
+                'Visit example.com/&fake;test!',
+                'Visit <a href="http://example.com/&amp;fake;test">example.com/&fake;test</a>!'
+            ),
+            # 6. Full http:// URL with entity in path followed by further path and punctuation.
+            (
+                'Visit http://example.com/&amp;section/more?!',
+                'Visit <a href="http://example.com/&amp;section/more">http://example.com/&amp;section/more</a>?!'
+            ),
+            # 7. Unknown entity in the middle of a path segment followed by punctuation.
+            (
+                'Check example.com/path&amp;and;more.',
+                'Check <a href="http://example.com/path&amp;and;more">example.com/path&amp;and;more</a>.'
+            ),
+            # 8. Mixed entity and text segment before trailing punctuation.
+            (
+                'Go to example.com/one&amp;two;three?!',
+                'Go to <a href="http://example.com/one&amp;two;three">example.com/one&amp;two;three</a>?!'
+            ),
+            # 9. Entity inside a path segment followed by another path piece and punctuation.
+            (
+                'Visit example.com/a&amp;b/c?!',
+                'Visit <a href="http://example.com/a&amp;b/c">example.com/a&amp;b/c</a>?!'
+            ),
+            # 10. Entity-like fragment and further text before punctuation.
+            (
+                'See example.com/&amp;mix;and;text!!',
+                'See <a href="http://example.com/&amp;mix;and;text">example.com/&amp;mix;and;text</a>!!'
+            ),
+        ]
+
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(urlize(value), expected)

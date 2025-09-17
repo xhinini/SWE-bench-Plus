@@ -1,0 +1,1 @@
+from sympy.physics.vector.vector import _check_vector

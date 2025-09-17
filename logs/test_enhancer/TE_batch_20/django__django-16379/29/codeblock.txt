@@ -1,0 +1,123 @@
+# No new imports required; tests use existing imports from the test module.
+from unittest import mock
+import os
+import tempfile
+import time
+from pathlib import Path
+
+from django.test import override_settings
+from django.core.cache import caches, cache, DEFAULT_CACHE_ALIAS
+
+# These tests are intended to be added to the existing FileBasedCacheTests
+# test case. They rely on the test module setting up the file-based cache
+# backend for the default cache alias as done in the surrounding test suite.
+
+@override_settings(
+    CACHES={
+        "default": {
+            "BACKEND": "django.core.cache.backends.filebased.FileBasedCache",
+        }
+    }
+)
+class AdditionalFileBasedCacheHasKeyTests:
+    def setUp(self):
+        # Create a temporary directory and configure the default cache to use it.
+        self.dirname = tempfile.mkdtemp()
+        for cache_params in __import__("django.conf", fromlist=["settings"]).settings.CACHES.values():
+            cache_params["LOCATION"] = self.dirname
+        # Trigger the setting_changed signal to ensure caches are reconfigured.
+        from django.test import setting_changed
+        setting_changed.send(self.__class__, setting="CACHES", enter=False)
+
+    def tearDown(self):
+        # Clear the cache and remove temp dir.
+        cache.clear()
+        try:
+            import shutil
+            shutil.rmtree(self.dirname)
+        except Exception:
+            pass
+
+    def test_has_key_handles_filenotfound_during_open(self):
+        cache.set("race_key", "value")
+        # Simulate a race where open() raises FileNotFoundError.
+        with mock.patch("builtins.open", side_effect=FileNotFoundError) as mocked_open:
+            self.assertIs(cache.has_key("race_key"), False)
+            mocked_open.assert_called_once()
+
+    def test_has_key_propagates_permissionerror_during_open(self):
+        cache.set("perm_key", "value")
+        # PermissionError (or other non-FileNotFoundError) should not be swallowed.
+        with mock.patch("builtins.open", side_effect=PermissionError):
+            with self.assertRaises(PermissionError):
+                cache.has_key("perm_key")
+
+    def test_has_key_handles_filenotfound_for_version(self):
+        cache.set("vkey", "value", version=2)
+        # Ensure FileNotFoundError for the file corresponding to the versioned key is handled.
+        with mock.patch("builtins.open", side_effect=FileNotFoundError):
+            self.assertIs(cache.has_key("vkey", version=2), False)
+        # The same should not mistakenly affect other versions.
+        self.assertIsNone(cache.get("vkey", version=1))
+
+    def test_has_key_opens_correct_file(self):
+        # Replace _key_to_file to a known filename and ensure open is called for that path.
+        fname = os.path.join(self.dirname, "known_cache_file.djcache")
+        # Manually write a valid cache file with a long expiry.
+        from django.core.cache.backends.filebased import FileBasedCache
+        fb = caches[DEFAULT_CACHE_ALIAS]
+        # Build content expected by FileBasedCache:_write_content (expiry + compressed pickled value).
+        fb.set("marker_key", "marker_value", timeout=60)
+        target_file = fb._key_to_file("marker_key")
+        # Now patch _key_to_file to return our own file path, and create that file with same format.
+        with open(target_file, "rb") as real_fh:
+            content = real_fh.read()
+        # Ensure the patched filename exists with identical content.
+        with open(fname, "wb") as fh:
+            fh.write(content)
+        called = []
+        real_open = open
+
+        def open_side_effect(file, mode="rb", *args, **kwargs):
+            called.append(file)
+            return real_open(file, mode, *args, **kwargs)
+
+        with mock.patch.object(fb, "_key_to_file", return_value=fname):
+            with mock.patch("builtins.open", side_effect=open_side_effect):
+                self.assertIs(fb.has_key("marker_key"), True)
+        self.assertIn(fname, called)
+
+    def test_has_key_returns_true_for_non_expired_value(self):
+        cache.set("alive", "here", timeout=10)
+        self.assertIs(cache.has_key("alive"), True)
+
+    def test_has_key_returns_false_for_expired_value(self):
+        cache.set("soon", "gone", timeout=1)
+        time.sleep(2)
+        self.assertIs(cache.has_key("soon"), False)
+
+    def test_has_key_does_not_swallow_generic_oserror(self):
+        cache.set("oserr", "value")
+        # OSError should propagate (only FileNotFoundError is handled).
+        with mock.patch("builtins.open", side_effect=OSError):
+            with self.assertRaises(OSError):
+                cache.has_key("oserr")
+
+    def test_has_key_handles_os_path_exists_true_race(self):
+        # Simulate os.path.exists returning True but open() raising FileNotFoundError.
+        cache.set("exists_race", "value")
+        fb = caches[DEFAULT_CACHE_ALIAS]
+        with mock.patch("os.path.exists", return_value=True):
+            with mock.patch("builtins.open", side_effect=FileNotFoundError):
+                # The implementation should catch FileNotFoundError and return False.
+                self.assertIs(fb.has_key("exists_race"), False)
+
+    def test_has_key_with_pathlib_key_to_file_handles_filenotfound(self):
+        # Ensure that if _key_to_file returns a pathlib.Path and open raises FileNotFoundError,
+        # has_key still returns False.
+        fb = caches[DEFAULT_CACHE_ALIAS]
+        cache.set("pl_key", "value")
+        path_obj = Path(self.dirname) / "nonexistent.djcache"
+        with mock.patch.object(fb, "_key_to_file", return_value=path_obj):
+            with mock.patch("builtins.open", side_effect=FileNotFoundError):
+                self.assertIs(fb.has_key("pl_key"), False)

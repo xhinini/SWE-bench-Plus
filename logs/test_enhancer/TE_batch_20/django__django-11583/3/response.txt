@@ -1,0 +1,149 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that iter_modules_and_files gracefully handles ValueError raised by Path.resolve() (e.g. from strange network filesystem paths). The gold patch swallows ValueError and continues; the model patch re-raises ValueError unless its message equals 'embedded null byte'. The tests simulate ValueError with a non-'embedded null byte' message and assert that iter_modules_and_files returns normally (excluding the problematic paths) and logs the occurrence. They exercise different input forms: extra_files as strings and Path objects, module origins, mixed good/bad files, and using the global _error_files via iter_all_python_module_files.
+test_code: |
+  from unittest import mock
+  import types
+  import sys
+  from pathlib import Path
+  import tempfile
+
+  from django.test import SimpleTestCase
+  from django.utils import autoreload
+
+  class TestIterModulesAndFilesValueErrorHandling(SimpleTestCase):
+      def setUp(self):
+          # Ensure the cached lru is cleared before each test.
+          autoreload.iter_modules_and_files.cache_clear()
+          # Keep a temp directory for good files.
+          self._td = tempfile.TemporaryDirectory()
+          self.tempdir = Path(self._td.name).resolve().absolute()
+          self.good_file = self.tempdir / "good.py"
+          self.good_file.parent.mkdir(parents=True, exist_ok=True)
+          self.good_file.touch()
+
+      def tearDown(self):
+          self._td.cleanup()
+          # Clear any modifications to _error_files
+          autoreload._error_files.clear()
+          autoreload.iter_modules_and_files.cache_clear()
+
+      def _patch_resolve_to_raise_for(self, marker):
+          """
+          Patch Path.resolve so that if the path contains `marker` it raises
+          ValueError('simulated error'), otherwise calls the real resolve.
+          """
+          real_resolve = Path.resolve
+
+          def fake_resolve(self, strict=True):
+              if marker in str(self):
+                  raise ValueError('simulated error')
+              return real_resolve(self, strict=strict)
+
+          return mock.patch.object(Path, 'resolve', side_effect=fake_resolve)
+
+      def test_ignores_valueerror_for_extra_file_string(self):
+          bad_path = str(self.tempdir / "bad_marker_file.py")
+          # Ensure string contains marker
+          bad_path = bad_path + ".marker"
+          with self._patch_resolve_to_raise_for(".marker"):
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+          # Should not include the bad path and should return a frozenset
+          self.assertIsInstance(result, frozenset)
+          self.assertNotIn(Path(bad_path).name, {p.name for p in result})
+
+      def test_ignores_valueerror_for_extra_file_path_object(self):
+          bad_path = self.tempdir / "bad_path_obj.marker"
+          with self._patch_resolve_to_raise_for(".marker"):
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+          self.assertIsInstance(result, frozenset)
+          self.assertNotIn(bad_path.resolve() if bad_path.exists() else bad_path, result)
+
+      def test_ignores_valueerror_for_module_origin(self):
+          # Create a fake module with a __spec__ that has an origin pointing to bad file.
+          bad_origin = str(self.tempdir / "module_bad.marker")
+          module = types.ModuleType("fake_module")
+          spec = types.SimpleNamespace(has_location=True, loader=object(), origin=bad_origin)
+          module.__spec__ = spec
+          with self._patch_resolve_to_raise_for(".marker"):
+              result = autoreload.iter_modules_and_files((module,), frozenset())
+          self.assertIsInstance(result, frozenset)
+          # The bad origin should not be present
+          self.assertNotIn(Path(bad_origin), result)
+
+      def test_continues_with_other_files_when_one_raises(self):
+          # One good file and one bad file; the bad one raises on resolve.
+          bad_path = str(self.tempdir / "bad2.marker")
+          good_path = str(self.good_file)
+          with self._patch_resolve_to_raise_for(".marker"):
+              result = autoreload.iter_modules_and_files((), frozenset([bad_path, good_path]))
+          # Good file must be present, bad file excluded.
+          resolved_good = self.good_file.resolve()
+          self.assertIn(resolved_good, result)
+          self.assertNotIn(Path(bad_path), result)
+
+      def test_logs_debug_on_valueerror(self):
+          bad_path = str(self.tempdir / "log_bad.marker")
+          with mock.patch.object(autoreload, 'logger') as mocked_logger:
+              with self._patch_resolve_to_raise_for(".marker"):
+                  result = autoreload.iter_modules_and_files((), frozenset([bad_path]))
+          # logger.debug should have been called with a message containing the path
+          mocked_logger.debug.assert_called()
+          called_args = mocked_logger.debug.call_args[0][0]
+          self.assertIn("log_bad.marker", called_args)
+
+      def test_iter_all_python_module_files_ignores_valueerror_from_error_files(self):
+          # Put a problematic filename into the global _error_files and ensure
+          # iter_all_python_module_files does not raise.
+          bad = str(self.tempdir / "global_bad.marker")
+          autoreload._error_files.append(bad)
+          with self._patch_resolve_to_raise_for(".marker"):
+              # Should not raise
+              files = list(autoreload.iter_all_python_module_files())
+          # Ensure none of the returned paths include the bad entry.
+          self.assertNotIn(Path(bad), files)
+
+      def test_handles_multiple_valueerrors(self):
+          bad1 = str(self.tempdir / "bad1.marker")
+          bad2 = str(self.tempdir / "bad2.marker")
+          good = str(self.good_file)
+          with self._patch_resolve_to_raise_for(".marker"):
+              result = autoreload.iter_modules_and_files((), frozenset([bad1, bad2, good]))
+          resolved_good = self.good_file.resolve()
+          self.assertIn(resolved_good, result)
+          # Bad entries not included
+          self.assertNotIn(Path(bad1), result)
+          self.assertNotIn(Path(bad2), result)
+
+      def test_returns_frozenset_even_when_valueerror_occurs(self):
+          bad = str(self.tempdir / "only_bad.marker")
+          with self._patch_resolve_to_raise_for(".marker"):
+              result = autoreload.iter_modules_and_files((), frozenset([bad]))
+          self.assertIsInstance(result, frozenset)
+
+      def test_module_main_file_with_valueerror_is_ignored(self):
+          # __main__ special-case: when module.__name__ == '__main__' and it has __file__
+          main_mod = types.ModuleType('__main__')
+          main_mod.__file__ = str(self.tempdir / "main_bad.marker")
+          # Ensure it will be added to sys_file_paths then path.resolve will raise
+          with self._patch_resolve_to_raise_for(".marker"):
+              result = autoreload.iter_modules_and_files((main_mod,), frozenset())
+          self.assertNotIn(Path(main_mod.__file__), result)
+
+      def test_mixed_module_and_extra_files_with_valueerror(self):
+          bad_mod_origin = str(self.tempdir / "mod_bad.marker")
+          module = types.ModuleType("mix_mod")
+          spec = types.SimpleNamespace(has_location=True, loader=object(), origin=bad_mod_origin)
+          module.__spec__ = spec
+          bad_extra = str(self.tempdir / "extra_bad.marker")
+          good_extra = str(self.good_file)
+          with self._patch_resolve_to_raise_for(".marker"):
+              result = autoreload.iter_modules_and_files((module,), frozenset([bad_extra, good_extra]))
+          # Good extra should be present, bad entries excluded
+          self.assertIn(self.good_file.resolve(), result)
+          self.assertNotIn(Path(bad_mod_origin), result)
+          self.assertNotIn(Path(bad_extra), result)
+new_imports_code: |
+  import types
+  import tempfile
+  from unittest import mock

@@ -1,0 +1,190 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  The tests verify that build_instance() correctly calls the model instance's
+  natural_key() on an instance that has been constructed with the provided data
+  and had its _state.db set to the provided db. The candidate (incorrect)
+  patch tried to avoid constructing the full instance and/or failed to set
+  _state.db, which leads to AttributeError or incorrect behavior when natural_key()
+  relies on relational attributes or on _state.db. Each test asserts that the
+  primary-key attribute (Model._meta.pk.attname) is populated (and converted)
+  from the manager.get_by_natural_key() result for cases where pk is missing.
+  These tests pass with the gold patch (which constructs the instance and sets
+  _state.db before calling natural_key()) and would fail under the candidate
+  patch.
+test_code: |
+  from types import SimpleNamespace
+  import unittest
+  from django.core.serializers.base import build_instance
+  
+  
+  def make_model(natural_key_func, pk_value="42", pk_attname="id"):
+      """
+      Helper to create a minimal Model-like class for testing build_instance.
+      The returned tuple is (ModelClass, manager_instance) where manager_instance
+      records the last db used when db_manager(db) is called.
+      """
+  
+      class DummyManager:
+          def __init__(self, pk_value):
+              self.pk_value = pk_value
+              self.last_db = None
+  
+          def db_manager(self, db):
+              # record the db and return self to allow chaining
+              self.last_db = db
+              return self
+  
+          def get_by_natural_key(self, *args):
+              # Return a simple object with a pk attribute
+              return SimpleNamespace(pk=self.pk_value)
+  
+      class Meta:
+          pass
+  
+      Meta.pk = SimpleNamespace(attname=pk_attname, to_python=lambda x: int(x))
+      manager = DummyManager(pk_value)
+      Meta.default_manager = manager
+      Meta.app_label = "tests"
+      Meta.model_name = "dummy"
+  
+      class Model:
+          _meta = Meta
+          DoesNotExist = Exception
+  
+          def __init__(self, **data):
+              # mimic Django's model state container
+              self._state = SimpleNamespace(db=None)
+              # set attributes from data
+              for k, v in data.items():
+                  setattr(self, k, v)
+  
+          def natural_key(self):
+              return natural_key_func(self)
+  
+      return Model, manager
+  
+  
+  class BuildInstanceTests(unittest.TestCase):
+      def test_natural_key_using_relational_attribute_sets_pk(self):
+          # natural_key expects self.author to be present (a relational attribute)
+          def nk(obj):
+              # Will raise AttributeError if candidate didn't set 'author'
+              return (obj.title, obj.author)
+  
+          Model, manager = make_model(nk, pk_value="100")
+          data = {"title": "My Title", "author": "AUTH-1"}  # no 'id' present
+          inst = build_instance(Model, data.copy(), db="other_db")
+          # gold: id converted to int 100; candidate fails to populate id
+          self.assertEqual(getattr(inst, "id"), 100)
+  
+      def test_natural_key_accessing_nested_relation_attribute(self):
+          # natural_key accesses a nested attribute on a relation object:
+          # self.author_name will be expected to exist (simulating a relation proxy)
+          def nk(obj):
+              # Accessing author_name would fail if 'author' relation wasn't set
+              return (obj.title, obj.author_name)
+  
+          Model, manager = make_model(nk, pk_value="101")
+          data = {"title": "T1", "author_name": "AUTHNAME"}
+          inst = build_instance(Model, data.copy(), db="db1")
+          self.assertEqual(getattr(inst, "id"), 101)
+  
+      def test_natural_key_requires_state_db_to_be_set(self):
+          # natural_key will explicitly require _state.db to be set (simulate
+          # code that inspects which database is in use)
+          def nk(obj):
+              if getattr(obj, "_state", None) is None or obj._state.db is None:
+                  # simulate behavior that depends on _state.db; cause AttributeError
+                  raise AttributeError("db not set")
+              return (obj.username,)
+  
+          Model, manager = make_model(nk, pk_value="202")
+          data = {"username": "user_x"}
+          inst = build_instance(Model, data.copy(), db="the-db")
+          self.assertEqual(getattr(inst, "id"), 202)
+  
+      def test_attname_variant_author_id_sets_pk(self):
+          # test when primary key attname is 'pkid' instead of 'id'
+          def nk(obj):
+              # natural key uses author id value normally present on the instance
+              return (obj.author_id,)
+  
+          Model, manager = make_model(nk, pk_value="303", pk_attname="pkid")
+          data = {"author_id": 7}
+          inst = build_instance(Model, data.copy(), db="mydb")
+          self.assertEqual(getattr(inst, "pkid"), 303)
+  
+      def test_multiple_fields_including_relation(self):
+          # natural_key mixes relational and non-relational fields
+          def nk(obj):
+              # Access both name and a relational attribute
+              return (obj.name, obj.related_token)
+  
+          Model, manager = make_model(nk, pk_value="404")
+          data = {"name": "n", "related_token": "tok"}
+          inst = build_instance(Model, data.copy(), db="dbX")
+          self.assertEqual(getattr(inst, "id"), 404)
+  
+      def test_db_forwarded_to_manager_db_manager(self):
+          # Ensure the db argument passed to build_instance is forwarded to the manager
+          def nk(obj):
+              return (obj.label,)
+  
+          Model, manager = make_model(nk, pk_value="505")
+          data = {"label": "lbl"}
+          inst = build_instance(Model, data.copy(), db="expected_db")
+          # ensure the manager saw the db value
+          self.assertEqual(manager.last_db, "expected_db")
+          self.assertEqual(getattr(inst, "id"), 505)
+  
+      def test_pk_to_python_conversion_occurs(self):
+          # Ensure pk returned as string is converted via to_python
+          def nk(obj):
+              return (obj.slug,)
+  
+          # The Meta.pk.to_python converts to int (defined in helper)
+          Model, manager = make_model(nk, pk_value="606")
+          data = {"slug": "s1"}
+          inst = build_instance(Model, data.copy(), db="dbZ")
+          self.assertIsInstance(getattr(inst, "id"), int)
+          self.assertEqual(getattr(inst, "id"), 606)
+  
+      def test_natural_key_combines_relation_and_state_db(self):
+          # natural_key needs both a relation attribute and _state.db
+          def nk(obj):
+              if getattr(obj, "_state", None) is None or obj._state.db is None:
+                  raise AttributeError("db missing")
+              # relation attribute that would be missing under candidate
+              return (obj.related_value,)
+  
+          Model, manager = make_model(nk, pk_value="707")
+          data = {"related_value": "rv"}
+          inst = build_instance(Model, data.copy(), db="db-needed")
+          self.assertEqual(getattr(inst, "id"), 707)
+  
+      def test_natural_key_with_various_field_names(self):
+          # natural_key uses an attribute whose name is uncommon
+          def nk(obj):
+              return (obj.unusual_field,)
+  
+          Model, manager = make_model(nk, pk_value="808")
+          data = {"unusual_field": "u"}
+          inst = build_instance(Model, data.copy(), db="db-v")
+          self.assertEqual(getattr(inst, "id"), 808)
+  
+      def test_natural_key_when_multiple_serialized_fields_present(self):
+          # natural_key uses one of many serialized fields, ensure it still works
+          def nk(obj):
+              return (obj.f1, obj.f2)
+  
+          Model, manager = make_model(nk, pk_value="909")
+          data = {"f1": "a", "f2": "b", "extra": "x"}
+          inst = build_instance(Model, data.copy(), db="db-multi")
+          self.assertEqual(getattr(inst, "id"), 909)
+  
+  
+  if __name__ == "__main__":
+      unittest.main()
+new_imports_code: |
+  from types import SimpleNamespace

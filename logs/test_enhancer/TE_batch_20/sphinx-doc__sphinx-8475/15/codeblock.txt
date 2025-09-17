@@ -1,0 +1,232 @@
+# No additional imports required beyond what the existing test module provides.
+import http.server
+import json
+import textwrap
+
+import pytest
+
+from .utils import http_server
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_head_toomany_fallback_get_success(app):
+    # HEAD keeps redirecting (causing TooManyRedirects), GET returns 200 -> working
+    class InfiniteRedirectOnHeadHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            # redirect to same URL -> causes TooManyRedirects when followed
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200, "OK")
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
+    with http_server(InfiniteRedirectOnHeadHandler):
+        app.builder.build_all()
+
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    assert content == {
+        "code": 0,
+        "status": "working",
+        "filename": "index.rst",
+        "lineno": 1,
+        "uri": "http://localhost:7777/",
+        "info": "",
+    }
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_head_toomany_fallback_get_404_marks_broken(app):
+    # HEAD keeps redirecting, GET returns 404 -> broken with 404 info
+    class RedirectHeadGet404Handler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(404, "Not Found")
+            self.end_headers()
+            self.wfile.write(b"notfound\n")
+
+    with http_server(RedirectHeadGet404Handler):
+        app.builder.build_all()
+
+    # output.json contains a single JSON object for this testroot
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    assert content["status"] == "broken"
+    assert "404 Client Error" in content["info"] or "404" in content["info"]
+    assert content["uri"] == "http://localhost:7777/"
+
+@pytest.mark.sphinx(
+    'linkcheck', testroot='linkcheck-localserver', freshenv=True,
+    confoverrides={'linkcheck_auth': [(r'^http://localhost:7777/$', ('user', 'pass'))]}
+)
+def test_head_toomany_fallback_get_uses_auth(app, capsys):
+    # HEAD loops, GET prints headers and should include Authorization
+    class HeadersOnGetHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200, "OK")
+            self.end_headers()
+            # echo headers to stdout so capsys can capture them
+            print(self.headers.as_string())
+
+    with http_server(HeadersOnGetHandler):
+        app.builder.build_all()
+    stdout, _stderr = capsys.readouterr()
+    assert "Authorization: " in stdout
+
+@pytest.mark.sphinx(
+    'linkcheck', testroot='linkcheck-localserver', freshenv=True,
+    confoverrides={'linkcheck_request_headers': {"http://localhost:7777/": {"Accept": "application/json"}}}
+)
+def test_head_toomany_fallback_get_uses_request_headers(app, capsys):
+    # HEAD loops, GET should include configured Accept header
+    class HeadersOnGetHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200, "OK")
+            self.end_headers()
+            print(self.headers.as_string())
+
+    with http_server(HeadersOnGetHandler):
+        app.builder.build_all()
+    stdout, _stderr = capsys.readouterr()
+    assert "Accept: application/json" in stdout
+
+@pytest.mark.sphinx(
+    'linkcheck', testroot='linkcheck-localserver', freshenv=True,
+    confoverrides={'linkcheck_ignore': ['http://localhost:7777/']}
+)
+def test_head_toomany_ignored_by_pattern(app):
+    # If the URL is in ignore list, no network access should be done at all
+    class BrokenIfRequestedHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            # If called, this would indicate ignore didn't work
+            self.send_response(500, "Internal Error")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(500, "Internal Error")
+            self.end_headers()
+
+    with http_server(BrokenIfRequestedHandler):
+        # Should not raise, and output file should be empty
+        app.builder.build_all()
+    content = (app.outdir / 'output.txt').read_text()
+    assert content == ""
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True,
+                    confoverrides={'linkcheck_retries': 2})
+def test_head_toomany_get_succeeds_on_second_try(app):
+    # HEAD loops causing TooManyRedirects, GET returns 500 first time then 200
+    state = {"count": 0}
+
+    class FlakyGetHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            # first GET -> 500, second GET -> 200
+            if state["count"] == 0:
+                state["count"] += 1
+                self.send_response(500, "Internal Error")
+                self.end_headers()
+                self.wfile.write(b"error\n")
+            else:
+                self.send_response(200, "OK")
+                self.end_headers()
+                self.wfile.write(b"ok\n")
+
+    with http_server(FlakyGetHandler):
+        app.builder.build_all()
+
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    # After retries, the link should be marked working (since second GET succeeded)
+    assert content["status"] == "working"
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_head_toomany_redirected_history_code_recorded(app, capsys):
+    # HEAD loops; GET returns a redirect chain (302 -> final 204)
+    class RedirectChainHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            if self.path == "/?redirected=1":
+                self.send_response(204, "No content")
+                self.end_headers()
+            else:
+                self.send_response(302, "Found")
+                self.send_header("Location", "http://localhost:7777/?redirected=1")
+                self.end_headers()
+
+    with http_server(RedirectChainHandler):
+        app.builder.build_all()
+
+    content = (app.outdir / 'output.txt').read_text()
+    # Expect redirected with Found and the target URL in the output
+    assert "redirected with Found" in content
+    assert "http://localhost:7777/ to http://localhost:7777/?redirected=1" in content
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_head_toomany_fallback_get_does_not_crash_builder(app):
+    # Ensure that TooManyRedirects during HEAD does not crash builder run
+    class InfiniteRedirectOnHeadHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200, "OK")
+            self.end_headers()
+            self.wfile.write(b"ok\n")
+
+    with http_server(InfiniteRedirectOnHeadHandler):
+        # Should complete without raising an exception
+        app.builder.build_all()
+
+    # output.json should exist and contain a status
+    with open(app.outdir / 'output.json') as fp:
+        content = json.load(fp)
+    assert "status" in content
+
+@pytest.mark.sphinx('linkcheck', testroot='linkcheck-localserver', freshenv=True)
+def test_head_toomany_with_multiple_hosts_does_not_mix_headers(app, capsys):
+    # Two hosts, each with its own header config, ensure fallback GET uses correct header for its host
+    # We'll only validate for localhost since the testroot points to localhost,
+    # but ensure behavior is stable when fallback occurs.
+    class EchoHeadersHandler(http.server.BaseHTTPRequestHandler):
+        def do_HEAD(self):
+            self.send_response(302, "Found")
+            self.send_header("Location", "http://localhost:7777/")
+            self.end_headers()
+
+        def do_GET(self):
+            self.send_response(200, "OK")
+            self.end_headers()
+            print(self.headers.as_string())
+
+    # Configure a specific Accept header for localhost
+    app.config.linkcheck_request_headers = {"http://localhost:7777/": {"Accept": "application/xml"}}
+    with http_server(EchoHeadersHandler):
+        app.builder.build_all()
+    stdout, _stderr = capsys.readouterr()
+    assert "Accept: application/xml" in stdout

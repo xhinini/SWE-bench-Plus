@@ -1,0 +1,176 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  Unit tests for DraggableBase-related callback registration and disconnection logic.
+  These tests create lightweight fake Canvas/Figure/Callbacks/Artist objects to assert that
+  DraggableBase registers callbacks via the figure._canvas_callbacks API and that
+  disconnect() invokes callbacks.disconnect for the connected ids. They also check
+  behavior when the figure or canvas is removed/None, and ensure on_pick/on_release/on_motion
+  drive the save/update/finalize hooks. The tests are designed to pass with the gold patch
+  (which stores partial disconnectors and always calls callbacks.disconnect) and fail
+  against the candidate/model patch (which may skip invoking callbacks.disconnect when the
+  canvas is None or use canvas.mpl_disconnect instead).
+test_code: |
+  import types
+  import pytest
+
+  from matplotlib.offsetbox import DraggableBase
+
+  class FakeCallbacks:
+      def __init__(self):
+          self._next = 1
+          self.connected = []  # list of (cid, name, func)
+          self.disconnected = []  # list of cids passed to disconnect
+
+      def _connect_picklable(self, name, func):
+          cid = self._next
+          self._next += 1
+          self.connected.append((cid, name, func))
+          return cid
+
+      def disconnect(self, cid):
+          self.disconnected.append(cid)
+
+  class FakeCanvas:
+      def __init__(self, callbacks):
+          self.supports_blit = True
+          self._callbacks = callbacks
+          self.mpl_disconnected = []
+
+      def mpl_disconnect(self, cid):
+          # Record usage of canvas-level disconnect (different from callbacks.disconnect)
+          self.mpl_disconnected.append(cid)
+
+      # Provide attribute access so that code referring to figure._canvas_callbacks
+      # can be satisfied by FakeFigure._canvas_callbacks referencing FakeCallbacks.
+      # This class intentionally does not call into callbacks.disconnect.
+
+  class FakeFigure:
+      def __init__(self):
+          self._canvas_callbacks = FakeCallbacks()
+          self.canvas = FakeCanvas(self._canvas_callbacks)
+
+  class FakeArtist:
+      def __init__(self, fig):
+          self._picker = False
+          self.figure = fig
+
+      def pickable(self):
+          return self._picker
+
+      def set_picker(self, val):
+          self._picker = val
+
+  class TestDraggable(DraggableBase):
+      def __init__(self, ref_artist, use_blit=False):
+          super().__init__(ref_artist, use_blit=use_blit)
+          self.saved = False
+          self.updated = None
+          self.finalized = False
+
+      def save_offset(self):
+          self.saved = True
+
+      def update_offset(self, dx, dy):
+          self.updated = (dx, dy)
+
+      def finalize_offset(self):
+          self.finalized = True
+
+  def make_draggable():
+      fig = FakeFigure()
+      art = FakeArtist(fig)
+      dr = TestDraggable(art, use_blit=False)
+      return fig, art, dr
+
+  def test_draggable_registers_three_callbacks():
+      fig, art, dr = make_draggable()
+      callbacks = fig._canvas_callbacks
+      # Should have registered pick_event, button_release_event, motion_notify_event
+      names = [name for (_cid, name, _func) in callbacks.connected]
+      assert set(names) == {"pick_event", "button_release_event", "motion_notify_event"}
+      # Ensure three distinct cids were produced.
+      cids = [cid for (cid, _name, _func) in callbacks.connected]
+      assert len(cids) == 3 and len(set(cids)) == 3
+
+  def test_disconnect_calls_callbacks_disconnect():
+      fig, art, dr = make_draggable()
+      callbacks = fig._canvas_callbacks
+      # Call disconnect and ensure callbacks.disconnect was called for each connected id.
+      dr.disconnect()
+      # The gold implementation calls callbacks.disconnect for each registration id.
+      assert callbacks.disconnected, "callbacks.disconnect() was not called by disconnect()"
+      # Ensure exactly the same ids were passed to callbacks.disconnect as were connected.
+      connected_ids = [cid for (cid, _n, _f) in callbacks.connected]
+      assert set(callbacks.disconnected) == set(connected_ids)
+
+  def test_cids_property_returns_first_two_connection_ids():
+      fig, art, dr = make_draggable()
+      callbacks = fig._canvas_callbacks
+      connected_ids = [cid for (cid, _n, _f) in callbacks.connected]
+      # cids property should expose first two connection ids (pick & release)
+      assert list(dr.cids) == connected_ids[:2]
+
+  def test_disconnect_calls_callbacks_even_if_canvas_is_none():
+      fig, art, dr = make_draggable()
+      callbacks = fig._canvas_callbacks
+      # Simulate the figure's canvas being removed
+      fig.canvas = None
+      # Under the gold patch, disconnect() should still invoke callbacks.disconnect
+      dr.disconnect()
+      assert callbacks.disconnected, "callbacks.disconnect was not called when canvas was None"
+
+  def test_on_pick_triggers_save_offset_and_sets_got_artist():
+      fig, art, dr = make_draggable()
+      # Create a fake event with artist equal to our ref_artist and a mouseevent
+      evt = types.SimpleNamespace(artist=art, mouseevent=types.SimpleNamespace(x=10, y=20))
+      dr.on_pick(evt)
+      assert dr.got_artist
+      assert dr.saved, "save_offset() was not called during on_pick"
+
+  def test_on_release_calls_finalize_and_resets_got_artist():
+      fig, art, dr = make_draggable()
+      # Simulate pick first
+      evt = types.SimpleNamespace(artist=art, mouseevent=types.SimpleNamespace(x=5, y=6))
+      dr.on_pick(evt)
+      assert dr.got_artist
+      # Now release: create a release event (only artist not required)
+      rel_evt = types.SimpleNamespace()
+      dr.on_release(rel_evt)
+      assert not dr.got_artist
+      assert dr.finalized, "finalize_offset() was not called during on_release"
+
+  def test_on_motion_calls_update_offset_with_correct_deltas():
+      fig, art, dr = make_draggable()
+      # Simulate picking to set mouse_x/mouse_y and got_artist
+      pick_evt = types.SimpleNamespace(artist=art, mouseevent=types.SimpleNamespace(x=50, y=60))
+      dr.on_pick(pick_evt)
+      # Now move to new coordinates
+      move_evt = types.SimpleNamespace(x=70, y=85)
+      dr.on_motion(move_evt)
+      assert dr.updated == (20, 25)
+
+  def test_canvas_property_raises_attribute_error_when_no_figure():
+      # The gold implementation exposes canvas as property accessing ref_artist.figure.canvas
+      # which will raise when ref_artist.figure is None. The candidate patch returns None
+      # instead; we assert the AttributeError to detect the candidate regression.
+      fig, art, dr = make_draggable()
+      # Remove figure entirely
+      art.figure = None
+      with pytest.raises(AttributeError):
+          _ = dr.canvas  # should raise under the gold patch
+
+  def test__check_still_parented_calls_disconnect_when_figure_removed():
+      fig, art, dr = make_draggable()
+      callbacks = fig._canvas_callbacks
+      # Ensure no disconnects yet
+      assert callbacks.disconnected == []
+      # Remove the figure (simulate artist's figure being cleared)
+      art.figure = None
+      res = dr._check_still_parented()
+      assert res is False
+      # Under the gold patch, disconnect() should have been called and callbacks.disconnect invoked
+      assert callbacks.disconnected, "disconnect() did not call callbacks.disconnect when figure removed"
+new_imports_code: |
+  # No new top-level imports required. The tests use standard library 'types' and 'pytest',
+  # and import DraggableBase from matplotlib.offsetbox as needed.

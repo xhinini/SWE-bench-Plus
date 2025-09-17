@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 utils_tests.test_datastructures_llm.OrderedSetReversedRegressionTests.test_reversed_called_even_when_keys_differ utils_tests.test_datastructures_llm.OrderedSetReversedRegressionTests.test_reversed_custom_works_with_different_key_orders utils_tests.test_datastructures_llm.OrderedSetReversedRegressionTests.test_reversed_detects_mutation_of_underlying_dict utils_tests.test_datastructures_llm.OrderedSetReversedRegressionTests.test_reversed_generator_return utils_tests.test_datastructures_llm.OrderedSetReversedRegressionTests.test_reversed_prefers_custom_over_keys_list utils_tests.test_datastructures_llm.OrderedSetReversedRegressionTests.test_reversed_propagates_exceptions_from_custom_reversed utils_tests.test_datastructures_llm.OrderedSetReversedRegressionTests.test_reversed_returns_non_iterator_value_if_custom_returns_it utils_tests.test_datastructures_llm.OrderedSetReversedRegressionTests.test_reversed_side_effect_flag utils_tests.test_datastructures_llm.OrderedSetReversedRegressionTests.test_reversed_uses_mapping_reversed
+coverage json -o coverage.json
+: '>>>>> End Test Output'

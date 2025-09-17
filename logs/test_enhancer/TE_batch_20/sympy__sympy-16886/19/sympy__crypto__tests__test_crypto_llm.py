@@ -1,0 +1,1 @@
+from sympy.crypto.crypto import char_morse

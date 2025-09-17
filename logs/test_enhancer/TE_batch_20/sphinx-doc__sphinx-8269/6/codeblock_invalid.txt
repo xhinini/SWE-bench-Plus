@@ -1,0 +1,141 @@
+# No additional imports needed beyond those in the test file.
+import queue
+from unittest import mock
+import pytest
+from requests.exceptions import HTTPError
+import types
+import io
+
+import sphinx.builders.linkcheck as lc
+from sphinx.builders.linkcheck import CheckExternalLinksBuilder
+
+class DummyConfig:
+    def __init__(self):
+        self.linkcheck_ignore = []
+        self.linkcheck_anchors_ignore = ["^!"]
+        self.linkcheck_auth = []
+        self.linkcheck_request_headers = {}
+        self.linkcheck_retries = 1
+        self.linkcheck_timeout = None
+        self.linkcheck_workers = 0
+        self.linkcheck_anchors = True
+
+class DummyEnv:
+    def doc2path(self, docname, _):
+        return docname + ".rst
+"
+    @property
+    def found_docs(self):
+        return set()
+
+class DummyApp:
+    def __init__(self, outdir, srcdir):
+        self.config = DummyConfig()
+        self.outdir = outdir
+        self.srcdir = srcdir
+        self.env = DummyEnv()
+        self.quiet = False
+        self.warningiserror = False
+        self.statuscode = 0
+
+class DummyResponse:
+    def __init__(self, status_code=200, content='', url='https://example.com/page',
+                 request_method='GET', history=None, headers=None):
+        self.status_code = status_code
+        self._content = content
+        self.url = url
+        self.history = history or []
+        self.request = types.SimpleNamespace(method=request_method)
+        self.headers = headers or {'content-type': 'text/html'}
+
+    def iter_content(self, chunk_size=4096, decode_unicode=False):
+        # yield content in one chunk
+        data = self._content
+        if isinstance(data, bytes):
+            if decode_unicode:
+                # simulate requests failing to decode -> decode later
+                yield data
+            else:
+                yield data
+        else:
+            # str
+            yield data
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise HTTPError(f"{self.status_code} Client Error", response=self)
+
+def run_check_for_uri(tmp_path, uri, head_resp, get_resp):
+    # Prepare fake app and builder
+    app = DummyApp(outdir=str(tmp_path / "outdir"), srcdir=str(tmp_path / "srcdir"))
+    builder = CheckExternalLinksBuilder(app)
+    # Manually perform init steps without starting threads
+    # init() creates files and queues; call parts of it:
+    builder.app = app
+    builder.to_ignore = [lc.re.compile(x) for x in app.config.linkcheck_ignore]
+    builder.anchors_ignore = [lc.re.compile(x) for x in app.config.linkcheck_anchors_ignore]
+    builder.auth = []
+    builder.good = set()
+    builder.broken = {}
+    builder.redirected = {}
+    builder.wqueue = queue.Queue()
+    builder.rqueue = queue.Queue()
+
+    # Put work item and sentinel so check_thread will finish
+    builder.wqueue.put((uri, 'docname', 10))
+    builder.wqueue.put((None, None, None))
+
+    # Patch requests.head and requests.get
+    with mock.patch.object(lc, 'requests') as mock_requests_module:
+        mock_requests_module.head = mock.MagicMock(return_value=head_resp)
+        mock_requests_module.get = mock.MagicMock(return_value=get_resp)
+
+        # Run the check_thread in the current thread
+        builder.check_thread()
+
+    # Fetch result
+    result = builder.rqueue.get_nowait()
+    return result
+
+@pytest.mark.parametrize("anchor_attr,content_bytes,anchor_encoded", [
+    # 10 combinations: variations of id/name, bytes/str, encoded/unencoded
+    ("id", False, False),
+    ("name", False, False),
+    ("id", True, False),
+    ("name", True, False),
+    ("id", False, True),
+    ("name", False, True),
+    ("id", True, True),
+    ("name", True, True),
+    # two more subtle cases to reach 10:
+    ("id", False, False),  # duplicate to ensure consistent behavior
+    ("name", True, False),
+])
+def test_head_ok_get_404_with_anchor_present_marks_broken(tmp_path, anchor_attr, content_bytes, anchor_encoded):
+    """
+    When HEAD succeeds but GET returns 404 containing the anchor, the link
+    must be considered broken (HTTP error should be raised for the GET).
+    This detects the regression where response.raise_for_status() was omitted
+    for the GET after a successful HEAD.
+    """
+    # anchor name, possibly percent-encoded
+    raw_anchor = "a b" if anchor_encoded else "anchor"
+    anchor = "a%20b" if anchor_encoded and raw_anchor == "a b" else raw_anchor
+    # Build URI with anchor
+    uri = "https://example.com/page#" + anchor
+
+    # Create HTML content containing the anchor in either id or name attribute
+    html = '<html><body><a {}="{}">here</a></body></html>'.format(anchor_attr, raw_anchor)
+    get_content = html.encode() if content_bytes else html
+
+    # Create head response: HEAD succeeded (200) and has request.method HEAD
+    head_resp = DummyResponse(status_code=200, content='', url="https://example.com/page",
+                              request_method='HEAD', history=[])
+    # Create get response: 404 but containing the anchor in the body
+    get_resp = DummyResponse(status_code=404, content=get_content, url="https://example.com/page",
+                             request_method='GET', history=[])
+
+    uri_out, docname, lineno, status, info, code = run_check_for_uri(tmp_path, uri, head_resp, get_resp)
+
+    # Expect the link to be treated as broken because the GET returned 404
+    assert status == 'broken', "Expected broken for GET 404 even if anchor is present; got %r (info=%r)" % (status, info)

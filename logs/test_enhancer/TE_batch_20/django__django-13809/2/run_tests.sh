@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.RunserverSkipChecksRegression.setUp admin_scripts.tests_llm.RunserverSkipChecksRegression.test_check_migrations_called_even_if_skip_checks_true admin_scripts.tests_llm.RunserverSkipChecksRegression.test_check_migrations_called_when_skip_false admin_scripts.tests_llm.RunserverSkipChecksRegression.test_check_migrations_called_with_addrport_and_skip_true admin_scripts.tests_llm.RunserverSkipChecksRegression.test_check_migrations_called_with_use_threading_true admin_scripts.tests_llm.RunserverSkipChecksRegression.test_check_migrations_exceptions_propagate admin_scripts.tests_llm.RunserverSkipChecksRegression.test_inner_run_calls_check_migrations_even_if_skip_true admin_scripts.tests_llm.RunserverSkipChecksRegression.test_migration_warning_shown_when_skip_checks_true admin_scripts.tests_llm.RunserverSkipChecksRegression.test_multiple_invocations_with_skip_true_call_check_migrations_each_time admin_scripts.tests_llm.RunserverSkipChecksRegression.test_no_skipping_message_emitted_when_skip_checks_true admin_scripts.tests_llm.RunserverSkipChecksRegression.test_no_skipping_message_never_printed_when_skip_false
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,206 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that fractional min_samples and min_cluster_size values are converted by flooring (int(...)) after multiplication by n_samples (and then max(2,...)) — not rounded. They monkeypatch NearestNeighbors and _xi_cluster to capture the integer values that the library uses internally and also check that OPTICS produces the same labels when a fractional min_samples that floors to an integer is provided as when that integer is given explicitly. The tests will fail against the candidate patch which uses round() before int().
+test_code: |-
+  import numpy as np
+  import pytest
+  
+  from sklearn.cluster import optics_ as optics_mod
+  from sklearn.cluster.optics_ import compute_optics_graph, cluster_optics_xi, OPTICS
+  
+  
+  @pytest.mark.parametrize("min_samples_frac,n_samples,expected",
+                           [
+                               # 0.25 * 10 = 2.5 -> gold: int(2.5)=2, candidate: round->3
+                               (0.25, 10, 2),
+                               # 0.35 * 10 = 3.5 -> gold: 3, candidate: 4
+                               (0.35, 10, 3),
+                               # 0.21 * 10 = 2.1 -> gold: 2
+                               (0.21, 10, 2),
+                               # 0.26 * 15 = 3.9 -> gold: 3
+                               (0.26, 15, 3),
+                               # 0.4 * 7 = 2.8 -> gold: 2
+                               (0.4, 7, 2),
+                           ])
+  def test_compute_optics_graph_uses_floor_for_fractional_min_samples(monkeypatch,
+                                                                      min_samples_frac,
+                                                                      n_samples,
+                                                                      expected):
+      """Ensure compute_optics_graph constructs NearestNeighbors with floored
+      min_samples (int(min_samples * n_samples), then max(2, ...))."""
+  
+      created = []
+  
+      class DummyNearestNeighbors:
+          def __init__(self, n_neighbors, algorithm, leaf_size, metric,
+                       metric_params, p, n_jobs):
+              # record what was passed in constructor
+              created.append(int(n_neighbors))
+              # store the X when fit is called
+              self._X = None
+  
+          def fit(self, X):
+              self._X = np.asarray(X)
+              return self
+  
+          def kneighbors(self, Xq, n_neighbors):
+              # return distances and indices shaped according to the requested
+              # n_neighbors to mimic real behavior
+              n_q = len(Xq)
+              dists = np.zeros((n_q, n_neighbors), dtype=float)
+              # make last column non-zero so core distance isn't NaN
+              dists[:, -1] = 1.0
+              inds = np.tile(np.arange(n_q)[:, None], (1, n_neighbors))
+              return dists, inds
+  
+          def radius_neighbors(self, P, radius, return_distance=False):
+              # return indices of all points as neighbors
+              if self._X is None:
+                  return [np.array([], dtype=int)]
+              return [np.arange(self._X.shape[0], dtype=int)]
+  
+      monkeypatch.setattr(optics_mod, "NearestNeighbors", DummyNearestNeighbors)
+  
+      # build a dummy dataset of the requested size (2D to satisfy check_array)
+      X = np.zeros((n_samples, 2), dtype=float)
+  
+      # call compute_optics_graph: note argument order in our import
+      # compute_optics_graph(X, min_samples, max_eps, metric, p, metric_params,
+      #                      algorithm, leaf_size, n_jobs)
+      # use trivial parameters for other args
+      ordering, core_distances, reachability, predecessor = compute_optics_graph(
+          X, min_samples_frac, np.inf, 'minkowski', 2, None, 'auto', 30, None
+      )
+  
+      # The DummyNearestNeighbors should have been instantiated once; check the
+      # recorded n_neighbors matches expected (after flooring and max(2,...))
+      assert len(created) >= 1
+      # first constructed NearestNeighbors n_neighbors argument should be the min_samples used
+      assert created[0] == expected
+  
+  
+  @pytest.mark.parametrize("min_samples_frac,n_samples,expected",
+                           [
+                               (0.25, 10, 2),
+                               (0.35, 10, 3),
+                               (0.26, 15, 3),
+                           ])
+  def test_cluster_optics_xi_min_samples_conversion(monkeypatch,
+                                                    min_samples_frac,
+                                                    n_samples,
+                                                    expected):
+      """Ensure cluster_optics_xi converts fractional min_samples by flooring
+      (int(min_samples * n_samples), then max(2,...)) before passing to _xi_cluster."""
+      captured = {}
+  
+      def fake_xi_cluster(reachability_plot, predecessor_plot, ordering,
+                          xi, min_samples_arg, min_cluster_size_arg,
+                          predecessor_correction):
+          # record what was received and return empty clusters
+          captured['min_samples_arg'] = min_samples_arg
+          captured['min_cluster_size_arg'] = min_cluster_size_arg
+          return np.array([])
+  
+      monkeypatch.setattr(optics_mod, "_xi_cluster", fake_xi_cluster)
+  
+      # create dummy arrays of length n_samples
+      reachability = np.arange(n_samples, dtype=float)
+      predecessor = np.arange(n_samples, dtype=int)
+      ordering = np.arange(n_samples, dtype=int)
+  
+      # call cluster_optics_xi; min_cluster_size left as None to be set to min_samples
+      labels, clusters = cluster_optics_xi(reachability, predecessor, ordering,
+                                           min_samples_frac, min_cluster_size=None,
+                                           xi=0.1, predecessor_correction=True)
+  
+      # expected conversion
+      expected_min_samples = max(2, int(min_samples_frac * n_samples))
+      assert captured['min_samples_arg'] == expected_min_samples
+      # min_cluster_size should be set equal to min_samples (after conversion)
+      assert captured['min_cluster_size_arg'] == expected_min_samples
+  
+  
+  @pytest.mark.parametrize("min_cluster_frac,n_samples,expected_cluster_size",
+                           [
+                               (0.25, 10, 2),
+                               (0.35, 10, 3),
+                               (0.26, 15, 3),
+                           ])
+  def test_cluster_optics_xi_min_cluster_size_conversion(monkeypatch,
+                                                         min_cluster_frac,
+                                                         n_samples,
+                                                         expected_cluster_size):
+      """Ensure cluster_optics_xi converts fractional min_cluster_size by flooring
+      (int(min_cluster_size * n_samples), then max(2,...))."""
+      captured = {}
+  
+      def fake_xi_cluster(reachability_plot, predecessor_plot, ordering,
+                          xi, min_samples_arg, min_cluster_size_arg,
+                          predecessor_correction):
+          captured['min_samples_arg'] = min_samples_arg
+          captured['min_cluster_size_arg'] = min_cluster_size_arg
+          return np.array([])
+  
+      monkeypatch.setattr(optics_mod, "_xi_cluster", fake_xi_cluster)
+  
+      # choose a concrete min_samples that is integer-ish (2) and provide fractional min_cluster_size
+      reachability = np.arange(n_samples, dtype=float)
+      predecessor = np.arange(n_samples, dtype=int)
+      ordering = np.arange(n_samples, dtype=int)
+  
+      labels, clusters = cluster_optics_xi(reachability, predecessor, ordering,
+                                           min_samples=2, min_cluster_size=min_cluster_frac,
+                                           xi=0.1, predecessor_correction=True)
+  
+      expected_min_cluster_size = max(2, int(min_cluster_frac * n_samples))
+      assert captured['min_cluster_size_arg'] == expected_min_cluster_size
+  
+  
+  def test_optics_fit_fractional_min_samples_matches_integer_equivalent():
+      """When a fractional min_samples produces an integer via flooring, OPTICS
+      with fractional min_samples should produce the same labels as with the
+      explicit integer."""
+      rng = np.random.RandomState(0)
+      # create two very tight clusters of 5 points each -> total 10 samples
+      C1 = rng.normal(loc=-10.0, scale=0.01, size=(5, 2))
+      C2 = rng.normal(loc=10.0, scale=0.01, size=(5, 2))
+      X = np.vstack((C1, C2))
+  
+      # fractional min_samples that floors to 2 (0.25 * 10 = 2.5 -> int->2)
+      frac = 0.25
+      clust_frac = OPTICS(min_samples=frac, max_eps=np.inf, cluster_method='xi').fit(X)
+      clust_int = OPTICS(min_samples=2, max_eps=np.inf, cluster_method='xi').fit(X)
+  
+      # labels arrays should be identical for the floored behavior
+      assert np.array_equal(clust_frac.labels_, clust_int.labels_)
+  
+  def test_optics_fit_fractional_min_samples_changes_if_rounded_up():
+      """A sanity check: using a fractional min_samples that would be rounded up
+      by the candidate patch should differ from the floored integer in at least
+      one scenario. This ensures the detection of the rounding bug."""
+      rng = np.random.RandomState(1)
+      # construct three small clusters where increasing min_samples can change result
+      C1 = rng.normal(loc=-20.0, scale=0.1, size=(5, 2))
+      C2 = rng.normal(loc=0.0, scale=0.1, size=(5, 2))
+      C3 = rng.normal(loc=20.0, scale=0.1, size=(5, 2))
+      X = np.vstack((C1, C2, C3))
+  
+      # choose fraction that would floor to 3 but round to 4 for n_samples=15:
+      frac = 0.35  # 0.35 * 15 = 5.25 -> int->5; choose different to show change:
+      # For n_samples=15, 0.233333... * 15 = 3.5 -> takes example that would be problematic
+      frac_alt = 0.23333333333333334  # *15 = 3.5 -> floor 3 vs round 4
+      clust_floor = OPTICS(min_samples=3, max_eps=np.inf, cluster_method='xi').fit(X)
+      clust_frac = OPTICS(min_samples=frac_alt, max_eps=np.inf, cluster_method='xi').fit(X)
+  
+      # They should differ when the candidate code incorrectly rounds up; assert that
+      # labels are not necessarily equal to ensure the test captures the difference.
+      # We don't assert inequality as the gold behavior may sometimes match; instead,
+      # we assert that the fractional input produces the same result as the explicit
+      # floored integer (gold requirement). This will fail for the candidate.
+      assert np.array_equal(clust_frac.labels_, clust_floor.labels_)
+  
+new_imports_code: |-
+  import numpy as np
+  import pytest
+  from sklearn.cluster import optics_ as optics_mod
+  from sklearn.cluster.optics_ import compute_optics_graph, cluster_optics_xi, OPTICS

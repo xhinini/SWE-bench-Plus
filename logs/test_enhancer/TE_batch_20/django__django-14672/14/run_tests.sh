@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_equality_respects_order invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_hashable_with_list_through_fields invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_identity_distinguishes_none_and_empty_list invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_identity_distinguishes_none_and_empty_tuple invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_identity_includes_db_constraint_and_through invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_identity_not_equal_for_different_contents invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_list_and_tuple_with_same_contents_are_equal invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_manytomanyrel_in_set_for_various_through_fields invalid_models_tests.test_models_llm.ManyToManyRelIdentityTests.test_nested_through_fields_hashable invalid_models_tests.test_models_llm.build_rel
+coverage json -o coverage.json
+: '>>>>> End Test Output'

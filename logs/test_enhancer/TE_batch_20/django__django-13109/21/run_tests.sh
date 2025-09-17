@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 model_forms.test_models_llm.ForeignKeyBaseManagerValidationTests.setUp model_forms.test_models_llm.ForeignKeyBaseManagerValidationTests.test_foreignkey_validate_allows_object_filtered_by_default_manager_saved_instance model_forms.test_models_llm.ForeignKeyBaseManagerValidationTests.test_foreignkey_validate_allows_object_filtered_by_default_manager_unsaved_instance model_forms.test_models_llm.ForeignKeyBaseManagerValidationTests.test_full_clean_accepts_filtered_object_when_instance_assigned model_forms.test_models_llm.ForeignKeyBaseManagerValidationTests.test_full_clean_accepts_filtered_object_when_value_assigned model_forms.test_models_llm.ForeignKeyBaseManagerValidationTests.test_model_form_field_accepts_filtered_when_overriding_queryset_to_base_manager model_forms.test_models_llm.ForeignKeyBaseManagerValidationTests.test_model_form_field_rejects_filtered_by_default_queryset model_forms.test_models_llm.ForeignKeyBaseManagerValidationTests.test_one_to_one_field_validate_allows_filtered model_forms.test_models_llm.ForeignKeyBaseManagerValidationTests.test_validate_accepts_instance_value_for_foreignkey model_forms.test_models_llm.ForeignKeyBaseManagerValidationTests.test_validate_raises_for_nonexistent_target model_forms.test_models_llm.ForeignKeyBaseManagerValidationTests.test_validate_uses_remote_field_field_name_for_lookup
+coverage json -o coverage.json
+: '>>>>> End Test Output'

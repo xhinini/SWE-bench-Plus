@@ -1,0 +1,150 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests add coverage for bulk_update when fields are set to "expression-like" objects that implement resolve_expression (but are not necessarily subclasses of Django's Expression). They verify that bulk_update correctly treats such objects as expressions (not wrapped in Value), works with a mix of plain and expression-like values, respects boolean and custom DB column updates, and continues to operate when the database backend feature requires casted CASE expressions. The tests should expose incorrect handling that relies on isinstance(attr, Expression) rather than duck-typing via hasattr(attr, "resolve_expression").
+test_code: |
+  from django.test import TestCase
+  from django.db import connections
+  from django.db.models import F, Value
+  from .models import Note, Individual, CustomDbColumn, Order, Number
+
+  class _ExprLike:
+      """
+      A tiny wrapper that pretends to be an expression by exposing a
+      resolve_expression() method which returns the underlying expression.
+      """
+      def __init__(self, expr):
+          self._expr = expr
+
+      def resolve_expression(self, *args, **kwargs):
+          # Emulate how custom expressions might expose resolve_expression.
+          return self._expr
+
+      def __repr__(self):
+          return "<_ExprLike: %r>" % (self._expr,)
+
+  class BulkUpdateExpressionLikeTests(TestCase):
+      def setUp(self):
+          # Create a small set of Note objects to operate on.
+          self.notes = [
+              Note.objects.create(note=f'note-{i}', misc=f'misc-{i}')
+              for i in range(5)
+          ]
+
+      def test_custom_expr_like_using_f_expression(self):
+          # Set misc to an expression-like wrapper around F('note').
+          for n in self.notes:
+              n.misc = _ExprLike(F('note'))
+          Note.objects.bulk_update(self.notes, ['misc'])
+          # All misc values should be taken from the note field.
+          self.assertCountEqual(
+              Note.objects.values_list('misc', flat=True),
+              [n.note for n in self.notes]
+          )
+
+      def test_custom_expr_like_using_value_expression(self):
+          for n in self.notes:
+              n.misc = _ExprLike(Value('constant'))
+          Note.objects.bulk_update(self.notes, ['misc'])
+          self.assertCountEqual(
+              Note.objects.values_list('misc', flat=True),
+              ['constant'] * len(self.notes)
+          )
+
+      def test_mixed_plain_and_expr_like_values(self):
+          # Half the notes use a plain value, half use an expr-like wrapper.
+          for i, n in enumerate(self.notes):
+              if i % 2:
+                  n.misc = 'plain-%d' % i
+              else:
+                  n.misc = _ExprLike(F('note'))
+          Note.objects.bulk_update(self.notes, ['misc'])
+          db_values = list(Note.objects.order_by('pk').values_list('misc', flat=True))
+          expected = []
+          for i, n in enumerate(self.notes):
+              expected.append(n.note if i % 2 == 0 else 'plain-%d' % i)
+          self.assertEqual(db_values, expected)
+
+      def test_expression_like_on_multiple_fields(self):
+          # Use same expr-like on two fields (note and misc).
+          for n in self.notes:
+              # Make the note field equal to a constant and misc mirror it using F('note').
+              n.note = 'shared'
+              n.misc = _ExprLike(F('note'))
+          Note.objects.bulk_update(self.notes, ['note', 'misc'])
+          self.assertCountEqual(Note.objects.values_list('note', flat=True), ['shared'] * len(self.notes))
+          self.assertCountEqual(Note.objects.values_list('misc', flat=True), ['shared'] * len(self.notes))
+
+      def test_expression_like_on_boolean_field(self):
+          # Use expr-like wrapper to set boolean field on Individual model.
+          individuals = [Individual.objects.create(alive=False) for _ in range(5)]
+          for inst in individuals:
+              inst.alive = _ExprLike(Value(True))
+          Individual.objects.bulk_update(individuals, ['alive'])
+          self.assertCountEqual(Individual.objects.filter(alive=True), individuals)
+
+      def test_expression_like_on_custom_db_column(self):
+          # CustomDbColumn has a custom DB column; ensure expr-like works.
+          models = [CustomDbColumn.objects.create(custom_column=0) for _ in range(3)]
+          for m in models:
+              m.custom_column = _ExprLike(Value(7))
+          CustomDbColumn.objects.bulk_update(models, ['custom_column'])
+          self.assertCountEqual(CustomDbColumn.objects.filter(custom_column=7), models)
+
+      def test_expression_like_with_falsey_pk(self):
+          # Ensure models with a falsey primary key (e.g., 0) are handled.
+          order = Order.objects.create(pk=0, name='orig')
+          order.name = _ExprLike(Value('updated'))
+          Order.objects.bulk_update([order], ['name'])
+          order.refresh_from_db()
+          self.assertEqual(order.name, 'updated')
+
+      def test_expression_like_with_numeric_field(self):
+          # Number model contains an integer field 'num'. Use expr-like wrapper.
+          numbers = [Number.objects.create(num=0) for _ in range(4)]
+          for num in numbers:
+              # Use Value to set a concrete integer via expr-like wrapper.
+              num.num = _ExprLike(Value(42))
+          Number.objects.bulk_update(numbers, ['num'])
+          self.assertCountEqual(Number.objects.filter(num=42), numbers)
+
+      def test_bulk_update_works_when_requires_casted_case_in_updates_is_true(self):
+          # Temporarily force the connection features to require casting.
+          conn = connections[Note.objects.db]
+          old = getattr(conn.features, 'requires_casted_case_in_updates', None)
+          try:
+              conn.features.requires_casted_case_in_updates = True
+              # Use expr-like wrappers to force the Case/When path.
+              for n in self.notes:
+                  n.misc = _ExprLike(F('note'))
+              Note.objects.bulk_update(self.notes, ['misc'])
+              self.assertCountEqual(
+                  Note.objects.values_list('misc', flat=True),
+                  [n.note for n in self.notes]
+              )
+          finally:
+              # Restore original feature flag.
+              if old is None:
+                  delattr(conn.features, 'requires_casted_case_in_updates')
+              else:
+                  conn.features.requires_casted_case_in_updates = old
+
+      def test_mixed_expr_like_and_plain_multiple_batches(self):
+          # Ensure duplicates across batches and mixing plain/expr-like values doesn't break.
+          notes = [Note.objects.create(note=f'n{i}', misc='x') for i in range(10)]
+          # Set every even record to expr-like, odd records to plain value.
+          for i, n in enumerate(notes):
+              if i % 2 == 0:
+                  n.misc = _ExprLike(F('note'))
+              else:
+                  n.misc = 'plain-%d' % i
+          # Force small batch size to exercise batched updates.
+          Note.objects.bulk_update(notes, ['misc'], batch_size=3)
+          # Validate results.
+          db = list(Note.objects.order_by('pk').values_list('misc', flat=True))
+          expected = []
+          for i, n in enumerate(notes):
+              expected.append(n.note if i % 2 == 0 else 'plain-%d' % i)
+          self.assertEqual(db, expected)
+new_imports_code: |
+  from django.db import connections
+  from django.db.models import Value

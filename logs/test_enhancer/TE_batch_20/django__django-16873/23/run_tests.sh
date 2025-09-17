@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_joiner_does_not_escape_elements template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_joiner_list_content_unchanged_after_failure template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_joiner_preserves_mark_safe_elements template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_joiner_preserves_type_for_tuple template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_joiner_returns_same_list_autoescape_false template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_joiner_returns_same_list_autoescape_true template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_joiner_with_empty_list_identity template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_joiner_with_list_subclass_preserves_identity template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_joiner_with_numeric_elements template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_noniterable_joiner_with_tuple_returns_same_tuple
+coverage json -o coverage.json
+: '>>>>> End Test Output'

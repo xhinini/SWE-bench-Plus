@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_writer_llm.ExtraNestedMethodSerializationTests.test_classmethod_imports_present migrations.test_writer_llm.ExtraNestedMethodSerializationTests.test_classmethod_single_level_nested migrations.test_writer_llm.ExtraNestedMethodSerializationTests.test_classmethod_three_level_nested migrations.test_writer_llm.ExtraNestedMethodSerializationTests.test_classmethod_two_level_nested migrations.test_writer_llm.ExtraNestedMethodSerializationTests.test_multiple_nested_variants_all_use_qualname migrations.test_writer_llm.ExtraNestedMethodSerializationTests.test_regular_method_single_level_nested migrations.test_writer_llm.ExtraNestedMethodSerializationTests.test_regular_method_three_level_nested migrations.test_writer_llm.ExtraNestedMethodSerializationTests.test_regular_method_two_level_nested migrations.test_writer_llm.ExtraNestedMethodSerializationTests.test_staticmethod_single_level_nested migrations.test_writer_llm.ExtraNestedMethodSerializationTests.test_staticmethod_two_level_nested migrations.test_writer_llm._make_classmethod_class migrations.test_writer_llm._make_regular_method_class migrations.test_writer_llm._make_static_method_class
+coverage json -o coverage.json
+: '>>>>> End Test Output'

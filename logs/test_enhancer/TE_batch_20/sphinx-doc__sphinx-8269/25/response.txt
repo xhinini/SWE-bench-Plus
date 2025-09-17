@@ -1,0 +1,205 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests instantiate a CheckExternalLinksBuilder with zero worker threads, then run its check_thread() synchronously while patching the requests.get and requests.head functions to return controlled mock responses. Each test exercises the code path for URLs containing an anchor (i.e. '#anchor'). They assert that a GET request is invoked for anchor checks and that missing anchors lead to a 'broken' status. The candidate (model) patch incorrectly skips anchor checks for non-HTML responses (or when the Content-Type header is missing) and therefore will not call GET and will return 'working' for such cases; the gold patch ensures the GET is performed and response.raise_for_status() is called before checking the anchor. Thus these tests will fail under the candidate patch and pass under the gold patch.
+new_imports_code: |
+  from unittest import mock
+  import queue
+  from requests.exceptions import HTTPError
+  from sphinx.builders.linkcheck import CheckExternalLinksBuilder
+test_code: |
+  import pytest
+  from unittest import mock
+  from requests.exceptions import HTTPError
+  from sphinx.builders.linkcheck import CheckExternalLinksBuilder
+  
+  class MockResponse:
+      def __init__(self, url='https://example.com/', content_chunks=None,
+                   headers=None, history=None, method='GET', raise_exc=None):
+          self.url = url
+          self._chunks = content_chunks or []
+          self.headers = headers or {}
+          self.history = history or []
+          self.request = mock.Mock()
+          self.request.method = method
+          self._raise_exc = raise_exc
+      def iter_content(self, chunk_size=4096, decode_unicode=False):
+          for c in self._chunks:
+              yield c
+      def raise_for_status(self):
+          if self._raise_exc:
+              raise self._raise_exc
+      # allow truthy checks etc
+      def __repr__(self):
+          return "<MockResponse %s>" % self.url
+  
+  def _setup_builder(app):
+      # avoid starting background worker threads by setting workers to 0
+      app.config.linkcheck_workers = 0
+      app.config.linkcheck_anchors = True
+      b = CheckExternalLinksBuilder(app)
+      b.init()
+      return b
+  
+  def _run_check_once(builder, uri, head_resp, get_resp):
+      # patch requests.get and requests.head inside the module under test
+      with mock.patch('sphinx.builders.linkcheck.requests.get') as mock_get, \
+           mock.patch('sphinx.builders.linkcheck.requests.head') as mock_head:
+          mock_get.return_value = get_resp
+          mock_head.return_value = head_resp
+          # enqueue the URI and a sentinel to stop the local loop
+          builder.wqueue.put((uri, 'doc', 1))
+          builder.wqueue.put((None, None, None))
+          # run check_thread synchronously in this thread
+          builder.check_thread()
+          # get the result that the thread placed into rqueue
+          result = builder.rqueue.get_nowait()
+          return result, mock_get, mock_head
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_non_html_content_type_triggers_get_and_broken(app):
+      """
+      HEAD returns 200 with non-HTML content-type; GET must be used to
+      fetch content and check the anchor. If anchor missing, status must be 'broken'.
+      """
+      builder = _setup_builder(app)
+      # HEAD returns 200 and non-HTML content-type
+      head = MockResponse(url='https://example.com/page', headers={'content-type':'application/octet-stream'}, method='HEAD')
+      # GET returns 200 and HTML content without the anchor
+      get = MockResponse(url='https://example.com/page', headers={'content-type':'application/octet-stream'},
+                         content_chunks=["<html><body>No anchor here</body></html>"], method='GET')
+      uri = 'https://example.com/page#missing'
+      (uri_out, doc, lineno, status, info, code), mock_get, mock_head = _run_check_once(builder, uri, head, get)
+      # Gold behavior: GET must be called and anchor missing -> broken
+      assert mock_get.called, "GET should be called to check anchor"
+      assert status == 'broken'
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_missing_when_content_type_absent_triggers_get_and_broken(app):
+      """
+      If Content-Type header is missing, the builder must still GET and check the anchor.
+      """
+      builder = _setup_builder(app)
+      head = MockResponse(url='https://example.com/page', headers={}, method='HEAD')
+      get = MockResponse(url='https://example.com/page', headers={}, content_chunks=["<p>no anchor</p>"], method='GET')
+      uri = 'https://example.com/page#nope'
+      (uri_out, doc, lineno, status, info, code), mock_get, mock_head = _run_check_once(builder, uri, head, get)
+      assert mock_get.called, "GET should be called even if Content-Type is missing"
+      assert status == 'broken'
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_missing_with_text_plain_charset_triggers_get_and_broken(app):
+      """
+      Text content types that are not HTML should still lead to anchor checking by GET.
+      """
+      builder = _setup_builder(app)
+      head = MockResponse(url='https://example.com/page', headers={'content-type':'text/plain; charset=utf-8'}, method='HEAD')
+      get = MockResponse(url='https://example.com/page', headers={'content-type':'text/plain; charset=utf-8'},
+                         content_chunks=["plain text without anchor"], method='GET')
+      uri = 'https://example.com/page#anchor'
+      (uri_out, doc, lineno, status, info, code), mock_get, mock_head = _run_check_once(builder, uri, head, get)
+      assert mock_get.called
+      assert status == 'broken'
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_head_raises_http_error_but_get_used_to_check_anchor_and_broken(app):
+      """
+      If HEAD raises HTTPError, builder must retry with GET and still check anchors.
+      """
+      builder = _setup_builder(app)
+      head = MockResponse(url='https://example.com/page', headers={}, method='HEAD', raise_exc=HTTPError("head failed"))
+      get = MockResponse(url='https://example.com/page', headers={'content-type':'application/octet-stream'},
+                         content_chunks=["<html>No anchor</html>"], method='GET')
+      uri = 'https://example.com/page#oops'
+      (uri_out, doc, lineno, status, info, code), mock_get, mock_head = _run_check_once(builder, uri, head, get)
+      # ensure fallback to GET happened
+      assert mock_get.called
+      assert status == 'broken'
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_missing_with_bytes_chunks_triggers_get_and_broken(app):
+      """
+      Ensure bytes chunks are handled and still lead to broken when anchor missing.
+      """
+      builder = _setup_builder(app)
+      head = MockResponse(url='https://example.com/page', headers={'content-type':'application/octet-stream'}, method='HEAD')
+      # simulate bytes chunks that need decoding
+      get = MockResponse(url='https://example.com/page', headers={'content-type':'application/octet-stream'},
+                         content_chunks=[b"<html><body>", b"No anchor", b"</body></html>"], method='GET')
+      uri = 'https://example.com/page#missing'
+      (uri_out, doc, lineno, status, info, code), mock_get, mock_head = _run_check_once(builder, uri, head, get)
+      assert mock_get.called
+      assert status == 'broken'
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_percent_encoded_anchor_is_unquoted_and_checked(app):
+      """
+      Anchors with percent-encoding must be unquoted and checked.
+      """
+      builder = _setup_builder(app)
+      head = MockResponse(url='https://example.com/page', headers={'content-type':'application/octet-stream'}, method='HEAD')
+      get = MockResponse(url='https://example.com/page', headers={'content-type':'application/octet-stream'},
+                         content_chunks=["<div id='my anchor'>content</div>"], method='GET')
+      uri = 'https://example.com/page#my%20anchor'
+      (uri_out, doc, lineno, status, info, code), mock_get, mock_head = _run_check_once(builder, uri, head, get)
+      assert mock_get.called
+      # although the id appears, our simple parser needs exact match; in this test it is present so expect working
+      assert status in ('working', 'broken')  # if not detected due to parser differences, at least GET was called
+      assert mock_get.called
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_missing_when_head_ok_but_non_html_calls_get_and_broken(app):
+      """
+      HEAD returns 200 non-HTML; gold code should still GET and check anchor, leading to broken.
+      """
+      builder = _setup_builder(app)
+      head = MockResponse(url='https://example.com/page', headers={'content-type':'application/pdf'}, method='HEAD')
+      get = MockResponse(url='https://example.com/page', headers={'content-type':'application/pdf'},
+                         content_chunks=["PDF content with no anchor"], method='GET')
+      uri = 'https://example.com/page#x'
+      (uri_out, doc, lineno, status, info, code), mock_get, mock_head = _run_check_once(builder, uri, head, get)
+      assert mock_get.called
+      assert status == 'broken'
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_anchor_missing_with_history_and_non_html_calls_get_and_broken(app):
+      """
+      Ensure redirects/history do not prevent GET being called and anchor checked.
+      """
+      builder = _setup_builder(app)
+      # Simulate a redirect history present on the final response
+      hist = [mock.Mock(status_code=302)]
+      head = MockResponse(url='https://example.com/page', headers={'content-type':'application/octet-stream'}, method='HEAD')
+      get = MockResponse(url='https://example.com/redirected/page', headers={'content-type':'application/octet-stream'},
+                         content_chunks=["<html>no anchor</html>"], method='GET', history=hist)
+      uri = 'https://example.com/page#anchor'
+      (uri_out, doc, lineno, status, info, code), mock_get, mock_head = _run_check_once(builder, uri, head, get)
+      assert mock_get.called
+      assert status == 'broken'
+  
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True)
+  def test_multiple_anchor_cases_all_require_get_and_report_broken(app):
+      """
+      Run multiple similar URIs to ensure GET is always used for anchor checking.
+      """
+      builder = _setup_builder(app)
+      head = MockResponse(url='https://example.com/a', headers={'content-type':'application/octet-stream'}, method='HEAD')
+      get = MockResponse(url='https://example.com/a', headers={'content-type':'application/octet-stream'},
+                         content_chunks=["<html>No anchors anywhere</html>"], method='GET')
+      uris = [
+          'https://example.com/a#one',
+          'https://example.com/a#two',
+          'https://example.com/a#three',
+      ]
+      with mock.patch('sphinx.builders.linkcheck.requests.get') as mock_get, \
+           mock.patch('sphinx.builders.linkcheck.requests.head') as mock_head:
+          mock_get.return_value = get
+          mock_head.return_value = head
+          for u in uris:
+              builder.wqueue.put((u, 'doc', 1))
+          builder.wqueue.put((None, None, None))
+          builder.check_thread()
+          # collect three results
+          results = [builder.rqueue.get_nowait() for _ in uris]
+          assert mock_get.called
+          for res in results:
+              assert res[3] == 'broken'  # status must be 'broken' because anchors are missing

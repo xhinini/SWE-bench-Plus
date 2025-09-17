@@ -1,0 +1,94 @@
+from django.db.models.expressions import SimpleCol, F
+from django.db.models.sql.query import Query
+from django.test import SimpleTestCase
+from .models import Item
+
+class TestResolveLookupValueNestedIterables(SimpleTestCase):
+
+    def test_resolve_lookup_value_nested_list_resolves_inner_F(self):
+        q = Query(Item)
+        value = [[F('created')]]
+        resolved = q.resolve_lookup_value(value, can_reuse=None, allow_joins=True, simple_col=True)
+        self.assertIsInstance(resolved, list)
+        self.assertIsInstance(resolved[0], list)
+        self.assertIsInstance(resolved[0][0], SimpleCol)
+        self.assertEqual(resolved[0][0].target, Item._meta.get_field('created'))
+
+    def test_resolve_lookup_value_nested_tuple_resolves_inner_F(self):
+        q = Query(Item)
+        value = ((F('created'),),)
+        resolved = q.resolve_lookup_value(value, can_reuse=None, allow_joins=True, simple_col=True)
+        self.assertIsInstance(resolved, tuple)
+        self.assertIsInstance(resolved[0], tuple)
+        self.assertIsInstance(resolved[0][0], SimpleCol)
+        self.assertEqual(resolved[0][0].target, Item._meta.get_field('created'))
+
+    def test_resolve_lookup_value_list_with_tuple_inner_preserves_inner_type(self):
+        q = Query(Item)
+        value = [(F('created'),)]
+        resolved = q.resolve_lookup_value(value, can_reuse=None, allow_joins=True, simple_col=True)
+        self.assertIsInstance(resolved, list)
+        self.assertIsInstance(resolved[0], tuple)
+        self.assertIsInstance(resolved[0][0], SimpleCol)
+        self.assertEqual(resolved[0][0].target, Item._meta.get_field('created'))
+
+    def test_resolve_lookup_value_tuple_with_list_inner_preserves_inner_type(self):
+        q = Query(Item)
+        value = ([F('created')],)
+        resolved = q.resolve_lookup_value(value, can_reuse=None, allow_joins=True, simple_col=True)
+        self.assertIsInstance(resolved, tuple)
+        self.assertIsInstance(resolved[0], list)
+        self.assertIsInstance(resolved[0][0], SimpleCol)
+        self.assertEqual(resolved[0][0].target, Item._meta.get_field('created'))
+
+    def test_resolve_lookup_value_mixed_nested_iterables(self):
+        q = Query(Item)
+        value = [F('created'), [F('modified'), F('created')], (F('created'),)]
+        resolved = q.resolve_lookup_value(value, can_reuse=None, allow_joins=True, simple_col=True)
+        self.assertIsInstance(resolved, list)
+        self.assertIsInstance(resolved[0], SimpleCol)
+        self.assertEqual(resolved[0].target, Item._meta.get_field('created'))
+        self.assertIsInstance(resolved[1], list)
+        self.assertIsInstance(resolved[1][0], SimpleCol)
+        self.assertIsInstance(resolved[1][1], SimpleCol)
+        self.assertIsInstance(resolved[2], tuple)
+        self.assertIsInstance(resolved[2][0], SimpleCol)
+
+    def test_resolve_lookup_value_deeply_nested_three_levels(self):
+        q = Query(Item)
+        value = [[[F('created')]]]
+        resolved = q.resolve_lookup_value(value, can_reuse=None, allow_joins=True, simple_col=True)
+        self.assertIsInstance(resolved, list)
+        self.assertIsInstance(resolved[0], list)
+        self.assertIsInstance(resolved[0][0], list)
+        self.assertIsInstance(resolved[0][0][0], SimpleCol)
+        self.assertEqual(resolved[0][0][0].target, Item._meta.get_field('created'))
+
+    def test_resolve_lookup_value_deeply_nested_mixed_types(self):
+        q = Query(Item)
+        value = ([([F('created')],)],)
+        resolved = q.resolve_lookup_value(value, can_reuse=None, allow_joins=True, simple_col=True)
+        self.assertIsInstance(resolved, tuple)
+        inner_list = resolved[0]
+        self.assertIsInstance(inner_list, list)
+        inner_tuple = inner_list[0]
+        self.assertIsInstance(inner_tuple, tuple)
+        inner_most_list = inner_tuple[0]
+        self.assertIsInstance(inner_most_list, list)
+        self.assertIsInstance(inner_most_list[0], SimpleCol)
+        self.assertEqual(inner_most_list[0].target, Item._meta.get_field('created'))
+
+    def test_resolve_lookup_value_multiple_levels_with_non_expressions(self):
+        q = Query(Item)
+        value = ([F('created'), 'x'], ('y', [F('modified')]))
+        resolved = q.resolve_lookup_value(value, can_reuse=None, allow_joins=True, simple_col=True)
+        self.assertIsInstance(resolved, tuple)
+        self.assertIsInstance(resolved[0], list)
+        self.assertIsInstance(resolved[1], tuple)
+        self.assertIsInstance(resolved[0][0], SimpleCol)
+        self.assertEqual(resolved[0][0].target, Item._meta.get_field('created'))
+        self.assertEqual(resolved[0][1], 'x')
+        self.assertEqual(resolved[1][0], 'y')
+        self.assertIsInstance(resolved[1][1], list)
+        self.assertIsInstance(resolved[1][1][0], SimpleCol)
+        self.assertEqual(resolved[1][1][0].target, Item._meta.get_field('modified'))

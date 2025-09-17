@@ -1,0 +1,139 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  A suite of regression tests exercising QuerySet.bulk_update() when instance
+  attributes are expression-like objects that implement resolve_expression()
+  (duck-typed expressions). These tests verify that such objects are treated
+  as expressions (not wrapped in Value) and are compiled correctly by the ORM.
+  They cover mixing expressions and plain values, different field types,
+  batching, duplicates and larger batches. They are intended to detect the bug
+  where bulk_update would not recognise expression-like objects (e.g. relied on
+  isinstance(..., Expression)) and would incorrectly wrap them or mis-handle
+  them.
+test_code: |
+  from django.test import TestCase
+  from django.db.models import F, Value
+  from django.db import transaction
+
+  from .models import (
+      Note, Number, CustomDbColumn, Individual,
+  )
+
+  class _GoodExpr:
+      """
+      A small duck-typed "expression" that implements resolve_expression()
+      by delegating to a Value() expression containing the provided value.
+      This is enough to exercise the code path that used to rely on an
+      isinstance(..., Expression) check.
+      """
+      def __init__(self, value):
+          self._value = value
+
+      def resolve_expression(self, *args, **kwargs):
+          # Return a concrete Value expression that the compiler can handle.
+          return Value(self._value)
+
+  class BulkUpdateRegressionTests(TestCase):
+      @classmethod
+      def setUpTestData(cls):
+          # Prepare a small set of objects to reuse across tests.
+          cls.notes = [Note.objects.create(note=str(i), misc=str(i)) for i in range(6)]
+          cls.numbers = [Number.objects.create(num=i) for i in range(6)]
+          cls.customs = [CustomDbColumn.objects.create(custom_column=i, ip_address='0.0.0.0') for i in range(4)]
+          cls.individuals = [Individual.objects.create(alive=False) for _ in range(4)]
+
+      def _refresh(self, objs):
+          for o in objs:
+              o.refresh_from_db()
+
+      def test_custom_resolve_expression_on_text_field(self):
+          # Assign _GoodExpr to a text field and ensure bulk_update writes the value.
+          for note in self.notes:
+              note.note = _GoodExpr('expr-text')
+          Note.objects.bulk_update(self.notes, ['note'])
+          self._refresh(self.notes)
+          self.assertEqual(set(n.note for n in self.notes), {'expr-text'})
+
+      def test_custom_resolve_expression_with_batch_size_one(self):
+          # Ensure batching does not change behavior.
+          for note in self.notes:
+              note.note = _GoodExpr('b1')
+          Note.objects.bulk_update(self.notes, ['note'], batch_size=1)
+          self._refresh(self.notes)
+          self.assertEqual(set(n.note for n in self.notes), {'b1'})
+
+      def test_mix_of_expressions_and_plain_values(self):
+          # Half the objects get a GoodExpr, half plain values.
+          half = len(self.notes) // 2
+          for i, note in enumerate(self.notes):
+              note.note = _GoodExpr('E') if i < half else 'P'
+          Note.objects.bulk_update(self.notes, ['note'])
+          self._refresh(self.notes)
+          self.assertEqual(set(n.note for n in self.notes), {'E', 'P'})
+
+      def test_custom_resolve_expression_on_integer_field(self):
+          # Integer field update using custom resolve_expression.
+          for number in self.numbers:
+              number.num = _GoodExpr(42)
+          Number.objects.bulk_update(self.numbers, ['num'])
+          self._refresh(self.numbers)
+          self.assertTrue(all(n.num == 42 for n in self.numbers))
+
+      def test_mix_of_f_and_custom_expression(self):
+          # Mix F() expression and duck-typed expression in same batch.
+          for i, number in enumerate(self.numbers):
+              if i % 2:
+                  number.num = F('num') + 1
+              else:
+                  number.num = _GoodExpr(100 + i)
+          Number.objects.bulk_update(self.numbers, ['num'])
+          # Validate results: the F() rows become original+1, the custom ones set to provided value.
+          self._refresh(self.numbers)
+          for i, number in enumerate(self.numbers):
+              if i % 2:
+                  self.assertEqual(number.num, i + 1)
+              else:
+                  self.assertEqual(number.num, 100 + i)
+
+      def test_null_and_custom_expression_mix(self):
+          # Some fields explicitly set to None and others via custom expression.
+          for i, note in enumerate(self.notes):
+              note.misc = None if i % 2 else _GoodExpr('nn')
+          Note.objects.bulk_update(self.notes, ['misc'])
+          self._refresh(self.notes)
+          self.assertEqual(set(n.misc for n in self.notes), {'nn', None})
+
+      def test_custom_expression_on_custom_db_column(self):
+          # Update custom db column using duck-typed expression.
+          for i, obj in enumerate(self.customs):
+              obj.custom_column = _GoodExpr(999 + i)
+          CustomDbColumn.objects.bulk_update(self.customs, ['custom_column'])
+          self._refresh(self.customs)
+          self.assertEqual([c.custom_column for c in self.customs], [999, 1000, 1001, 1002])
+
+      def test_boolean_field_with_custom_expression(self):
+          # Boolean field set via custom expression (True/False values).
+          for i, ind in enumerate(self.individuals):
+              ind.alive = _GoodExpr(True if i % 2 == 0 else False)
+          Individual.objects.bulk_update(self.individuals, ['alive'])
+          self._refresh(self.individuals)
+          self.assertEqual([p.alive for p in self.individuals], [True, False, True, False])
+
+      def test_duplicates_and_batching_with_custom_expression(self):
+          # Passing duplicate objects in the list: duplicates should be handled per occurrence.
+          obj = self.notes[0]
+          obj.note = _GoodExpr('dup')
+          # duplicate twice in different batches by forcing small batch_size
+          rows_updated = Note.objects.bulk_update([obj, obj], ['note'], batch_size=1)
+          # Two updates expected because the object appears twice and batch_size=1 leads to two update operations
+          self.assertEqual(rows_updated, 2)
+
+      def test_large_batch_with_custom_expression_returns_correct_count(self):
+          # Create a larger set and ensure return value equals number of objects updated.
+          many = [Number.objects.create(num=0) for _ in range(30)]
+          for n in many:
+              n.num = _GoodExpr(7)
+          rows_updated = Number.objects.bulk_update(many, ['num'])
+          self.assertEqual(rows_updated, len(many))
+new_imports_code: |
+  # No global imports required beyond what the test file declares.

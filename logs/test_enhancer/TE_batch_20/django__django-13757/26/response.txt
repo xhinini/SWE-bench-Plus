@@ -1,0 +1,134 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests directly exercise KeyTransformIsNull.as_oracle and KeyTransformIsNull.as_sqlite code paths using a dummy compiler/connection to ensure the lookup returns the expected SQL fragments and includes the lhs compile parameters. They detect the candidate patch's incorrect negation-only behavior (missing the "OR <lhs> IS NULL" clause and failing to return lhs params) and the incorrect SQLite handling (wrapping with NOT(...) instead of using the IS NULL template).
+test_code: |
+  from types import SimpleNamespace
+  from django.test import SimpleTestCase
+  from django.db.models.fields.json import KeyTransformIsNull, KeyTransform, HasKey
+  import json
+
+  class DummyCompiler:
+      def __init__(self, compiled_sql='"col"', params=None):
+          self.compiled_sql = compiled_sql
+          self.params = [] if params is None else list(params)
+
+      def compile(self, expr):
+          # Return a compiled SQL fragment and parameters for that fragment.
+          # The tests vary the self.params to assert they are propagated.
+          return (self.compiled_sql, list(self.params))
+
+  class KeyTransformIsNullRegressionTests(SimpleTestCase):
+      def test_oracle_isnull_true_includes_or_and_is_null_and_includes_lhs_params(self):
+          # Simulate compiling a column with one bind parameter to ensure params are returned.
+          compiler = DummyCompiler(compiled_sql='"tbl"."col"', params=[7])
+          connection = SimpleNamespace(vendor='oracle', features=SimpleNamespace(supports_json_field=True))
+          # lhs is KeyTransform('k', 'value') - the lookup is value__k__isnull
+          kt = KeyTransform('k', 'value')
+          lookup = KeyTransformIsNull(kt, True)
+          sql, params = lookup.as_oracle(compiler, connection)
+          # Gold: should include an OR <lhs> IS NULL clause and include the compiler params.
+          self.assertIn('OR', sql)
+          self.assertIn('IS NULL', sql)
+          # The returned params should include the lhs compile params (7).
+          self.assertEqual(params, (7,))
+
+      def test_oracle_isnull_true_contains_quoted_key_path(self):
+          compiler = DummyCompiler(compiled_sql='value', params=[1])
+          connection = SimpleNamespace(vendor='oracle', features=SimpleNamespace(supports_json_field=True))
+          kt = KeyTransform('myKey', 'value')
+          lookup = KeyTransformIsNull(kt, True)
+          sql, params = lookup.as_oracle(compiler, connection)
+          # The JSON path for a non-integer key should include a quoted member ("myKey")
+          # and the SQL should include JSON_EXISTS (used by HasKey.as_oracle).
+          self.assertIn('JSON_EXISTS', sql)
+          self.assertIn('"myKey"', sql)
+          self.assertIn('IS NULL', sql)
+          self.assertEqual(params, (1,))
+
+      def test_oracle_isnull_true_numeric_key_uses_bracket_path(self):
+          compiler = DummyCompiler(compiled_sql='value', params=[2])
+          connection = SimpleNamespace(vendor='oracle', features=SimpleNamespace(supports_json_field=True))
+          kt = KeyTransform('0', 'value')  # numeric index
+          lookup = KeyTransformIsNull(kt, True)
+          sql, params = lookup.as_oracle(compiler, connection)
+          # Numeric keys should use bracket JSON path like $[0]
+          self.assertIn('$[0]', sql)
+          self.assertIn('IS NULL', sql)
+          self.assertEqual(params, (2,))
+
+      def test_oracle_isnull_false_returns_haskey_sql_without_is_null(self):
+          compiler = DummyCompiler(compiled_sql='value', params=[])
+          connection = SimpleNamespace(vendor='oracle', features=SimpleNamespace(supports_json_field=True))
+          kt = KeyTransform('k', 'value')
+          lookup = KeyTransformIsNull(kt, False)
+          sql, params = lookup.as_oracle(compiler, connection)
+          # For isnull=False, KeyTransformIsNull should behave like HasKey and not include IS NULL.
+          self.assertIn('JSON_EXISTS', sql)
+          self.assertNotIn('IS NULL', sql)
+          self.assertEqual(params, ())
+
+      def test_oracle_isnull_true_nested_key_includes_or_and_params(self):
+          # lhs is nested: KeyTransform('y', KeyTransform('x', 'value'))
+          compiler = DummyCompiler(compiled_sql='"tbl"."col"', params=[99])
+          connection = SimpleNamespace(vendor='oracle', features=SimpleNamespace(supports_json_field=True))
+          nested = KeyTransform('y', KeyTransform('x', 'value'))
+          lookup = KeyTransformIsNull(nested, True)
+          sql, params = lookup.as_oracle(compiler, connection)
+          # Should include OR ... IS NULL and include the compiler params (99,)
+          self.assertIn('OR', sql)
+          self.assertIn('IS NULL', sql)
+          self.assertEqual(params, (99,))
+
+      def test_sqlite_isnull_true_uses_is_null_template_and_returns_params(self):
+          compiler = DummyCompiler(compiled_sql='col', params=[11])
+          connection = SimpleNamespace(vendor='sqlite', features=SimpleNamespace(supports_json_field=True))
+          kt = KeyTransform('k', 'value')
+          lookup = KeyTransformIsNull(kt, True)
+          sql, params = lookup.as_sqlite(compiler, connection)
+          # Gold: should use the IS NULL template (not a NOT(...) wrapper).
+          self.assertIn('JSON_TYPE', sql)
+          self.assertIn('IS NULL', sql)
+          # Params should include the compiled lhs params and the JSON path.
+          self.assertTrue(len(params) >= 1)
+          self.assertEqual(params[0], 11)
+
+      def test_sqlite_isnull_false_uses_is_not_null_template(self):
+          compiler = DummyCompiler(compiled_sql='col', params=[12])
+          connection = SimpleNamespace(vendor='sqlite', features=SimpleNamespace(supports_json_field=True))
+          kt = KeyTransform('k', 'value')
+          lookup = KeyTransformIsNull(kt, False)
+          sql, params = lookup.as_sqlite(compiler, connection)
+          self.assertIn('JSON_TYPE', sql)
+          self.assertIn('IS NOT NULL', sql)
+          self.assertTrue(len(params) >= 1)
+          self.assertEqual(params[0], 12)
+
+      def test_sqlite_isnull_true_numeric_key_path_and_params(self):
+          compiler = DummyCompiler(compiled_sql='col', params=[13])
+          connection = SimpleNamespace(vendor='sqlite', features=SimpleNamespace(supports_json_field=True))
+          kt = KeyTransform('0', 'value')
+          lookup = KeyTransformIsNull(kt, True)
+          sql, params = lookup.as_sqlite(compiler, connection)
+          # Numeric key path should use bracket form and SQL should use IS NULL.
+          self.assertIn('$[0]', sql)
+          self.assertIn('IS NULL', sql)
+          self.assertEqual(params[0], 13)
+
+      def test_sqlite_isnull_true_returns_compiler_params_tuple(self):
+          compiler = DummyCompiler(compiled_sql='"t"."c"', params=[21, 22])
+          connection = SimpleNamespace(vendor='sqlite', features=SimpleNamespace(supports_json_field=True))
+          kt = KeyTransform('key', 'value')
+          lookup = KeyTransformIsNull(kt, True)
+          sql, params = lookup.as_sqlite(compiler, connection)
+          # The returned params should include the lhs compilation params at the start.
+          self.assertTrue(params[0] == 21 and params[1] == 22)
+
+      def test_sqlite_isnull_false_returns_compiler_params_tuple(self):
+          compiler = DummyCompiler(compiled_sql='"t"."c"', params=[31, 32])
+          connection = SimpleNamespace(vendor='sqlite', features=SimpleNamespace(supports_json_field=True))
+          kt = KeyTransform('key', 'value')
+          lookup = KeyTransformIsNull(kt, False)
+          sql, params = lookup.as_sqlite(compiler, connection)
+          self.assertTrue(params[0] == 31 and params[1] == 32)
+new_imports_code: |
+  from types import SimpleNamespace

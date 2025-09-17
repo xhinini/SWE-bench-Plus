@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.test_admin_llm.FakeRequest.__getattr__ admin_changelist.test_admin_llm.FakeRequest.__init__ admin_changelist.test_admin_llm.ModelAdminSearchTests.setUp admin_changelist.test_admin_llm.ModelAdminSearchTests.test_combined_term_across_relation_path admin_changelist.test_admin_llm.ModelAdminSearchTests.test_missing_term_filters_out_result admin_changelist.test_admin_llm.ModelAdminSearchTests.test_multi_field_search_combines_fields_for_each_term admin_changelist.test_admin_llm.ModelAdminSearchTests.test_multiple_terms_are_combined_as_and admin_changelist.test_admin_llm.ModelAdminSearchTests.test_quoted_phrase_treated_as_single_term admin_changelist.test_admin_llm.ModelAdminSearchTests.test_search_handles_single_word_that_matches_multiple_rows admin_changelist.test_admin_llm.ModelAdminSearchTests.test_search_with_single_nonexistent_term_results_empty admin_changelist.test_admin_llm.ModelAdminSearchTests.test_single_term_partial_match admin_changelist.test_admin_llm.ModelAdminSearchTests.test_spaces_and_extra_whitespace_handled admin_changelist.test_admin_llm.ModelAdminSearchTests.test_term_order_irrelevant
+coverage json -o coverage.json
+: '>>>>> End Test Output'

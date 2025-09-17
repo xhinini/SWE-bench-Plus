@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 cache.tests_llm.AdditionalFileBasedCacheTests.setUp cache.tests_llm.AdditionalFileBasedCacheTests.tearDown cache.tests_llm.AdditionalFileBasedCacheTests.test_has_key_handles_filenotfound_even_if_os_path_exists_true cache.tests_llm.AdditionalFileBasedCacheTests.test_has_key_handles_filenotfound_when_open_raises cache.tests_llm.AdditionalFileBasedCacheTests.test_has_key_no_file_returns_false cache.tests_llm.AdditionalFileBasedCacheTests.test_has_key_open_called_once_on_race cache.tests_llm.AdditionalFileBasedCacheTests.test_has_key_propagates_generic_os_error cache.tests_llm.AdditionalFileBasedCacheTests.test_has_key_propagates_permission_error cache.tests_llm.AdditionalFileBasedCacheTests.test_has_key_propagates_unpickling_error cache.tests_llm.AdditionalFileBasedCacheTests.test_has_key_removes_empty_file cache.tests_llm.AdditionalFileBasedCacheTests.test_has_key_removes_expired_file cache.tests_llm.AdditionalFileBasedCacheTests.test_has_key_returns_true_for_nonexpiring_entry
+coverage json -o coverage.json
+: '>>>>> End Test Output'

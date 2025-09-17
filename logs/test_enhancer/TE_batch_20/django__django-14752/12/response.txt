@@ -1,0 +1,249 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that AutocompleteJsonView uses its serialize_result() method when producing JSON results. They cover overriding serialize_result to add extra keys, track calls and to_field_name values, ensure ordering and pagination are preserved, verify that serialize_result is not invoked when permission checks fail, and confirm behavior with various to_field resolutions (including UUID and FK PK). These tests would fail against the original buggy implementation (which built the result dict inline in get() and ignored serialize_result) and pass with the provided gold patch.
+test_code: |
+  import json
+  from django.core.exceptions import PermissionDenied
+  from django.test import override_settings
+  
+  from django.contrib.admin.views.autocomplete import AutocompleteJsonView
+  from .models import Question, WorkHour, Employee, PKChild, Toy
+  
+  # Add new tests as methods on the existing AutocompleteJsonViewTests class.
+  def _attach_tests(cls):
+      def test_serialize_result_override_invoked(self):
+          """
+          Overriding serialize_result() should be invoked for every object in the
+          results. Track calls and ensure the number of calls matches the number
+          of results.
+          """
+          class TrackView(AutocompleteJsonView):
+              called = []
+              def serialize_result(self, obj, to_field_name):
+                  # record pk and to_field_name for assertions
+                  self.__class__.called.append((obj.pk, to_field_name))
+                  return super().serialize_result(obj, to_field_name)
+  
+          # Create two questions that match the search term.
+          q1 = Question.objects.create(question='Alpha question')
+          q2 = Question.objects.create(question='Beta question')
+          request = self.factory.get(self.url, {'term': 'question', **self.opts})
+          request.user = self.superuser
+          TrackView.called.clear()
+          response = TrackView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          # Two results -> two calls
+          self.assertEqual(len(TrackView.called), 2)
+          # Ensure recorded pks correspond to returned order
+          data = json.loads(response.content.decode('utf-8'))
+          returned_ids = [int(r['id']) for r in data['results']]
+          recorded_ids = [call[0] for call in TrackView.called]
+          self.assertEqual(returned_ids, recorded_ids)
+  
+      def test_serialize_result_can_add_extra_key(self):
+          """
+          A subclass can augment the serialized result with extra keys and they
+          should appear in the JSON response.
+          """
+          class ExtraKeyView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  base = super().serialize_result(obj, to_field_name)
+                  base['extra'] = f"extra-{obj.pk}"
+                  return base
+  
+          q = Question.objects.create(question='Unique question')
+          request = self.factory.get(self.url, {'term': 'unique', **self.opts})
+          request.user = self.superuser
+          response = ExtraKeyView.as_view(**self.as_view_args)(request)
+          data = json.loads(response.content.decode('utf-8'))
+          self.assertEqual(len(data['results']), 1)
+          self.assertIn('extra', data['results'][0])
+          self.assertEqual(data['results'][0]['extra'], f"extra-{q.pk}")
+  
+      def test_serialize_result_with_uuid_to_field(self):
+          """
+          When a related field defines a custom to_field (UUID), serialize_result
+          should receive the resolved to_field_name and be able to use it.
+          """
+          class ToFieldView(AutocompleteJsonView):
+              recorded_to_field = None
+              recorded_value = None
+              def serialize_result(self, obj, to_field_name):
+                  # capture the to_field_name and the actual attribute value
+                  self.__class__.recorded_to_field = to_field_name
+                  self.__class__.recorded_value = getattr(obj, to_field_name)
+                  return super().serialize_result(obj, to_field_name)
+  
+          q = Question.objects.create(question='UUID question')
+          opts = {
+              'app_label': Question._meta.app_label,
+              'model_name': Question._meta.model_name,
+              'field_name': 'question_with_to_field',
+          }
+          request = self.factory.get(self.url, {'term': 'uuid', **opts})
+          request.user = self.superuser
+          ToFieldView.recorded_to_field = None
+          response = ToFieldView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          # The recorded value should match the uuid used in the result id.
+          data = json.loads(response.content.decode('utf-8'))
+          self.assertEqual(str(ToFieldView.recorded_value), data['results'][0]['id'])
+  
+      def test_serialize_result_preserves_pagination_and_order(self):
+          """
+          Overriding serialize_result should not affect pagination or ordering.
+          """
+          class PassThroughView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  # don't change ordering or ids, just call super
+                  return super().serialize_result(obj, to_field_name)
+  
+          # Create more objects than paginate_by to ensure pagination is exercised.
+          total = AutocompleteJsonView.paginate_by + 5
+          Question.objects.bulk_create(Question(question=str(i)) for i in range(total))
+          request = self.factory.get(self.url, {'term': '', **self.opts})
+          request.user = self.superuser
+          response = PassThroughView.as_view(**self.as_view_args)(request)
+          data = json.loads(response.content.decode('utf-8'))
+          # First page should contain paginate_by results and indicate more=True.
+          self.assertEqual(len(data['results']), AutocompleteJsonView.paginate_by)
+          self.assertTrue(data['pagination']['more'])
+  
+          # Second page contains the rest.
+          request = self.factory.get(self.url, {'term': '', 'page': '2', **self.opts})
+          request.user = self.superuser
+          response = PassThroughView.as_view(**self.as_view_args)(request)
+          data = json.loads(response.content.decode('utf-8'))
+          self.assertEqual(len(data['results']), total - AutocompleteJsonView.paginate_by)
+          self.assertFalse(data['pagination']['more'])
+  
+      def test_serialize_result_called_with_correct_to_field_mti(self):
+          """
+          For MTI target models, serialize_result should be called with the
+          correct to_field_name (primary key attname) and the id in the results
+          should match the object's pk.
+          """
+          class MTIView(AutocompleteJsonView):
+              recorded = []
+              def serialize_result(self, obj, to_field_name):
+                  self.__class__.recorded.append((obj.pk, to_field_name))
+                  return super().serialize_result(obj, to_field_name)
+  
+          o = Employee.objects.create(name="MTI Person", gender=1, code="x", alive=True)
+          opts = {
+              'app_label': WorkHour._meta.app_label,
+              'model_name': WorkHour._meta.model_name,
+              'field_name': 'employee',
+          }
+          request = self.factory.get(self.url, {'term': 'MTI', **opts})
+          request.user = self.superuser
+          MTIView.recorded.clear()
+          response = MTIView.as_view(**self.as_view_args)(request)
+          data = json.loads(response.content.decode('utf-8'))
+          # One result, and the recorded to_field_name should be the pk attname.
+          self.assertEqual(len(data['results']), 1)
+          self.assertEqual(MTIView.recorded[0][0], o.pk)
+          self.assertEqual(data['results'][0]['id'], str(o.pk))
+  
+      def test_serialize_result_not_called_when_permission_denied(self):
+          """
+          If the user lacks permission, process_request/has_perm should raise
+          PermissionDenied before serialize_result is called.
+          """
+          class SideEffectView(AutocompleteJsonView):
+              called = False
+              def serialize_result(self, obj, to_field_name):
+                  # If this is ever called, flag it.
+                  self.__class__.called = True
+                  return super().serialize_result(obj, to_field_name)
+  
+          q = Question.objects.create(question='Secret question')
+          request = self.factory.get(self.url, {'term': 'secret', **self.opts})
+          # Use a regular non-privileged user; ensure no permissions.
+          request.user = self.user
+          SideEffectView.called = False
+          with self.assertRaises(PermissionDenied):
+              SideEffectView.as_view(**self.as_view_args)(request)
+          # serialize_result must not have been called.
+          self.assertFalse(SideEffectView.called)
+  
+      def test_serialize_result_with_fk_pk_field(self):
+          """
+          For a foreign key that uses the target model's PK, the to_field_name
+          should resolve to the PK attname and the serialized id should use
+          that value.
+          """
+          parent = PKChild.objects.create(parent=None, name="ParentName")  # create a PKChild itself for simplicity
+          # Create a child and a toy related to that child.
+          c = PKChild.objects.create(parent=None, name="Anna")
+          t = Toy.objects.create(child=c, name="Toy for Anna")
+          opts = {
+              'app_label': Toy._meta.app_label,
+              'model_name': Toy._meta.model_name,
+              'field_name': 'child',
+          }
+          class FKView(AutocompleteJsonView):
+              recorded = None
+              def serialize_result(self, obj, to_field_name):
+                  # record the attribute value read
+                  self.__class__.recorded = getattr(obj, to_field_name)
+                  return super().serialize_result(obj, to_field_name)
+  
+          request = self.factory.get(self.url, {'term': 'anna', **opts})
+          request.user = self.superuser
+          FKView.recorded = None
+          response = FKView.as_view(**self.as_view_args)(request)
+          data = json.loads(response.content.decode('utf-8'))
+          self.assertEqual(data['results'][0]['id'], str(c.pk))
+          self.assertEqual(str(FKView.recorded), data['results'][0]['id'])
+  
+      def test_serialize_result_can_modify_text(self):
+          """
+          Overriding serialize_result can modify the 'text' value (display
+          label) and that modified value should be returned to the client.
+          """
+          class UpperTextView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  base = super().serialize_result(obj, to_field_name)
+                  base['text'] = base['text'].upper()
+                  return base
+  
+          q = Question.objects.create(question='Who am I?')
+          request = self.factory.get(self.url, {'term': 'who', **self.opts})
+          request.user = self.superuser
+          response = UpperTextView.as_view(**self.as_view_args)(request)
+          data = json.loads(response.content.decode('utf-8'))
+          self.assertEqual(data['results'][0]['text'], q.question.upper())
+  
+      def test_serialize_result_preserves_ordering_by_field(self):
+          """
+          When serialize_result is overridden but does not change ordering,
+          the ordering produced by ModelAdmin (for example ordering by posted)
+          should be preserved in the results.
+          """
+          class PreserveOrderView(AutocompleteJsonView):
+              recorded_ids = []
+              def serialize_result(self, obj, to_field_name):
+                  self.__class__.recorded_ids.append(obj.pk)
+                  return super().serialize_result(obj, to_field_name)
+  
+          Question.objects.create(question='Q1', posted='2021-08-09')
+          Question.objects.create(question='Q2', posted='2021-08-07')
+          request = self.factory.get(self.url, {'term': 'question', **self.opts})
+          request.user = self.superuser
+          PreserveOrderView.recorded_ids.clear()
+          response = PreserveOrderView.as_view(**self.as_view_args)(request)
+          # Ensure results are ordered according to admin ordering (by -posted in tests' context)
+          data = json.loads(response.content.decode('utf-8'))
+          returned_ids = [int(r['id']) for r in data['results']]
+          self.assertEqual(PreserveOrderView.recorded_ids, returned_ids)
+  
+      # Attach the new test methods to the test class.
+      for name, func in list(locals().items()):
+          if name.startswith('test_'):
+              setattr(cls, name, func)
+  
+  # Hook to append our tests to the existing test class.
+  _attach_tests(AutocompleteJsonViewTests)
+new_imports_code: |-
+  # No new imports required; tests reuse existing imports in tests/admin_views/test_autocomplete_view.py.

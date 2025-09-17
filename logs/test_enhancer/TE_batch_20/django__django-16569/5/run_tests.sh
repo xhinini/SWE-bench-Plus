@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.EmptyFormDeletionRegressionTests.test_access_empty_form_on_bound_formset_does_not_raise forms_tests.tests.test_formsets_llm.EmptyFormDeletionRegressionTests.test_empty_form_bound_with_initial_and_can_delete_no_extra forms_tests.tests.test_formsets_llm.EmptyFormDeletionRegressionTests.test_empty_form_does_not_change_forms_collection forms_tests.tests.test_formsets_llm.EmptyFormDeletionRegressionTests.test_empty_form_has_delete_with_can_delete_extra_true forms_tests.tests.test_formsets_llm.EmptyFormDeletionRegressionTests.test_empty_form_index_none_does_not_affect_ordering_fields forms_tests.tests.test_formsets_llm.EmptyFormDeletionRegressionTests.test_empty_form_no_delete_when_can_delete_false forms_tests.tests.test_formsets_llm.EmptyFormDeletionRegressionTests.test_empty_form_no_delete_with_can_delete_no_extra forms_tests.tests.test_formsets_llm.EmptyFormDeletionRegressionTests.test_empty_form_widget_respects_deletion_widget_attribute forms_tests.tests.test_formsets_llm.EmptyFormDeletionRegressionTests.test_empty_form_with_initial_and_can_delete_no_extra
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_widgets.tests_llm.test_radio_fields_foreignkey_direct_kwargs_empty_string admin_widgets.tests_llm.test_radio_fields_foreignkey_direct_kwargs_false admin_widgets.tests_llm.test_radio_fields_foreignkey_direct_kwargs_none admin_widgets.tests_llm.test_radio_fields_foreignkey_direct_kwargs_zero admin_widgets.tests_llm.test_radio_fields_foreignkey_formfield_overrides_empty_label_empty_string admin_widgets.tests_llm.test_radio_fields_foreignkey_formfield_overrides_empty_label_false admin_widgets.tests_llm.test_radio_fields_foreignkey_formfield_overrides_empty_label_none admin_widgets.tests_llm.test_radio_fields_foreignkey_formfield_overrides_empty_label_zero admin_widgets.tests_llm.test_radio_fields_formfield_for_dbfield_with_overrides_preserves_empty_string admin_widgets.tests_llm.test_radio_fields_formfield_for_dbfield_with_overrides_preserves_none
+coverage json -o coverage.json
+: '>>>>> End Test Output'

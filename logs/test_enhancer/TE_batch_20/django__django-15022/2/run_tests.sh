@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.test_admin_llm.DummyReq.__init__ admin_changelist.test_admin_llm.GetSearchResultsTests.setUp admin_changelist.test_admin_llm.GetSearchResultsTests.test_multiple_terms_with_overlap admin_changelist.test_admin_llm.GetSearchResultsTests.test_quoted_phrase_treated_as_single_term admin_changelist.test_admin_llm.GetSearchResultsTests.test_search_case_insensitive_and_lookup_types admin_changelist.test_admin_llm.GetSearchResultsTests.test_search_multiple_tokens_with_commas_and_spaces admin_changelist.test_admin_llm.GetSearchResultsTests.test_search_on_child_age_via_dynamic_search_fields admin_changelist.test_admin_llm.GetSearchResultsTests.test_search_respects_and_not_or admin_changelist.test_admin_llm.GetSearchResultsTests.test_search_results_do_not_return_duplicates_unnecessarily admin_changelist.test_admin_llm.GetSearchResultsTests.test_single_term_related_lookup admin_changelist.test_admin_llm.GetSearchResultsTests.test_two_terms_and_behavior_same_field admin_changelist.test_admin_llm.GetSearchResultsTests.test_two_terms_and_behavior_split_across_fields
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,193 @@
+from django.test import RequestFactory, TestCase
+from django.contrib import admin
+from django.contrib.auth.models import User
+from django.test import TestCase, RequestFactory
+from django.contrib import admin
+from django.contrib.auth.models import User
+from django.utils.http import urlencode
+
+from .models import Parent, Child
+from . import admin as test_admin_module  # contains 'site' and admin registrations
+
+
+class SearchResultsTestCase(TestCase):
+    def setUp(self):
+        # Create a user (not strictly required for get_search_results but makes
+        # request.user available for any dynamic behavior).
+        self.user = User.objects.create_user(username='tester', password='pass')
+        self.request_factory = RequestFactory()
+
+        # Create Parents with names that include spaces and different tokens
+        self.parent_london = Parent.objects.create(name='London')
+        self.parent_paris = Parent.objects.create(name='Paris')
+        self.parent_bigcity = Parent.objects.create(name='Big City')
+
+        # Create Children linked to parents, names chosen to test search combinations
+        # Child linked to London and with name that should match term 'Alice'
+        self.child_alice_london = Child.objects.create(name='Alice', parent=self.parent_london, age=30)
+        # Child with same name but different parent -> used to ensure AND semantics on parent name
+        self.child_alice_paris = Child.objects.create(name='Alice', parent=self.parent_paris, age=25)
+        # Child linked to Big City, used for quoted-phrase searches
+        self.child_john_bigcity = Child.objects.create(name='John', parent=self.parent_bigcity, age=40)
+        # Child with multiple name fields (name2) to test multi-field AND
+        # Some test models may not have name2; if not, skip by providing alternate checks.
+
+    def _get_request(self, path='/', method='GET', data=None):
+        if method.upper() == 'GET':
+            req = self.request_factory.get(path + ('?' + urlencode(data) if data else ''))
+        else:
+            req = self.request_factory.post(path, data or {})
+        req.user = self.user
+        return req
+
+    def test_single_term_matches_any_configured_lookup(self):
+        """
+        A single term should match if any of the configured search_fields matches.
+        """
+        ma = admin.ModelAdmin(Child, test_admin_module.site)
+        ma.search_fields = ('name', 'parent__name')
+        queryset = Child.objects.all()
+        request = self._get_request()
+
+        qs, may_have_duplicates = ma.get_search_results(request, queryset, 'Alice')
+        pks = set(o.pk for o in qs)
+        self.assertIn(self.child_alice_london.pk, pks)
+        self.assertIn(self.child_alice_paris.pk, pks)
+        # Single-field searches shouldn't signal duplicates for these simple lookups
+        self.assertFalse(may_have_duplicates)
+
+    def test_two_terms_are_anded_across_lookups(self):
+        """
+        Searching for two terms should return objects matching term1 AND term2,
+        where each term is itself an OR of the configured lookups.
+
+        Searching "Alice London" should only return the child whose name contains
+        'Alice' and whose parent name contains 'London'.
+        """
+        ma = admin.ModelAdmin(Child, test_admin_module.site)
+        ma.search_fields = ('name', 'parent__name')
+        queryset = Child.objects.all()
+        request = self._get_request()
+
+        qs, _ = ma.get_search_results(request, queryset, 'Alice London')
+        pks = set(o.pk for o in qs)
+        self.assertIn(self.child_alice_london.pk, pks)
+        self.assertNotIn(self.child_alice_paris.pk, pks)
+        self.assertNotIn(self.child_john_bigcity.pk, pks)
+
+    def test_quoted_phrase_is_treated_as_single_search_term(self):
+        """
+        A quoted phrase should be treated as a single token (i.e., spaces preserved).
+        Searching for "Big City" must match the parent name "Big City" and return the child.
+        """
+        ma = admin.ModelAdmin(Child, test_admin_module.site)
+        ma.search_fields = ('parent__name',)
+        queryset = Child.objects.all()
+        request = self._get_request()
+
+        qs, _ = ma.get_search_results(request, queryset, '"Big City"')
+        pks = set(o.pk for o in qs)
+        self.assertIn(self.child_john_bigcity.pk, pks)
+        self.assertNotIn(self.child_alice_london.pk, pks)
+
+    def test_prefix_equals_uses_exact_match(self):
+        """
+        The '=' prefix should force an iexact lookup for the term.
+        """
+        ma = admin.ModelAdmin(Child, test_admin_module.site)
+        # Ensure there's one exact-name match and others that contain the term
+        ma.search_fields = ('name',)
+        queryset = Child.objects.all()
+        request = self._get_request()
+
+        # Create an object with name exactly 'AliceExact'
+        exact = Child.objects.create(name='AliceExact', parent=self.parent_london, age=20)
+        # A non-exact one that contains 'AliceExact' as substring
+        substring = Child.objects.create(name='AliceExactExtra', parent=self.parent_paris, age=22)
+
+        qs, _ = ma.get_search_results(request, queryset, '=AliceExact')
+        names = {o.name for o in qs}
+        self.assertIn('AliceExact', names)
+        self.assertNotIn('AliceExactExtra', names)
+
+    def test_prefix_caret_uses_startswith(self):
+        """
+        The '^' prefix should use istartswith.
+        """
+        ma = admin.ModelAdmin(Child, test_admin_module.site)
+        ma.search_fields = ('name',)
+        queryset = Child.objects.all()
+        request = self._get_request()
+
+        lead = Child.objects.create(name='Alfred', parent=self.parent_london, age=50)
+        tail = Child.objects.create(name='XAlfred', parent=self.parent_london, age=51)
+
+        qs, _ = ma.get_search_results(request, queryset, '^Al')
+        names = {o.name for o in qs}
+        self.assertIn('Alfred', names)
+        self.assertNotIn('XAlfred', names)
+
+    def test_pk_token_maps_to_primary_key(self):
+        """
+        Using 'pk' in search_fields should search the primary key field name.
+        Searching by a pk value should return the corresponding instance.
+        """
+        ma = admin.ModelAdmin(Child, test_admin_module.site)
+        ma.search_fields = ('pk',)
+        queryset = Child.objects.all()
+        request = self._get_request()
+
+        target = self.child_alice_paris
+        qs, _ = ma.get_search_results(request, queryset, str(target.pk))
+        pks = set(o.pk for o in qs)
+        self.assertIn(target.pk, pks)
+
+    def test_multiple_lookup_fields_are_considered_for_each_term(self):
+        """
+        If multiple lookups are configured, each search term should be ORed across them,
+        and multiple terms should be ANDed together.
+        """
+        ma = admin.ModelAdmin(Child, test_admin_module.site)
+        # Use both name and parent's name so AND semantics are meaningful
+        ma.search_fields = ('name', 'parent__name')
+        queryset = Child.objects.all()
+        request = self._get_request()
+
+        # Searching for 'John "Big City"' should match the child 'John' whose parent is 'Big City'
+        qs, _ = ma.get_search_results(request, queryset, 'John "Big City"')
+        pks = set(o.pk for o in qs)
+        self.assertIn(self.child_john_bigcity.pk, pks)
+        self.assertNotIn(self.child_alice_london.pk, pks)
+
+    def test_search_with_unknown_transform_does_not_raise(self):
+        """
+        If a transform/lookup doesn't exist on a field (e.g., due to a misconfigured
+        search_fields entry), the search should not raise an exception.
+        """
+        ma = admin.ModelAdmin(Child, test_admin_module.site)
+        # Deliberately use a lookup that's not valid for the field; construct_search
+        # should handle this gracefully and fall back to default behaviour.
+        ma.search_fields = ('name__nonexistenttransform',)
+        queryset = Child.objects.all()
+        request = self._get_request()
+
+        # Should not raise; may simply return no results.
+        qs, _ = ma.get_search_results(request, queryset, 'Alice')
+        # Ensure function returns a queryset (possibly empty) and doesn't crash.
+        self.assertIsNotNone(qs)
+
+    def test_multi_term_with_overlap_only_matches_when_all_terms_satisfied(self):
+        """
+        A final sanity check: when there are overlapping possible matches, both terms
+        must be satisfied (AND) for an object to be returned.
+        """
+        ma = admin.ModelAdmin(Child, test_admin_module.site)
+        ma.search_fields = ('name', 'parent__name')
+        queryset = Child.objects.all()
+        request = self._get_request()
+
+        # 'Alice Paris' should only match the child whose parent is Paris
+        qs, _ = ma.get_search_results(request, queryset, 'Alice Paris')
+        pks = set(o.pk for o in qs)
+        self.assertIn(self.child_alice_paris.pk, pks)
+        self.assertNotIn(self.child_alice_london.pk, pks)

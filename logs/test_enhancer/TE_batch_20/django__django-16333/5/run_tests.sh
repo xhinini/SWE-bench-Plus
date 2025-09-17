@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.SaveM2MRegressionTests._basic_form_data auth_tests.test_forms_llm.SaveM2MRegressionTests.setUp auth_tests.test_forms_llm.SaveM2MRegressionTests.test_basic_usercreation_save_commit_false_with_property_missing auth_tests.test_forms_llm.SaveM2MRegressionTests.test_basic_usercreation_save_with_descriptor_raising_attributeerror auth_tests.test_forms_llm.SaveM2MRegressionTests.test_basic_usercreation_save_with_getattribute_raising_attributeerror auth_tests.test_forms_llm.SaveM2MRegressionTests.test_basic_usercreation_save_with_property_missing_save_m2m auth_tests.test_forms_llm.SaveM2MRegressionTests.test_custom_m2m_save_with_descriptor_raising_attributeerror_and_commit_false auth_tests.test_forms_llm.SaveM2MRegressionTests.test_custom_m2m_usercreation_save_commit_false_with_property_missing auth_tests.test_forms_llm.SaveM2MRegressionTests.test_custom_m2m_usercreation_save_with_getattribute_raising_attributeerror auth_tests.test_forms_llm.SaveM2MRegressionTests.test_custom_m2m_usercreation_save_with_property_missing
+coverage json -o coverage.json
+: '>>>>> End Test Output'

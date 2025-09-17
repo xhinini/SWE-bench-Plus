@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.StartAppTargetNormalizationRegression._run_and_check admin_scripts.tests_llm.StartAppTargetNormalizationRegression.test_complex_redundant_components admin_scripts.tests_llm.StartAppTargetNormalizationRegression.test_mixed_current_and_parent admin_scripts.tests_llm.StartAppTargetNormalizationRegression.test_multiple_current_components admin_scripts.tests_llm.StartAppTargetNormalizationRegression.test_parent_then_child_with_dot admin_scripts.tests_llm.StartAppTargetNormalizationRegression.test_parent_then_child_with_dot_slash admin_scripts.tests_llm.StartAppTargetNormalizationRegression.test_target_parent_dir admin_scripts.tests_llm.StartAppTargetNormalizationRegression.test_target_parent_dir_slash admin_scripts.tests_llm.StartAppTargetNormalizationRegression.test_target_trailing_dot admin_scripts.tests_llm.StartAppTargetNormalizationRegression.test_target_trailing_dot_slash admin_scripts.tests_llm.StartAppTargetNormalizationRegression.test_tricky_combination
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,161 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests create various simple models (some dynamically) and assert that calling instance.delete() on a single deletable instance sets the instance's primary key attribute to None. They cover default AutoField PKs, CharField PKs, BigAutoField PKs, UUID PKs, proxy models, inherited models, and multiple permutations to ensure the early-return fast-delete path clears the instance primary key. These tests would fail if the early-return optimization does not set instance.pk to None (the bug fixed by the patch).
+new_imports_code: |
+  import uuid
+test_code: |
+  from django.db import connection, models
+  from django.test import TestCase
+  from django.db.models import BigAutoField, UUIDField, CharField, AutoField
+  from django.db import transaction
+
+  class RegressionDeletionTests(TestCase):
+      def _create_model(self, name, fields):
+          """
+          Dynamically create a simple model with the given name and fields,
+          create its database table and return the model class.
+          """
+          attrs = {'__module__': __name__}
+          class Meta:
+              app_label = 'tests'
+          attrs['Meta'] = Meta
+          attrs.update(fields)
+          model = type(name, (models.Model,), attrs)
+          with connection.schema_editor() as schema_editor:
+              schema_editor.create_model(model)
+          return model
+
+      def _delete_model(self, model):
+          with connection.schema_editor() as schema_editor:
+              schema_editor.delete_model(model)
+
+      def test_avatar_delete_sets_pk_none(self):
+          # Use existing Avatar model from the test suite (simple auto PK model).
+          from .models import Avatar
+          a = Avatar.objects.create(desc='regression')
+          a.delete()
+          self.assertIsNone(a.pk)
+
+      def test_child_model_delete_sets_pk_none(self):
+          # Use existing Child model (inheritance) to ensure pk gets cleared.
+          from .models import Child
+          c = Child.objects.create()
+          c.delete()
+          self.assertIsNone(c.pk)
+
+      def test_dynamic_default_auto_pk_delete_sets_pk_none(self):
+          ModelA = self._create_model('TempAutoPKModel', {
+              'name': models.CharField(max_length=16, default='x'),
+              # No explicit pk field -> AutoField should be created.
+          })
+          try:
+              obj = ModelA.objects.create(name='a')
+              obj.delete()
+              self.assertIsNone(obj.pk)
+          finally:
+              self._delete_model(ModelA)
+
+      def test_dynamic_char_pk_delete_sets_pk_none(self):
+          ModelB = self._create_model('TempCharPKModel', {
+              'id': CharField(primary_key=True, max_length=36),
+              'name': models.CharField(max_length=16, default='x'),
+          })
+          try:
+              obj = ModelB.objects.create(id='custom-1', name='b')
+              obj.delete()
+              self.assertIsNone(obj.pk)
+          finally:
+              self._delete_model(ModelB)
+
+      def test_dynamic_bigautofield_pk_delete_sets_pk_none(self):
+          ModelC = self._create_model('TempBigAutoPKModel', {
+              'id': BigAutoField(primary_key=True),
+              'name': models.CharField(max_length=16, default='x'),
+          })
+          try:
+              obj = ModelC.objects.create(name='c')
+              obj.delete()
+              self.assertIsNone(obj.pk)
+          finally:
+              self._delete_model(ModelC)
+
+      def test_dynamic_uuid_pk_delete_sets_pk_none(self):
+          ModelD = self._create_model('TempUUIDPKModel', {
+              'id': UUIDField(primary_key=True, default=uuid.uuid4),
+              'name': models.CharField(max_length=16, default='x'),
+          })
+          try:
+              obj = ModelD.objects.create(name='d')
+              obj.delete()
+              self.assertIsNone(obj.pk)
+          finally:
+              self._delete_model(ModelD)
+
+      def test_proxy_model_delete_sets_pk_none(self):
+          # Create a base model, then a proxy class for it.
+          Base = self._create_model('TempBaseForProxy', {
+              'name': models.CharField(max_length=16, default='x'),
+          })
+          try:
+              Proxy = type('TempProxyModel', (Base,), {
+                  '__module__': __name__,
+                  'Meta': type('Meta',(object,),{'proxy': True, 'app_label':'tests'})
+              })
+              # Create instance using base, fetch via proxy manager to get a proxy instance.
+              base_obj = Base.objects.create(name='p')
+              proxy_obj = Proxy.objects.get(pk=base_obj.pk)
+              proxy_obj.delete()
+              self.assertIsNone(proxy_obj.pk)
+          finally:
+              self._delete_model(Base)
+
+      def test_inherited_model_delete_sets_pk_none(self):
+          # Create a simple parent and child (multi-table inheritance)
+          Parent = self._create_model('TempParentModel', {
+              'name': models.CharField(max_length=16, default='x'),
+          })
+          Child = type('TempChildModel', (Parent,), {
+              '__module__': __name__,
+              # No additional fields; this creates a multi-table inheritance child.
+              'Meta': type('Meta',(object,),{'app_label':'tests'})
+          })
+          # Create DB table for Child as well (Django expects separate table)
+          with connection.schema_editor() as schema_editor:
+              schema_editor.create_model(Child)
+          try:
+              child = Child.objects.create(name='child')
+              child.delete()
+              self.assertIsNone(child.pk)
+          finally:
+              # delete child then parent model tables
+              with connection.schema_editor() as schema_editor:
+                  schema_editor.delete_model(Child)
+              self._delete_model(Parent)
+
+      def test_custom_field_name_pk_delete_sets_pk_none(self):
+          # Create a model with a PK that isn't named 'id' or 'pk' attribute name.
+          ModelE = self._create_model('TempCustomNamePKModel', {
+              'custom_id': CharField(primary_key=True, max_length=20),
+              'value': models.CharField(max_length=8, default='v'),
+          })
+          try:
+              obj = ModelE.objects.create(custom_id='CUST1', value='v1')
+              # Accessing obj.pk should return the PK; after delete, it should be None.
+              self.assertEqual(obj.pk, 'CUST1')
+              obj.delete()
+              self.assertIsNone(obj.pk)
+          finally:
+              self._delete_model(ModelE)
+
+      def test_multiple_sequential_single_deletes_clear_pk(self):
+          # Ensure clearing pk works across multiple sequential single-object deletes.
+          ModelF = self._create_model('TempSeqDeleteModel', {
+              'name': models.CharField(max_length=16, default='x'),
+          })
+          try:
+              for i in range(3):
+                  obj = ModelF.objects.create(name='seq%d' % i)
+                  obj.delete()
+                  self.assertIsNone(obj.pk)
+          finally:
+              self._delete_model(ModelF)

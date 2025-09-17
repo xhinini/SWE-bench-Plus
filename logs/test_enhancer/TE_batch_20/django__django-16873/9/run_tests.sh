@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.filter_tests.test_join_llm.JoinAdditionalFunctionTests.test_join_bytes_joiner_autoescape_off_returns_original template_tests.filter_tests.test_join_llm.JoinAdditionalFunctionTests.test_join_return_is_safedata template_tests.filter_tests.test_join_llm.JoinAdditionalFunctionTests.test_join_with_int_elements_autoescape_on template_tests.filter_tests.test_join_llm.JoinAdditionalFunctionTests.test_join_with_mark_safe_joiner_autoescape_on template_tests.filter_tests.test_join_llm.JoinAdditionalTemplateTests.test_template_autoescape_off_with_variable_joiner template_tests.filter_tests.test_join_llm.JoinAdditionalTemplateTests.test_template_generator_autoescape_off template_tests.filter_tests.test_join_llm.JoinAdditionalTemplateTests.test_template_generator_autoescape_on template_tests.filter_tests.test_join_llm.JoinAdditionalTemplateTests.test_template_mark_safe_joiner_autoescape_off template_tests.filter_tests.test_join_llm.JoinAdditionalTemplateTests.test_template_unicode_join
+coverage json -o coverage.json
+: '>>>>> End Test Output'

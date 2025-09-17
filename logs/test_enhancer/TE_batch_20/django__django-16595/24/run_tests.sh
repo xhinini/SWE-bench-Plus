@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_optimizer_llm.RegressionOptimizerTests.assertDoesNotOptimize migrations.test_optimizer_llm.RegressionOptimizerTests.assertOptimizesTo migrations.test_optimizer_llm.RegressionOptimizerTests.optimize migrations.test_optimizer_llm.RegressionOptimizerTests.serialize migrations.test_optimizer_llm.RegressionOptimizerTests.test_alterfield_and_removefield_reduce_to_remove migrations.test_optimizer_llm.RegressionOptimizerTests.test_alterfield_and_renamefield_with_db_column_none migrations.test_optimizer_llm.RegressionOptimizerTests.test_alterfield_and_renamefield_with_db_column_set migrations.test_optimizer_llm.RegressionOptimizerTests.test_alterfield_case_insensitive_field_names_collapse migrations.test_optimizer_llm.RegressionOptimizerTests.test_alterfields_different_fields_do_not_collapse migrations.test_optimizer_llm.RegressionOptimizerTests.test_alterfields_on_different_models_do_not_collapse migrations.test_optimizer_llm.RegressionOptimizerTests.test_alterfields_with_elidable_between_collapse migrations.test_optimizer_llm.RegressionOptimizerTests.test_consecutive_alterfields_collapses_to_last migrations.test_optimizer_llm.RegressionOptimizerTests.test_multiple_alterfields_collapse_to_single
+coverage json -o coverage.json
+: '>>>>> End Test Output'

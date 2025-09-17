@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_autoescape_off_joiner_with_angle_brackets template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_autoescape_off_literal_joiner_amp template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_autoescape_off_literal_joiner_entity template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_autoescape_off_mark_safe_joiner_preserved template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_autoescape_off_variable_joiner_ampersand template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_autoescape_off_variable_joiner_br template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_autoescape_off_with_generator template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_autoescape_off_with_safe_elements template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_join_function_autoescape_false_amp template_tests.filter_tests.test_join_llm.JoinRegressionTests.test_join_function_autoescape_false_entity
+coverage json -o coverage.json
+: '>>>>> End Test Output'

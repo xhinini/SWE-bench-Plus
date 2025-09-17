@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_error_id_is_admin_E035 admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_error_obj_is_admin_class admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_label_string_included_in_message admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_missing_field_on_different_model_includes_field_name admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_model_label_is_included_in_message admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_multiple_missing_readonly_fields_produce_separate_messages_with_names admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_nonexistent_field_includes_field_name admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_nonexistent_field_on_inline_includes_field_name admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_nonexistent_second_index_includes_field_name admin_checks.tests_llm.ReadonlyFieldsMessageTests.test_underscore_named_missing_field_includes_field_name
+coverage json -o coverage.json
+: '>>>>> End Test Output'

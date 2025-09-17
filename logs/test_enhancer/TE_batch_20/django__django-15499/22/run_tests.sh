@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_optimizer_llm.CreateAlterManagersOptimizerTests.assertOptimizesTo migrations.test_optimizer_llm.CreateAlterManagersOptimizerTests.optimize migrations.test_optimizer_llm.CreateAlterManagersOptimizerTests.test_alter_managers_following_rename_chain migrations.test_optimizer_llm.CreateAlterManagersOptimizerTests.test_alter_managers_for_other_model_no_change migrations.test_optimizer_llm.CreateAlterManagersOptimizerTests.test_case_insensitive_model_name_matching migrations.test_optimizer_llm.CreateAlterManagersOptimizerTests.test_create_addfield_then_alter_managers migrations.test_optimizer_llm.CreateAlterManagersOptimizerTests.test_create_rename_field_then_alter_managers migrations.test_optimizer_llm.CreateAlterManagersOptimizerTests.test_create_rename_then_alter_managers migrations.test_optimizer_llm.CreateAlterManagersOptimizerTests.test_create_then_alter_managers_replaced migrations.test_optimizer_llm.CreateAlterManagersOptimizerTests.test_create_with_existing_managers_replaced_not_merged migrations.test_optimizer_llm.CreateAlterManagersOptimizerTests.test_multiple_alter_managers_last_wins
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,191 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests verify MigrationLoader.load_disk() correctly distinguishes regular
+  packages (which may lack a __file__ attribute in frozen environments) from
+  namespace packages (which also lack __file__ but have a non-list __path__),
+  and correctly treats modules that are files (no __path__) as unmigrated.
+  They also check handling of various __path__ types (list, tuple, list subclass,
+  custom iterable). A test asserts that reload() is called when the module was
+  already present in sys.modules, and one test ensures names starting with
+  underscore are ignored by the migration discovery logic.
+test_code: |
+  import sys
+  import types
+  from unittest import mock
+
+  from django.test import TestCase
+
+  from django.db.migrations.loader import MigrationLoader
+  from django.apps import apps
+
+  class FakeAppConfig:
+      def __init__(self, label, name='fake_app'):
+          self.label = label
+          self.name = name
+
+  class MigrationLoaderNamespaceTests(TestCase):
+      """
+      Tests for distinguishing regular packages (possibly without __file__) from
+      namespace packages and module files in MigrationLoader.load_disk().
+      """
+
+      def _run_loader_with_module(self, module_name, module_obj):
+          """
+          Helper to run load_disk with a single fake app config and a given
+          module object in sys.modules. Returns the loader after load_disk().
+          """
+          # Ensure apps.get_app_configs() returns a single fake app config.
+          with mock.patch('django.db.migrations.loader.apps.get_app_configs',
+                          return_value=[FakeAppConfig('fake')]):
+              # Make migrations_module() return our module name for label 'fake'.
+              with mock.patch.object(
+                  MigrationLoader,
+                  'migrations_module',
+                  new=classmethod(lambda cls, label: (module_name, False))
+              ):
+                  # Avoid iterating the real filesystem; make it yield nothing by default.
+                  with mock.patch('django.db.migrations.loader.pkgutil.iter_modules', return_value=iter(())):
+                      # Prevent reload() from performing real reloads; allow spying.
+                      with mock.patch('django.db.migrations.loader.reload', side_effect=lambda m: m) as reload_mock:
+                          # Inject our module into sys.modules for import_module to find.
+                          with mock.patch.dict(sys.modules, {module_name: module_obj}):
+                              loader = MigrationLoader(connection=None, load=False)
+                              loader.load_disk()
+                              return loader, reload_mock
+
+      def test_regular_package_without_file_is_migrated(self):
+          # Regular package: no __file__ attribute, but __path__ is a list.
+          module_name = 'fake_app.migrations'
+          module = types.ModuleType(module_name)
+          module.__path__ = ['some/path']
+          if hasattr(module, '__file__'):
+              del module.__file__
+          loader, _ = self._run_loader_with_module(module_name, module)
+          self.assertIn('fake', loader.migrated_apps)
+          self.assertNotIn('fake', loader.unmigrated_apps)
+
+      def test_namespace_package_without_file_is_unmigrated(self):
+          # Namespace package: no __file__, and __path__ is a custom iterable (not a list).
+          module_name = 'fake_app.migrations'
+          module = types.ModuleType(module_name)
+          class CustomPath:
+              def __iter__(self):
+                  yield 'x'
+          module.__path__ = CustomPath()
+          if hasattr(module, '__file__'):
+              del module.__file__
+          loader, _ = self._run_loader_with_module(module_name, module)
+          self.assertIn('fake', loader.unmigrated_apps)
+          self.assertNotIn('fake', loader.migrated_apps)
+
+      def test_module_file_no_path_is_unmigrated(self):
+          # migrations.py style module: has __file__ but no __path__ attribute.
+          module_name = 'fake_app.migrations'
+          module = types.ModuleType(module_name)
+          module.__file__ = '/some/file.py'
+          # Ensure no __path__ attribute
+          if hasattr(module, '__path__'):
+              del module.__path__
+          loader, _ = self._run_loader_with_module(module_name, module)
+          self.assertIn('fake', loader.unmigrated_apps)
+          self.assertNotIn('fake', loader.migrated_apps)
+
+      def test_path_tuple_treated_as_namespace(self):
+          # __path__ as a tuple should be treated like a namespace (not a list).
+          module_name = 'fake_app.migrations'
+          module = types.ModuleType(module_name)
+          module.__path__ = ('some/path',)
+          if hasattr(module, '__file__'):
+              del module.__file__
+          loader, _ = self._run_loader_with_module(module_name, module)
+          self.assertIn('fake', loader.unmigrated_apps)
+
+      def test_list_subclass_treated_as_package(self):
+          # __path__ is a subclass of list -> should be treated as a regular package.
+          class MyList(list):
+              pass
+          module_name = 'fake_app.migrations'
+          module = types.ModuleType(module_name)
+          module.__path__ = MyList(['p'])
+          if hasattr(module, '__file__'):
+              del module.__file__
+          loader, _ = self._run_loader_with_module(module_name, module)
+          self.assertIn('fake', loader.migrated_apps)
+          self.assertNotIn('fake', loader.unmigrated_apps)
+
+      def test_file_present_no_path_unmigrated(self):
+          # If __file__ present but __path__ missing, it's treated as a module file.
+          module_name = 'fake_app.migrations'
+          module = types.ModuleType(module_name)
+          module.__file__ = '/some/path'
+          if hasattr(module, '__path__'):
+              del module.__path__
+          loader, _ = self._run_loader_with_module(module_name, module)
+          self.assertIn('fake', loader.unmigrated_apps)
+
+      def test_custom_iterable_path_is_namespace(self):
+          # Custom iterable for __path__ should be considered a namespace.
+          module_name = 'fake_app.migrations'
+          module = types.ModuleType(module_name)
+          class IterPath:
+              def __iter__(self):
+                  yield '/p'
+          module.__path__ = IterPath()
+          if hasattr(module, '__file__'):
+              del module.__file__
+          loader, _ = self._run_loader_with_module(module_name, module)
+          self.assertIn('fake', loader.unmigrated_apps)
+
+      def test_list_like_instance_subclass_true_is_package(self):
+          # Ensure that a list subclass instance (even if custom) is recognized as list.
+          class CustomList(list):
+              pass
+          module_name = 'fake_app.migrations'
+          module = types.ModuleType(module_name)
+          module.__path__ = CustomList(['/p'])
+          if hasattr(module, '__file__'):
+              del module.__file__
+          loader, _ = self._run_loader_with_module(module_name, module)
+          self.assertIn('fake', loader.migrated_apps)
+
+      def test_reload_called_when_module_was_loaded(self):
+          # If module was already present in sys.modules, reload() should be called.
+          module_name = 'fake_app.migrations'
+          module = types.ModuleType(module_name)
+          module.__path__ = ['some/path']
+          if hasattr(module, '__file__'):
+              del module.__file__
+          # We expect reload to be called once during load_disk() because was_loaded is True.
+          with mock.patch('django.db.migrations.loader.pkgutil.iter_modules', return_value=iter(())):
+              with mock.patch('django.db.migrations.loader.apps.get_app_configs',
+                              return_value=[FakeAppConfig('fake')]):
+                  with mock.patch.object(
+                      MigrationLoader,
+                      'migrations_module',
+                      new=classmethod(lambda cls, label: (module_name, False))
+                  ):
+                      with mock.patch.dict(sys.modules, {module_name: module}):
+                          with mock.patch('django.db.migrations.loader.reload') as reload_mock:
+                              loader = MigrationLoader(connection=None, load=False)
+                              loader.load_disk()
+                              self.assertTrue(reload_mock.called)
+
+      def test_underscore_prefixed_names_ignored(self):
+          # Names beginning with '_' should not be attempted to be imported as migrations.
+          module_name = 'fake_app.migrations'
+          module = types.ModuleType(module_name)
+          module.__path__ = ['some/path']
+          if hasattr(module, '__file__'):
+              del module.__file__
+          # Make pkgutil.iter_modules return a name starting with '_' which should be ignored.
+          with mock.patch('django.db.migrations.loader.pkgutil.iter_modules',
+                          return_value=[(None, '_private', False)]):
+              loader, _ = self._run_loader_with_module(module_name, module)
+              # No disk_migrations should have been loaded for our fake app.
+              migrations = [name for app, name in loader.disk_migrations if app == 'fake']
+              self.assertEqual(migrations, [])
+new_imports_code: |
+  import types
+  import sys
+  from unittest import mock

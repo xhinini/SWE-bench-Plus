@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 cache.tests_llm.FileBasedCacheRegressionTests.setUp cache.tests_llm.FileBasedCacheRegressionTests.tearDown cache.tests_llm.FileBasedCacheRegressionTests.test_delete_handles_file_removed_after_exists cache.tests_llm.FileBasedCacheRegressionTests.test_get_handles_race_when_exists_true_but_open_fails cache.tests_llm.FileBasedCacheRegressionTests.test_get_reports_default_and_open_called_even_if_exists_true cache.tests_llm.FileBasedCacheRegressionTests.test_has_key_handles_race_when_exists_true_but_open_fails cache.tests_llm.FileBasedCacheRegressionTests.test_has_key_propagates_non_filenotfound_errors cache.tests_llm.FileBasedCacheRegressionTests.test_has_key_with_version_handles_race cache.tests_llm.FileBasedCacheRegressionTests.test_list_cache_files_only_includes_cache_suffix cache.tests_llm.FileBasedCacheRegressionTests.test_pathlib_based_location_handles_open_race cache.tests_llm.FileBasedCacheRegressionTests.test_touch_handles_race_when_exists_true_but_open_fails cache.tests_llm.FileBasedCacheRegressionTests.test_versioned_keys_produce_different_files
+coverage json -o coverage.json
+: '>>>>> End Test Output'

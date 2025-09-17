@@ -1,0 +1,169 @@
+from django.core import management
+from django.db import connection, connections
+from django.test import TransactionTestCase, override_settings
+from django.core.cache import caches
+from cache.tests import caches_setting_for_tests
+from django.core import management
+from django.db import connection, connections
+from django.test import TransactionTestCase, override_settings
+from django.core.cache import caches
+from django.conf import settings
+import time
+
+from cache.tests import caches_setting_for_tests
+
+@override_settings(CACHES=caches_setting_for_tests(
+    BACKEND='django.core.cache.backends.db.DatabaseCache',
+    # Spaces in the table name to ensure quoting/escaping is working
+    LOCATION='test cache table'
+))
+class AdditionalDBCullTests(TransactionTestCase):
+    available_apps = ['cache']
+
+    def setUp(self):
+        super().setUp()
+        management.call_command('createcachetable', verbosity=0)
+        self.cache = caches['default']
+        # convenience
+        self.conn = connections[self._db_for_cache()]
+        self.quoted_table = self.conn.ops.quote_name('test cache table')
+
+    def tearDown(self):
+        super().tearDown()
+        with connection.cursor() as cursor:
+            cursor.execute('DROP TABLE %s' % self.quoted_table)
+
+    def _db_for_cache(self):
+        # determine DB alias used by the cache backend
+        return 'default'
+
+    def _row_count(self):
+        with self.conn.cursor() as cursor:
+            cursor.execute("SELECT COUNT(*) FROM %s" % self.quoted_table)
+            return cursor.fetchone()[0]
+
+    def test_cull_does_not_crash_when_no_last_cache_key(self):
+        """
+        If the culling helper query returns no rows (fetchone() is None),
+        _cull should not raise an exception. Refs regression where
+        cursor.fetchone()[0] was used without checking for None.
+        """
+        # Force a scenario where _cull is invoked but the cull query will
+        # likely return no last_cache_key (cull_num == 0).
+        self.cache._max_entries = 1
+        self.cache._cull_frequency = 1000  # make cull_num 0
+        initial = self._row_count()
+        # Insert two keys to overflow and trigger cull path
+        self.cache.set('k1', 'v1', timeout=1000)
+        self.cache.set('k2', 'v2', timeout=1000)
+        # No exception should be raised; table should have at least 1 row.
+        final = self._row_count()
+        self.assertGreaterEqual(final, 1)
+
+    def test_cull_deletes_some_keys_when_overflow(self):
+        """
+        When the number of entries exceeds _max_entries, culling should
+        remove some keys. Ensure that after overflow and cull the count
+        decreases relative to the peak.
+        """
+        self.cache._max_entries = 3
+        self.cache._cull_frequency = 2
+        # Insert more keys than _max_entries to force culling
+        for i in range(1, 7):
+            self.cache.set('ck%d' % i, 'val', timeout=1000)
+        # After culling there should be fewer keys than the number inserted
+        count = self._row_count()
+        self.assertLessEqual(count, 6)
+        self.assertLess(count, 6)
+
+    def test_cull_frequency_zero_triggers_clear_then_insert(self):
+        """
+        If _cull_frequency == 0, _cull should call clear() (delete everything)
+        and then the insert proceeds. The final insert should exist.
+        """
+        # Force immediate cull path
+        old_max = self.cache._max_entries
+        old_cull_freq = self.cache._cull_frequency
+        try:
+            self.cache._max_entries = -1
+            self.cache._cull_frequency = 0
+            # This set should trigger _cull, which will clear and then insert.
+            self.cache.set('force', 'value', timeout=1000)
+            self.assertTrue(self.cache.has_key('force'))
+        finally:
+            self.cache._max_entries = old_max
+            self.cache._cull_frequency = old_cull_freq
+
+    def test_base_delete_many_empty_returns_false(self):
+        """_base_delete_many([]) should return False and not raise."""
+        res = self.cache._base_delete_many([])
+        self.assertFalse(res)
+
+    def test_cull_noop_when_cull_query_returns_nothing(self):
+        """
+        Another scenario for when cull SQL returns no rows: ensure the
+        number of rows increments by one when inserting a key and that
+        no exceptions occur.
+        """
+        self.cache._max_entries = 1
+        self.cache._cull_frequency = 10000  # make cull_num 0
+        before = self._row_count()
+        self.cache.set('unique_no_last', 'x', timeout=1000)
+        after = self._row_count()
+        # The table should reflect the new insert (count increases or stays
+        # >= 1). No exceptions should have been raised.
+        self.assertGreaterEqual(after, before)
+
+    def test_multiple_cull_calls_do_not_crash(self):
+        """Repeated inserts that trigger culling shouldn't raise."""
+        self.cache._max_entries = 5
+        self.cache._cull_frequency = 2
+        # Repeatedly add many keys to exercise multiple cull invocations.
+        for i in range(1, 30):
+            self.cache.set('mck%d' % i, 'v', timeout=1000)
+        # Ensure at least one key remains and no exception occurred.
+        self.assertGreater(self._row_count(), 0)
+
+    def test_cull_respects_max_entries(self):
+        """After aggressive inserts, number of keys should not wildly exceed _max_entries."""
+        self.cache._max_entries = 10
+        self.cache._cull_frequency = 3
+        for i in range(1, 40):
+            self.cache.set('cap%d' % i, 'v', timeout=1000)
+        # After culling finishes, the number of rows should be <= max_entries + slack
+        count = self._row_count()
+        # Allow some slack because of culling algorithm (it may not reduce to exactly max_entries)
+        self.assertLessEqual(count, 25)
+
+    def test_set_triggers_cull_when_num_exceeds_max_entries(self):
+        """Setting keys beyond _max_entries should result in culling being invoked (no crash)."""
+        self.cache._max_entries = 2
+        self.cache._cull_frequency = 2
+        self.cache.set('a1', 1, timeout=1000)
+        self.cache.set('a2', 2, timeout=1000)
+        # This set will push over _max_entries and call _cull
+        self.cache.set('a3', 3, timeout=1000)
+        # Ensure at least one key still present
+        self.assertGreaterEqual(self._row_count(), 1)
+
+    def test_delete_many_removes_keys(self):
+        """delete_many should remove the specified keys."""
+        self.cache.set('d1', 1, timeout=1000)
+        self.cache.set('d2', 2, timeout=1000)
+        self.cache.set('d3', 3, timeout=1000)
+        before = self._row_count()
+        self.cache.delete_many(['d1', 'd2'])
+        after = self._row_count()
+        self.assertLess(after, before)
+
+    def test_create_and_drop_cache_table_commands_work(self):
+        """createcachetable called twice should not error; drop then create works."""
+        # Calling createcachetable a second time should print "already exists"
+        management.call_command('createcachetable', verbosity=0)
+        # drop and recreate
+        with connection.cursor() as cursor:
+            cursor.execute('DROP TABLE %s' % self.quoted_table)
+        # Recreate
+        management.call_command('createcachetable', verbosity=0)
+        # Table exists again
+        self.assertGreaterEqual(self._row_count(), 0)

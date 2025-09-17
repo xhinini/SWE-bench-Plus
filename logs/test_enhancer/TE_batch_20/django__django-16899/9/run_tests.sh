@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_checks.tests_llm.ReadonlyMessageTests.test_error_message_contains_model_label admin_checks.tests_llm.ReadonlyMessageTests.test_error_obj_attribute_is_admin_class admin_checks.tests_llm.ReadonlyMessageTests.test_inline_missing_fields_includes_field_name_and_correct_obj admin_checks.tests_llm.ReadonlyMessageTests.test_missing_field_multiple_reports_each_with_correct_index_and_name admin_checks.tests_llm.ReadonlyMessageTests.test_missing_field_single_includes_field_name_and_index admin_checks.tests_llm.ReadonlyMessageTests.test_missing_field_with_numeric_like_name admin_checks.tests_llm.ReadonlyMessageTests.test_missing_field_with_special_characters_in_name admin_checks.tests_llm.ReadonlyMessageTests.test_missing_field_with_unicode_name admin_checks.tests_llm.ReadonlyMessageTests.test_mixed_existing_and_missing_fields_indices admin_checks.tests_llm.ReadonlyMessageTests.test_multiple_missing_fields_ordering_matches_readonly_fields_order
+coverage json -o coverage.json
+: '>>>>> End Test Output'

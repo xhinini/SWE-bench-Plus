@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_helptext_anchor_equals_expected_relative_path auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_helptext_anchor_only_one_link auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_helptext_anchor_text_contains_this_form auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_helptext_does_not_contain_unformatted_placeholder auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_helptext_href_has_no_double_slashes_and_ends_with_password_path auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_helptext_rendered_in_form_table_contains_link auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_helptext_uses_pk_even_if_username_contains_slash auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_link_resolves_in_admin_urls_using_pk auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_password_helptext_contains_instance_pk
+coverage json -o coverage.json
+: '>>>>> End Test Output'

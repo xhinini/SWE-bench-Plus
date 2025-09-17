@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 backends.sqlite.test_features_llm.BuildInstanceTests._make_meta backends.sqlite.test_features_llm.BuildInstanceTests._make_model_class backends.sqlite.test_features_llm.BuildInstanceTests.test_build_instance_calls_natural_key_and_resolves_pk_even_if_other_fields_present backends.sqlite.test_features_llm.BuildInstanceTests.test_different_attname_for_pk backends.sqlite.test_features_llm.BuildInstanceTests.test_multiple_relation_field_names backends.sqlite.test_features_llm.BuildInstanceTests.test_natural_key_relying_on_non_string_db_identifier backends.sqlite.test_features_llm.BuildInstanceTests.test_natural_key_uses_relation_name_that_is_python_keyword_like backends.sqlite.test_features_llm.BuildInstanceTests.test_natural_key_with_multiple_component_types backends.sqlite.test_features_llm.BuildInstanceTests.test_sets_pk_when_natural_key_uses_multiple_fields backends.sqlite.test_features_llm.BuildInstanceTests.test_sets_pk_when_natural_key_uses_relation_field_author backends.sqlite.test_features_llm.BuildInstanceTests.test_sets_pk_with_integer_like_natural_key_component backends.sqlite.test_features_llm.BuildInstanceTests.test_sets_pk_with_nested_natural_key_tuple backends.sqlite.test_features_llm.FakeField.__init__ backends.sqlite.test_features_llm.FakePK.__init__ backends.sqlite.test_features_llm.FakePK.to_python backends.sqlite.test_features_llm.make_manager
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_helptext_anchor_text_contains_expected_phrase auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_helptext_contains_pk_path_standard auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_helptext_for_non_integer_pk_like_uuid auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_helptext_has_single_anchor_placeholder_replacement auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_join_with_deep_admin_change_url auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_link_resolves_to_password_change_url_from_to_field auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_mutated_pk_as_string_reflected_in_helptext auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_numeric_pk_zero auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_password_field_is_omitted_when_set_to_none_on_subclass auth_tests.test_forms_llm.UserChangeFormPasswordLinkTests.test_unsaved_instance_uses_none_pk_in_helptext
+coverage json -o coverage.json
+: '>>>>> End Test Output'

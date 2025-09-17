@@ -1,0 +1,3 @@
+import unittest
+from django.contrib.admindocs.utils import parse_docstring
+from django.contrib.admindocs.views import get_return_data_type, get_readable_field_data_type, extract_views_from_urlpatterns, simplify_regex

@@ -1,0 +1,1019 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `django/db/models/deletion.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 from collections import Counter
+2 from operator import attrgetter
+3 
+4 from django.db import IntegrityError, connections, transaction
+5 from django.db.models import signals, sql
+6 
+7 
+8 class ProtectedError(IntegrityError):
+9     def __init__(self, msg, protected_objects):
+10         self.protected_objects = protected_objects
+11         super().__init__(msg, protected_objects)
+12 
+13 
+14 def CASCADE(collector, field, sub_objs, using):
+15     collector.collect(sub_objs, source=field.remote_field.model,
+16                       source_attr=field.name, nullable=field.null)
+17     if field.null and not connections[using].features.can_defer_constraint_checks:
+18         collector.add_field_update(field, None, sub_objs)
+19 
+20 
+21 def PROTECT(collector, field, sub_objs, using):
+22     raise ProtectedError(
+23         "Cannot delete some instances of model '%s' because they are "
+24         "referenced through a protected foreign key: '%s.%s'" % (
+25             field.remote_field.model.__name__, sub_objs[0].__class__.__name__, field.name
+26         ),
+27         sub_objs
+28     )
+29 
+30 
+31 def SET(value):
+32     if callable(value):
+33         def set_on_delete(collector, field, sub_objs, using):
+34             collector.add_field_update(field, value(), sub_objs)
+35     else:
+36         def set_on_delete(collector, field, sub_objs, using):
+37             collector.add_field_update(field, value, sub_objs)
+38     set_on_delete.deconstruct = lambda: ('django.db.models.SET', (value,), {})
+39     return set_on_delete
+40 
+41 
+42 def SET_NULL(collector, field, sub_objs, using):
+43     collector.add_field_update(field, None, sub_objs)
+44 
+45 
+46 def SET_DEFAULT(collector, field, sub_objs, using):
+47     collector.add_field_update(field, field.get_default(), sub_objs)
+48 
+49 
+50 def DO_NOTHING(collector, field, sub_objs, using):
+51     pass
+52 
+53 
+54 def get_candidate_relations_to_delete(opts):
+55     # The candidate relations are the ones that come from N-1 and 1-1 relations.
+56     # N-N  (i.e., many-to-many) relations aren't candidates for deletion.
+57     return (
+58         f for f in opts.get_fields(include_hidden=True)
+59         if f.auto_created and not f.concrete and (f.one_to_one or f.one_to_many)
+60     )
+61 
+62 
+63 class Collector:
+64     def __init__(self, using):
+65         self.using = using
+66         # Initially, {model: {instances}}, later values become lists.
+67         self.data = {}
+68         self.field_updates = {}  # {model: {(field, value): {instances}}}
+69         # fast_deletes is a list of queryset-likes that can be deleted without
+70         # fetching the objects into memory.
+71         self.fast_deletes = []
+72 
+73         # Tracks deletion-order dependency for databases without transactions
+74         # or ability to defer constraint checks. Only concrete model classes
+75         # should be included, as the dependencies exist only between actual
+76         # database tables; proxy models are represented here by their concrete
+77         # parent.
+78         self.dependencies = {}  # {model: {models}}
+79 
+80     def add(self, objs, source=None, nullable=False, reverse_dependency=False):
+81         """
+82         Add 'objs' to the collection of objects to be deleted.  If the call is
+83         the result of a cascade, 'source' should be the model that caused it,
+84         and 'nullable' should be set to True if the relation can be null.
+85 
+86         Return a list of all objects that were not already collected.
+87         """
+88         if not objs:
+89             return []
+90         new_objs = []
+91         model = objs[0].__class__
+92         instances = self.data.setdefault(model, set())
+93         for obj in objs:
+94             if obj not in instances:
+95                 new_objs.append(obj)
+96         instances.update(new_objs)
+97         # Nullable relationships can be ignored -- they are nulled out before
+98         # deleting, and therefore do not affect the order in which objects have
+99         # to be deleted.
+100         if source is not None and not nullable:
+101             if reverse_dependency:
+102                 source, model = model, source
+103             self.dependencies.setdefault(
+104                 source._meta.concrete_model, set()).add(model._meta.concrete_model)
+105         return new_objs
+106 
+107     def add_field_update(self, field, value, objs):
+108         """
+109         Schedule a field update. 'objs' must be a homogeneous iterable
+110         collection of model instances (e.g. a QuerySet).
+111         """
+112         if not objs:
+113             return
+114         model = objs[0].__class__
+115         self.field_updates.setdefault(
+116             model, {}).setdefault(
+117             (field, value), set()).update(objs)
+118 
+119     def can_fast_delete(self, objs, from_field=None):
+120         """
+121         Determine if the objects in the given queryset-like or single object
+122         can be fast-deleted. This can be done if there are no cascades, no
+123         parents and no signal listeners for the object class.
+124 
+125         The 'from_field' tells where we are coming from - we need this to
+126         determine if the objects are in fact to be deleted. Allow also
+127         skipping parent -> child -> parent chain preventing fast delete of
+128         the child.
+129         """
+130         if from_field and from_field.remote_field.on_delete is not CASCADE:
+131             return False
+132         if hasattr(objs, '_meta'):
+133             model = type(objs)
+134         elif hasattr(objs, 'model') and hasattr(objs, '_raw_delete'):
+135             model = objs.model
+136         else:
+137             return False
+138         if (signals.pre_delete.has_listeners(model) or
+139                 signals.post_delete.has_listeners(model) or
+140                 signals.m2m_changed.has_listeners(model)):
+141             return False
+142         # The use of from_field comes from the need to avoid cascade back to
+143         # parent when parent delete is cascading to child.
+144         opts = model._meta
+145         return (
+146             all(link == from_field for link in opts.concrete_model._meta.parents.values()) and
+147             # Foreign keys pointing to this model.
+148             all(
+149                 related.field.remote_field.on_delete is DO_NOTHING
+150                 for related in get_candidate_relations_to_delete(opts)
+151             ) and (
+152                 # Something like generic foreign key.
+153                 not any(hasattr(field, 'bulk_related_objects') for field in opts.private_fields)
+154             )
+155         )
+156 
+157     def get_del_batches(self, objs, field):
+158         """
+159         Return the objs in suitably sized batches for the used connection.
+160         """
+161         conn_batch_size = max(
+162             connections[self.using].ops.bulk_batch_size([field.name], objs), 1)
+163         if len(objs) > conn_batch_size:
+164             return [objs[i:i + conn_batch_size]
+165                     for i in range(0, len(objs), conn_batch_size)]
+166         else:
+167             return [objs]
+168 
+169     def collect(self, objs, source=None, nullable=False, collect_related=True,
+170                 source_attr=None, reverse_dependency=False, keep_parents=False):
+171         """
+172         Add 'objs' to the collection of objects to be deleted as well as all
+173         parent instances.  'objs' must be a homogeneous iterable collection of
+174         model instances (e.g. a QuerySet).  If 'collect_related' is True,
+175         related objects will be handled by their respective on_delete handler.
+176 
+177         If the call is the result of a cascade, 'source' should be the model
+178         that caused it and 'nullable' should be set to True, if the relation
+179         can be null.
+180 
+181         If 'reverse_dependency' is True, 'source' will be deleted before the
+182         current model, rather than after. (Needed for cascading to parent
+183         models, the one case in which the cascade follows the forwards
+184         direction of an FK rather than the reverse direction.)
+185 
+186         If 'keep_parents' is True, data of parent model's will be not deleted.
+187         """
+188         if self.can_fast_delete(objs):
+189             self.fast_deletes.append(objs)
+190             return
+191         new_objs = self.add(objs, source, nullable,
+192                             reverse_dependency=reverse_dependency)
+193         if not new_objs:
+194             return
+195 
+196         model = new_objs[0].__class__
+197 
+198         if not keep_parents:
+199             # Recursively collect concrete model's parent models, but not their
+200             # related objects. These will be found by meta.get_fields()
+201             concrete_model = model._meta.concrete_model
+202             for ptr in concrete_model._meta.parents.values():
+203                 if ptr:
+204                     parent_objs = [getattr(obj, ptr.name) for obj in new_objs]
+205                     self.collect(parent_objs, source=model,
+206                                  source_attr=ptr.remote_field.related_name,
+207                                  collect_related=False,
+208                                  reverse_dependency=True)
+209         if collect_related:
+210             parents = model._meta.parents
+211             for related in get_candidate_relations_to_delete(model._meta):
+212                 # Preserve parent reverse relationships if keep_parents=True.
+213                 if keep_parents and related.model in parents:
+214                     continue
+215                 field = related.field
+216                 if field.remote_field.on_delete == DO_NOTHING:
+217                     continue
+218                 batches = self.get_del_batches(new_objs, field)
+219                 for batch in batches:
+220                     sub_objs = self.related_objects(related, batch)
+221                     if self.can_fast_delete(sub_objs, from_field=field):
+222                         self.fast_deletes.append(sub_objs)
+223                     elif sub_objs:
+224                         field.remote_field.on_delete(self, field, sub_objs, self.using)
+225             for field in model._meta.private_fields:
+226                 if hasattr(field, 'bulk_related_objects'):
+227                     # It's something like generic foreign key.
+228                     sub_objs = field.bulk_related_objects(new_objs, self.using)
+229                     self.collect(sub_objs, source=model, nullable=True)
+230 
+231     def related_objects(self, related, objs):
+232         """
+233         Get a QuerySet of objects related to `objs` via the relation `related`.
+234         """
+235         return related.related_model._base_manager.using(self.using).filter(
+236             **{"%s__in" % related.field.name: objs}
+237         )
+238 
+239     def instances_with_model(self):
+240         for model, instances in self.data.items():
+241             for obj in instances:
+242                 yield model, obj
+243 
+244     def sort(self):
+245         sorted_models = []
+246         concrete_models = set()
+247         models = list(self.data)
+248         while len(sorted_models) < len(models):
+249             found = False
+250             for model in models:
+251                 if model in sorted_models:
+252                     continue
+253                 dependencies = self.dependencies.get(model._meta.concrete_model)
+254                 if not (dependencies and dependencies.difference(concrete_models)):
+255                     sorted_models.append(model)
+256                     concrete_models.add(model._meta.concrete_model)
+257                     found = True
+258             if not found:
+259                 return
+260         self.data = {model: self.data[model] for model in sorted_models}
+261 
+262     def delete(self):
+263         # sort instance collections
+264         for model, instances in self.data.items():
+265             self.data[model] = sorted(instances, key=attrgetter("pk"))
+266 
+267         # if possible, bring the models in an order suitable for databases that
+268         # don't support transactions or cannot defer constraint checks until the
+269         # end of a transaction.
+270         self.sort()
+271         # number of objects deleted for each model label
+272         deleted_counter = Counter()
+273 
+274         # Optimize for the case with a single obj and no dependencies
+275         if len(self.data) == 1 and len(instances) == 1:
+276             instance = list(instances)[0]
+277             if self.can_fast_delete(instance):
+278                 with transaction.mark_for_rollback_on_error():
+279                     count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
+280                 setattr(instance, model._meta.pk.attname, None)
+281                 return count, {model._meta.label: count}
+282 
+283         with transaction.atomic(using=self.using, savepoint=False):
+284             # send pre_delete signals
+285             for model, obj in self.instances_with_model():
+286                 if not model._meta.auto_created:
+287                     signals.pre_delete.send(
+288                         sender=model, instance=obj, using=self.using
+289                     )
+290 
+291             # fast deletes
+292             for qs in self.fast_deletes:
+293                 count = qs._raw_delete(using=self.using)
+294                 deleted_counter[qs.model._meta.label] += count
+295 
+296             # update fields
+297             for model, instances_for_fieldvalues in self.field_updates.items():
+298                 for (field, value), instances in instances_for_fieldvalues.items():
+299                     query = sql.UpdateQuery(model)
+300                     query.update_batch([obj.pk for obj in instances],
+301                                        {field.name: value}, self.using)
+302 
+303             # reverse instance collections
+304             for instances in self.data.values():
+305                 instances.reverse()
+306 
+307             # delete instances
+308             for model, instances in self.data.items():
+309                 query = sql.DeleteQuery(model)
+310                 pk_list = [obj.pk for obj in instances]
+311                 count = query.delete_batch(pk_list, self.using)
+312                 deleted_counter[model._meta.label] += count
+313 
+314                 if not model._meta.auto_created:
+315                     for obj in instances:
+316                         signals.post_delete.send(
+317                             sender=model, instance=obj, using=self.using
+318                         )
+319 
+320         # update collected instances
+321         for instances_for_fieldvalues in self.field_updates.values():
+322             for (field, value), instances in instances_for_fieldvalues.items():
+323                 for obj in instances:
+324                     setattr(obj, field.attname, value)
+325         for model, instances in self.data.items():
+326             for instance in instances:
+327                 setattr(instance, model._meta.pk.attname, None)
+328         return sum(deleted_counter.values()), dict(deleted_counter)
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `django/db/models/deletion.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -277,6 +277,7 @@ def delete(self):
+             if self.can_fast_delete(instance):
+                 with transaction.mark_for_rollback_on_error():
+                     count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
++                setattr(instance, model._meta.pk.attname, None)
+                 return count, {model._meta.label: count}
+ 
+         with transaction.atomic(using=self.using, savepoint=False):
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/django/db/models/deletion.py b/django/db/models/deletion.py
+index 92fe4affb9..68383c24ce 100644
+--- a/django/db/models/deletion.py
++++ b/django/db/models/deletion.py
+@@ -277,6 +277,8 @@ class Collector:
+             if self.can_fast_delete(instance):
+                 with transaction.mark_for_rollback_on_error():
+                     count = sql.DeleteQuery(model).delete_batch([instance.pk], self.using)
++                    # Set primary key to None after deletion
++                    setattr(instance, model._meta.pk.attname, None)
+                 return count, {model._meta.label: count}
+ 
+         with transaction.atomic(using=self.using, savepoint=False):
+diff --git a/reproduce.py b/reproduce.py
+new file mode 100644
+index 0000000000..c0a0a82316
+--- /dev/null
++++ b/reproduce.py
+@@ -0,0 +1,56 @@
++from django.conf import settings
++from django.db import models
++import os
++
++# Configure Django settings
++settings.configure(
++    DATABASES={
++        'default': {
++            'ENGINE': 'django.db.backends.sqlite3',
++            'NAME': ':memory:',
++        }
++    },
++    INSTALLED_APPS=[],
++)
++
++import django
++django.setup()
++
++# Create models with no dependencies
++class SimpleModel(models.Model):
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'test_app'
++
++class CustomPKModel(models.Model):
++    id = models.CharField(max_length=100, primary_key=True)
++    name = models.CharField(max_length=100)
++
++    class Meta:
++        app_label = 'test_app'
++
++# Create the database tables
++from django.db import connection
++with connection.schema_editor() as schema_editor:
++    schema_editor.create_model(SimpleModel)
++    schema_editor.create_model(CustomPKModel)
++
++# Test single object deletion with auto-incrementing PK
++obj1 = SimpleModel.objects.create(name='test1')
++print(f"Before deletion (auto PK) - PK: {obj1.pk}")
++obj1.delete()
++print(f"After deletion (auto PK) - PK: {obj1.pk}")
++
++# Test single object deletion with custom PK
++obj2 = CustomPKModel.objects.create(id='custom1', name='test2')
++print(f"\nBefore deletion (custom PK) - PK: {obj2.pk}")
++obj2.delete()
++print(f"After deletion (custom PK) - PK: {obj2.pk}")
++
++# Test multiple objects deletion
++obj3 = SimpleModel.objects.create(name='test3')
++obj4 = SimpleModel.objects.create(name='test4')
++print(f"\nBefore deletion (multiple) - PKs: {obj3.pk}, {obj4.pk}")
++SimpleModel.objects.filter(name__in=['test3', 'test4']).delete()
++print(f"After deletion (multiple) - PKs: {obj3.pk}, {obj4.pk}")  # These should stay as is since they use the normal path
+\ No newline at end of file
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `tests/delete/tests.py` that contains the existing tests.
+-----------------------------------------------------------
+from math import ceil
+
+from django.db import IntegrityError, connection, models
+from django.db.models.deletion import Collector
+from django.db.models.sql.constants import GET_ITERATOR_CHUNK_SIZE
+from django.test import TestCase, skipIfDBFeature, skipUnlessDBFeature
+
+from .models import (
+    MR, A, Avatar, Base, Child, HiddenUser, HiddenUserProfile, M, M2MFrom,
+    M2MTo, MRNull, Parent, R, RChild, S, T, User, create_a, get_default_r,
+)
+
+
+class OnDeleteTests(TestCase):
+    def setUp(self):
+        self.DEFAULT = get_default_r()
+
+    def test_auto(self):
+        a = create_a('auto')
+        a.auto.delete()
+        self.assertFalse(A.objects.filter(name='auto').exists())
+
+    def test_auto_nullable(self):
+        a = create_a('auto_nullable')
+        a.auto_nullable.delete()
+        self.assertFalse(A.objects.filter(name='auto_nullable').exists())
+
+    def test_setvalue(self):
+        a = create_a('setvalue')
+        a.setvalue.delete()
+        a = A.objects.get(pk=a.pk)
+        self.assertEqual(self.DEFAULT, a.setvalue.pk)
+
+    def test_setnull(self):
+        a = create_a('setnull')
+        a.setnull.delete()
+        a = A.objects.get(pk=a.pk)
+        self.assertIsNone(a.setnull)
+
+    def test_setdefault(self):
+        a = create_a('setdefault')
+        a.setdefault.delete()
+        a = A.objects.get(pk=a.pk)
+        self.assertEqual(self.DEFAULT, a.setdefault.pk)
+
+    def test_setdefault_none(self):
+        a = create_a('setdefault_none')
+        a.setdefault_none.delete()
+        a = A.objects.get(pk=a.pk)
+        self.assertIsNone(a.setdefault_none)
+
+    def test_cascade(self):
+        a = create_a('cascade')
+        a.cascade.delete()
+        self.assertFalse(A.objects.filter(name='cascade').exists())
+
+    def test_cascade_nullable(self):
+        a = create_a('cascade_nullable')
+        a.cascade_nullable.delete()
+        self.assertFalse(A.objects.filter(name='cascade_nullable').exists())
+
+    def test_protect(self):
+        a = create_a('protect')
+        msg = (
+            "Cannot delete some instances of model 'R' because they are "
+            "referenced through a protected foreign key: 'A.protect'"
+        )
+        with self.assertRaisesMessage(IntegrityError, msg):
+            a.protect.delete()
+
+    def test_do_nothing(self):
+        # Testing DO_NOTHING is a bit harder: It would raise IntegrityError for a normal model,
+        # so we connect to pre_delete and set the fk to a known value.
+        replacement_r = R.objects.create()
+
+        def check_do_nothing(sender, **kwargs):
+            obj = kwargs['instance']
+            obj.donothing_set.update(donothing=replacement_r)
+        models.signals.pre_delete.connect(check_do_nothing)
+        a = create_a('do_nothing')
+        a.donothing.delete()
+        a = A.objects.get(pk=a.pk)
+        self.assertEqual(replacement_r, a.donothing)
+        models.signals.pre_delete.disconnect(check_do_nothing)
+
+    def test_do_nothing_qscount(self):
+        """
+        A models.DO_NOTHING relation doesn't trigger a query.
+        """
+        b = Base.objects.create()
+        with self.assertNumQueries(1):
+            # RelToBase should not be queried.
+            b.delete()
+        self.assertEqual(Base.objects.count(), 0)
+
+    def test_inheritance_cascade_up(self):
+        child = RChild.objects.create()
+        child.delete()
+        self.assertFalse(R.objects.filter(pk=child.pk).exists())
+
+    def test_inheritance_cascade_down(self):
+        child = RChild.objects.create()
+        parent = child.r_ptr
+        parent.delete()
+        self.assertFalse(RChild.objects.filter(pk=child.pk).exists())
+
+    def test_cascade_from_child(self):
+        a = create_a('child')
+        a.child.delete()
+        self.assertFalse(A.objects.filter(name='child').exists())
+        self.assertFalse(R.objects.filter(pk=a.child_id).exists())
+
+    def test_cascade_from_parent(self):
+        a = create_a('child')
+        R.objects.get(pk=a.child_id).delete()
+        self.assertFalse(A.objects.filter(name='child').exists())
+        self.assertFalse(RChild.objects.filter(pk=a.child_id).exists())
+
+    def test_setnull_from_child(self):
+        a = create_a('child_setnull')
+        a.child_setnull.delete()
+        self.assertFalse(R.objects.filter(pk=a.child_setnull_id).exists())
+
+        a = A.objects.get(pk=a.pk)
+        self.assertIsNone(a.child_setnull)
+
+    def test_setnull_from_parent(self):
+        a = create_a('child_setnull')
+        R.objects.get(pk=a.child_setnull_id).delete()
+        self.assertFalse(RChild.objects.filter(pk=a.child_setnull_id).exists())
+
+        a = A.objects.get(pk=a.pk)
+        self.assertIsNone(a.child_setnull)
+
+    def test_o2o_setnull(self):
+        a = create_a('o2o_setnull')
+        a.o2o_setnull.delete()
+        a = A.objects.get(pk=a.pk)
+        self.assertIsNone(a.o2o_setnull)
+
+
+class DeletionTests(TestCase):
+
+    def test_m2m(self):
+        m = M.objects.create()
+        r = R.objects.create()
+        MR.objects.create(m=m, r=r)
+        r.delete()
+        self.assertFalse(MR.objects.exists())
+
+        r = R.objects.create()
+        MR.objects.create(m=m, r=r)
+        m.delete()
+        self.assertFalse(MR.objects.exists())
+
+        m = M.objects.create()
+        r = R.objects.create()
+        m.m2m.add(r)
+        r.delete()
+        through = M._meta.get_field('m2m').remote_field.through
+        self.assertFalse(through.objects.exists())
+
+        r = R.objects.create()
+        m.m2m.add(r)
+        m.delete()
+        self.assertFalse(through.objects.exists())
+
+        m = M.objects.create()
+        r = R.objects.create()
+        MRNull.objects.create(m=m, r=r)
+        r.delete()
+        self.assertFalse(not MRNull.objects.exists())
+        self.assertFalse(m.m2m_through_null.exists())
+
+    def test_bulk(self):
+        s = S.objects.create(r=R.objects.create())
+        for i in range(2 * GET_ITERATOR_CHUNK_SIZE):
+            T.objects.create(s=s)
+        #   1 (select related `T` instances)
+        # + 1 (select related `U` instances)
+        # + 2 (delete `T` instances in batches)
+        # + 1 (delete `s`)
+        self.assertNumQueries(5, s.delete)
+        self.assertFalse(S.objects.exists())
+
+    def test_instance_update(self):
+        deleted = []
+        related_setnull_sets = []
+
+        def pre_delete(sender, **kwargs):
+            obj = kwargs['instance']
+            deleted.append(obj)
+            if isinstance(obj, R):
+                related_setnull_sets.append([a.pk for a in obj.setnull_set.all()])
+
+        models.signals.pre_delete.connect(pre_delete)
+        a = create_a('update_setnull')
+        a.setnull.delete()
+
+        a = create_a('update_cascade')
+        a.cascade.delete()
+
+        for obj in deleted:
+            self.assertIsNone(obj.pk)
+
+        for pk_list in related_setnull_sets:
+            for a in A.objects.filter(id__in=pk_list):
+                self.assertIsNone(a.setnull)
+
+        models.signals.pre_delete.disconnect(pre_delete)
+
+    def test_deletion_order(self):
+        pre_delete_order = []
+        post_delete_order = []
+
+        def log_post_delete(sender, **kwargs):
+            pre_delete_order.append((sender, kwargs['instance'].pk))
+
+        def log_pre_delete(sender, **kwargs):
+            post_delete_order.append((sender, kwargs['instance'].pk))
+
+        models.signals.post_delete.connect(log_post_delete)
+        models.signals.pre_delete.connect(log_pre_delete)
+
+        r = R.objects.create(pk=1)
+        s1 = S.objects.create(pk=1, r=r)
+        s2 = S.objects.create(pk=2, r=r)
+        T.objects.create(pk=1, s=s1)
+        T.objects.create(pk=2, s=s2)
+        RChild.objects.create(r_ptr=r)
+        r.delete()
+        self.assertEqual(
+            pre_delete_order, [(T, 2), (T, 1), (RChild, 1), (S, 2), (S, 1), (R, 1)]
+        )
+        self.assertEqual(
+            post_delete_order, [(T, 1), (T, 2), (RChild, 1), (S, 1), (S, 2), (R, 1)]
+        )
+
+        models.signals.post_delete.disconnect(log_post_delete)
+        models.signals.pre_delete.disconnect(log_pre_delete)
+
+    def test_relational_post_delete_signals_happen_before_parent_object(self):
+        deletions = []
+
+        def log_post_delete(instance, **kwargs):
+            self.assertTrue(R.objects.filter(pk=instance.r_id))
+            self.assertIs(type(instance), S)
+            deletions.append(instance.id)
+
+        r = R.objects.create(pk=1)
+        S.objects.create(pk=1, r=r)
+
+        models.signals.post_delete.connect(log_post_delete, sender=S)
+
+        try:
+            r.delete()
+        finally:
+            models.signals.post_delete.disconnect(log_post_delete)
+
+        self.assertEqual(len(deletions), 1)
+        self.assertEqual(deletions[0], 1)
+
+    @skipUnlessDBFeature("can_defer_constraint_checks")
+    def test_can_defer_constraint_checks(self):
+        u = User.objects.create(
+            avatar=Avatar.objects.create()
+        )
+        a = Avatar.objects.get(pk=u.avatar_id)
+        # 1 query to find the users for the avatar.
+        # 1 query to delete the user
+        # 1 query to delete the avatar
+        # The important thing is that when we can defer constraint checks there
+        # is no need to do an UPDATE on User.avatar to null it out.
+
+        # Attach a signal to make sure we will not do fast_deletes.
+        calls = []
+
+        def noop(*args, **kwargs):
+            calls.append('')
+        models.signals.post_delete.connect(noop, sender=User)
+
+        self.assertNumQueries(3, a.delete)
+        self.assertFalse(User.objects.exists())
+        self.assertFalse(Avatar.objects.exists())
+        self.assertEqual(len(calls), 1)
+        models.signals.post_delete.disconnect(noop, sender=User)
+
+    @skipIfDBFeature("can_defer_constraint_checks")
+    def test_cannot_defer_constraint_checks(self):
+        u = User.objects.create(
+            avatar=Avatar.objects.create()
+        )
+        # Attach a signal to make sure we will not do fast_deletes.
+        calls = []
+
+        def noop(*args, **kwargs):
+            calls.append('')
+        models.signals.post_delete.connect(noop, sender=User)
+
+        a = Avatar.objects.get(pk=u.avatar_id)
+        # The below doesn't make sense... Why do we need to null out
+        # user.avatar if we are going to delete the user immediately after it,
+        # and there are no more cascades.
+        # 1 query to find the users for the avatar.
+        # 1 query to delete the user
+        # 1 query to null out user.avatar, because we can't defer the constraint
+        # 1 query to delete the avatar
+        self.assertNumQueries(4, a.delete)
+        self.assertFalse(User.objects.exists())
+        self.assertFalse(Avatar.objects.exists())
+        self.assertEqual(len(calls), 1)
+        models.signals.post_delete.disconnect(noop, sender=User)
+
+    def test_hidden_related(self):
+        r = R.objects.create()
+        h = HiddenUser.objects.create(r=r)
+        HiddenUserProfile.objects.create(user=h)
+
+        r.delete()
+        self.assertEqual(HiddenUserProfile.objects.count(), 0)
+
+    def test_large_delete(self):
+        TEST_SIZE = 2000
+        objs = [Avatar() for i in range(0, TEST_SIZE)]
+        Avatar.objects.bulk_create(objs)
+        # Calculate the number of queries needed.
+        batch_size = connection.ops.bulk_batch_size(['pk'], objs)
+        # The related fetches are done in batches.
+        batches = ceil(len(objs) / batch_size)
+        # One query for Avatar.objects.all() and then one related fast delete for
+        # each batch.
+        fetches_to_mem = 1 + batches
+        # The Avatar objects are going to be deleted in batches of GET_ITERATOR_CHUNK_SIZE
+        queries = fetches_to_mem + TEST_SIZE // GET_ITERATOR_CHUNK_SIZE
+        self.assertNumQueries(queries, Avatar.objects.all().delete)
+        self.assertFalse(Avatar.objects.exists())
+
+    def test_large_delete_related(self):
+        TEST_SIZE = 2000
+        s = S.objects.create(r=R.objects.create())
+        for i in range(TEST_SIZE):
+            T.objects.create(s=s)
+
+        batch_size = max(connection.ops.bulk_batch_size(['pk'], range(TEST_SIZE)), 1)
+
+        # TEST_SIZE / batch_size (select related `T` instances)
+        # + 1 (select related `U` instances)
+        # + TEST_SIZE / GET_ITERATOR_CHUNK_SIZE (delete `T` instances in batches)
+        # + 1 (delete `s`)
+        expected_num_queries = ceil(TEST_SIZE / batch_size)
+        expected_num_queries += ceil(TEST_SIZE / GET_ITERATOR_CHUNK_SIZE) + 2
+
+        self.assertNumQueries(expected_num_queries, s.delete)
+        self.assertFalse(S.objects.exists())
+        self.assertFalse(T.objects.exists())
+
+    def test_delete_with_keeping_parents(self):
+        child = RChild.objects.create()
+        parent_id = child.r_ptr_id
+        child.delete(keep_parents=True)
+        self.assertFalse(RChild.objects.filter(id=child.id).exists())
+        self.assertTrue(R.objects.filter(id=parent_id).exists())
+
+    def test_delete_with_keeping_parents_relationships(self):
+        child = RChild.objects.create()
+        parent_id = child.r_ptr_id
+        parent_referent_id = S.objects.create(r=child.r_ptr).pk
+        child.delete(keep_parents=True)
+        self.assertFalse(RChild.objects.filter(id=child.id).exists())
+        self.assertTrue(R.objects.filter(id=parent_id).exists())
+        self.assertTrue(S.objects.filter(pk=parent_referent_id).exists())
+
+    def test_queryset_delete_returns_num_rows(self):
+        """
+        QuerySet.delete() should return the number of deleted rows and a
+        dictionary with the number of deletions for each object type.
+        """
+        Avatar.objects.bulk_create([Avatar(desc='a'), Avatar(desc='b'), Avatar(desc='c')])
+        avatars_count = Avatar.objects.count()
+        deleted, rows_count = Avatar.objects.all().delete()
+        self.assertEqual(deleted, avatars_count)
+
+        # more complex example with multiple object types
+        r = R.objects.create()
+        h1 = HiddenUser.objects.create(r=r)
+        HiddenUser.objects.create(r=r)
+        HiddenUserProfile.objects.create(user=h1)
+        existed_objs = {
+            R._meta.label: R.objects.count(),
+            HiddenUser._meta.label: HiddenUser.objects.count(),
+            A._meta.label: A.objects.count(),
+            MR._meta.label: MR.objects.count(),
+            HiddenUserProfile._meta.label: HiddenUserProfile.objects.count(),
+        }
+        deleted, deleted_objs = R.objects.all().delete()
+        for k, v in existed_objs.items():
+            self.assertEqual(deleted_objs[k], v)
+
+    def test_model_delete_returns_num_rows(self):
+        """
+        Model.delete() should return the number of deleted rows and a
+        dictionary with the number of deletions for each object type.
+        """
+        r = R.objects.create()
+        h1 = HiddenUser.objects.create(r=r)
+        h2 = HiddenUser.objects.create(r=r)
+        HiddenUser.objects.create(r=r)
+        HiddenUserProfile.objects.create(user=h1)
+        HiddenUserProfile.objects.create(user=h2)
+        m1 = M.objects.create()
+        m2 = M.objects.create()
+        MR.objects.create(r=r, m=m1)
+        r.m_set.add(m1)
+        r.m_set.add(m2)
+        r.save()
+        existed_objs = {
+            R._meta.label: R.objects.count(),
+            HiddenUser._meta.label: HiddenUser.objects.count(),
+            A._meta.label: A.objects.count(),
+            MR._meta.label: MR.objects.count(),
+            HiddenUserProfile._meta.label: HiddenUserProfile.objects.count(),
+            M.m2m.through._meta.label: M.m2m.through.objects.count(),
+        }
+        deleted, deleted_objs = r.delete()
+        self.assertEqual(deleted, sum(existed_objs.values()))
+        for k, v in existed_objs.items():
+            self.assertEqual(deleted_objs[k], v)
+
+    def test_proxied_model_duplicate_queries(self):
+        """
+        #25685 - Deleting instances of a model with existing proxy
+        classes should not issue multiple queries during cascade
+        deletion of referring models.
+        """
+        avatar = Avatar.objects.create()
+        # One query for the Avatar table and a second for the User one.
+        with self.assertNumQueries(2):
+            avatar.delete()
+
+
+class FastDeleteTests(TestCase):
+
+    def test_fast_delete_fk(self):
+        u = User.objects.create(
+            avatar=Avatar.objects.create()
+        )
+        a = Avatar.objects.get(pk=u.avatar_id)
+        # 1 query to fast-delete the user
+        # 1 query to delete the avatar
+        self.assertNumQueries(2, a.delete)
+        self.assertFalse(User.objects.exists())
+        self.assertFalse(Avatar.objects.exists())
+
+    def test_fast_delete_m2m(self):
+        t = M2MTo.objects.create()
+        f = M2MFrom.objects.create()
+        f.m2m.add(t)
+        # 1 to delete f, 1 to fast-delete m2m for f
+        self.assertNumQueries(2, f.delete)
+
+    def test_fast_delete_revm2m(self):
+        t = M2MTo.objects.create()
+        f = M2MFrom.objects.create()
+        f.m2m.add(t)
+        # 1 to delete t, 1 to fast-delete t's m_set
+        self.assertNumQueries(2, f.delete)
+
+    def test_fast_delete_qs(self):
+        u1 = User.objects.create()
+        u2 = User.objects.create()
+        self.assertNumQueries(1, User.objects.filter(pk=u1.pk).delete)
+        self.assertEqual(User.objects.count(), 1)
+        self.assertTrue(User.objects.filter(pk=u2.pk).exists())
+
+    def test_fast_delete_instance_set_pk_none(self):
+        u = User.objects.create()
+        # User can be fast-deleted.
+        collector = Collector(using='default')
+        self.assertTrue(collector.can_fast_delete(u))
+        u.delete()
+        self.assertIsNone(u.pk)
+
+    def test_fast_delete_joined_qs(self):
+        a = Avatar.objects.create(desc='a')
+        User.objects.create(avatar=a)
+        u2 = User.objects.create()
+        expected_queries = 1 if connection.features.update_can_self_select else 2
+        self.assertNumQueries(expected_queries,
+                              User.objects.filter(avatar__desc='a').delete)
+        self.assertEqual(User.objects.count(), 1)
+        self.assertTrue(User.objects.filter(pk=u2.pk).exists())
+
+    def test_fast_delete_inheritance(self):
+        c = Child.objects.create()
+        p = Parent.objects.create()
+        # 1 for self, 1 for parent
+        self.assertNumQueries(2, c.delete)
+        self.assertFalse(Child.objects.exists())
+        self.assertEqual(Parent.objects.count(), 1)
+        self.assertEqual(Parent.objects.filter(pk=p.pk).count(), 1)
+        # 1 for self delete, 1 for fast delete of empty "child" qs.
+        self.assertNumQueries(2, p.delete)
+        self.assertFalse(Parent.objects.exists())
+        # 1 for self delete, 1 for fast delete of empty "child" qs.
+        c = Child.objects.create()
+        p = c.parent_ptr
+        self.assertNumQueries(2, p.delete)
+        self.assertFalse(Parent.objects.exists())
+        self.assertFalse(Child.objects.exists())
+
+    def test_fast_delete_large_batch(self):
+        User.objects.bulk_create(User() for i in range(0, 2000))
+        # No problems here - we aren't going to cascade, so we will fast
+        # delete the objects in a single query.
+        self.assertNumQueries(1, User.objects.all().delete)
+        a = Avatar.objects.create(desc='a')
+        User.objects.bulk_create(User(avatar=a) for i in range(0, 2000))
+        # We don't hit parameter amount limits for a, so just one query for
+        # that + fast delete of the related objs.
+        self.assertNumQueries(2, a.delete)
+        self.assertEqual(User.objects.count(), 0)
+
+    def test_fast_delete_empty_no_update_can_self_select(self):
+        """
+        #25932 - Fast deleting on backends that don't have the
+        `no_update_can_self_select` feature should work even if the specified
+        filter doesn't match any row.
+        """
+        with self.assertNumQueries(1):
+            self.assertEqual(
+                User.objects.filter(avatar__desc='missing').delete(),
+                (0, {'delete.User': 0})
+            )
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""

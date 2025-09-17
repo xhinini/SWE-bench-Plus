@@ -1,0 +1,212 @@
+import unittest
+from types import SimpleNamespace
+from django.db.models.expressions import OrderBy, RawSQL, Value
+import unittest
+from types import SimpleNamespace
+
+from django.db.models.expressions import OrderBy, RawSQL, Value
+from django.db.models.sql.compiler import SQLCompiler
+
+class DummyOps:
+    def quote_name(self, name):
+        return name
+
+class DummyConnection:
+    def __init__(self):
+        self.vendor = 'default'
+        self.ops = DummyOps()
+        # minimal features attr needed elsewhere if touched
+        self.features = SimpleNamespace(
+            allows_group_by_pk=False,
+            allows_group_by_selected_pks=False,
+            allows_group_by_selected_pks_on_model=lambda m: False,
+            can_use_chunked_reads=False,
+            can_return_rows_from_bulk_insert=False,
+        )
+
+class DummyAlias:
+    def __init__(self, join_cols=None):
+        self.join_cols = join_cols
+
+def make_compiler_stub(field, targets, joins, opts_ordering, transform_prefix='R'):
+    """
+    Create a SQLCompiler instance and patch its _setup_joins to return the
+    provided field, targets, joins, opts, and a transform_function that
+    produces RawSQL expressions prefixed by transform_prefix.
+    """
+    query = SimpleNamespace()
+    # alias_map entries referenced by find_ordering_name when building join_tuple
+    query.alias_map = {j: DummyAlias(join_cols=(j,)) for j in joins}
+    # trim_joins should return targets and alias for the path used in the final transform
+    def trim_joins(targets_in, joins_in, path_in):
+        return (targets, 'alias', None)
+    query.trim_joins = trim_joins
+
+    # Build opts object to be returned by _setup_joins (opts.ordering is used)
+    opts = SimpleNamespace(ordering=opts_ordering)
+
+    connection = DummyConnection()
+    compiler = SQLCompiler(query, connection, using='default')
+
+    # Define transform function producing distinct RawSQL expressions per target
+    def transform_function(t, alias):
+        # Use a SQL fragment that is easily distinguishable
+        return RawSQL(f"{transform_prefix}_{t}", ())
+
+    # Patch the instance method _setup_joins
+    def _setup_joins_stub(pieces, opts_in, alias_in):
+        # pieces, opts_in, alias_in are ignored in favor of our controlled values
+        return (field, targets, 'alias', joins, 'path', opts, transform_function)
+
+    compiler._setup_joins = _setup_joins_stub
+    return compiler
+
+class FindOrderingNameTests(unittest.TestCase):
+    def test_attname_equals_last_piece_simple(self):
+        # name 'a__b', pieces[-1] == 'b', field.attname == 'b' -> use transform
+        field = SimpleNamespace(is_relation=True, attname='b')
+        targets = ['t1']
+        joins = ['J']
+        opts_ordering = [Value(1)]
+        compiler = make_compiler_stub(field, targets, joins, opts_ordering, transform_prefix='X')
+        result = compiler.find_ordering_name('a__b', SimpleNamespace())
+        # Expect transform SQL 'X_t1'
+        orderby_expr = result[0][0]
+        inner = orderby_expr.get_source_expressions()[0]
+        sql, params = compiler.compile(inner)
+        self.assertEqual(sql, 'X_t1')
+        self.assertEqual(params, ())
+
+    def test_attname_equals_last_piece_descending(self):
+        # Same as above but with descending flag in name ('-a__b')
+        field = SimpleNamespace(is_relation=True, attname='b')
+        targets = ['t1']
+        joins = ['J']
+        opts_ordering = [Value(1)]
+        compiler = make_compiler_stub(field, targets, joins, opts_ordering, transform_prefix='D')
+        result = compiler.find_ordering_name('-a__b', SimpleNamespace())
+        orderby_expr = result[0][0]
+        inner = orderby_expr.get_source_expressions()[0]
+        sql, params = compiler.compile(inner)
+        self.assertEqual(sql, 'D_t1')
+        self.assertEqual(params, ())
+
+    def test_attname_equals_last_piece_multiple_targets(self):
+        # Multiple targets return multiple transformed orderings
+        field = SimpleNamespace(is_relation=True, attname='b')
+        targets = ['t1', 't2']
+        joins = ['J1', 'J2']
+        opts_ordering = [Value(1)]
+        compiler = make_compiler_stub(field, targets, joins, opts_ordering, transform_prefix='M')
+        result = compiler.find_ordering_name('a__b', SimpleNamespace())
+        self.assertEqual(len(result), 2)
+        sqls = []
+        params_list = []
+        for item in result:
+            inner = item[0].get_source_expressions()[0]
+            s, p = compiler.compile(inner)
+            sqls.append(s)
+            params_list.append(p)
+        self.assertEqual(sqls, ['M_t1', 'M_t2'])
+        self.assertEqual(params_list, [(), ()])
+
+    def test_attname_not_equal_uses_opts_ordering(self):
+        # field.attname != pieces[-1] -> should use opts.ordering (Value(1)) resulting in param [1]
+        field = SimpleNamespace(is_relation=True, attname='other')
+        targets = ['t1']
+        joins = ['J']
+        opts_ordering = [Value(1)]
+        compiler = make_compiler_stub(field, targets, joins, opts_ordering, transform_prefix='S')
+        result = compiler.find_ordering_name('a__b', SimpleNamespace())
+        orderby_expr = result[0][0]
+        inner = orderby_expr.get_source_expressions()[0]
+        sql, params = compiler.compile(inner)
+        # Value(1).asc()/desc() compiles to a placeholder with parameter 1
+        self.assertIn(1, params)
+
+    def test_non_relation_field_uses_transform(self):
+        # If field.is_relation is False, go straight to transform behavior
+        field = SimpleNamespace(is_relation=False, attname='irrelevant')
+        targets = ['tX']
+        joins = ['J']
+        opts_ordering = [Value(1)]
+        compiler = make_compiler_stub(field, targets, joins, opts_ordering, transform_prefix='NR')
+        result = compiler.find_ordering_name('a__b', SimpleNamespace())
+        inner = result[0][0].get_source_expressions()[0]
+        sql, params = compiler.compile(inner)
+        self.assertEqual(sql, 'NR_tX')
+
+    def test_pk_name_skips_default_ordering(self):
+        # name == 'pk' should skip default ordering path and use transform
+        field = SimpleNamespace(is_relation=True, attname='pk')
+        targets = ['tpk']
+        joins = ['JP']
+        opts_ordering = [Value(1)]
+        compiler = make_compiler_stub(field, targets, joins, opts_ordering, transform_prefix='PK')
+        result = compiler.find_ordering_name('pk', SimpleNamespace())
+        inner = result[0][0].get_source_expressions()[0]
+        sql, params = compiler.compile(inner)
+        self.assertEqual(sql, 'PK_tpk')
+
+    def test_opts_ordering_already_orderby_used(self):
+        # If opts.ordering contains an OrderBy already, and attname mismatches,
+        # the existing OrderBy should be returned.
+        field = SimpleNamespace(is_relation=True, attname='X')
+        targets = ['t1']
+        joins = ['J']
+        # Create a pre-made OrderBy with a RawSQL inner expression 'PRE'
+        existing_orderby = OrderBy(RawSQL('PRE', ()))
+        opts_ordering = [existing_orderby]
+        compiler = make_compiler_stub(field, targets, joins, opts_ordering, transform_prefix='T')
+        result = compiler.find_ordering_name('a__b', SimpleNamespace())
+        # The returned OrderBy should contain our RawSQL('PRE', ())
+        inner = result[0][0].get_source_expressions()[0]
+        sql, params = compiler.compile(inner)
+        self.assertEqual(sql, 'PRE')
+        self.assertEqual(params, ())
+
+    def test_attname_equals_last_piece_with_complex_name(self):
+        # pieces[-1] can contain underscores; ensure comparison is against pieces[-1]
+        field = SimpleNamespace(is_relation=True, attname='last_part')
+        targets = ['u1']
+        joins = ['J']
+        opts_ordering = [Value(1)]
+        compiler = make_compiler_stub(field, targets, joins, opts_ordering, transform_prefix='U')
+        result = compiler.find_ordering_name('prefix__last_part', SimpleNamespace())
+        inner = result[0][0].get_source_expressions()[0]
+        sql, params = compiler.compile(inner)
+        self.assertEqual(sql, 'U_u1')
+        self.assertEqual(params, ())
+
+    def test_single_piece_name_equals_attname(self):
+        # name has no lookup (single piece) and equals attname -> transform
+        field = SimpleNamespace(is_relation=True, attname='solo')
+        targets = ['s1']
+        joins = ['J']
+        opts_ordering = [Value(1)]
+        compiler = make_compiler_stub(field, targets, joins, opts_ordering, transform_prefix='Z')
+        result = compiler.find_ordering_name('solo', SimpleNamespace())
+        inner = result[0][0].get_source_expressions()[0]
+        sql, params = compiler.compile(inner)
+        self.assertEqual(sql, 'Z_s1')
+        self.assertEqual(params, ())
+
+    def test_multiple_ordering_items_are_returned_when_applicable(self):
+        # When opts.ordering contains multiple Value() expressions and
+        # the attname does not equal the last piece, all ordering items are used.
+        field = SimpleNamespace(is_relation=True, attname='notlast')
+        targets = ['tA']
+        joins = ['J']
+        opts_ordering = [Value(1), Value(2)]
+        compiler = make_compiler_stub(field, targets, joins, opts_ordering, transform_prefix='IGN')
+        result = compiler.find_ordering_name('a__b', SimpleNamespace())
+        # We expect two ordering tuples corresponding to the two Value() entries
+        self.assertEqual(len(result), 2)
+        # Their compiled params should include 1 and 2 respectively
+        params0 = compiler.compile(result[0][0].get_source_expressions()[0])[1]
+        params1 = compiler.compile(result[1][0].get_source_expressions()[0])[1]
+        self.assertIn(1, params0)
+        self.assertIn(2, params1)
+
+if __name__ == "__main__":
+    unittest.main()

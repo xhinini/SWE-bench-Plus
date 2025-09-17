@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_optimizer_llm.AdditionalOptimizerTests.assertOptimizesTo migrations.test_optimizer_llm.AdditionalOptimizerTests.optimize migrations.test_optimizer_llm.AdditionalOptimizerTests.serialize migrations.test_optimizer_llm.AdditionalOptimizerTests.test_addfield_removefield_case_insensitive_cancel migrations.test_optimizer_llm.AdditionalOptimizerTests.test_alter_alter_alters_to_last migrations.test_optimizer_llm.AdditionalOptimizerTests.test_alter_alter_alters_to_last_with_app_label migrations.test_optimizer_llm.AdditionalOptimizerTests.test_alter_different_fields_unaffected migrations.test_optimizer_llm.AdditionalOptimizerTests.test_alter_then_removefield_case_insensitive_results_in_remove migrations.test_optimizer_llm.AdditionalOptimizerTests.test_alter_then_removefield_results_in_remove migrations.test_optimizer_llm.AdditionalOptimizerTests.test_alter_then_rename_results_in_rename_and_alter migrations.test_optimizer_llm.AdditionalOptimizerTests.test_chained_alters_then_rename migrations.test_optimizer_llm.AdditionalOptimizerTests.test_optimize_slice_alterfields_only
+coverage json -o coverage.json
+: '>>>>> End Test Output'

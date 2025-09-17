@@ -1,0 +1,193 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise MigrationLoader.load_disk() classification of migration modules as migrated or unmigrated based on combinations of module attributes (__file__ presence/absence and __path__ being a list vs a non-list). They simulate app configs via monkeypatching django.apps.apps.get_app_configs and place fake modules into sys.modules. Each test asserts that MigrationLoader marks the app as migrated or unmigrated per the intended (gold-patched) behavior.
+test_code: |
+  import sys
+  import types
+  from unittest import mock
+
+  from django.test import TestCase, override_settings
+  from django.apps import apps
+  from django.db.migrations.loader import MigrationLoader
+
+  class FakeAppConfig:
+      def __init__(self, label, name=None):
+          self.label = label
+          # name is used only when MIGRATION_MODULES doesn't supply an explicit path
+          self.name = name or label
+
+  class LoaderModuleClassificationTests(TestCase):
+      def setUp(self):
+          # Ensure no leftover modules interfere
+          self._orig_get_app_configs = apps.get_app_configs
+          self._patched = []
+
+      def tearDown(self):
+          # Restore apps.get_app_configs if we changed it
+          apps.get_app_configs = self._orig_get_app_configs
+          # Remove any modules we injected
+          for mod_name in self._patched:
+              sys.modules.pop(mod_name, None)
+
+      def _run_with_module(self, module_name, module_obj, app_label):
+          """
+          Helper to put a module into sys.modules, patch apps.get_app_configs to
+          return our FakeAppConfig, run load_disk, and return the loader.
+          """
+          sys.modules[module_name] = module_obj
+          self._patched.append(module_name)
+
+          apps.get_app_configs = lambda: [FakeAppConfig(app_label)]
+          # Ensure settings point the app_label to our module_name
+          settings_patch = {app_label: module_name}
+          with override_settings(MIGRATION_MODULES=settings_patch):
+              loader = MigrationLoader(connection=None, load=False)
+              loader.load_disk()
+          return loader
+
+      def test_regular_package_without___file___is_migrated(self):
+          """
+          Regular package (has __path__ as a list) with no __file__ should be
+          treated as a migrated app (package with migrations).
+          """
+          module = types.ModuleType("pkg_no_file")
+          # __path__ as a normal list => regular package
+          module.__path__ = ['/fake/path']
+          # Simulate absence of __file__
+          if hasattr(module, "__file__"):
+              delattr(module, "__file__")
+          loader = self._run_with_module("pkg_no_file", module, "pkgapp")
+          self.assertIn("pkgapp", loader.migrated_apps)
+          self.assertNotIn("pkgapp", loader.unmigrated_apps)
+
+      def test_namespace_package_ignored(self):
+          """
+          Namespace package (no __file__ and __path__ not a list) should be
+          treated as unmigrated (ignored).
+          """
+          module = types.ModuleType("ns_pkg")
+          # __path__ is a namespace path object (not a list)
+          class FakeNSPath:
+              pass
+          module.__path__ = FakeNSPath()
+          # No __file__
+          if hasattr(module, "__file__"):
+              delattr(module, "__file__")
+          loader = self._run_with_module("ns_pkg", module, "nsapp")
+          self.assertIn("nsapp", loader.unmigrated_apps)
+          self.assertNotIn("nsapp", loader.migrated_apps)
+
+      def test_module_file_not_package_marked_unmigrated(self):
+          """
+          A migrations module that is a plain module file (no __path__) should
+          be treated as unmigrated.
+          """
+          module = types.ModuleType("file_mod")
+          # Module files have __file__ set
+          module.__file__ = "/some/path/migrations.py"
+          # Ensure no __path__ attribute => not a package
+          if hasattr(module, "__path__"):
+              delattr(module, "__path__")
+          loader = self._run_with_module("file_mod", module, "fileapp")
+          self.assertIn("fileapp", loader.unmigrated_apps)
+          self.assertNotIn("fileapp", loader.migrated_apps)
+
+      def test_missing___file___and_no___path___is_unmigrated(self):
+          """
+          A module with neither __file__ nor __path__ should be treated as
+          unmigrated (can't be a package and no file location).
+          """
+          module = types.ModuleType("no_file_no_path")
+          # Ensure neither attribute exists
+          if hasattr(module, "__file__"):
+              delattr(module, "__file__")
+          if hasattr(module, "__path__"):
+              delattr(module, "__path__")
+          loader = self._run_with_module("no_file_no_path", module, "noinfo")
+          self.assertIn("noinfo", loader.unmigrated_apps)
+          self.assertNotIn("noinfo", loader.migrated_apps)
+
+      def test_package_with___path__as_list_subclass_is_migrated(self):
+          """
+          If __path__ is a list subclass, it should still be treated as a
+          regular package and thus be migrated even if __file__ is None.
+          """
+          class MyPath(list):
+              pass
+          module = types.ModuleType("listsub_pkg")
+          module.__path__ = MyPath(['/some/path'])
+          if hasattr(module, "__file__"):
+              delattr(module, "__file__")
+          loader = self._run_with_module("listsub_pkg", module, "listsub")
+          self.assertIn("listsub", loader.migrated_apps)
+          self.assertNotIn("listsub", loader.unmigrated_apps)
+
+      def test_namespace_when_path_is_tuple_is_unmigrated(self):
+          """
+          __path__ being a tuple (not list) should be treated as a namespace-like
+          package and thus ignored/unmigrated when __file__ is not present.
+          """
+          module = types.ModuleType("tuple_path_pkg")
+          module.__path__ = ('/some/path',)
+          if hasattr(module, "__file__"):
+              delattr(module, "__file__")
+          loader = self._run_with_module("tuple_path_pkg", module, "tupleapp")
+          self.assertIn("tupleapp", loader.unmigrated_apps)
+          self.assertNotIn("tupleapp", loader.migrated_apps)
+
+      def test_package_with__file__present_and_path_not_list_is_migrated_if_package(self):
+          """
+          If __file__ is present (module has a location) and __path__ exists but
+          is not a list, it should still be considered a package only if it's
+          actually a package. In our simulation, having __path__ but a real
+          __file__ indicates a package with location; MigrationLoader should
+          treat it as migrated (because __path__ exists).
+          """
+          module = types.ModuleType("weird_pkg")
+          module.__path__ = object()  # not a list
+          module.__file__ = "/some/path/__init__.py"
+          loader = self._run_with_module("weird_pkg", module, "weirdapp")
+          # Because __path__ exists, MigrationLoader treats it as a package.
+          # Whether it's treated as namespace vs package depends on __file__,
+          # and here __file__ exists, so it should be migrated.
+          self.assertIn("weirdapp", loader.migrated_apps)
+          self.assertNotIn("weirdapp", loader.unmigrated_apps)
+
+      def test_package_with__path__property_like_object_and_no_file_is_unmigrated(self):
+          """
+          Edge-case where __path__ exists but is a custom iterable (like some
+          namespace implementations) and __file__ is absent — should be
+          treated as unmigrated.
+          """
+          class PathLike:
+              def __iter__(self):
+                  yield "/x"
+          module = types.ModuleType("pathlike_ns")
+          module.__path__ = PathLike()
+          if hasattr(module, "__file__"):
+              delattr(module, "__file__")
+          loader = self._run_with_module("pathlike_ns", module, "pathlikeapp")
+          self.assertIn("pathlikeapp", loader.unmigrated_apps)
+          self.assertNotIn("pathlikeapp", loader.migrated_apps)
+
+      def test_reload_called_if_already_loaded_and_package_is_valid(self):
+          """
+          If the module is already present in sys.modules and is a valid
+          package (list __path__), load_disk should still mark it as migrated.
+          This test ensures the code path that forces a reload doesn't prevent
+          the package from being treated as migrated.
+          """
+          module = types.ModuleType("preloaded_pkg")
+          module.__path__ = ['/some/path']
+          # Simulate preloaded module with __file__ missing (frozen package)
+          if hasattr(module, "__file__"):
+              delattr(module, "__file__")
+          # Pre-insert into sys.modules to simulate "was_loaded" == True
+          sys.modules["preloaded_pkg"] = module
+          self._patched.append("preloaded_pkg")
+          loader = self._run_with_module("preloaded_pkg", module, "preloaded")
+          self.assertIn("preloaded", loader.migrated_apps)
+          self.assertNotIn("preloaded", loader.unmigrated_apps)
+new_imports_code: |
+  import types
+  from unittest import mock

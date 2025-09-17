@@ -1,0 +1,272 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These tests exercise the link anchor-checking path in CheckExternalLinksBuilder.check_thread.
+  They simulate HTTP HEAD and GET responses (with various Content-Type headers and body contents)
+  and assert whether an URL containing a fragment (anchor) is treated as broken when the anchor
+  is not present in the target resource. The gold patch enforces response.raise_for_status()
+  before checking anchors (i.e. will treat missing anchors as broken for HTML resources fetched
+  by GET). The candidate (model) patch incorrectly skips anchor checking for non-HTML responses
+  by inspecting the Content-Type on the (HEAD) response and returning "working", so these tests
+  will fail under that candidate patch but pass under the gold patch.
+new_imports_code: |
+  import threading
+  import queue
+  from types import SimpleNamespace
+  from requests.exceptions import HTTPError
+  import re
+test_code: |
+  import pytest
+  from sphinx.builders import linkcheck
+  from sphinx.builders.linkcheck import CheckExternalLinksBuilder
+  from types import SimpleNamespace
+  import queue
+  import threading
+  from requests.exceptions import HTTPError
+
+  # Helper fake response used to simulate requests responses
+  class FakeResponse:
+      def __init__(self, url, content='', status_code=200, headers=None, history=None, request_method='GET'):
+          self.url = url
+          self._content = content
+          self.status_code = status_code
+          self.headers = headers or {}
+          self.history = history or []
+          self.request = SimpleNamespace(method=request_method)
+
+      def iter_content(self, chunk_size=4096, decode_unicode=False):
+          # Simulate streaming a single chunk
+          if isinstance(self._content, bytes):
+              if decode_unicode:
+                  yield self._content.decode('utf-8', errors='ignore')
+              else:
+                  yield self._content
+          else:
+              yield self._content
+
+      def raise_for_status(self):
+          if self.status_code >= 400:
+              # raise a requests.HTTPError with a response attribute like requests does
+              err = HTTPError(f"{self.status_code} Error for url: {self.url}")
+              err.response = self
+              raise err
+
+  def make_builder():
+      """
+      Create an instance of CheckExternalLinksBuilder without running its init.
+      Populate required attributes used by check_thread.
+      """
+      b = object.__new__(CheckExternalLinksBuilder)
+      # minimal app/config object
+      cfg = SimpleNamespace(
+          linkcheck_anchors=True,
+          linkcheck_anchors_ignore=["^!"],
+          linkcheck_request_headers={},
+          linkcheck_retries=1,
+          linkcheck_timeout=None,
+          linkcheck_workers=1
+      )
+      app = SimpleNamespace(config=cfg, quiet=False, warningiserror=False)
+      b.app = app
+      # some code references self.config in the nested function
+      b.config = cfg
+      b.anchors_ignore = [re.compile(x) for x in cfg.linkcheck_anchors_ignore]
+      b.to_ignore = []
+      b.auth = []
+      b.good = set()
+      b.broken = {}
+      b.redirected = {}
+      b.srcdir = ''
+      b.outdir = ''
+      b.wqueue = queue.Queue()
+      b.rqueue = queue.Queue()
+      return b
+
+  def run_check_with_responses(head_resp, get_resp, uri):
+      """
+      Puts a single URI into builder.wqueue, runs check_thread in a thread,
+      then returns the single result retrieved from rqueue.
+      head_resp/get_resp are FakeResponse or callables that return FakeResponse.
+      """
+      b = make_builder()
+
+      # patch requests used in module scope
+      original_get = linkcheck.requests.get
+      original_head = linkcheck.requests.head
+      try:
+          def fake_get(url, *args, **kwargs):
+              # simulate that the returned response.request.method is 'GET'
+              resp = get_resp() if callable(get_resp) else get_resp
+              resp.request = SimpleNamespace(method='GET')
+              return resp
+
+          def fake_head(url, *args, **kwargs):
+              resp = head_resp() if callable(head_resp) else head_resp
+              resp.request = SimpleNamespace(method='HEAD')
+              return resp
+
+          linkcheck.requests.get = fake_get
+          linkcheck.requests.head = fake_head
+
+          # enqueue the URI and a sentinel to stop the loop
+          b.wqueue.put((uri, 'docname', 1))
+          b.wqueue.put((None, None, None))
+
+          th = threading.Thread(target=b.check_thread)
+          th.start()
+
+          # get result
+          res = b.rqueue.get(timeout=5)
+          th.join(timeout=1)
+          return res
+      finally:
+          linkcheck.requests.get = original_get
+          linkcheck.requests.head = original_head
+
+  # --- Tests ---
+
+  def test_non_html_content_type_without_anchor_should_be_broken():
+      """
+      HEAD returns 200 with non-HTML Content-Type, GET returns 200 body without the anchor.
+      Gold patch: performs GET then raise_for_status then check_anchor -> anchor missing -> broken.
+      Candidate: returns 'working' early because Content-Type != text/html on HEAD.
+      """
+      head = FakeResponse('https://example.org/page', content='', status_code=200,
+                          headers={'content-type': 'application/octet-stream'})
+      get = FakeResponse('https://example.org/page', content='<html><body>No anchor here</body></html>', status_code=200,
+                         headers={'content-type': 'application/octet-stream'})
+      uri = 'https://example.org/page#missing'
+      uri_out, doc, lineno, status, info, code = run_check_with_responses(head, get, uri)
+      assert uri_out == uri
+      assert status == 'broken'
+      assert "Anchor 'missing' not found" in info
+
+  def test_missing_content_type_header_without_anchor_should_be_broken():
+      """
+      No Content-Type header on HEAD; candidate treats empty content-type as non-HTML and returns 'working'.
+      Gold patch will fetch GET and check anchor, so anchor missing should be broken.
+      """
+      head = FakeResponse('https://example.org/page', content='', status_code=200, headers={})
+      get = FakeResponse('https://example.org/page', content='<html>No anchor</html>', status_code=200, headers={})
+      uri = 'https://example.org/page#nope'
+      uri_out, doc, lineno, status, info, code = run_check_with_responses(head, get, uri)
+      assert uri_out == uri
+      assert status == 'broken'
+      assert "Anchor 'nope' not found" in info
+
+  def test_content_type_case_variation_should_be_treated_as_html_by_gold():
+      """
+      Content-Type header has different case 'Text/Html'; candidate's startswith('text/html') is case-sensitive
+      and will treat it as non-HTML (incorrect). Gold patch ignores content-type and checks anchor via GET.
+      """
+      head = FakeResponse('https://example.org/page', content='', status_code=200,
+                          headers={'content-type': 'Text/Html; charset=utf-8'})
+      get = FakeResponse('https://example.org/page', content='<html><body>no-anchor</body></html>', status_code=200,
+                         headers={'content-type': 'Text/Html; charset=utf-8'})
+      uri = 'https://example.org/page#anchorX'
+      uri_out, doc, lineno, status, info, code = run_check_with_responses(head, get, uri)
+      assert uri_out == uri
+      assert status == 'broken'
+      assert "Anchor 'anchorX' not found" in info
+
+  def test_text_plain_content_type_without_anchor_should_be_broken():
+      """
+      Content-Type 'text/plain' is not HTML. Candidate incorrectly skips anchor check.
+      Gold patch should still check anchor and mark as broken if missing.
+      """
+      head = FakeResponse('https://example.org/data', content='', status_code=200,
+                          headers={'content-type': 'text/plain; charset=utf-8'})
+      get = FakeResponse('https://example.org/data', content='plain content without anchor', status_code=200,
+                         headers={'content-type': 'text/plain; charset=utf-8'})
+      uri = 'https://example.org/data#frag'
+      uri_out, doc, lineno, status, info, code = run_check_with_responses(head, get, uri)
+      assert uri_out == uri
+      assert status == 'broken'
+      assert "Anchor 'frag' not found" in info
+
+  def test_percent_encoded_anchor_without_anchor_should_be_broken():
+      """
+      Anchor is percent-encoded in the URI. Gold patch unquotes and checks the decoded anchor.
+      Candidate may skip due to content-type check on HEAD. Expect broken.
+      """
+      head = FakeResponse('https://example.org/page', content='', status_code=200,
+                          headers={'content-type': 'application/octet-stream'})
+      # GET returns HTML that does not contain 'a b' anchor
+      get = FakeResponse('https://example.org/page', content='<html><body>no anchor a b</body></html>', status_code=200,
+                         headers={'content-type': 'application/octet-stream'})
+      uri = 'https://example.org/page#a%20b'
+      uri_out, doc, lineno, status, info, code = run_check_with_responses(head, get, uri)
+      assert uri_out == uri
+      assert status == 'broken'
+      assert "Anchor 'a%20b' not found" in info
+
+  def test_non_html_with_similar_fragment_should_be_broken():
+      """
+      Ensure fragments that might appear as part of binary content still trigger anchor checking under gold.
+      Candidate returns 'working' incorrectly if it skips anchor checking.
+      """
+      head = FakeResponse('https://example.org/bin', content=b'\x00\x01\x02', status_code=200,
+                          headers={'content-type': 'application/octet-stream'})
+      get = FakeResponse('https://example.org/bin', content=b'\x00\x01\x02', status_code=200,
+                         headers={'content-type': 'application/octet-stream'})
+      uri = 'https://example.org/bin#fragbyte'
+      uri_out, doc, lineno, status, info, code = run_check_with_responses(head, get, uri)
+      assert uri_out == uri
+      assert status == 'broken'
+      assert "Anchor 'fragbyte' not found" in info
+
+  def test_non_html_content_type_with_slash_variation_should_be_broken():
+      """
+      Content-Type that is not exactly 'text/html' (e.g. 'application/xhtml+xml' or other) must not be used
+      by the candidate to skip anchor checking. Gold performs GET and checks anchors irrespective of content-type.
+      """
+      head = FakeResponse('https://example.org/xhtml', content='', status_code=200,
+                          headers={'content-type': 'application/xhtml+xml'})
+      get = FakeResponse('https://example.org/xhtml', content='<html><body>noanchor</body></html>', status_code=200,
+                         headers={'content-type': 'application/xhtml+xml'})
+      uri = 'https://example.org/xhtml#noanchor'
+      uri_out, doc, lineno, status, info, code = run_check_with_responses(head, get, uri)
+      assert uri_out == uri
+      assert status == 'broken'
+      assert "Anchor 'noanchor' not found" in info
+
+  def test_anchor_missing_even_when_head_succeeds_should_be_broken():
+      """
+      HEAD returns 200 and would normally allow the candidate to decide based on content-type.
+      Gold's behavior (GET + check_anchor) must mark missing anchor as broken.
+      """
+      head = FakeResponse('https://example.org/p', content='', status_code=200,
+                          headers={'content-type': 'application/octet-stream'})
+      get = FakeResponse('https://example.org/p', content='<html><body>nope</body></html>', status_code=200,
+                         headers={'content-type': 'application/octet-stream'})
+      uri = 'https://example.org/p#missing-anchor'
+      uri_out, doc, lineno, status, info, code = run_check_with_responses(head, get, uri)
+      assert uri_out == uri
+      assert status == 'broken'
+      assert "Anchor 'missing-anchor' not found" in info
+
+  def test_non_html_content_with_hashbang_anchor_not_ignored_by_gold():
+      """
+      Anchors starting with '!' are ignored by default (linkcheck_anchors_ignore), ensure that regular
+      non-! anchors are checked. This test ensures we are not accidentally ignoring anchors that should be checked.
+      """
+      head = FakeResponse('https://example.org/page', content='', status_code=200,
+                          headers={'content-type': 'application/octet-stream'})
+      get = FakeResponse('https://example.org/page', content='<html><body>no anchor</body></html>', status_code=200,
+                         headers={'content-type': 'application/octet-stream'})
+      uri = 'https://example.org/page#!not-checked'  # anchor begins with ! -> anchors_ignore matches and should be ignored
+      # For this test, since anchors_ignore default is ["^!"], the anchor will be ignored and the URI should be treated
+      # like a non-anchored URL: GET/HEAD will just check existence. Simulate HEAD 200 -> working.
+      head2 = FakeResponse('https://example.org/page', content='', status_code=200,
+                           headers={'content-type': 'application/octet-stream'})
+      get2 = FakeResponse('https://example.org/page', content='<html><body>no anchor</body></html>', status_code=200,
+                          headers={'content-type': 'application/octet-stream'})
+      # When anchor ignored, the builder will not raise about missing anchor; it will treat it as working (if GET/HEAD ok).
+      uri_out, doc, lineno, status, info, code = run_check_with_responses(head2, get2, uri)
+      assert uri_out == uri
+      # The link should be considered working (not 'broken') because anchor was ignored.
+      assert status == 'working' or status == 'redirected' or status == 'unchecked'
+
+  # Run tests when executed directly
+  if __name__ == "__main__":
+      pytest.main([__file__])

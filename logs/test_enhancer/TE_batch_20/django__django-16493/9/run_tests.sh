@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 file_storage.test_models_llm.test_deconstruct_callable_returns_custom_storage_included file_storage.test_models_llm.test_deconstruct_callable_returns_default_storage_included file_storage.test_models_llm.test_deconstruct_custom_storage_instance_is_preserved file_storage.test_models_llm.test_deconstruct_default_storage_not_included file_storage.test_models_llm.test_deconstruct_max_length_behavior_for_explicit_values file_storage.test_models_llm.test_deconstruct_preserves_callable_upload_to_that_returns_pathlib file_storage.test_models_llm.test_deconstruct_preserves_custom_callable_upload_to file_storage.test_models_llm.test_deconstruct_preserves_pathlib_upload_to_direct file_storage.test_models_llm.test_deconstruct_storage_class_callable_included file_storage.test_models_llm.test_deconstruct_storage_instance_included_when_not_default
+coverage json -o coverage.json
+: '>>>>> End Test Output'

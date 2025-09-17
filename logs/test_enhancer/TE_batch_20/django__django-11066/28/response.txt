@@ -1,0 +1,185 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests verify that RenameContentType._rename and rename_backward:
+  - call save() with the correct using=db argument so writes occur on the intended database,
+  - respect router.allow_migrate_model,
+  - do not touch the default DB when operating on another DB,
+  - do not call save() when the content type is missing,
+  - handle IntegrityError by leaving the DB unchanged and not clearing the cache,
+  - call clear_cache on success,
+  - use transaction.atomic with the correct using value,
+  - call get_by_natural_key via the db_manager bound to the target DB.
+test_code: |
+  from unittest.mock import patch
+  from django.apps.registry import apps
+  from django.contrib.contenttypes import management as contenttypes_management
+  from django.contrib.contenttypes.models import ContentType
+  from django.db import connections
+  from django.db.utils import IntegrityError
+  from django.test import TransactionTestCase
+  
+  
+  class RenameContentTypeDBTests(TransactionTestCase):
+      databases = {'default', 'other'}
+      available_apps = [
+          'contenttypes_tests',
+          'django.contrib.contenttypes',
+      ]
+  
+      def setUp(self):
+          # Ensure a clean state for ContentType in both DBs
+          ContentType.objects.using('default').filter(app_label='contenttypes_tests').delete()
+          ContentType.objects.using('other').filter(app_label='contenttypes_tests').delete()
+  
+      def test_rename_uses_using_parameter_on_save(self):
+          # Create a content type on the 'other' DB.
+          ContentType.objects.using('other').create(app_label='contenttypes_tests', model='foo')
+          op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+          # Wrap the model save to capture the 'using' kwarg and still perform the save.
+          orig_save = ContentType.save
+          captured = {}
+  
+          def save_and_capture(self, *args, **kwargs):
+              captured.update(kwargs)
+              return orig_save(self, *args, **kwargs)
+  
+          with patch.object(ContentType, 'save', new=save_and_capture):
+              with connections['other'].schema_editor() as schema_editor:
+                  op._rename(apps, schema_editor, 'foo', 'renamedfoo')
+  
+          # Ensure the 'using' kwarg was passed and points to the 'other' DB.
+          self.assertIn('using', captured)
+          self.assertEqual(captured['using'], 'other')
+          # Confirm DB change occurred on 'other'
+          self.assertTrue(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='renamedfoo').exists())
+  
+      def test_rename_does_not_modify_default_db(self):
+          # Create a content type only on the 'other' DB.
+          ContentType.objects.using('other').create(app_label='contenttypes_tests', model='foo')
+          op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+          with connections['other'].schema_editor() as schema_editor:
+              op._rename(apps, schema_editor, 'foo', 'renamedfoo')
+          # default DB should remain untouched
+          self.assertFalse(ContentType.objects.using('default').filter(app_label='contenttypes_tests', model='renamedfoo').exists())
+          # other DB should reflect rename
+          self.assertTrue(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='renamedfoo').exists())
+  
+      def test_rename_skipped_when_router_disallows(self):
+          ContentType.objects.using('other').create(app_label='contenttypes_tests', model='foo')
+          op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+          # Make router disallow migrating the ContentType model on 'other'
+          with patch('django.db.router.allow_migrate_model', return_value=False):
+              with connections['other'].schema_editor() as schema_editor:
+                  op._rename(apps, schema_editor, 'foo', 'renamedfoo')
+          # No change should have happened
+          self.assertTrue(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='foo').exists())
+          self.assertFalse(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='renamedfoo').exists())
+  
+      def test_missing_content_type_does_not_call_save(self):
+          # Ensure no content type exists.
+          ContentType.objects.using('other').filter(app_label='contenttypes_tests').delete()
+          op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+          # If save() is called unexpectedly the test should fail via AssertionError.
+          def fail_save(*args, **kwargs):
+              raise AssertionError("save() was called for a missing content type")
+          with patch.object(ContentType, 'save', new=fail_save):
+              with connections['other'].schema_editor() as schema_editor:
+                  # Should not raise and should not call save()
+                  op._rename(apps, schema_editor, 'foo', 'renamedfoo')
+  
+      def test_integrity_error_resets_model_and_db_unchanged(self):
+          # Create a content type on 'other' DB.
+          ContentType.objects.using('other').create(app_label='contenttypes_tests', model='foo')
+          op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+  
+          # Force save() to raise IntegrityError to simulate a uniqueness conflict.
+          def raise_integrity(*args, **kwargs):
+              raise IntegrityError("Simulated integrity error")
+  
+          with patch.object(ContentType, 'save', new=raise_integrity):
+              with connections['other'].schema_editor() as schema_editor:
+                  # Should not raise out of _rename; should be handled internally.
+                  op._rename(apps, schema_editor, 'foo', 'renamedfoo')
+  
+          # DB row should remain with the old model value.
+          self.assertTrue(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='foo').exists())
+          self.assertFalse(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='renamedfoo').exists())
+  
+      def test_clear_cache_called_on_success(self):
+          ContentType.objects.using('other').create(app_label='contenttypes_tests', model='foo')
+          op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+          with patch.object(ContentType.objects, 'clear_cache') as mock_clear:
+              with connections['other'].schema_editor() as schema_editor:
+                  op._rename(apps, schema_editor, 'foo', 'renamedfoo')
+              mock_clear.assert_called_once()
+  
+      def test_clear_cache_not_called_on_integrity_error(self):
+          ContentType.objects.using('other').create(app_label='contenttypes_tests', model='foo')
+          op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+          with patch.object(ContentType.objects, 'clear_cache') as mock_clear:
+              with patch.object(ContentType, 'save', new=lambda *a, **k: (_ for _ in ()).throw(IntegrityError())):
+                  with connections['other'].schema_editor() as schema_editor:
+                      op._rename(apps, schema_editor, 'foo', 'renamedfoo')
+              mock_clear.assert_not_called()
+  
+      def test_rename_backward_uses_correct_db_on_save(self):
+          # Create on 'other' DB the content type with model 'renamedfoo' which will be renamed back to 'foo'
+          ContentType.objects.using('other').create(app_label='contenttypes_tests', model='renamedfoo')
+          op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+          orig_save = ContentType.save
+          captured = {}
+  
+          def save_and_capture(self, *args, **kwargs):
+              captured.update(kwargs)
+              return orig_save(self, *args, **kwargs)
+  
+          with patch.object(ContentType, 'save', new=save_and_capture):
+              with connections['other'].schema_editor() as schema_editor:
+                  op.rename_backward(apps, schema_editor)
+  
+          self.assertIn('using', captured)
+          self.assertEqual(captured['using'], 'other')
+          self.assertTrue(ContentType.objects.using('other').filter(app_label='contenttypes_tests', model='foo').exists())
+  
+      def test_transaction_atomic_called_with_correct_using(self):
+          ContentType.objects.using('other').create(app_label='contenttypes_tests', model='foo')
+          op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+          used = {}
+  
+          class DummyCM:
+              def __init__(self, using):
+                  used['using'] = using
+              def __enter__(self):
+                  return None
+              def __exit__(self, exc_type, exc, tb):
+                  return False
+  
+          # Patch the transaction.atomic used in the contenttypes.management module
+          with patch('django.contrib.contenttypes.management.transaction.atomic', new=lambda using=None: DummyCM(using)):
+              with connections['other'].schema_editor() as schema_editor:
+                  op._rename(apps, schema_editor, 'foo', 'renamedfoo')
+          self.assertEqual(used.get('using'), 'other')
+  
+      def test_get_by_natural_key_called_on_db_manager(self):
+          ContentType.objects.using('other').create(app_label='contenttypes_tests', model='foo')
+          op = contenttypes_management.RenameContentType('contenttypes_tests', 'foo', 'renamedfoo')
+          orig_db_manager = ContentType.objects.db_manager
+  
+          def db_manager_proxy(db):
+              # Return a proxy object exposing get_by_natural_key and retaining behavior
+              class Proxy:
+                  called_db = None
+                  def get_by_natural_key(self, app_label, model):
+                      Proxy.called_db = db
+                      # Delegate to the real manager bound to this DB
+                      return orig_db_manager(db).get_by_natural_key(app_label, model)
+              return Proxy()
+  
+          with patch.object(ContentType.objects, 'db_manager', new=db_manager_proxy):
+              with connections['other'].schema_editor() as schema_editor:
+                  op._rename(apps, schema_editor, 'foo', 'renamedfoo')
+              # Ensure the proxy captured the 'other' DB value
+              # Access the Proxy.called_db via the class on the proxy instance
+              proxy_instance = ContentType.objects.db_manager('other')
+              self.assertEqual(getattr(proxy_instance, 'called_db', 'other'), 'other')

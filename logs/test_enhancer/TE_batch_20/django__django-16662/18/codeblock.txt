@@ -1,0 +1,258 @@
+# No additional imports required; tests reuse imports from the existing test module context.
+
+from django import get_version
+from django.db import migrations, models
+from django.db.migrations.writer import MigrationWriter
+import datetime
+import time
+import uuid
+import pathlib
+from django.conf import settings
+
+class RegressionImportSortingTests(SimpleTestCase):
+    def _extract_imports_block(self, output):
+        # Find the class Migration marker and return the imports block preceding it.
+        class_idx = output.index("\nclass Migration")
+        # The imports block is expected to be separated from the class by a blank line.
+        start = output.rfind("\n\n", 0, class_idx)
+        if start == -1:
+            # No header case (unlikely here), fall back to beginning
+            start = 0
+        imports_block = output[start + 2 : class_idx]
+        return imports_block
+
+    def test_regression_imports_datetime_time_order(self):
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "mymodel",
+                        "myfield",
+                        models.DateTimeField(
+                            default=datetime.datetime(
+                                2012, 1, 1, 1, 1, tzinfo=datetime.timezone.utc
+                            )
+                        ),
+                    ),
+                    migrations.AddField(
+                        "mymodel",
+                        "myfield2",
+                        models.FloatField(default=time.time),
+                    ),
+                ],
+                "dependencies": [],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        imports_block = self._extract_imports_block(output)
+        expected = "import datetime\nimport time\nfrom django.db import migrations, models\n"
+        self.assertIn(expected, imports_block)
+
+    def test_regression_imports_with_settings_and_datetime(self):
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "mymodel",
+                        "myfield",
+                        models.DateTimeField(default=datetime.datetime.now),
+                    )
+                ],
+                "dependencies": [("__setting__", "AUTH_USER_MODEL")],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        imports_block = self._extract_imports_block(output)
+        # import group first, then from-group; within from-group django.conf before django.db
+        self.assertIn(
+            "import datetime\nfrom django.conf import settings\nfrom django.db import migrations, models\n",
+            imports_block,
+        )
+
+    def test_regression_models_import_merged(self):
+        # When a models import is required, it should be merged with migrations into
+        # "from django.db import migrations, models"
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AlterModelOptions(
+                        name="model",
+                        options={"verbose_name": "model", "verbose_name_plural": "models"},
+                    ),
+                ],
+                "dependencies": [],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        imports_block = self._extract_imports_block(output)
+        # Exact merged import line must be present
+        self.assertIn("from django.db import migrations, models\n", imports_block)
+        # Ensure there's only one line that starts with "from django.db"
+        db_lines = [l for l in imports_block.splitlines() if l.startswith("from django.db")]
+        self.assertEqual(len(db_lines), 1)
+
+    def test_regression_many_imports_ordering(self):
+        # Trigger imports: decimal (via Decimal default), uuid and pathlib
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "mymodel",
+                        "dfield",
+                        models.DecimalField(default=None, max_digits=5, decimal_places=2),
+                    ),
+                    migrations.AddField(
+                        "mymodel",
+                        "uuidfield",
+                        models.UUIDField(default=uuid.UUID("5c859437-d061-4847-b3f7-e6b78852f8c8")),
+                    ),
+                    migrations.AddField(
+                        "mymodel",
+                        "pathfield",
+                        models.FilePathField(path=pathlib.PurePosixPath("/home/user")),
+                    ),
+                ],
+                "dependencies": [],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        imports_block = self._extract_imports_block(output)
+        # import group should contain decimal, pathlib, uuid in alphabetical order, then from django.db...
+        expected_sequence = "import decimal\nimport pathlib\nimport uuid\nfrom django.db import migrations, models\n"
+        # The precise imports may include other necessary imports as well, but this sequence must appear
+        self.assertIn(expected_sequence, imports_block)
+
+    def test_regression_custom_operation_imports_sorted(self):
+        # custom_migration_operations.* modules are imported by OperationWriter as "import ...".
+        # Ensure import-group sorting keeps 'custom_migration_operations.operations' before 'import datetime'.
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    # custom op referenced earlier in the test module imports
+                    custom_migration_operations.operations.TestOperation(),
+                    migrations.AddField(
+                        "mymodel",
+                        "dt",
+                        models.DateTimeField(default=datetime.datetime.now),
+                    ),
+                ],
+                "dependencies": [],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        imports_block = self._extract_imports_block(output)
+        # Expect custom_migration_operations.* to come before datetime (alphabetical order)
+        self.assertRegex(imports_block, r"import custom_migration_operations\.operations\nimport datetime\n")
+
+    def test_regression_only_migrations_import_when_models_unused(self):
+        # If models aren't used, only migrations should be imported from django.db
+        migration = type("Migration", (migrations.Migration,), {"operations": [], "dependencies": []})
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        imports_block = self._extract_imports_block(output)
+        # Even with no other imports, django.db migrations import must be present
+        self.assertIn("from django.db import migrations\n", imports_block)
+        # Should NOT contain "models" in that line when models are unused
+        self.assertNotIn("from django.db import migrations, models\n\n", imports_block)  # sanity check
+
+    def test_regression_from_group_sorted_by_module(self):
+        # Create a scenario with two 'from' imports that should be ordered by module:
+        # django.conf before django.db
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "mymodel",
+                        "dt",
+                        models.DateTimeField(default=datetime.datetime.now),
+                    ),
+                ],
+                "dependencies": [("__setting__", "AUTH_USER_MODEL")],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        imports_block = self._extract_imports_block(output)
+        # Ensure django.conf comes before django.db within the 'from' group
+        from_lines = [l for l in imports_block.splitlines() if l.startswith("from ")]
+        self.assertTrue(from_lines.index("from django.conf import settings") < from_lines.index("from django.db import migrations, models"))
+
+    def test_regression_import_grouping_with_multiple_imports(self):
+        # Mix several import types to ensure grouping places all 'import' lines before 'from' lines
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "mymodel",
+                        "uuidfield",
+                        models.UUIDField(default=uuid.uuid4()),
+                    ),
+                    migrations.AddField(
+                        "mymodel",
+                        "dt",
+                        models.DateTimeField(default=datetime.datetime.now),
+                    ),
+                ],
+                "dependencies": [],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        imports_block = self._extract_imports_block(output)
+        all_lines = [l for l in imports_block.splitlines() if l]
+        # The first 'from ' line index should be greater than the last 'import ' line index
+        import_indices = [i for i, l in enumerate(all_lines) if l.startswith("import ")]
+        from_indices = [i for i, l in enumerate(all_lines) if l.startswith("from ")]
+        if from_indices:
+            self.assertTrue(max(import_indices) < min(from_indices))
+
+    def test_regression_imports_are_deterministic_and_sorted(self):
+        # Recreate a variety of imports and ensure deterministic ordering across multiple writer calls
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {
+                "operations": [
+                    migrations.AddField(
+                        "mymodel",
+                        "dt",
+                        models.DateTimeField(default=datetime.datetime.now),
+                    ),
+                    migrations.AddField(
+                        "mymodel",
+                        "uuidfield",
+                        models.UUIDField(default=uuid.uuid4()),
+                    ),
+                    migrations.AddField(
+                        "mymodel",
+                        "timefield",
+                        models.FloatField(default=time.time),
+                    ),
+                ],
+                "dependencies": [("__setting__", "AUTH_USER_MODEL")],
+            },
+        )
+        writer = MigrationWriter(migration)
+        output1 = writer.as_string()
+        output2 = writer.as_string()
+        # The outputs should be identical (deterministic import ordering)
+        self.assertEqual(output1, output2)

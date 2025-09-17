@@ -1,0 +1,217 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These unit tests exercise django.core.serializers.base.build_instance to ensure the
+  instance's _state.db is set before calling Model.natural_key(), and that the resulting
+  natural key is passed to the default manager's get_by_natural_key via db_manager(db).
+  The tests verify that the primary key is set via get_by_natural_key when appropriate,
+  that DoesNotExist is handled silently, and that relation attributes provided in the
+  input data are visible to natural_key (this is the behavior the provided patch fixes).
+test_code: |
+  import unittest
+  from types import SimpleNamespace
+  from django.core.serializers.base import build_instance
+
+  def make_model_class(natural_key_func=None, manager_result_pk=None, manager_raises=False, include_get_by=True):
+      """
+      Create a fake Model class with a _meta.DEFAULT_MANAGER, _meta.pk, and optional
+      natural_key implementation. The manager records db_manager() calls and last args.
+      """
+      DoesNotExist = type("DoesNotExist", (Exception,), {})
+
+      class Meta:
+          # pk.attname must be present and to_python should convert to an int for tests.
+          pk = SimpleNamespace(attname="id", to_python=lambda v: int(v))
+
+      class FakeModel:
+          DoesNotExist = DoesNotExist
+          _meta = Meta
+
+          def __init__(self, **kwargs):
+              # Simulate Django's _state with a db attribute
+              self._state = SimpleNamespace(db=None)
+              for k, v in kwargs.items():
+                  setattr(self, k, v)
+
+          # Allow an informative repr for debugging
+          def __repr__(self):
+              return f"<FakeModel id={getattr(self, 'id', None)}>"
+
+      # Manager that records usage
+      class Manager:
+          def __init__(self):
+              self.last_db_manager_arg = None
+              self.last_get_by_args = None
+              self.result_pk = manager_result_pk
+              self.raises = manager_raises
+
+          def db_manager(self, db):
+              # record which db() was requested and return self for chaining
+              self.last_db_manager_arg = db
+              return self
+
+          if include_get_by:
+              def get_by_natural_key(self, *args):
+                  self.last_get_by_args = args
+                  if self.raises:
+                      raise DoesNotExist()
+                  # Return an object with a pk attribute
+                  return SimpleNamespace(pk=self.result_pk)
+
+      manager = Manager()
+      Meta.default_manager = manager
+
+      # Attach natural_key method optionally using the provided function
+      if natural_key_func:
+          def natural_key(self):
+              return natural_key_func(self)
+          setattr(FakeModel, "natural_key", natural_key)
+
+      return FakeModel, manager
+
+  class BuildInstanceTests(unittest.TestCase):
+      def test_no_lookup_when_pk_present(self):
+          # If pk present, manager.get_by_natural_key should not be called.
+          Model, manager = make_model_class(
+              natural_key_func=lambda self: (self._state.db,),
+              manager_result_pk="999",
+              include_get_by=True,
+          )
+          # Provide 'id' -> should skip natural key lookup
+          data = {"id": "5", "name": "should_not_matter"}
+          result = build_instance(Model, data, db="other_db")
+          # Manager should not have been invoked because pk was present
+          self.assertIsNone(manager.last_get_by_args)
+          # The returned instance has id attribute from data (string, as Model(**data))
+          self.assertEqual(getattr(result, "id"), "5")
+
+      def test_db_propagation_to_natural_key_simple(self):
+          # natural_key uses _state.db, so build_instance must set it to the requested db
+          Model, manager = make_model_class(
+              natural_key_func=lambda self: (self._state.db,),
+              manager_result_pk="42",
+              include_get_by=True,
+          )
+          data = {}  # No id -> should attempt natural key lookup
+          result = build_instance(Model, data, db="other_db")
+          # natural_key should have produced ('other_db',)
+          self.assertEqual(manager.last_get_by_args, ("other_db",))
+          # pk from manager (string "42") should be converted to int by pk.to_python
+          # and used for the returned instance's id
+          self.assertEqual(getattr(result, "id"), 42)
+
+      def test_natural_key_with_additional_field(self):
+          # natural_key uses _state.db plus a non-relational attribute 'name'
+          Model, manager = make_model_class(
+              natural_key_func=lambda self: (self._state.db, getattr(self, "name", None)),
+              manager_result_pk="7",
+              include_get_by=True,
+          )
+          data = {"name": "alice"}
+          result = build_instance(Model, data, db="db_alias")
+          self.assertEqual(manager.last_get_by_args, ("db_alias", "alice"))
+          self.assertEqual(getattr(result, "id"), 7)
+
+      def test_get_by_natural_key_sets_pk_with_to_python(self):
+          # Ensure returned pk is run through to_python
+          Model, manager = make_model_class(
+              natural_key_func=lambda self: (self._state.db,),
+              manager_result_pk="77",
+              include_get_by=True,
+          )
+          data = {}
+          result = build_instance(Model, data, db="somedb")
+          # Confirm manager was called and id converted
+          self.assertEqual(manager.last_get_by_args, ("somedb",))
+          self.assertEqual(getattr(result, "id"), 77)
+
+      def test_get_by_natural_key_does_not_exist_is_ignored(self):
+          # If get_by_natural_key raises DoesNotExist, build_instance should ignore it
+          Model, manager = make_model_class(
+              natural_key_func=lambda self: (self._state.db,),
+              manager_raises=True,
+              include_get_by=True,
+          )
+          data = {}
+          # Should not raise
+          result = build_instance(Model, data, db="dbx")
+          # No id should have been set
+          self.assertIsNone(getattr(result, "id", None))
+          # Manager was invoked even though it raised
+          self.assertEqual(manager.last_get_by_args, ("dbx",))
+
+      def test_no_get_by_natural_key_method_skipped(self):
+          # If default_manager lacks get_by_natural_key, nothing should be attempted
+          Model, manager = make_model_class(
+              natural_key_func=lambda self: (self._state.db,),
+              manager_result_pk="1",
+              include_get_by=False,  # manager does not expose get_by_natural_key
+          )
+          data = {}
+          # This should not raise and should not call get_by_natural_key
+          result = build_instance(Model, data, db="dbz")
+          # Manager last_get_by_args should not exist (attribute won't be present)
+          self.assertFalse(hasattr(manager, "last_get_by_args"))
+          # No id set because no lookup was done
+          self.assertIsNone(getattr(result, "id", None))
+
+      def test_relation_attribute_used_in_natural_key(self):
+          # natural_key depends on a relation attribute passed through data (related.name)
+          def nk(self):
+              # Expect 'related' attribute to be present and to have a 'name' attr
+              return (self.related.name,)
+
+          Model, manager = make_model_class(
+              natural_key_func=nk, manager_result_pk="123", include_get_by=True
+          )
+          # Provide related object in data; Model(**data) should attach it so natural_key can use it
+          data = {"related": SimpleNamespace(name="bob")}
+          result = build_instance(Model, data, db="special_db")
+          # If build_instance sets _state.db on the constructed instance, natural_key runs and manager is called
+          self.assertEqual(manager.last_get_by_args, ("bob",))
+          self.assertEqual(getattr(result, "id"), 123)
+
+      def test_db_manager_called_with_db(self):
+          # Ensure db_manager(...) receives the db argument passed to build_instance
+          Model, manager = make_model_class(
+              natural_key_func=lambda self: (self._state.db,),
+              manager_result_pk="321",
+              include_get_by=True,
+          )
+          data = {}
+          dbname = "my_database_alias"
+          result = build_instance(Model, data, db=dbname)
+          self.assertEqual(manager.last_db_manager_arg, dbname)
+          self.assertEqual(getattr(result, "id"), 321)
+
+      def test_natural_key_multiple_components_including_relation(self):
+          # natural_key returns a tuple mixing db, non-relational, and relational data
+          def nk(self):
+              return (self._state.db, getattr(self, "slug", None), self.related.name)
+
+          Model, manager = make_model_class(
+              natural_key_func=nk, manager_result_pk="555", include_get_by=True
+          )
+          data = {"slug": "xyz", "related": SimpleNamespace(name="relname")}
+          result = build_instance(Model, data, db="db_multi")
+          self.assertEqual(manager.last_get_by_args, ("db_multi", "xyz", "relname"))
+          self.assertEqual(getattr(result, "id"), 555)
+
+      def test_multiple_calls_with_different_dbs_propagate_correctly(self):
+          # Reuse same model class but call build_instance with different db values
+          Model, manager = make_model_class(
+              natural_key_func=lambda self: (self._state.db,), manager_result_pk="88", include_get_by=True
+          )
+          data = {}
+          result1 = build_instance(Model, data, db="db1")
+          self.assertEqual(manager.last_get_by_args, ("db1",))
+          self.assertEqual(getattr(result1, "id"), 88)
+          # Call with a different db and ensure manager records the new args
+          result2 = build_instance(Model, data, db="db2")
+          self.assertEqual(manager.last_get_by_args, ("db2",))
+          self.assertEqual(getattr(result2, "id"), 88)
+
+  if __name__ == "__main__":
+      unittest.main()
+new_imports_code: |
+  # No additional imports required beyond the test module.

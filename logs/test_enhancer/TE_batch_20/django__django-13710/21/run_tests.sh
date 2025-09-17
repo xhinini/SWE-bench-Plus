@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_inlines.tests_llm.TestInlineVerboseNamePluralRegression._set_meta_plural admin_inlines.tests_llm.TestInlineVerboseNamePluralRegression.test_inlinemodeladmin_subclass_explicit_verbose_name_equal_to_model_pluralized admin_inlines.tests_llm.TestInlineVerboseNamePluralRegression.test_profile_stacked_inline_explicit_verbose_name_equal_to_model_pluralized admin_inlines.tests_llm.TestInlineVerboseNamePluralRegression.test_profile_tabular_inline_explicit_verbose_name_equal_to_model_pluralized admin_inlines.tests_llm.TestInlineVerboseNamePluralRegression.test_stacked_inline_explicit_verbose_name_equal_to_model_pluralized admin_inlines.tests_llm.TestInlineVerboseNamePluralRegression.test_tabular_inline_explicit_verbose_name_equal_to_model_pluralized
+coverage json -o coverage.json
+: '>>>>> End Test Output'

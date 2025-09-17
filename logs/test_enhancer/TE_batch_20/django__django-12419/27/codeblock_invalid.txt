@@ -1,0 +1,128 @@
+# No additional imports beyond standard library and Django testing utilities are required.
+import os
+import shutil
+import tempfile
+from django import conf
+from django.test import SimpleTestCase
+from django.test.utils import extend_sys_path
+
+class TestSecureReferrerPolicy(SimpleTestCase):
+    def setUp(self):
+        # Prepare a temporary directory and copy the settings template used by
+        # the project_template tests so we can import its MIDDLEWARE.
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        template_settings_py = os.path.join(
+            os.path.dirname(conf.__file__),
+            'project_template',
+            'project_name',
+            'settings.py-tpl',
+        )
+        self.test_settings_py = os.path.join(self.temp_dir.name, 'test_settings.py')
+        shutil.copyfile(template_settings_py, self.test_settings_py)
+
+        # Create a tiny URLconf module in the temp dir that exposes two views:
+        # - /empty/ returns an empty response
+        # - /custom/ returns a response that sets Referrer-Policy explicitly
+        urls_py = os.path.join(self.temp_dir.name, 'test_urls.py')
+        with open(urls_py, 'w') as f:
+            f.write(
+                "from django.http import HttpResponse\n"
+                "from django.urls import path\n\n"
+                "def empty_view(request):\n"
+                "    return HttpResponse()\n\n"
+                "def header_view(request):\n"
+                "    resp = HttpResponse()\n"
+                "    resp['Referrer-Policy'] = 'unsafe-url'\n"
+                "    return resp\n\n"
+                "urlpatterns = [\n"
+                "    path('empty/', empty_view),\n                  "    path('custom/', header_view),\n"
+                "]\n"
+            )
+
+    def _get_middleware_from_template(self):
+        # Import the MIDDLEWARE list from the copied settings template.
+        with extend_sys_path(self.temp_dir.name):
+            from test_settings import MIDDLEWARE
+            return MIDDLEWARE
+
+    def test_global_default_setting_value(self):
+        # The global default in django.conf.global_settings should be 'same-origin'.
+        from django.conf import global_settings
+        self.assertEqual(global_settings.SECURE_REFERRER_POLICY, 'same-origin')
+
+    def test_project_template_middleware_header_default(self):
+        MIDDLEWARE = self._get_middleware_from_template()
+        # The project template's middleware stack should produce a Referrer-Policy header
+        with self.settings(MIDDLEWARE=MIDDLEWARE, ROOT_URLCONF='project_template.urls'):
+            response = self.client.get('/empty/')
+            headers = response.serialize_headers().split(b'\r\n')
+            self.assertIn(b'Referrer-Policy: same-origin', headers)
+
+    def test_override_to_none_removes_header(self):
+        MIDDLEWARE = self._get_middleware_from_template()
+        with extend_sys_path(self.temp_dir.name):
+            # Use our simple URLconf for deterministic views
+            with self.settings(MIDDLEWARE=MIDDLEWARE, ROOT_URLCONF='test_urls', SECURE_REFERRER_POLICY=None):
+                response = self.client.get('/empty/')
+                headers = response.serialize_headers().split(b'\r\n')
+                # When SECURE_REFERRER_POLICY is None, middleware should not add the header.
+                matches = [h for h in headers if h.startswith(b'Referrer-Policy:')]
+                self.assertEqual(matches, [])
+
+    def test_override_to_custom_value_changes_header(self):
+        MIDDLEWARE = self._get_middleware_from_template()
+        with extend_sys_path(self.temp_dir.name):
+            with self.settings(MIDDLEWARE=MIDDLEWARE, ROOT_URLCONF='test_urls', SECURE_REFERRER_POLICY='no-referrer'):
+                response = self.client.get('/empty/')
+                headers = response.serialize_headers().split(b'\r\n')
+                self.assertIn(b'Referrer-Policy: no-referrer', headers)
+
+    def test_middleware_overwrites_view_header_with_configured_value(self):
+        # If a view sets Referrer-Policy, SecurityMiddleware should set it to the configured value.
+        MIDDLEWARE = self._get_middleware_from_template()
+        with extend_sys_path(self.temp_dir.name):
+            with self.settings(MIDDLEWARE=MIDDLEWARE, ROOT_URLCONF='test_urls', SECURE_REFERRER_POLICY='same-origin'):
+                response = self.client.get('/custom/')
+                headers = response.serialize_headers().split(b'\r\n')
+                # Expect the middleware's configured value to be present (overwriting view value).
+                self.assertIn(b'Referrer-Policy: same-origin', headers)
+                # The view's original 'unsafe-url' should not remain.
+                self.assertNotIn(b'Referrer-Policy: unsafe-url', headers)
+
+    def test_duplicate_security_middleware_does_not_duplicate_header(self):
+        # Include SecurityMiddleware twice to ensure header is not duplicated.
+        MIDDLEWARE = self._get_middleware_from_template()
+        # Insert an extra copy of SecurityMiddleware at the beginning and end.
+        extra = 'django.middleware.security.SecurityMiddleware'
+        duplicated = [extra] + MIDDLEWARE + [extra]
+        with extend_sys_path(self.temp_dir.name):
+            with self.settings(MIDDLEWARE=duplicated, ROOT_URLCONF='test_urls', SECURE_REFERRER_POLICY='same-origin'):
+                response = self.client.get('/empty/')
+                serialized = response.serialize_headers()
+                # Count occurrences of the header line in the raw serialized header bytes.
+                occurrences = serialized.count(b'Referrer-Policy: same-origin')
+                self.assertEqual(occurrences, 1)
+
+    def test_post_request_also_has_header(self):
+        MIDDLEWARE = self._get_middleware_from_template()
+        with extend_sys_path(self.temp_dir.name):
+            with self.settings(MIDDLEWARE=MIDDLEWARE, ROOT_URLCONF='test_urls', SECURE_REFERRER_POLICY='same-origin'):
+                response = self.client.post('/empty/', data={'a': 'b'})
+                headers = response.serialize_headers().split(b'\r\n')
+                self.assertIn(b'Referrer-Policy: same-origin', headers)
+
+    def test_empty_string_setting_results_in_empty_header_value(self):
+        MIDDLEWARE = self._get_middleware_from_template()
+        with extend_sys_path(self.temp_dir.name):
+            with self.settings(MIDDLEWARE=MIDDLEWARE, ROOT_URLCONF='test_urls', SECURE_REFERRER_POLICY=''):
+                response = self.client.get('/empty/')
+                # Expect the header line to be present with an empty value after the colon.
+                serialized = response.serialize_headers()
+                self.assertIn(b'Referrer-Policy: ', serialized)
+
+    def test_project_template_settings_file_contains_same_origin_default(self):
+        # Ensure the copied settings template explicitly contains the updated default.
+        with open(self.test_settings_py, 'r', encoding='utf-8') as f:
+            content = f.read()
+        self.assertIn("SECURE_REFERRER_POLICY = 'same-origin'", content)

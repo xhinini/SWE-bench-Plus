@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.TemplateCommandTrailingSlashTests._run_handle admin_scripts.tests_llm.TemplateCommandTrailingSlashTests.test_absolute_path_double_trailing_slash admin_scripts.tests_llm.TemplateCommandTrailingSlashTests.test_absolute_path_single_trailing_slash admin_scripts.tests_llm.TemplateCommandTrailingSlashTests.test_absolute_path_triple_trailing_slash admin_scripts.tests_llm.TemplateCommandTrailingSlashTests.test_deep_absolute_path_trailing_slash admin_scripts.tests_llm.TemplateCommandTrailingSlashTests.test_parent_dir_with_trailing_slash admin_scripts.tests_llm.TemplateCommandTrailingSlashTests.test_path_with_mixed_components_and_trailing_slash admin_scripts.tests_llm.TemplateCommandTrailingSlashTests.test_path_with_trailing_forward_slash_after_backslash_components admin_scripts.tests_llm.TemplateCommandTrailingSlashTests.test_relative_path_double_trailing_slash admin_scripts.tests_llm.TemplateCommandTrailingSlashTests.test_relative_path_single_trailing_slash admin_scripts.tests_llm.TemplateCommandTrailingSlashTests.test_relative_path_with_dot_prefix_and_trailing_slash
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_scripts.tests_llm.TemplateCommandTargetValidationTests._create_structure admin_scripts.tests_llm.TemplateCommandTargetValidationTests._run_handle admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_absolute_path_ending_with_dot admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_absolute_path_with_parent_ref admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_home_expansion_target admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_leading_dot_slash_parent_ref admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_mixed_relative_components admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_multiple_parent_refs_resolve_inside_tree admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_redundant_separators_parent_ref admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_relative_path_ending_with_dot admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_relative_path_with_parent_ref admin_scripts.tests_llm.TemplateCommandTargetValidationTests.test_with_trailing_slash_after_parent_ref
+coverage json -o coverage.json
+: '>>>>> End Test Output'

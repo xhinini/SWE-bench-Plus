@@ -1,0 +1,167 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests assert that deserialize_db_from_string() uses the constraint_checks_disabled() context manager and calls check_constraints() afterwards. The candidate patch omitted using constraint_checks_disabled() and check_constraints(), so these tests will fail against the candidate patch and pass with the provided (gold) patch. Tests cover multiple input shapes (circular reference, empty list, reversed ordering, whitespace-rich JSON), repeated calls, and validate that the context manager's __enter__/__exit__ are invoked and that serializers.deserialize is called only after entering the constraint-disabling context.
+test_code: |
+  from unittest import mock
+
+  from django.db import connection
+  from django.test import SimpleTestCase
+
+  class TestDeserializeConstraintHandling(SimpleTestCase):
+      databases = {'default'}
+
+      # Reuse the same circular-reference data used in the existing tests.
+      circular_data = """
+      [
+          {
+              "model": "backends.object",
+              "pk": 1,
+              "fields": {"obj_ref": 1, "related_objects": []}
+          },
+          {
+              "model": "backends.objectreference",
+              "pk": 1,
+              "fields": {"obj": 1}
+          }
+      ]
+      """
+
+      def _make_cm(self):
+          """
+          Return a MagicMock context manager whose __enter__ records a flag and
+          whose __exit__ is a MagicMock as well.
+          """
+          cm = mock.MagicMock()
+          # __enter__ should set an attribute so other code can observe the enter.
+          def enter_side_effect(*args, **kwargs):
+              cm.entered = True
+              return None
+          cm.__enter__ = mock.MagicMock(side_effect=enter_side_effect)
+          cm.__exit__ = mock.MagicMock(return_value=None)
+          return cm
+
+      def test_constraint_and_check_called_circular_reference(self):
+          cm = self._make_cm()
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm) as mocked_ctx, \
+               mock.patch.object(connection, 'check_constraints') as mocked_check:
+              connection.creation.deserialize_db_from_string(self.circular_data)
+              # The context factory should be called and the context entered.
+              mocked_ctx.assert_called_once()
+              self.assertTrue(cm.__enter__.called)
+              self.assertTrue(cm.__exit__.called)
+              # check_constraints should be called once after the deserialize/save loop.
+              mocked_check.assert_called_once()
+
+      def test_constraint_and_check_called_empty_list(self):
+          cm = self._make_cm()
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm) as mocked_ctx, \
+               mock.patch.object(connection, 'check_constraints') as mocked_check:
+              connection.creation.deserialize_db_from_string("[]")
+              mocked_ctx.assert_called_once()
+              self.assertTrue(cm.__enter__.called)
+              self.assertTrue(cm.__exit__.called)
+              mocked_check.assert_called_once()
+
+      def test_constraint_and_check_called_reverse_order(self):
+          # Send the same objects but in reverse order to assert constraint handling
+          reverse_data = """
+          [
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              },
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              }
+          ]
+          """
+          cm = self._make_cm()
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm) as mocked_ctx, \
+               mock.patch.object(connection, 'check_constraints') as mocked_check:
+              connection.creation.deserialize_db_from_string(reverse_data)
+              mocked_ctx.assert_called_once()
+              self.assertTrue(cm.__enter__.called)
+              self.assertTrue(cm.__exit__.called)
+              mocked_check.assert_called_once()
+
+      def test_check_constraints_called_once_for_single_call(self):
+          cm = self._make_cm()
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm), \
+               mock.patch.object(connection, 'check_constraints') as mocked_check:
+              connection.creation.deserialize_db_from_string(self.circular_data)
+              mocked_check.assert_called_once()
+
+      def test_constraint_context_enter_and_exit_called(self):
+          cm = self._make_cm()
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm):
+              connection.creation.deserialize_db_from_string(self.circular_data)
+              # __enter__ and __exit__ must both be invoked.
+              self.assertTrue(cm.__enter__.called)
+              self.assertTrue(cm.__exit__.called)
+
+      def test_deserialize_called_after_constraint_context_entered(self):
+          # Ensure that serializers.deserialize is invoked only after entering the
+          # constraint-disabling context by providing a fake deserialize that checks.
+          cm = self._make_cm()
+
+          def fake_deserialize(format, data, using=None):
+              # At the time this function is called, the context __enter__ should
+              # already have been invoked.
+              if not getattr(cm, 'entered', False):
+                  raise AssertionError("constraint_checks_disabled context not entered before deserialize()")
+              # Yield a fake object with a save() method.
+              fake_obj = mock.MagicMock()
+              fake_obj.save = mock.MagicMock()
+              yield fake_obj
+
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm), \
+               mock.patch('django.core.serializers.deserialize', side_effect=fake_deserialize):
+              # This should not raise if the context was entered before deserialize().
+              connection.creation.deserialize_db_from_string(self.circular_data)
+
+      def test_check_constraints_called_twice_on_two_calls(self):
+          cm1 = self._make_cm()
+          cm2 = self._make_cm()
+          with mock.patch.object(connection, 'constraint_checks_disabled', side_effect=[cm1, cm2]), \
+               mock.patch.object(connection, 'check_constraints') as mocked_check:
+              connection.creation.deserialize_db_from_string(self.circular_data)
+              connection.creation.deserialize_db_from_string(self.circular_data)
+              # check_constraints should be called once per invocation.
+              self.assertEqual(mocked_check.call_count, 2)
+
+      def test_constraint_and_check_called_with_whitespace_data(self):
+          # Use the original circular data which contains whitespace/newlines.
+          cm = self._make_cm()
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm), \
+               mock.patch.object(connection, 'check_constraints') as mocked_check:
+              connection.creation.deserialize_db_from_string(self.circular_data)
+              self.assertTrue(cm.__enter__.called)
+              self.assertTrue(cm.__exit__.called)
+              mocked_check.assert_called_once()
+
+      def test_constraint_context_called_when_serialized_string_from_serialize_db_to_string(self):
+          # When using a serialized string produced by serialize_db_to_string(),
+          # deserialize_db_from_string() should still use the constraint-disabling context.
+          cm = self._make_cm()
+          # Ensure there's some data in the DB to serialize by creating objects via the serializer path.
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm), \
+               mock.patch.object(connection, 'check_constraints') as mocked_check:
+              serialized = connection.creation.serialize_db_to_string()
+              # Now deserialize the serialized contents.
+              connection.creation.deserialize_db_from_string(serialized)
+              mocked_check.assert_called()
+
+      def test_constraint_context_and_check_called_for_multiple_objects(self):
+          # Create a JSON list with multiple repeated entries (same circular objects repeated).
+          multiple_data = "[" + ",".join([self.circular_data.strip()[1:-1]] * 3) + "]"
+          cm = self._make_cm()
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm), \
+               mock.patch.object(connection, 'check_constraints') as mocked_check:
+              connection.creation.deserialize_db_from_string(multiple_data)
+              self.assertTrue(cm.__enter__.called)
+              self.assertTrue(cm.__exit__.called)
+              mocked_check.assert_called_once()
+new_imports_code: ""

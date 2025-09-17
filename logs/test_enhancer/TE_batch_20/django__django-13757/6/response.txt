@@ -1,0 +1,159 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify the behavior of KeyTransformIsNull.as_oracle and KeyTransformIsNull.as_sqlite, ensuring the Oracle and SQLite specific SQL generation uses the HasKey SQL and correctly composes the "IS NULL" checks and templates. They would fail for the candidate (incorrect) patch which negates HasKey incorrectly or uses HasKey.as_sqlite/as_oracle directly without composing the proper expressions.
+test_code: |
+  from unittest import mock
+
+  from django.test import SimpleTestCase
+
+  from django.db.models.fields.json import (
+      HasKey, KeyTransform, KeyTransformIsNull,
+  )
+
+  class DummyCompiler:
+      def compile(self, expression):
+          # Return a predictable column SQL and a single lhs param.
+          return ('col', ('lhs_param',))
+
+  class DummyConnection:
+      def __init__(self, vendor):
+          self.vendor = vendor
+
+  class KeyTransformIsNullTests(SimpleTestCase):
+      def test_oracle_isnull_false_returns_haskey(self):
+          compiler = DummyCompiler()
+          connection = DummyConnection('oracle')
+          kt = KeyTransform('k', 'value')
+          lookup = KeyTransformIsNull(kt, False)
+          # Mock HasKey.as_oracle to return a known SQL and params.
+          with mock.patch.object(HasKey, 'as_oracle', return_value=('HASKEY_SQL', ('hp',))) as mocked:
+              sql, params = lookup.as_oracle(compiler, connection)
+              # isnull=False should return the HasKey SQL unmodified.
+              self.assertEqual(sql, 'HASKEY_SQL')
+              self.assertEqual(params, ('hp',))
+              mocked.assert_called_once()
+
+      def test_oracle_isnull_true_returns_not_or_is_null(self):
+          compiler = DummyCompiler()
+          connection = DummyConnection('oracle')
+          kt = KeyTransform('k', 'value')
+          lookup = KeyTransformIsNull(kt, True)
+          with mock.patch.object(HasKey, 'as_oracle', return_value=('HASKEY_SQL', ('hp',))):
+              sql, params = lookup.as_oracle(compiler, connection)
+              # isnull=True should return "(NOT <haskey_sql> OR <lhs> IS NULL)"
+              self.assertEqual(sql, '(NOT HASKEY_SQL OR col IS NULL)')
+              # params should be HasKey params + lhs params returned by compiler.compile
+              self.assertEqual(params, ('hp', 'lhs_param'))
+
+      def test_oracle_isnull_true_handles_empty_haskey_params(self):
+          compiler = DummyCompiler()
+          connection = DummyConnection('oracle')
+          kt = KeyTransform('k', 'value')
+          lookup = KeyTransformIsNull(kt, True)
+          # Simulate HasKey.as_oracle returning no params (common for Oracle)
+          with mock.patch.object(HasKey, 'as_oracle', return_value=('HASKEY_SQL_NO_PARAMS', ())) as mocked:
+              sql, params = lookup.as_oracle(compiler, connection)
+              self.assertEqual(sql, '(NOT HASKEY_SQL_NO_PARAMS OR col IS NULL)')
+              # params should be just the lhs params
+              self.assertEqual(params, ('lhs_param',))
+              mocked.assert_called_once()
+
+      def test_oracle_isnull_true_with_nested_key_transform_concatenates_lhs_params(self):
+          compiler = DummyCompiler()
+          connection = DummyConnection('oracle')
+          # Create a nested KeyTransform: key 'x' on top of previous transform
+          inner = KeyTransform('inner', 'value')
+          kt = KeyTransform('outer', inner)
+          lookup = KeyTransformIsNull(kt, True)
+          # When preprocess_lhs executes, compiler.compile will be called with inner.lhs (a string).
+          with mock.patch.object(HasKey, 'as_oracle', return_value=('HASKEY_SQL_NESTED', ('hp1', 'hp2'))) as mocked:
+              sql, params = lookup.as_oracle(compiler, connection)
+              self.assertEqual(sql, '(NOT HASKEY_SQL_NESTED OR col IS NULL)')
+              # HasKey params (hp1, hp2) should come first, then lhs params ('lhs_param')
+              self.assertEqual(params, ('hp1', 'hp2', 'lhs_param'))
+              mocked.assert_called_once()
+
+      def test_sqlite_isnull_false_uses_is_not_null_template(self):
+          compiler = DummyCompiler()
+          connection = DummyConnection('sqlite')
+          kt = KeyTransform('k', 'value')
+          lookup = KeyTransformIsNull(kt, False)
+          # Patch HasKey.as_sql to capture the template argument behaviour.
+          def fake_as_sql(self_compiler, self_connection, template=None):
+              # Return the template formatted with a fake column and a params tuple.
+              return (template % 'col', ('hp_sqlite',))
+          with mock.patch.object(HasKey, 'as_sql', new=fake_as_sql):
+              sql, params = lookup.as_sqlite(compiler, connection)
+              # For isnull=False the template should be IS NOT NULL
+              expected_template = 'JSON_TYPE(col, %s) IS NOT NULL'
+              self.assertEqual(sql, expected_template)
+              self.assertEqual(params, ('hp_sqlite',))
+
+      def test_sqlite_isnull_true_uses_is_null_template(self):
+          compiler = DummyCompiler()
+          connection = DummyConnection('sqlite')
+          kt = KeyTransform('k', 'value')
+          lookup = KeyTransformIsNull(kt, True)
+          def fake_as_sql(self_compiler, self_connection, template=None):
+              return (template % 'col', ('hp_sqlite2',))
+          with mock.patch.object(HasKey, 'as_sql', new=fake_as_sql):
+              sql, params = lookup.as_sqlite(compiler, connection)
+              # For isnull=True the template should be IS NULL
+              expected_template = 'JSON_TYPE(col, %s) IS NULL'
+              self.assertEqual(sql, expected_template)
+              self.assertEqual(params, ('hp_sqlite2',))
+
+      def test_sqlite_template_passed_through_correctly_for_multiple_calls(self):
+          compiler = DummyCompiler()
+          connection = DummyConnection('sqlite')
+          kt = KeyTransform('k', 'value')
+          # Verify both True and False consistently pass correct templates.
+          lookup_true = KeyTransformIsNull(kt, True)
+          lookup_false = KeyTransformIsNull(kt, False)
+          def fake_as_sql(self_compiler, self_connection, template=None):
+              return (template % 'col', ('param',))
+          with mock.patch.object(HasKey, 'as_sql', new=fake_as_sql):
+              sql_true, params_true = lookup_true.as_sqlite(compiler, connection)
+              sql_false, params_false = lookup_false.as_sqlite(compiler, connection)
+              self.assertEqual(sql_true, 'JSON_TYPE(col, %s) IS NULL')
+              self.assertEqual(sql_false, 'JSON_TYPE(col, %s) IS NOT NULL')
+              self.assertEqual(params_true, ('param',))
+              self.assertEqual(params_false, ('param',))
+
+      def test_oracle_haskey_sql_with_percent_and_lhs_escape(self):
+          # Ensure that any percent signs in key names (which are escaped in preprocess_lhs)
+          # don't cause malformed SQL composition. We simulate preprocess_lhs returning an lhs
+          # that includes '%' and a lhs param.
+          class PercentCompiler:
+              def compile(self, expression):
+                  return ('col_with_%_pct', ('lhs_pct',))
+          compiler = PercentCompiler()
+          connection = DummyConnection('oracle')
+          kt = KeyTransform('%special%', 'value')
+          lookup = KeyTransformIsNull(kt, True)
+          with mock.patch.object(HasKey, 'as_oracle', return_value=('HASKEY_WITH_%', ('hp_pct',))):
+              sql, params = lookup.as_oracle(compiler, connection)
+              # The composed SQL should include both the HasKey SQL and the "col_with_%_pct IS NULL" part.
+              self.assertIn('HASKEY_WITH_%', sql)
+              self.assertIn('col_with_%_pct IS NULL', sql)
+              # Params should include haskey params followed by lhs param.
+              self.assertEqual(params, ('hp_pct', 'lhs_pct'))
+
+      def test_sqlite_haskey_template_used_once_and_params_returned(self):
+          # Confirm that the template passed to HasKey.as_sql is used exactly to produce the final SQL,
+          # and the params returned by HasKey.as_sql are propagated as-is.
+          compiler = DummyCompiler()
+          connection = DummyConnection('sqlite')
+          kt = KeyTransform('k', 'value')
+          lookup = KeyTransformIsNull(kt, False)
+          def fake_as_sql(self_compiler, self_connection, template=None):
+              # Return a SQL string built from the template, and a tuple of params.
+              return (template % 'col', ('p1', 'p2'))
+          with mock.patch.object(HasKey, 'as_sql', new=fake_as_sql):
+              sql, params = lookup.as_sqlite(compiler, connection)
+              self.assertEqual(sql, 'JSON_TYPE(col, %s) IS NOT NULL')
+              self.assertEqual(params, ('p1', 'p2'))
+new_imports_code: |
+  from unittest import mock
+  from django.test import SimpleTestCase
+  from django.db.models.fields.json import HasKey, KeyTransform, KeyTransformIsNull

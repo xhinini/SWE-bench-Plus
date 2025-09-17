@@ -1,0 +1,170 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify the AutocompleteJsonView serialization contract introduced by the patch. They ensure the view's get() docstring documents the serialize_result API, that serialize_result exists and is used for each result, and that subclasses can override serialize_result (including calling super()). One of the tests asserts that the get() docstring references "serialize_result()", which will fail for the candidate patch (it doesn't update the docstring) and pass for the gold patch.
+test_code: |
+  from django.contrib import admin
+  from django.contrib.admin.views.autocomplete import AutocompleteJsonView
+  from django.test import RequestFactory, override_settings
+  from django.urls import reverse_lazy
+  from django.core import serializers
+  import json
+  import datetime
+  
+  from .admin import QuestionAdmin
+  from .models import Question
+  
+  from .tests import AdminViewBasicTestCase
+  
+  PAGINATOR_SIZE = AutocompleteJsonView.paginate_by
+  url = reverse_lazy('autocomplete_admin:autocomplete')
+  factory = RequestFactory()
+  
+  class AutocompleteSerializeTests(AdminViewBasicTestCase):
+      as_view_args = {'admin_site': admin.site}
+      opts = {
+          'app_label': Question._meta.app_label,
+          'model_name': Question._meta.model_name,
+          'field_name': 'question'
+      }
+  
+      def test_get_docstring_mentions_serialize_result(self):
+          """
+          The get() docstring should document that results are produced by
+          serialize_result(). The gold patch updated the get() docstring to
+          reference serialize_result(), which this test asserts.
+          The candidate patch failed to update the docstring, so this test
+          will detect that regression.
+          """
+          doc = AutocompleteJsonView.get.__doc__ or ''
+          # The gold patch includes "serialize_result()" in the get docstring.
+          self.assertIn('serialize_result()', doc)
+  
+      def test_serialize_result_method_exists(self):
+          """serialize_result should be provided as a callable on the class."""
+          self.assertTrue(callable(getattr(AutocompleteJsonView, 'serialize_result', None)))
+  
+      def test_default_serialize_output_shape(self):
+          """Default serialize_result returns {'id': str(...), 'text': str(...)}."""
+          q = Question.objects.create(question='Is this a question?')
+          request = factory.get(url, {'term': 'is', **self.opts})
+          request.user = self.superuser
+          response = AutocompleteJsonView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          data = json.loads(response.content.decode('utf-8'))
+          self.assertEqual(data, {
+              'results': [{'id': str(q.pk), 'text': q.question}],
+              'pagination': {'more': False},
+          })
+  
+      def test_custom_serialize_result_is_used(self):
+          """A subclass can override serialize_result to add fields to results."""
+          class CustomView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  base = super().serialize_result(obj, to_field_name)
+                  base['posted'] = str(obj.posted)
+                  return base
+  
+          Question.objects.create(question='Q1', posted=datetime.date(2021, 1, 1))
+          Question.objects.create(question='Q2', posted=datetime.date(2021, 1, 2))
+          request = factory.get(url, {'term': 'Q', **self.opts})
+          request.user = self.superuser
+          response = CustomView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          data = json.loads(response.content.decode('utf-8'))
+          # Expect the extra 'posted' key returned by the custom serializer.
+          self.assertTrue(all('posted' in item for item in data['results']))
+  
+      def test_serialize_result_called_per_object(self):
+          """serialize_result should be invoked once per returned object."""
+          calls = []
+  
+          class CountingView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  calls.append((obj.pk, to_field_name))
+                  return super().serialize_result(obj, to_field_name)
+  
+          # Create several objects to ensure multiple calls.
+          objs = [Question.objects.create(question=str(i)) for i in range(5)]
+          request = factory.get(url, {'term': '', **self.opts})
+          request.user = self.superuser
+          response = CountingView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          data = json.loads(response.content.decode('utf-8'))
+          # The number of calls should match the number of serialized results.
+          self.assertEqual(len(calls), len(data['results']))
+  
+      def test_serialize_receives_correct_to_field_name(self):
+          """serialize_result should receive the resolved to_field_name."""
+          received = []
+  
+          class InspectingView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  received.append(to_field_name)
+                  return super().serialize_result(obj, to_field_name)
+  
+          q = Question.objects.create(question='Is this a question?')
+          request = factory.get(url, {'term': 'is', **self.opts, 'field_name': 'question_with_to_field'})
+          request.user = self.superuser
+          response = InspectingView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          # Ensure we received at least one to_field_name and it's a string attribute name.
+          self.assertTrue(len(received) >= 1)
+          self.assertTrue(all(isinstance(n, str) for n in received))
+  
+      def test_pagination_uses_serialize_result_for_first_page(self):
+          """Paginated first page results should be produced via serialize_result."""
+          class TaggingView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  base = super().serialize_result(obj, to_field_name)
+                  base['tag'] = 'page1'
+                  return base
+  
+          Question.objects.bulk_create(Question(question=str(i)) for i in range(PAGINATOR_SIZE + 2))
+          request = factory.get(url, {'term': '', **self.opts})
+          request.user = self.superuser
+          response = TaggingView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          data = json.loads(response.content.decode('utf-8'))
+          # All returned items should have the extra 'tag' produced by serialize_result.
+          self.assertTrue(all('tag' in item and item['tag'] == 'page1' for item in data['results']))
+          self.assertEqual(data['pagination']['more'], True)
+  
+      def test_pagination_second_page_serialization(self):
+          """Pagination second page should still serialize via serialize_result."""
+          class TaggingView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  base = super().serialize_result(obj, to_field_name)
+                  base['page'] = '2'
+                  return base
+  
+          Question.objects.bulk_create(Question(question=str(i)) for i in range(PAGINATOR_SIZE + 3))
+          request = factory.get(url, {'term': '', 'page': '2', **self.opts})
+          request.user = self.superuser
+          response = TaggingView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          data = json.loads(response.content.decode('utf-8'))
+          # Every item on the second page should have the page marker.
+          self.assertTrue(all(item.get('page') == '2' for item in data['results']))
+          self.assertEqual(data['pagination']['more'], False)
+  
+      def test_subclass_can_call_super_serialize(self):
+          """A subclass should be able to call super().serialize_result() safely."""
+          class ChainedView(AutocompleteJsonView):
+              def serialize_result(self, obj, to_field_name):
+                  base = super().serialize_result(obj, to_field_name)
+                  # mutate returned mapping without breaking base contract
+                  base['extra'] = 'ok'
+                  return base
+  
+          Question.objects.create(question='Chain')
+          request = factory.get(url, {'term': 'Chain', **self.opts})
+          request.user = self.superuser
+          response = ChainedView.as_view(**self.as_view_args)(request)
+          self.assertEqual(response.status_code, 200)
+          data = json.loads(response.content.decode('utf-8'))
+          self.assertEqual(data['results'][0]['extra'], 'ok')
+new_imports_code: |
+  from django.contrib import admin
+  from django.contrib.admin.views.autocomplete import AutocompleteJsonView
+  from django.test import RequestFactory
+  from .tests import AdminViewBasicTestCase

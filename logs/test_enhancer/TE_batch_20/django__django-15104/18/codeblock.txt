@@ -1,0 +1,166 @@
+# No new imports required; using existing imports at top of test file.
+from django.test import SimpleTestCase
+from django.db import models
+from django.db.migrations.autodetector import MigrationAutodetector
+from django.db.migrations.state import ProjectState, ModelState
+
+class HardcodedForeignKey(models.ForeignKey):
+    """
+    A ForeignKey that hardcodes 'to' in __init__ then removes it in deconstruct,
+    simulating third-party fields that don't expose 'to' when deconstructed.
+    """
+    def __init__(self, *args, **kwargs):
+        # Hardcode to to simulate fields that don't return 'to' in deconstruct
+        kwargs['to'] = 'testapp.Author'
+        super().__init__(*args, **kwargs)
+
+    def deconstruct(self):
+        name, path, args, kwargs = super().deconstruct()
+        # Remove 'to' from deconstructed kwargs to simulate the situation that
+        # would cause a KeyError when using del ...['to']
+        kwargs.pop('to', None)
+        return name, path, args, kwargs
+
+class HardcodedManyToMany(models.ManyToManyField):
+    """
+    Same approach for ManyToManyField.
+    """
+    def __init__(self, *args, **kwargs):
+        kwargs['to'] = 'testapp.Publisher'
+        super().__init__(*args, **kwargs)
+
+    def deconstruct(self):
+        name, path, args, kwargs = super().deconstruct()
+        kwargs.pop('to', None)
+        return name, path, args, kwargs
+
+class OnlyRelationAgnosticFieldsTests(SimpleTestCase):
+    def setUp(self):
+        # Minimal detector instance (states are not used by only_relation_agnostic_fields)
+        self.detector = MigrationAutodetector(ProjectState(), ProjectState())
+
+    def _assert_no_to_in_result(self, result):
+        # Helper: ensure no 'to' present in any deconstructed kwargs
+        for item in result:
+            # item is (path, args_list, kwargs_dict)
+            kwargs = item[2]
+            self.assertIsInstance(kwargs, dict)
+            self.assertNotIn('to', kwargs)
+
+    def test_custom_fk_single_field(self):
+        fields = {'author_fk': HardcodedForeignKey(on_delete=models.CASCADE)}
+        result = self.detector.only_relation_agnostic_fields(fields)
+        self.assertEqual(len(result), 1)
+        self._assert_no_to_in_result(result)
+
+    def test_normal_fk_single_field_is_stripped(self):
+        # Normal FK normally has 'to' in deconstruct; ensure it's removed safely.
+        fields = {'author_fk': models.ForeignKey('testapp.Author', models.CASCADE)}
+        result = self.detector.only_relation_agnostic_fields(fields)
+        self.assertEqual(len(result), 1)
+        self._assert_no_to_in_result(result)
+
+    def test_mixed_custom_and_normal_fk(self):
+        fields = {
+            'a': HardcodedForeignKey(on_delete=models.CASCADE),
+            'b': models.ForeignKey('testapp.Author', models.CASCADE),
+        }
+        result = self.detector.only_relation_agnostic_fields(fields)
+        self.assertEqual(len(result), 2)
+        self._assert_no_to_in_result(result)
+
+    def test_multiple_custom_fks(self):
+        fields = {
+            'a': HardcodedForeignKey(on_delete=models.CASCADE),
+            'b': HardcodedForeignKey(on_delete=models.CASCADE),
+            'c': models.ForeignKey('testapp.Author', models.CASCADE),
+        }
+        result = self.detector.only_relation_agnostic_fields(fields)
+        self.assertEqual(len(result), 3)
+        self._assert_no_to_in_result(result)
+
+    def test_custom_many_to_many(self):
+        fields = {'pubs': HardcodedManyToMany()}
+        result = self.detector.only_relation_agnostic_fields(fields)
+        self.assertEqual(len(result), 1)
+        self._assert_no_to_in_result(result)
+
+    def test_m2m_and_fk_combination(self):
+        fields = {
+            'pubs': HardcodedManyToMany(),
+            'author_fk': HardcodedForeignKey(on_delete=models.CASCADE),
+            'normal_fk': models.ForeignKey('testapp.Author', models.CASCADE),
+        }
+        result = self.detector.only_relation_agnostic_fields(fields)
+        self.assertEqual(len(result), 3)
+        self._assert_no_to_in_result(result)
+
+    def test_only_relation_agnostic_fields_non_related_field_ignored(self):
+        # IntegerField has no remote_field; should not cause any issues.
+        fields = {
+            'num': models.IntegerField(),
+            'author_fk': HardcodedForeignKey(on_delete=models.CASCADE),
+        }
+        result = self.detector.only_relation_agnostic_fields(fields)
+        # Both fields are deconstructed (function doesn't filter non-related),
+        # and no 'to' key should be present in any kwargs.
+        self.assertEqual(len(result), 2)
+        self._assert_no_to_in_result(result)
+
+    def test_detect_changes_create_model_with_custom_fk(self):
+        # Run through the full autodetector flow: creating a model that contains
+        # a HardcodedForeignKey. This would hit only_relation_agnostic_fields
+        # during various phases and must not raise.
+        before = ProjectState()
+        after = ProjectState()
+        author = ModelState('testapp', 'Author', [('id', models.AutoField(primary_key=True))])
+        book = ModelState('testapp', 'Book', [
+            ('id', models.AutoField(primary_key=True)),
+            ('author', HardcodedForeignKey(on_delete=models.CASCADE)),
+        ])
+        after.add_model(author)
+        after.add_model(book)
+        autodetector = MigrationAutodetector(before, after)
+        changes = autodetector._detect_changes()
+        self.assertIn('testapp', changes)
+        # The create model operation for Book (and Author) should be present.
+        self.assertTrue(any(op.__class__.__name__ == 'CreateModel' for m in changes['testapp'] for op in m.operations))
+
+    def test_detect_changes_add_field_custom_fk(self):
+        # Adding a field that is a HardcodedForeignKey to an existing model.
+        before = ProjectState()
+        author = ModelState('testapp', 'Author', [('id', models.AutoField(primary_key=True))])
+        before.add_model(author)
+        after = before.clone()
+        # Add Book model as well to reference and then an extra field on Author
+        book = ModelState('testapp', 'Book', [('id', models.AutoField(primary_key=True))])
+        after.add_model(book)
+        # Add an FK on Author referencing Book but via HardcodedForeignKey to simulate missing 'to'
+        author_with_fk = ModelState('testapp', 'Author', [
+            ('id', models.AutoField(primary_key=True)),
+            ('fav_book', HardcodedForeignKey(on_delete=models.CASCADE)),
+        ])
+        # Replace the Author model in after state
+        after.models[('testapp', 'Author')] = author_with_fk
+        autodetector = MigrationAutodetector(before, after)
+        changes = autodetector._detect_changes()
+        # There should be a migration for testapp (adding the field or models)
+        self.assertIn('testapp', changes)
+
+    def test_detect_changes_many_to_many_custom_through(self):
+        # Create models where a HardcodedManyToMany exists; ensure no crash in detection.
+        before = ProjectState()
+        a = ModelState('testapp', 'A', [('id', models.AutoField(primary_key=True))])
+        b = ModelState('testapp', 'B', [('id', models.AutoField(primary_key=True))])
+        before.add_model(a)
+        after = before.clone()
+        # Add a ManyToMany on A to B using HardcodedManyToMany
+        a_with_m2m = ModelState('testapp', 'A', [
+            ('id', models.AutoField(primary_key=True)),
+            ('bs', HardcodedManyToMany()),
+        ])
+        after.models[('testapp', 'A')] = a_with_m2m
+        after.models[('testapp', 'B')] = b
+        autodetector = MigrationAutodetector(before, after)
+        changes = autodetector._detect_changes()
+        self.assertIn('testapp', changes)

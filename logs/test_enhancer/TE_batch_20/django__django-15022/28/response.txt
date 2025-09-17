@@ -1,0 +1,155 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise ModelAdmin.get_search_results to ensure multiple search terms are combined correctly (OR across lookups for each term, AND across multiple terms), quoted terms are handled as single terms, and lookup prefixes (^ for startswith, = for exact) behave as expected. They also assert that may_have_duplicates is returned correctly for normal lookups. The tests are written to match the style of the existing admin changelist tests and use the admin classes and models defined in that package.
+test_code: |
+  from django.test import TestCase, RequestFactory
+  from django.contrib import admin
+  from django.contrib.auth.models import User
+  from django.db import transaction
+
+  from .models import Parent, Child, Band, Swallow
+  from .admin import (
+      ChildAdmin, ParentAdmin, ParentAdminTwoSearchFields,
+      ConcertAdmin, DynamicSearchFieldsChildAdmin, SwallowAdmin,
+  )
+
+  class GetSearchResultsTests(TestCase):
+      def setUp(self):
+          self.factory = RequestFactory()
+          # Create some parents and children for testing search across relations
+          self.parent_a = Parent.objects.create(name="Alpha Parent")
+          self.parent_b = Parent.objects.create(name="Beta Parent")
+          self.child_1 = Child.objects.create(name="alpha child", age=5, parent=self.parent_a)
+          self.child_2 = Child.objects.create(name="beta child", age=30, parent=self.parent_b)
+          self.child_3 = Child.objects.create(name="alpha beta", age=7, parent=self.parent_a)
+          # For other tests
+          self.swallow1 = Swallow.objects.create(origin="Africa", load=1, speed=100)
+          self.swallow2 = Swallow.objects.create(origin="Europe", load=2, speed=200)
+
+      def _get_qs_pks(self, qs):
+          return sorted(list(qs.values_list('pk', flat=True)))
+
+      def test_single_term_single_field(self):
+          """Single-term search against a single field returns matching rows."""
+          admin_instance = ChildAdmin(Child, admin.AdminSite())
+          request = self.factory.get('/', {})  # request not used by default get_search_fields
+          qs, may_have_duplicates = admin_instance.get_search_results(request, Child.objects.all(), "alpha")
+          pks = self._get_qs_pks(qs)
+          # child_1 and child_3 contain "alpha"
+          self.assertEqual(sorted(pks), sorted([self.child_1.pk, self.child_3.pk]))
+          self.assertFalse(may_have_duplicates)
+
+      def test_two_terms_and_across_fields(self):
+          """
+          Two search terms should be ANDed together, but each term matches across
+          the configured lookups (OR). For example "alpha parent" should find
+          child records whose fields contain "alpha" and whose related parent
+          contains "parent".
+          """
+          # Use an admin that searches both child.name and parent.name via get_search_fields
+          admin_instance = ParentAdmin()  # ParentAdmin has search_fields = ['child__name']
+          # Use the parent queryset for searching child__name (indirect). We'll search term that should match
+          request = self.factory.get('/', {})
+          # Here we search for a term that should match child name and parent name separately.
+          # We'll use the ChildAdmin to search child name and parent name together by overriding get_search_fields.
+          child_admin = ChildAdmin(Child, admin.AdminSite())
+          # simulate search across child.name and parent__name by temporarily patching get_search_fields
+          original_get_search_fields = child_admin.get_search_fields
+          try:
+              child_admin.get_search_fields = lambda req: ('name', 'parent__name')
+              qs, may_have_duplicates = child_admin.get_search_results(request, Child.objects.all(), "alpha Parent")
+              pks = self._get_qs_pks(qs)
+              # Only child_1 and child_3 have 'alpha' in name and parent has 'Parent' in name;
+              # both child_1 and child_3 have parent 'Alpha Parent', so they should be returned.
+              self.assertEqual(sorted(pks), sorted([self.child_1.pk, self.child_3.pk]))
+              self.assertFalse(may_have_duplicates)
+          finally:
+              child_admin.get_search_fields = original_get_search_fields
+
+      def test_quoted_phrase_treated_as_single_term(self):
+          """A quoted phrase should be treated as a single search term."""
+          admin_instance = ChildAdmin(Child, admin.AdminSite())
+          request = self.factory.get('/', {})
+          # Create a child with a name that includes a space phrase
+          child_phrase = Child.objects.create(name='complex phrase', age=10, parent=self.parent_b)
+          qs, may_have_duplicates = admin_instance.get_search_results(request, Child.objects.all(), '"complex phrase"')
+          pks = self._get_qs_pks(qs)
+          self.assertIn(child_phrase.pk, pks)
+          self.assertFalse(may_have_duplicates)
+
+      def test_prefix_lookup_startswith(self):
+          """Search fields with ^ prefix should use istartswith lookup."""
+          admin_instance = ChildAdmin(Child, admin.AdminSite())
+          request = self.factory.get('/', {})
+          # Temporarily override get_search_fields to use ^name (starts-with)
+          original = admin_instance.get_search_fields
+          try:
+              admin_instance.get_search_fields = lambda req: ('^name',)
+              qs, may_have_duplicates = admin_instance.get_search_results(request, Child.objects.all(), "alpha")
+              pks = self._get_qs_pks(qs)
+              # Both child_1 name starts with 'alpha' and child_3 starts with 'alpha'
+              self.assertEqual(sorted(pks), sorted([self.child_1.pk, self.child_3.pk]))
+          finally:
+              admin_instance.get_search_fields = original
+
+      def test_exact_lookup_equals_prefix(self):
+          """Search fields with = prefix should use iexact lookup."""
+          admin_instance = ChildAdmin(Child, admin.AdminSite())
+          request = self.factory.get('/', {})
+          original = admin_instance.get_search_fields
+          try:
+              admin_instance.get_search_fields = lambda req: ('=name',)
+              exact_child = Child.objects.create(name='ExactName', age=3, parent=self.parent_a)
+              # Should match regardless of case
+              qs, may_have_duplicates = admin_instance.get_search_results(request, Child.objects.all(), "ExactName")
+              pks = self._get_qs_pks(qs)
+              self.assertIn(exact_child.pk, pks)
+          finally:
+              admin_instance.get_search_fields = original
+
+      def test_multiple_terms_all_must_match(self):
+          """Multiple unquoted terms should be ANDed: all terms must match somewhere."""
+          admin_instance = ChildAdmin(Child, admin.AdminSite())
+          request = self.factory.get('/', {})
+          # Search for two terms: one appearing in name, another in parent's name
+          original = admin_instance.get_search_fields
+          try:
+              admin_instance.get_search_fields = lambda req: ('name', 'parent__name')
+              qs, _ = admin_instance.get_search_results(request, Child.objects.all(), "alpha Parent")
+              pks = self._get_qs_pks(qs)
+              self.assertTrue(self.child_1.pk in pks)
+              self.assertTrue(self.child_3.pk in pks)
+              # child_2 should not be returned as it doesn't match both terms
+              self.assertNotIn(self.child_2.pk, pks)
+          finally:
+              admin_instance.get_search_fields = original
+
+      def test_search_respects_dynamic_search_fields(self):
+          """get_search_results should use get_search_fields (which may be dynamic)."""
+          admin_instance = DynamicSearchFieldsChildAdmin(Child, admin.AdminSite())
+          request = self.factory.get('/', {})
+          qs, _ = admin_instance.get_search_results(request, Child.objects.all(), "5")
+          # DynamicSearchFieldsChildAdmin adds 'age' to search_fields via get_search_fields,
+          # so searching for '5' should find child with age 5.
+          pks = self._get_qs_pks(qs)
+          self.assertIn(self.child_1.pk, pks)
+
+      def test_search_returns_empty_when_no_match(self):
+          """No matching results yields an empty queryset."""
+          admin_instance = ChildAdmin(Child, admin.AdminSite())
+          request = self.factory.get('/', {})
+          qs, _ = admin_instance.get_search_results(request, Child.objects.all(), "nonexistentterm")
+          self.assertEqual(list(qs), [])
+
+      def test_swallow_list_editable_search_ok(self):
+          """
+          Ensure other admin classes that set actions=None or have list_editable
+          do not interfere with get_search_results. (sanity check across admin classes)
+          """
+          admin_instance = SwallowAdmin(Swallow, admin.AdminSite())
+          request = self.factory.get('/', {})
+          qs, _ = admin_instance.get_search_results(request, Swallow.objects.all(), "Africa")
+          pks = self._get_qs_pks(qs)
+          self.assertIn(self.swallow1.pk, pks)
+new_imports_code: |
+  # No extra imports needed beyond those in the test file; standard Django test utilities are used.

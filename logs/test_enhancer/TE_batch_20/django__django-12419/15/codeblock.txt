@@ -1,0 +1,167 @@
+import types
+import sys
+import os
+import shutil
+import sys
+import tempfile
+import types
+from django import conf
+from django.test import SimpleTestCase
+from django.test.utils import extend_sys_path
+from django.http import HttpResponse, StreamingHttpResponse
+from django.urls import path
+
+class TestReferrerPolicyBehavior(SimpleTestCase):
+    def setUp(self):
+        # Prepare a temporary settings module based on the project template
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp_dir.cleanup)
+        template_settings_py = os.path.join(
+            os.path.dirname(conf.__file__),
+            'project_template',
+            'project_name',
+            'settings.py-tpl',
+        )
+        test_settings_py = os.path.join(self.temp_dir.name, 'test_settings.py')
+        shutil.copyfile(template_settings_py, test_settings_py)
+
+    def _import_template_middleware(self):
+        # Helper to import MIDDLEWARE from the copied template settings
+        with extend_sys_path(self.temp_dir.name):
+            from test_settings import MIDDLEWARE  # noqa: F401
+            return MIDDLEWARE
+
+    def _make_urlconf(self, view, route='temp/'):
+        """
+        Create a transient URLConf module that maps 'route' to the given view.
+        Returns the module name to be used as ROOT_URLCONF.
+        """
+        module_name = f'temp_test_urls_{id(view)}'
+        mod = types.ModuleType(module_name)
+        mod.urlpatterns = [path(route, view)]
+        sys.modules[module_name] = mod
+        # Ensure cleanup after test run
+        self.addCleanup(sys.modules.pop, module_name, None)
+        return module_name
+
+    def test_global_default_setting_value(self):
+        # Ensure the global default is 'same-origin' (the bug fix ensures this).
+        from django.conf import global_settings
+        self.assertEqual(global_settings.SECURE_REFERRER_POLICY, 'same-origin')
+
+    def test_default_header_present_with_template_middleware(self):
+        # Using the template MIDDLEWARE and default settings, header should be present.
+        MIDDLEWARE = self._import_template_middleware()
+        with self.settings(
+            MIDDLEWARE=MIDDLEWARE,
+            ROOT_URLCONF='project_template.urls',
+        ):
+            response = self.client.get('/empty/')
+            self.assertEqual(response.get('Referrer-Policy'), 'same-origin')
+
+    def test_header_absent_when_setting_none(self):
+        # When SECURE_REFERRER_POLICY is explicitly None, middleware must not add header.
+        MIDDLEWARE = self._import_template_middleware()
+        with self.settings(
+            SECURE_REFERRER_POLICY=None,
+            MIDDLEWARE=MIDDLEWARE,
+            ROOT_URLCONF='project_template.urls',
+        ):
+            response = self.client.get('/empty/')
+            self.assertIsNone(response.get('Referrer-Policy'))
+
+    def test_custom_referrer_policy_value_applied(self):
+        # Custom values should be applied verbatim by the middleware.
+        MIDDLEWARE = self._import_template_middleware()
+        with self.settings(
+            SECURE_REFERRER_POLICY='no-referrer',
+            MIDDLEWARE=MIDDLEWARE,
+            ROOT_URLCONF='project_template.urls',
+        ):
+            response = self.client.get('/empty/')
+            self.assertEqual(response.get('Referrer-Policy'), 'no-referrer')
+
+    def test_no_header_when_security_middleware_missing(self):
+        # If SecurityMiddleware is removed, no header should be added even if setting present.
+        MIDDLEWARE = self._import_template_middleware()
+        # Filter out SecurityMiddleware if present in the template middleware.
+        filtered = [m for m in MIDDLEWARE if m != 'django.middleware.security.SecurityMiddleware']
+        with self.settings(
+            SECURE_REFERRER_POLICY='same-origin',
+            MIDDLEWARE=filtered,
+            ROOT_URLCONF='project_template.urls',
+        ):
+            response = self.client.get('/empty/')
+            self.assertIsNone(response.get('Referrer-Policy'))
+
+    def test_view_set_header_not_overwritten_by_middleware(self):
+        # If a view explicitly sets the header, SecurityMiddleware should not overwrite it.
+        def view(request):
+            resp = HttpResponse('ok')
+            resp['Referrer-Policy'] = 'unsafe-url'
+            return resp
+        urlconf = self._make_urlconf(view, route='custom/')
+        MIDDLEWARE = self._import_template_middleware()
+        with self.settings(
+            MIDDLEWARE=MIDDLEWARE,
+            ROOT_URLCONF=urlconf,
+        ):
+            response = self.client.get('/custom/')
+            self.assertEqual(response.get('Referrer-Policy'), 'unsafe-url')
+
+    def test_header_present_on_multiple_requests(self):
+        # Ensure header presence is consistent across multiple requests.
+        MIDDLEWARE = self._import_template_middleware()
+        with self.settings(
+            MIDDLEWARE=MIDDLEWARE,
+            ROOT_URLCONF='project_template.urls',
+        ):
+            r1 = self.client.get('/empty/')
+            r2 = self.client.get('/empty/')
+            self.assertEqual(r1.get('Referrer-Policy'), 'same-origin')
+            self.assertEqual(r2.get('Referrer-Policy'), 'same-origin')
+
+    def test_header_for_non_200_response(self):
+        # The middleware should add the header even for non-200 responses (e.g., 204).
+        def view_204(request):
+            return HttpResponse(status=204)
+        urlconf = self._make_urlconf(view_204, route='no-content/')
+        MIDDLEWARE = self._import_template_middleware()
+        with self.settings(
+            MIDDLEWARE=MIDDLEWARE,
+            ROOT_URLCONF=urlconf,
+        ):
+            response = self.client.get('/no-content/')
+            self.assertEqual(response.status_code, 204)
+            self.assertEqual(response.get('Referrer-Policy'), 'same-origin')
+
+    def test_header_on_streaming_response(self):
+        # Streaming responses should also receive the header from the middleware.
+        def stream_view(request):
+            return StreamingHttpResponse(['a', 'b', 'c'])
+        urlconf = self._make_urlconf(stream_view, route='stream/')
+        MIDDLEWARE = self._import_template_middleware()
+        with self.settings(
+            MIDDLEWARE=MIDDLEWARE,
+            ROOT_URLCONF=urlconf,
+        ):
+            response = self.client.get('/stream/')
+            self.assertEqual(response.get('Referrer-Policy'), 'same-origin')
+
+    def test_setting_empty_string_results_in_header_when_explicit(self):
+        # If SECURE_REFERRER_POLICY is set to an explicit empty string, middleware
+        # behavior should be consistent: it should set the header to the empty value.
+        # (This guards against treating an empty string as "unset" unintentionally.)
+        MIDDLEWARE = self._import_template_middleware()
+        with self.settings(
+            SECURE_REFERRER_POLICY='',
+            MIDDLEWARE=MIDDLEWARE,
+            ROOT_URLCONF='project_template.urls',
+        ):
+            response = self.client.get('/empty/')
+            # The middleware should set the header to the provided value (empty string),
+            # so retrieving it yields '' (an empty string), not None.
+            # Use is not None to be slightly more permissive across potential implementations
+            # that may treat '' as unset; the important bit is that an explicit setting
+            # is respected versus a missing default.
+            self.assertIsNotNone(response.get('Referrer-Policy'))

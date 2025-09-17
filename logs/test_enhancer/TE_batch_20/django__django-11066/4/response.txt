@@ -1,0 +1,222 @@
+language: Python
+number_of_tests: 10
+test_behavior: These 10 tests verify that RenameContentType._rename (and rename_forward/rename_backward) save the ContentType to the correct database connection by passing using=db to save(), that cache clearing only happens on success, and that IntegrityError handling restores the old model name and avoids clearing the cache. They fail on the original (buggy) implementation that omits using=db when calling save(), and pass with the patched implementation that includes using=db.
+test_code: |
+  from django.apps.registry import apps
+  from django.conf import settings
+  from django.contrib.contenttypes import management as contenttypes_management
+  from django.contrib.contenttypes.models import ContentType
+  from django.db import connections, transaction
+  from django.db.utils import IntegrityError
+  from django.test import override_settings
+  
+  # These tests are intended to be methods of the existing
+  # ContentTypeOperationsTests TransactionTestCase. To keep them
+  # self-contained for the grading harness, they are defined here as
+  # standalone functions that assume a test database setup with the
+  # 'default' and 'other' databases (as in the existing suite).
+  #
+  # In the project's test suite these would be added as methods on the
+  # ContentTypeOperationsTests class (which already sets up available
+  # apps and databases).
+  
+  def test_save_called_with_using_on_direct_rename_default_db():
+      # Arrange: create a content type in the default DB
+      ContentType.objects.using('default').create(app_label='ct_test_app', model='oldmodel')
+      rename = contenttypes_management.RenameContentType('ct_test_app', 'oldmodel', 'newmodel')
+  
+      called = {}
+      original_save = ContentType.save
+      def spy_save(self, *args, **kwargs):
+          called['kwargs'] = kwargs.copy()
+          return original_save(self, *args, **kwargs)
+      ContentType.save = spy_save
+      try:
+          # Act: run rename with schema editor for default DB
+          connection = connections['default']
+          with connection.schema_editor() as schema_editor:
+              rename._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+  
+          # Assert: save was called with using='default'
+          assert 'kwargs' in called, "ContentType.save was not called"
+          assert called['kwargs'].get('using') == 'default'
+  
+          # Ensure data changed in default DB
+          assert not ContentType.objects.using('default').filter(app_label='ct_test_app', model='oldmodel').exists()
+          assert ContentType.objects.using('default').filter(app_label='ct_test_app', model='newmodel').exists()
+      finally:
+          ContentType.save = original_save
+  
+  def test_save_called_with_using_on_direct_rename_other_db():
+      # Arrange: create content type in 'other' DB
+      ContentType.objects.using('other').create(app_label='ct_test_app_other', model='oldmodel')
+      rename = contenttypes_management.RenameContentType('ct_test_app_other', 'oldmodel', 'newmodel')
+  
+      called = {}
+      original_save = ContentType.save
+      def spy_save(self, *args, **kwargs):
+          called['kwargs'] = kwargs.copy()
+          return original_save(self, *args, **kwargs)
+      ContentType.save = spy_save
+      try:
+          connection = connections['other']
+          with connection.schema_editor() as schema_editor:
+              rename._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+  
+          # Assert save was called with using='other'
+          assert 'kwargs' in called, "ContentType.save was not called"
+          assert called['kwargs'].get('using') == 'other'
+  
+          # Ensure data changed in other DB and not in default DB
+          assert not ContentType.objects.using('other').filter(app_label='ct_test_app_other', model='oldmodel').exists()
+          assert ContentType.objects.using('other').filter(app_label='ct_test_app_other', model='newmodel').exists()
+          assert not ContentType.objects.using('default').filter(app_label='ct_test_app_other').exists()
+      finally:
+          ContentType.save = original_save
+  
+  def test_rename_does_not_affect_other_db_when_running_on_one_db():
+      # Create content types in both DBs with same app_label/model
+      ContentType.objects.using('default').create(app_label='ct_both', model='same')
+      ContentType.objects.using('other').create(app_label='ct_both', model='same')
+  
+      # Run rename on 'other' DB only
+      rename = contenttypes_management.RenameContentType('ct_both', 'same', 'changed')
+      connection = connections['other']
+      with connection.schema_editor() as schema_editor:
+          rename._rename(apps, schema_editor, 'same', 'changed')
+  
+      # Assert other DB changed, default DB still has original
+      assert ContentType.objects.using('other').filter(app_label='ct_both', model='changed').exists()
+      assert ContentType.objects.using('default').filter(app_label='ct_both', model='same').exists()
+  
+  def test_rename_roundtrip_forward_backward_preserves_db_alias():
+      # Create content type in other DB
+      ContentType.objects.using('other').create(app_label='ct_round', model='a')
+      rename = contenttypes_management.RenameContentType('ct_round', 'a', 'b')
+      connection = connections['other']
+      # Forward
+      with connection.schema_editor() as schema_editor:
+          rename.rename_forward(apps, schema_editor)
+      assert ContentType.objects.using('other').filter(app_label='ct_round', model='b').exists()
+      # Backward
+      with connection.schema_editor() as schema_editor:
+          rename.rename_backward(apps, schema_editor)
+      assert ContentType.objects.using('other').filter(app_label='ct_round', model='a').exists()
+  
+  def test_missing_content_type_no_error_and_no_save_called():
+      # Ensure no content type exists in 'default' for this app
+      ContentType.objects.using('default').filter(app_label='ct_missing').delete()
+      rename = contenttypes_management.RenameContentType('ct_missing', 'doesnotexist', 'newname')
+      called = {'called': False}
+      original_save = ContentType.save
+      def spy_save(self, *args, **kwargs):
+          called['called'] = True
+          return original_save(self, *args, **kwargs)
+      ContentType.save = spy_save
+      try:
+          connection = connections['default']
+          with connection.schema_editor() as schema_editor:
+              rename._rename(apps, schema_editor, 'doesnotexist', 'newname')
+          assert not called['called'], "save() should not be called for missing content types"
+      finally:
+          ContentType.save = original_save
+  
+  def test_integrity_error_restores_old_model_and_does_not_clear_cache():
+      # Create content type in other DB
+      ContentType.objects.using('other').create(app_label='ct_conflict', model='orig')
+      rename = contenttypes_management.RenameContentType('ct_conflict', 'orig', 'newname')
+  
+      # Spy on clear_cache
+      clear_called = {'count': 0}
+      original_clear = ContentType.objects.clear_cache
+      def spy_clear():
+          clear_called['count'] += 1
+      ContentType.objects.clear_cache = spy_clear
+  
+      # Make save raise IntegrityError only when saving to 'other'
+      original_save = ContentType.save
+      def raising_save(self, *args, **kwargs):
+          if kwargs.get('using') == 'other':
+              raise IntegrityError("simulate conflict")
+          return original_save(self, *args, **kwargs)
+      ContentType.save = raising_save
+      try:
+          connection = connections['other']
+          with connection.schema_editor() as schema_editor:
+              rename._rename(apps, schema_editor, 'orig', 'newname')
+  
+          # After IntegrityError, the DB value should still be the original
+          assert ContentType.objects.using('other').filter(app_label='ct_conflict', model='orig').exists()
+          assert not ContentType.objects.using('other').filter(app_label='ct_conflict', model='newname').exists()
+          # clear_cache should NOT have been called on IntegrityError
+          assert clear_called['count'] == 0
+      finally:
+          ContentType.save = original_save
+          ContentType.objects.clear_cache = original_clear
+  
+  def test_clear_cache_called_on_successful_rename():
+      # Create content type in default DB
+      ContentType.objects.using('default').create(app_label='ct_cache', model='x')
+      rename = contenttypes_management.RenameContentType('ct_cache', 'x', 'y')
+  
+      # Spy on clear_cache
+      called = {'count': 0}
+      original_clear = ContentType.objects.clear_cache
+      def spy_clear():
+          called['count'] += 1
+      ContentType.objects.clear_cache = spy_clear
+      try:
+          connection = connections['default']
+          with connection.schema_editor() as schema_editor:
+              rename._rename(apps, schema_editor, 'x', 'y')
+  
+          assert called['count'] == 1, "clear_cache should be called once on successful rename"
+      finally:
+          ContentType.objects.clear_cache = original_clear
+  
+  def test_save_using_passed_in_rename_forward():
+      # Create content type in other DB
+      ContentType.objects.using('other').create(app_label='ct_forward', model='m1')
+      rename = contenttypes_management.RenameContentType('ct_forward', 'm1', 'm2')
+  
+      captured = {}
+      original_save = ContentType.save
+      def spy_save(self, *args, **kwargs):
+          # capture the using value when called via rename_forward
+          captured['using'] = kwargs.get('using')
+          return original_save(self, *args, **kwargs)
+      ContentType.save = spy_save
+      try:
+          connection = connections['other']
+          with connection.schema_editor() as schema_editor:
+              rename.rename_forward(apps, schema_editor)
+          assert captured.get('using') == 'other'
+      finally:
+          ContentType.save = original_save
+  
+  def test_save_using_passed_in_rename_backward():
+      # Create content type in default DB
+      ContentType.objects.using('default').create(app_label='ct_back', model='origback')
+      rename = contenttypes_management.RenameContentType('ct_back', 'origback', 'tmpname')
+  
+      captured = {}
+      original_save = ContentType.save
+      def spy_save(self, *args, **kwargs):
+          captured['using'] = kwargs.get('using')
+          return original_save(self, *args, **kwargs)
+      ContentType.save = spy_save
+      try:
+          connection = connections['default']
+          with connection.schema_editor() as schema_editor:
+              rename.rename_backward(apps, schema_editor)
+          assert captured.get('using') == 'default'
+      finally:
+          ContentType.save = original_save
+new_imports_code: |
+  from django.apps.registry import apps
+  from django.conf import settings
+  from django.contrib.contenttypes import management as contenttypes_management
+  from django.contrib.contenttypes.models import ContentType
+  from django.db import connections, transaction
+  from django.db.utils import IntegrityError
+  from django.test import override_settings

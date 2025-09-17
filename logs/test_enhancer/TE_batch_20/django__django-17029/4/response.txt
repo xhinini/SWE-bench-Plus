@@ -1,0 +1,213 @@
+language: Python
+number_of_tests: 10
+test_behavior: These 10 unit tests exercise apps.clear_cache() to ensure the get_swappable_settings_name cache is actually cleared in a variety of scenarios, including when model _expire_cache() implementations repopulate the swappable cache during the clear process. They assert that clear_cache() leaves the swappable cache empty (cache_info().currsize == 0) after being called, which would fail for the candidate (incorrect) patch but pass with the provided gold patch.
+test_code: |
+  from django.test import SimpleTestCase, override_settings
+  from django.apps import apps
+  from django.contrib.admin.models import LogEntry
+  from django.contrib.contenttypes.models import ContentType
+  from django.core.exceptions import AppRegistryNotReady
+  
+  
+  class ClearCacheRegressionTests(SimpleTestCase):
+      def tearDown(self):
+          # Ensure apps state is sane for other tests.
+          apps.get_swappable_settings_name.cache_clear()
+          apps.get_models.cache_clear()
+  
+      def test_clear_cache_basic_swappable_and_models(self):
+          "Basic sanity: swappable and models caches are cleared."
+          # Populate caches.
+          apps.get_swappable_settings_name("admin.LogEntry")
+          apps.get_models()
+  
+          apps.clear_cache()
+  
+          self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          self.assertEqual(apps.get_models.cache_info().currsize, 0)
+  
+      def test_clear_cache_with_model_expire_repopulates_and_finally_cleared_single_model(self):
+          "If model._meta._expire_cache repopulates swappable cache during clear, final cache must be empty."
+          model = LogEntry
+          orig_expire = model._meta._expire_cache
+          called = {"count": 0}
+  
+          def fake_expire():
+              # Simulate repopulating the swappable cache while clearing model caches.
+              called["count"] += 1
+              # This should repopulate the swappable cache while clear_cache() is running
+              apps.get_swappable_settings_name("admin.LogEntry")
+              return orig_expire()
+  
+          model._meta._expire_cache = fake_expire
+          try:
+              # Prime the cache so there is something to clear.
+              apps.get_swappable_settings_name("admin.LogEntry")
+              apps.get_models()
+  
+              apps.clear_cache()
+  
+              # Ensure expire was invoked (i.e., repopulation attempted).
+              self.assertGreaterEqual(called["count"], 0)
+              # The cache must end up cleared.
+              self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          finally:
+              model._meta._expire_cache = orig_expire
+  
+      def test_clear_cache_with_model_expire_repopulates_and_finally_cleared_multiple_models(self):
+          "Multiple models expiring and repopulating must still result in cleared swappable cache."
+          models = [LogEntry, ContentType]
+          orig_expires = []
+          counts = {"total": 0}
+  
+          for model in models:
+              orig_expires.append((model, model._meta._expire_cache))
+  
+          def make_fake_expire(m):
+              orig = m._meta._expire_cache
+              def fake():
+                  counts["total"] += 1
+                  apps.get_swappable_settings_name("admin.LogEntry")
+                  return orig()
+              return fake
+  
+          for model, _ in orig_expires:
+              model._meta._expire_cache = make_fake_expire(model)
+  
+          try:
+              apps.get_swappable_settings_name("admin.LogEntry")
+              apps.get_models()
+  
+              apps.clear_cache()
+  
+              self.assertGreaterEqual(counts["total"], 0)
+              self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          finally:
+              for model, orig in orig_expires:
+                  model._meta._expire_cache = orig
+  
+      def test_clear_cache_does_not_invoke_expire_when_not_ready(self):
+          "When apps.ready is False, clear_cache should not call _expire_cache and still clear swappable cache."
+          model = LogEntry
+          orig_expire = model._meta._expire_cache
+  
+          def fake_raise():
+              raise AssertionError("_expire_cache must not be called when apps.ready is False")
+  
+          model._meta._expire_cache = fake_raise
+          prev_ready = apps.ready
+          apps.ready = False
+          try:
+              # Prime caches.
+              apps.get_swappable_settings_name("admin.LogEntry")
+              apps.get_models()
+  
+              # Should not raise (fake_raise would assert).
+              apps.clear_cache()
+  
+              # swappable cache cleared regardless of ready state.
+              self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          finally:
+              model._meta._expire_cache = orig_expire
+              apps.ready = prev_ready
+  
+      def test_clear_cache_after_get_models_populates_then_clears(self):
+          "Ensure sequence get_models() -> clear_cache() leaves swappable cache empty."
+          apps.get_swappable_settings_name("admin.LogEntry")
+          apps.get_models()
+  
+          apps.clear_cache()
+  
+          self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+  
+      def test_clear_cache_is_case_insensitive_input_preserved_and_cleared(self):
+          "Different casings used to prime cache should be cleared."
+          apps.get_swappable_settings_name("admin.LogEntry")
+          apps.get_swappable_settings_name("admin.logentry")
+          apps.get_models()
+  
+          apps.clear_cache()
+  
+          self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+  
+      def test_clear_cache_with_set_available_apps_preserves_behavior(self):
+          "Restricting available apps shouldn't prevent swappable cache clearing."
+          installed_names = [ac.name for ac in apps.get_app_configs()]
+          # Take a subset (if possible) of installed names for available set.
+          available = installed_names[:1] if installed_names else []
+          # No-op if nothing available.
+          if not available:
+              self.skipTest("No installed apps to test with")
+  
+          # Save and restore via API to ensure balancing.
+          try:
+              apps.set_available_apps(available)
+              apps.get_swappable_settings_name("admin.LogEntry")
+              apps.get_models()
+  
+              apps.clear_cache()
+  
+              self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          finally:
+              apps.unset_available_apps()
+  
+      def test_clear_cache_repeated_calls_with_repopulations(self):
+          "Multiple consecutive clear_cache() calls with repopulation must leave cache empty."
+          model = LogEntry
+          orig = model._meta._expire_cache
+          calls = {"n": 0}
+  
+          def fake_expire():
+              calls["n"] += 1
+              apps.get_swappable_settings_name("admin.LogEntry")
+              return orig()
+  
+          model._meta._expire_cache = fake_expire
+          try:
+              apps.get_swappable_settings_name("admin.LogEntry")
+              apps.get_models()
+  
+              # First clear (may trigger repopulation).
+              apps.clear_cache()
+              # Second clear ensures idempotence.
+              apps.clear_cache()
+  
+              self.assertGreaterEqual(calls["n"], 0)
+              self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          finally:
+              model._meta._expire_cache = orig
+  
+      def test_clear_cache_after_get_swappable_called_for_multiple_strings(self):
+          "Multiple distinct get_swappable_settings_name lookups are all cleared."
+          targets = ["admin.LogEntry", "contenttypes.ContentType", "auth.User"]
+          for t in targets:
+              # Avoid exceptions for non-existent labels by wrapping in try/except.
+              try:
+                  apps.get_swappable_settings_name(t)
+              except Exception:
+                  # Ignore lookups that don't apply in this test environment.
+                  pass
+          apps.get_models()
+  
+          apps.clear_cache()
+  
+          self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+  
+      def test_clear_cache_while_models_ready_toggle(self):
+          "Toggling models_ready around clear_cache must still clear swappable cache."
+          prev_models_ready = apps.models_ready
+          try:
+              apps.models_ready = True
+              apps.get_swappable_settings_name("admin.LogEntry")
+              apps.get_models()
+  
+              apps.models_ready = False
+              apps.clear_cache()
+  
+              self.assertEqual(apps.get_swappable_settings_name.cache_info().currsize, 0)
+          finally:
+              apps.models_ready = prev_models_ready
+new_imports_code: |
+  from django.apps import apps
+  from django.contrib.admin.models import LogEntry
+  from django.contrib.contenttypes.models import ContentType

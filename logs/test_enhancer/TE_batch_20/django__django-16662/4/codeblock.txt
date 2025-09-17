@@ -1,0 +1,160 @@
+from unittest import mock
+
+from django.test import SimpleTestCase
+from django.db import migrations
+from django.db.migrations.writer import MigrationWriter
+
+# Sentinel type used to produce controlled import lines from the patched serializer.
+class Sentinel:
+    pass
+
+class DummyOp:
+    """
+    A minimal operation-like object that OperationWriter can handle:
+    - has an __init__ with one argument so get_func_args works
+    - has a deconstruct returning a name and positional args
+    """
+    def __init__(self, val=None):
+        self.val = val
+
+    def deconstruct(self):
+        # Name not present in django.db.migrations, so OperationWriter will add
+        # an import for this class's module. That's okay for the tests.
+        return ("DummyOp", [self.val], {})
+
+def _extract_import_lines(output):
+    """
+    Helper to extract the import lines from the produced migration string,
+    in order. We ignore the header comments and blank lines.
+    """
+    lines = []
+    for line in output.splitlines():
+        line = line.rstrip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            continue
+        # Stop at the class declaration
+        if line.startswith("class Migration"):
+            break
+        lines.append(line)
+    return [l for l in lines if l.startswith("import ") or l.startswith("from ")]
+
+class ImportSortingTests(SimpleTestCase):
+    def _run_with_imports(self, imports_set):
+        """
+        Create a migration with a DummyOp carrying a Sentinel value. Patch
+        MigrationWriter.serialize to return the given imports_set when
+        serializing the Sentinel, delegating to the real serializer otherwise.
+        Return the produced migration string.
+        """
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {"operations": [DummyOp(Sentinel())], "dependencies": []},
+        )
+
+        orig_serialize = MigrationWriter.serialize
+
+        def fake_serialize(value):
+            # If it's our sentinel, return a dummy string and the imports_set
+            if isinstance(value, Sentinel):
+                return ("Sentinel()", set(imports_set))
+            return orig_serialize(value)
+
+        with mock.patch.object(MigrationWriter, "serialize", new=fake_serialize):
+            writer = MigrationWriter(migration)
+            return writer.as_string()
+
+    def test_import_before_from_grouping(self):
+        # import should come before from
+        imports = {"import z_mod", "from alpha import a"}
+        output = self._run_with_imports(imports)
+        import_lines = _extract_import_lines(output)
+        # find indexes
+        idx_import = next(i for i, l in enumerate(import_lines) if l.startswith("import "))
+        idx_from = next(i for i, l in enumerate(import_lines) if l.startswith("from "))
+        self.assertLess(idx_import, idx_from)
+
+    def test_imports_sorted_alphabetically_within_imports(self):
+        imports = {"import z_mod", "import a_mod"}
+        output = self._run_with_imports(imports)
+        import_lines = _extract_import_lines(output)
+        # Expect "import a_mod" before "import z_mod"
+        self.assertEqual(import_lines[0], "import a_mod")
+        self.assertEqual(import_lines[1], "import z_mod")
+
+    def test_from_imports_sorted_by_module(self):
+        imports = {"from z_pkg import x", "from a_pkg import y"}
+        output = self._run_with_imports(imports)
+        import_lines = _extract_import_lines(output)
+        # Both are "from ..." lines and should be sorted by module ('a_pkg' before 'z_pkg')
+        self.assertEqual(import_lines, ["from a_pkg import y", "from z_pkg import x"])
+
+    def test_import_then_from_same_module(self):
+        # When there is both "import a" and "from a import b", "import a" should come first.
+        imports = {"import alpha", "from alpha import b"}
+        output = self._run_with_imports(imports)
+        import_lines = _extract_import_lines(output)
+        # Find the two relevant lines and assert ordering
+        found = [l for l in import_lines if "alpha" in l]
+        self.assertEqual(found, ["import alpha", "from alpha import b"])
+
+    def test_merge_models_into_migrations(self):
+        # If "from django.db import models" is present, it should be merged into
+        # "from django.db import migrations, models"
+        imports = {"from django.db import models"}
+        output = self._run_with_imports(imports)
+        import_lines = _extract_import_lines(output)
+        self.assertIn("from django.db import migrations, models", import_lines)
+        # Should not contain the unmerged models-only import anymore
+        self.assertNotIn("from django.db import models", import_lines)
+
+    def test_add_migrations_import_if_models_missing(self):
+        # If neither "from django.db import models" nor "from django.db import migrations"
+        # are present, the writer should add "from django.db import migrations"
+        imports = {"import something_else"}
+        output = self._run_with_imports(imports)
+        import_lines = _extract_import_lines(output)
+        self.assertIn("from django.db import migrations", import_lines)
+
+    def test_from_settings_dependency_included(self):
+        # Test the special-case dependency that yields "from django.conf import settings"
+        migration = type(
+            "Migration",
+            (migrations.Migration,),
+            {"operations": [], "dependencies": [("__setting__", "AUTH_USER_MODEL")]},
+        )
+        writer = MigrationWriter(migration)
+        output = writer.as_string()
+        import_lines = _extract_import_lines(output)
+        # Should include from django.conf import settings
+        self.assertIn("from django.conf import settings", import_lines)
+
+    def test_detect_migration_imports_and_add_manual_comment(self):
+        # If an import like "import package.0001_something" is present, it should be
+        # removed from the imports and the manual-porting comment should be added.
+        imports = {"import package.0001_funcs", "import another_mod"}
+        output = self._run_with_imports(imports)
+        # The manual-porting comment mentions the package name (after "import")
+        self.assertIn("# Functions from the following migrations need manual copying.", output)
+        # The module part (after 'import ') should be present in the comment body
+        self.assertIn("package.0001_funcs".split(".", 1)[0] or "package", output)
+
+    def test_imports_with_leading_space_are_included(self):
+        # Leading whitespace in the import string should still be included in the final output.
+        # The candidate patch filters using startswith('from '), so " from ..." would be omitted.
+        imports = {" from leading.space import a", "import aa_mod"}
+        output = self._run_with_imports(imports)
+        import_lines = _extract_import_lines(output)
+        # The leading-space import line should appear somewhere in the import block (trimmed by writer)
+        # The writer does no additional stripping of the import strings, so assert the module name is present.
+        self.assertTrue(any("leading.space" in l for l in import_lines))
+
+    def test_imports_with_leading_tab_are_included(self):
+        # Same as above but with a leading tab character.
+        imports = {"\tfrom tabspace.pkg import x", "import bb_mod"}
+        output = self._run_with_imports(imports)
+        import_lines = _extract_import_lines(output)
+        # Ensure the 'tabspace.pkg' import is present in the final import list.
+        self.assertTrue(any("tabspace.pkg" in l for l in import_lines))

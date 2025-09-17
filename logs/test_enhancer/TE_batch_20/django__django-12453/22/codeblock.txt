@@ -1,0 +1,147 @@
+# No new module-level imports required; tests use mocking and existing test infrastructure.
+from unittest import mock
+from io import StringIO
+
+from django.test import SimpleTestCase
+from django.db import connection
+from django.core import serializers
+
+# The module under test
+import django.db.backends.base.creation as creation_module
+
+
+class DummyCM:
+    """
+    Simple context manager for simulating constraint_checks_disabled().
+    Records enter/exit in the provided list.
+    """
+    def __init__(self, recorder):
+        self.recorder = recorder
+    def __enter__(self):
+        self.recorder.append('enter')
+        return None
+    def __exit__(self, exc_type, exc, tb):
+        self.recorder.append('exit')
+        # Don't swallow exceptions
+        return False
+
+
+class DeserializeDbFromStringRegressionTests(SimpleTestCase):
+    databases = {'default'}
+
+    @mock.patch('django.db.backends.base.creation.atomic')
+    def test_atomic_context_manager_is_used_for_deserialize(self, mocked_atomic):
+        # Empty payload should still use atomic(using=...)
+        connection.creation.deserialize_db_from_string('[]')
+        mocked_atomic.assert_called()
+        # Ensure the atomic is called with the connection alias
+        mocked_atomic.assert_any_call(using=connection.alias)
+
+    def test_constraint_checks_disabled_context_manager_is_used(self):
+        calls = []
+        cm = DummyCM(calls)
+        with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm):
+            connection.creation.deserialize_db_from_string('[]')
+        # Ensure we entered and exited the constraint-disabling context
+        self.assertEqual(calls, ['enter', 'exit'])
+
+    def test_check_constraints_called_after_deserialize(self):
+        calls = []
+        cm = DummyCM(calls)
+        with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm):
+            with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                connection.creation.deserialize_db_from_string('[]')
+                mocked_check.assert_called_once()
+        # Ensure check_constraints is called after the context manager exit
+        # which results in calls sequence having enter, exit (check call not logged in calls)
+        self.assertEqual(calls, ['enter', 'exit'])
+
+    def test_order_of_operations_constraint_disable_then_check_constraints(self):
+        sequence = []
+        # Context manager will append 'enter' and 'exit'
+        cm = DummyCM(sequence)
+        def fake_check_constraints():
+            sequence.append('check')
+        with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm):
+            with mock.patch.object(connection, 'check_constraints', side_effect=fake_check_constraints):
+                connection.creation.deserialize_db_from_string('[]')
+        # Ensure check_constraints called after exiting the constraint-disabled block
+        self.assertEqual(sequence, ['enter', 'exit', 'check'])
+
+    @mock.patch('django.db.backends.base.creation.atomic')
+    def test_atomic_used_even_with_nonempty_payload(self, mocked_atomic):
+        # Non-empty but simple payload should also trigger atomic()
+        payload = '[]'
+        connection.creation.deserialize_db_from_string(payload)
+        mocked_atomic.assert_called_with(using=connection.alias)
+
+    def test_deserialize_saves_objects_and_calls_check_constraints(self):
+        # Use a simple single-object payload for the test models included in tests
+        # Reuse the same structure used elsewhere in the test-suite; it should
+        # create the objects and then check_constraints should be called.
+        data = """
+        [
+            {
+                "model": "backends.object",
+                "pk": 1,
+                "fields": {}
+            }
+        ]
+        """
+        calls = []
+        cm = DummyCM(calls)
+        with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm):
+            with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                connection.creation.deserialize_db_from_string(data)
+                mocked_check.assert_called_once()
+        # Ensure the context manager was used
+        self.assertEqual(calls, ['enter', 'exit'])
+
+    @mock.patch('django.db.backends.base.creation.atomic')
+    def test_circular_reference_deserialization_uses_constraint_disable_and_atomic(self, mocked_atomic):
+        # Use the circular ref payload used in existing tests to assert both
+        # atomic and constraint-disabling behavior.
+        data = """
+        [
+            {
+                "model": "backends.object",
+                "pk": 1,
+                "fields": {"obj_ref": 1, "related_objects": []}
+            },
+            {
+                "model": "backends.objectreference",
+                "pk": 1,
+                "fields": {"obj": 1}
+            }
+        ]
+        """
+        calls = []
+        cm = DummyCM(calls)
+        with mock.patch.object(connection, 'constraint_checks_disabled', return_value=cm):
+            with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                connection.creation.deserialize_db_from_string(data)
+                mocked_check.assert_called_once()
+        # atomic should have been used
+        mocked_atomic.assert_called_with(using=connection.alias)
+        # Ensure context manager entered/exited
+        self.assertEqual(calls, ['enter', 'exit'])
+
+    def test_deserialize_does_not_call_check_constraints_on_exception_from_deserialize(self):
+        # Simulate serializers.deserialize raising an exception — check_constraints should not be called.
+        fake_exc = ValueError("bad data")
+        with mock.patch('django.db.backends.base.creation.serializers.deserialize', side_effect=fake_exc):
+            with mock.patch.object(connection, 'check_constraints') as mocked_check:
+                # The ValueError should propagate
+                with self.assertRaises(ValueError):
+                    connection.creation.deserialize_db_from_string('INVALID')
+                mocked_check.assert_not_called()
+
+    def test_constraint_checks_disabled_called_each_time_deserialize_invoked(self):
+        calls = []
+        cm1 = DummyCM(calls)
+        cm2 = DummyCM(calls)
+        # First call uses cm1, second uses cm2; we assert two enter/exit sequences appended
+        with mock.patch.object(connection, 'constraint_checks_disabled', side_effect=[cm1, cm2]):
+            connection.creation.deserialize_db_from_string('[]')
+            connection.creation.deserialize_db_from_string('[]')
+        self.assertEqual(calls, ['enter', 'exit', 'enter', 'exit'])

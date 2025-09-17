@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.tests_llm.ListEditableMultiDBAtomicityTests._create_swallow_on_other admin_changelist.tests_llm.ListEditableMultiDBAtomicityTests._post_changelist admin_changelist.tests_llm.ListEditableMultiDBAtomicityTests.setUp admin_changelist.tests_llm.ListEditableMultiDBAtomicityTests.test_atomicity_when_construct_change_message_raises admin_changelist.tests_llm.ListEditableMultiDBAtomicityTests.test_atomicity_when_exception_on_first_form admin_changelist.tests_llm.ListEditableMultiDBAtomicityTests.test_atomicity_when_exception_on_second_form_save_related admin_changelist.tests_llm.ListEditableMultiDBAtomicityTests.test_atomicity_when_log_change_raises admin_changelist.tests_llm.ListEditableMultiDBAtomicityTests.test_atomicity_when_log_change_raises_on_second admin_changelist.tests_llm.ListEditableMultiDBAtomicityTests.test_atomicity_when_save_form_raises admin_changelist.tests_llm.ListEditableMultiDBAtomicityTests.test_atomicity_when_save_model_raises admin_changelist.tests_llm.ListEditableMultiDBAtomicityTests.test_atomicity_when_save_related_raises
+coverage json -o coverage.json
+: '>>>>> End Test Output'

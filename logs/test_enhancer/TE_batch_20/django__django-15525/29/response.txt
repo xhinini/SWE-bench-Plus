@@ -1,0 +1,270 @@
+language: Python
+number_of_tests: 10
+test_behavior: These unit tests validate build_instance() behavior around when a model instance's natural_key() is invoked and which database is used. They ensure that build_instance sets the instance _state.db before calling natural_key(), that get_by_natural_key is invoked on the correct DB manager, that DoesNotExist is handled, that to_python is applied, and that exceptions from natural_key propagate. The tests are pure-Python and use small dummy model/manager classes to simulate Django model metadata and managers.
+test_code: |
+  import unittest
+
+  from django.core.serializers.base import build_instance
+
+  class DummyPK:
+      def __init__(self, attname="id", to_python=lambda x: x):
+          self.attname = attname
+          self.to_python = to_python
+          self.remote_field = None
+
+  class DummyState:
+      def __init__(self):
+          self.db = None
+
+  class DummyManager:
+      def __init__(self, db_manager_callable=None):
+          # db_manager_callable should be a callable that accepts db and returns
+          # an object exposing get_by_natural_key(...)
+          self._db_manager_callable = db_manager_callable or (lambda db: self)
+
+      def db_manager(self, db):
+          return self._db_manager_callable(db)
+
+      # default fallback; tests will override this or wrap it
+      def get_by_natural_key(self, *args):
+          raise NotImplementedError("get_by_natural_key should be provided by tests")
+
+  class DummyDoesNotExist(Exception):
+      pass
+
+  def make_model_class(
+      *,
+      has_get_by_natural_key=True,
+      natural_key_func=None,
+      pk_attname="id",
+      pk_to_python=lambda x: x,
+      manager_db_manager_callable=None,
+  ):
+      """
+      Create a minimal dummy Model class compatible with build_instance() testing.
+      natural_key_func is a callable(self) -> tuple to emulate natural_key.
+      manager_db_manager_callable(db) -> manager_with_get_by_natural_key
+      """
+      class Model:
+          DoesNotExist = DummyDoesNotExist
+
+          class _Meta:
+              pass
+
+          _meta = _Meta()
+          _meta.pk = DummyPK(attname=pk_attname, to_python=pk_to_python)
+          # Provide a default_manager with db_manager capability.
+          if has_get_by_natural_key:
+              default_manager = DummyManager(db_manager_callable=manager_db_manager_callable)
+          else:
+              # manager without get_by_natural_key attribute
+              default_manager = object()
+
+          def __init__(self, **kwargs):
+              # simple attribute assignment to mimic Django model instance behavior
+              self._state = DummyState()
+              for k, v in kwargs.items():
+                  setattr(self, k, v)
+
+          # attach natural_key if provided
+          if natural_key_func is not None:
+              def natural_key(self):
+                  return natural_key_func(self)
+
+      return Model
+
+  class BuildInstanceTests(unittest.TestCase):
+      def test_with_pk_provided_returns_model_with_pk(self):
+          Model = make_model_class(has_get_by_natural_key=False)
+          data = {"id": 42, "name": "foo"}
+          inst = build_instance(Model, data.copy(), db="other_db")
+          # Model(**data) should preserve provided pk value
+          self.assertEqual(getattr(inst, "id"), 42)
+          self.assertEqual(getattr(inst, "name"), "foo")
+
+      def test_no_get_by_natural_key_returns_model_without_pk_set(self):
+          Model = make_model_class(has_get_by_natural_key=False)
+          data = {"name": "bar"}  # no id provided
+          inst = build_instance(Model, data.copy(), db="other_db")
+          # returned instance shouldn't magically have an id attribute set
+          self.assertFalse(hasattr(inst, "id"))
+
+      def test_no_natural_key_method_returns_model(self):
+          # Model has default_manager with get_by_natural_key but no natural_key method
+          Model = make_model_class(has_get_by_natural_key=False)
+          data = {"name": "baz"}
+          inst = build_instance(Model, data.copy(), db="other_db")
+          self.assertFalse(hasattr(inst, "id"))
+
+      def test_sets_state_db_before_natural_key_call(self):
+          # natural_key asserts that _state.db was set to the db argument.
+          def nk(self):
+              # natural_key should be called after _state.db is set.
+              if self._state.db != "other_db":
+                  raise AssertionError("Instance _state.db not set before natural_key")
+              return ("nkvalue",)
+
+          # manager that will be returned by db_manager; it should not be used here
+          def db_manager_callable(db):
+              class M:
+                  def get_by_natural_key(self, *args):
+                      class O: pass
+                      o = O()
+                      o.pk = 99
+                      return o
+              return M()
+
+          Model = make_model_class(
+              has_get_by_natural_key=True,
+              natural_key_func=nk,
+              manager_db_manager_callable=db_manager_callable,
+          )
+          data = {"name": "should_not_matter"}
+          # If build_instance fails to set _state.db before calling natural_key, nk will assert.
+          inst = build_instance(Model, data.copy(), db="other_db")
+          self.assertIsInstance(inst, Model)
+
+      def test_uses_db_in_get_by_natural_key_call(self):
+          captured = {}
+          def db_manager_callable(db):
+              captured['db_used'] = db
+              class M:
+                  def get_by_natural_key(self, *args):
+                      class O: pass
+                      o = O()
+                      o.pk = 1234
+                      return o
+              return M()
+
+          def nk(self):
+              return ("value",)
+
+          Model = make_model_class(
+              has_get_by_natural_key=True,
+              natural_key_func=nk,
+              manager_db_manager_callable=db_manager_callable,
+          )
+          data = {}
+          inst = build_instance(Model, data, db="other-db-name")
+          # Default manager db_manager should have been called with the db we passed.
+          self.assertEqual(captured.get('db_used'), "other-db-name")
+          # And the returned instance should have had the pk set to the pk.to_python conversion
+          self.assertEqual(getattr(inst, "id"), 1234)
+
+      def test_handles_does_not_exist(self):
+          # Ensure that if get_by_natural_key raises DoesNotExist, build_instance doesn't propagate.
+          def db_manager_callable(db):
+              class M:
+                  def get_by_natural_key(self, *args):
+                      raise DummyDoesNotExist()
+              return M()
+
+          def nk(self):
+              return ("missing",)
+
+          Model = make_model_class(
+              has_get_by_natural_key=True,
+              natural_key_func=nk,
+              manager_db_manager_callable=db_manager_callable,
+          )
+          data = {}
+          # Should not raise; just return Model(**data) without id set
+          inst = build_instance(Model, data.copy(), db="any")
+          self.assertFalse(hasattr(inst, "id"))
+
+      def test_applies_pk_to_python(self):
+          # make to_python mutate the value so we can detect it was applied
+          def to_python(value):
+              return "converted-%s" % value
+
+          def db_manager_callable(db):
+              class M:
+                  def get_by_natural_key(self, *args):
+                      class O: pass
+                      o = O()
+                      o.pk = "rawpk"
+                      return o
+              return M()
+
+          def nk(self):
+              return ("x",)
+
+          Model = make_model_class(
+              has_get_by_natural_key=True,
+              natural_key_func=nk,
+              pk_to_python=to_python,
+              manager_db_manager_callable=db_manager_callable,
+          )
+          inst = build_instance(Model, {}, db="db")
+          self.assertEqual(getattr(inst, "id"), "converted-rawpk")
+
+      def test_natural_key_exceptions_propagate(self):
+          # If natural_key raises an AttributeError, it should propagate (gold behavior).
+          def nk(self):
+              raise AttributeError("natural_key failed")
+
+          def db_manager_callable(db):
+              class M:
+                  def get_by_natural_key(self, *args):
+                      class O: pass
+                      o = O()
+                      o.pk = 1
+                      return o
+              return M()
+
+          Model = make_model_class(
+              has_get_by_natural_key=True,
+              natural_key_func=nk,
+              manager_db_manager_callable=db_manager_callable,
+          )
+          with self.assertRaises(AttributeError):
+              build_instance(Model, {}, db="db")
+
+      def test_natural_key_sees_relation_field_from_data(self):
+          # natural_key will access a relation-like attribute 'fk'; ensure build_instance
+          # constructs the object with that attribute before calling natural_key.
+          def nk(self):
+              # Expect fk to be set from data. If it's not set, raise to fail.
+              if not hasattr(self, "fk"):
+                  raise AssertionError("fk missing in natural_key instance")
+              return (self.fk,)
+
+          def db_manager_callable(db):
+              class M:
+                  def get_by_natural_key(self, *args):
+                      class O: pass
+                      o = O()
+                      o.pk = 777
+                      return o
+              return M()
+
+          Model = make_model_class(
+              has_get_by_natural_key=True,
+              natural_key_func=nk,
+              manager_db_manager_callable=db_manager_callable,
+          )
+          data = {"fk": "related-value"}
+          inst = build_instance(Model, data.copy(), db="db")
+          self.assertEqual(getattr(inst, "id"), 777)
+
+      def test_when_pk_present_skips_manager_call(self):
+          # Provide a manager that would raise if called.
+          def db_manager_callable(db):
+              class M:
+                  def get_by_natural_key(self, *args):
+                      raise AssertionError("get_by_natural_key should not be called when pk provided")
+              return M()
+
+          Model = make_model_class(
+              has_get_by_natural_key=True,
+              natural_key_func=lambda self: ("should-not-be-called",),
+              manager_db_manager_callable=db_manager_callable,
+          )
+          data = {"id": 555, "other": "value"}
+          inst = build_instance(Model, data.copy(), db="some-db")
+          # Should keep the provided id, and manager should not have been invoked.
+          self.assertEqual(getattr(inst, "id"), 555)
+
+  if __name__ == "__main__":
+      unittest.main()
+new_imports_code: ""

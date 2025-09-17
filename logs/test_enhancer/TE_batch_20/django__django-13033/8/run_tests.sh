@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 ordering.test_models_llm.OrderingRelatedDefaultOrderingTests.count_orderby_pk_mentions ordering.test_models_llm.OrderingRelatedDefaultOrderingTests.setUpTestData ordering.test_models_llm.OrderingRelatedDefaultOrderingTests.test_multiple_ordering_items_contain_related_default ordering.test_models_llm.OrderingRelatedDefaultOrderingTests.test_order_by_related_proxy_model_respects_related_default ordering.test_models_llm.OrderingRelatedDefaultOrderingTests.test_order_by_relation_appends_related_default_ordering ordering.test_models_llm.OrderingRelatedDefaultOrderingTests.test_order_by_relation_double_underscore_id_appends_related_default_ordering ordering.test_models_llm.OrderingRelatedDefaultOrderingTests.test_order_by_relation_field_name_not_attname_preserves_default ordering.test_models_llm.OrderingRelatedDefaultOrderingTests.test_order_by_relation_field_with_F_expression_preserves_default ordering.test_models_llm.OrderingRelatedDefaultOrderingTests.test_order_by_relation_negative_forms_preserve_related_default ordering.test_models_llm.OrderingRelatedDefaultOrderingTests.test_order_by_relation_pk_keyword_appends_related_default_ordering ordering.test_models_llm.OrderingRelatedDefaultOrderingTests.test_order_by_relation_then_field_preserves_related_default ordering.test_models_llm.OrderingRelatedDefaultOrderingTests.test_order_by_second_author_related_preserves_default
+coverage json -o coverage.json
+: '>>>>> End Test Output'

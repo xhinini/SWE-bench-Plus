@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.setUp staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_hashed_name_fragment_preserved staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_no_passes_existing_hashed_file_overwritten staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_no_passes_multiple_adjustable_files staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_no_passes_non_adjustable_file_png_yielded staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_no_passes_simple_css_image_reference staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_post_process_zero_does_not_raise_runtime_error staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_post_process_zero_manifest_mixin staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_post_process_zero_no_adjustable_paths staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.test_stored_name_resolves_with_max_zero staticfiles_tests.test_storage_llm.PostProcessMaxZeroTests.write_file staticfiles_tests.test_storage_llm.TempStorage.__init__
+coverage json -o coverage.json
+: '>>>>> End Test Output'

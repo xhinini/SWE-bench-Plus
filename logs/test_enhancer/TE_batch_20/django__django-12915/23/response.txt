@@ -1,0 +1,219 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that StaticFilesHandlerMixin.get_response_async does not block the event loop when calling a synchronous, blocking serve() implementation. The correct implementation uses sync_to_async to run the blocking serve() in a thread, allowing other coroutines to run concurrently. The candidate (incorrect) patch calls the blocking serve() directly inside the async coroutine, which blocks the event loop; these tests detect that by scheduling a short "quick" coroutine alongside get_response_async and asserting the quick coroutine completes before the blocking serve() finishes. Additional tests cover the exception path where serve() raises Http404 and ensure response_for_exception is invoked without blocking the event loop.
+test_code: |
+  import asyncio
+  import time
+  import pytest
+  from django.http import Http404
+  from django.test.utils import override_settings
+  
+  # Helper to import the handlers module under a controlled settings context
+  def import_handlers():
+      # Import inside the test so we pick up override_settings
+      from django.contrib.staticfiles import handlers as handlers_module
+      return handlers_module
+  
+  def make_handler_module_instance(handlers_module, serve_func):
+      class Handler(handlers_module.StaticFilesHandlerMixin):
+          def __init__(self, serve):
+              # attach a synchronous blocking serve implementation
+              self.serve = serve
+      return Handler(serve_func)
+  
+  async def _assert_non_blocking(handler, expected_result):
+      """
+      Schedule handler.get_response_async concurrently with a quick coroutine.
+      The quick coroutine should complete before the blocking serve finishes.
+      Returns the result from get_response_async.
+      """
+      done = []
+  
+      # Start both tasks at almost the same time
+      task_slow = asyncio.create_task(handler.get_response_async(object()))
+  
+      async def quick():
+          # yield control to allow other scheduled tasks to run
+          await asyncio.sleep(0)
+          done.append("quick")
+  
+      task_quick = asyncio.create_task(quick())
+  
+      # Wait for the quick task to finish; if the event loop is blocked by the
+      # slow task, this will timeout / not complete promptly.
+      await asyncio.wait_for(task_quick, timeout=1.0)
+      assert done == ["quick"], "Quick task did not run before slow task completed (event loop blocked)."
+  
+      # Now await the slow task result (give it a bit more time)
+      res = await asyncio.wait_for(task_slow, timeout=2.0)
+      assert res == expected_result
+      return res
+  
+  async def _assert_non_blocking_exception_path(handler, expected_result):
+      """
+      Like _assert_non_blocking but for the case where handler.serve raises Http404.
+      We monkeypatch response_for_exception to return expected_result, and verify
+      quick runs before serve completes and the returned value is expected_result.
+      """
+      done = []
+      task_slow = asyncio.create_task(handler.get_response_async(object()))
+  
+      async def quick():
+          await asyncio.sleep(0)
+          done.append("quick")
+  
+      task_quick = asyncio.create_task(quick())
+      await asyncio.wait_for(task_quick, timeout=1.0)
+      assert done == ["quick"], "Quick task did not run before slow exception path (event loop blocked)."
+  
+      res = await asyncio.wait_for(task_slow, timeout=2.0)
+      assert res == expected_result
+      return res
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_non_blocking_short_sleep():
+      with override_settings(STATIC_URL='/static/'):
+          handlers = import_handlers()
+          def serve_sync(request):
+              time.sleep(0.05)  # blocking sleep
+              return "ok-short"
+          handler = make_handler_module_instance(handlers, serve_sync)
+          await _assert_non_blocking(handler, "ok-short")
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_non_blocking_tiny_sleep():
+      with override_settings(STATIC_URL='/static/'):
+          handlers = import_handlers()
+          def serve_sync(request):
+              time.sleep(0.01)
+              return "ok-tiny"
+          handler = make_handler_module_instance(handlers, serve_sync)
+          await _assert_non_blocking(handler, "ok-tiny")
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_non_blocking_longer_sleep():
+      with override_settings(STATIC_URL='/static/'):
+          handlers = import_handlers()
+          def serve_sync(request):
+              time.sleep(0.12)
+              return "ok-long"
+          handler = make_handler_module_instance(handlers, serve_sync)
+          await _assert_non_blocking(handler, "ok-long")
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_non_blocking_bound_method():
+      with override_settings(STATIC_URL='/static/'):
+          handlers = import_handlers()
+          # Use a bound method style by defining serve on an object and binding
+          class S:
+              def serve(self, request):
+                  time.sleep(0.05)
+                  return "ok-bound"
+          s = S()
+          handler = make_handler_module_instance(handlers, s.serve)
+          await _assert_non_blocking(handler, "ok-bound")
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_non_blocking_multiple_quick_yields():
+      with override_settings(STATIC_URL='/static/'):
+          handlers = import_handlers()
+          def serve_sync(request):
+              time.sleep(0.08)
+              return "ok-multi"
+          handler = make_handler_module_instance(handlers, serve_sync)
+  
+          done = []
+          task_slow = asyncio.create_task(handler.get_response_async(object()))
+  
+          async def quick_many():
+              # several yields to ensure the event loop can interleave tasks
+              for _ in range(3):
+                  await asyncio.sleep(0)
+                  done.append("q")
+  
+          task_quick = asyncio.create_task(quick_many())
+          await asyncio.wait_for(task_quick, timeout=1.0)
+          assert done == ["q", "q", "q"]
+          res = await asyncio.wait_for(task_slow, timeout=2.0)
+          assert res == "ok-multi"
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_exception_path_non_blocking_short_sleep(monkeypatch):
+      with override_settings(STATIC_URL='/static/'):
+          handlers = import_handlers()
+          def serve_sync(request):
+              time.sleep(0.05)
+              raise Http404("not found")
+          handler = make_handler_module_instance(handlers, serve_sync)
+  
+          # Patch the module-level response_for_exception to a simple sentinel
+          monkeypatch.setattr(handlers, "response_for_exception", lambda request, exc: "handled-1")
+          await _assert_non_blocking_exception_path(handler, "handled-1")
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_exception_path_non_blocking_tiny_sleep(monkeypatch):
+      with override_settings(STATIC_URL='/static/'):
+          handlers = import_handlers()
+          def serve_sync(request):
+              time.sleep(0.01)
+              raise Http404("missing")
+          handler = make_handler_module_instance(handlers, serve_sync)
+          monkeypatch.setattr(handlers, "response_for_exception", lambda request, exc: "handled-2")
+          await _assert_non_blocking_exception_path(handler, "handled-2")
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_exception_path_non_blocking_bound_method(monkeypatch):
+      with override_settings(STATIC_URL='/static/'):
+          handlers = import_handlers()
+          class S:
+              def serve(self, request):
+                  time.sleep(0.05)
+                  raise Http404("gone")
+          s = S()
+          handler = make_handler_module_instance(handlers, s.serve)
+          monkeypatch.setattr(handlers, "response_for_exception", lambda request, exc: "handled-3")
+          await _assert_non_blocking_exception_path(handler, "handled-3")
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_exception_path_non_blocking_longer_sleep(monkeypatch):
+      with override_settings(STATIC_URL='/static/'):
+          handlers = import_handlers()
+          def serve_sync(request):
+              time.sleep(0.12)
+              raise Http404("not here")
+          handler = make_handler_module_instance(handlers, serve_sync)
+          monkeypatch.setattr(handlers, "response_for_exception", lambda request, exc: "handled-4")
+          await _assert_non_blocking_exception_path(handler, "handled-4")
+  
+  @pytest.mark.asyncio
+  async def test_get_response_async_multiple_concurrent_calls_do_not_block_each_other():
+      """
+      Start multiple get_response_async calls with blocking serves; all of them
+      should run in threads and not block an unrelated quick coroutine.
+      """
+      with override_settings(STATIC_URL='/static/'):
+          handlers = import_handlers()
+          def serve_sync(request):
+              time.sleep(0.08)
+              return "ok-multi-2"
+          # create several handler instances
+          handlers_list = [make_handler_module_instance(handlers, serve_sync) for _ in range(4)]
+  
+          tasks = [asyncio.create_task(h.get_response_async(object())) for h in handlers_list]
+  
+          done = []
+          async def quick():
+              await asyncio.sleep(0)
+              done.append("quick")
+  
+          # quick should be able to run even if all get_response_async tasks are executing
+          await asyncio.wait_for(asyncio.create_task(quick()), timeout=1.0)
+          assert done == ["quick"]
+          results = await asyncio.wait_for(asyncio.gather(*tasks), timeout=3.0)
+          assert results == ["ok-multi-2"] * 4
+new_imports_code: |
+  import asyncio
+  import time
+  import pytest
+  from django.http import Http404
+  from django.test.utils import override_settings

@@ -1,0 +1,181 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that DraggableBase correctly registers and unregisters callbacks from the figure's callback registry, and that its event handlers (on_pick, on_release, on_motion) call the expected hooks. They specifically target disconnect behavior when the referenced artist's figure is removed (which the gold patch addresses by capturing the callbacks registry at construction time), and ensure idempotent disconnect and proper pick/set_picker behavior.
+test_code: |
+  import types
+  from types import SimpleNamespace
+  import pytest
+
+  from matplotlib.offsetbox import DraggableBase
+
+  class DummyCallbacks:
+      def __init__(self):
+          self._next = 1
+          self.connected = {}   # cid -> (name, func)
+          self.disconnect_calls = []
+
+      def _connect_picklable(self, name, func):
+          cid = self._next
+          self._next += 1
+          self.connected[cid] = (name, func)
+          return cid
+
+      def disconnect(self, cid):
+          # record the disconnect attempt and remove the connection
+          self.disconnect_calls.append(cid)
+          self.connected.pop(cid, None)
+
+  class DummyCanvas:
+      def __init__(self, callbacks):
+          self.supports_blit = False
+          self._callbacks = callbacks
+
+      def mpl_disconnect(self, cid):
+          # route to callbacks for consistency with canvas behavior
+          self._callbacks.disconnect(cid)
+
+  class DummyFigure:
+      def __init__(self, callbacks):
+          self._canvas_callbacks = callbacks
+          self.canvas = DummyCanvas(callbacks)
+
+  class DummyArtist:
+      def __init__(self, fig):
+          self._figure = fig
+          self._picker = False
+          self.animated = False
+
+      def pickable(self):
+          return self._picker
+
+      def set_picker(self, val):
+          self._picker = bool(val)
+
+      def set_animated(self, val):
+          self.animated = val
+
+      @property
+      def figure(self):
+          return self._figure
+
+      @figure.setter
+      def figure(self, val):
+          self._figure = val
+
+  class TestDraggable(DraggableBase):
+      def __init__(self, ref_artist, use_blit=False):
+          super().__init__(ref_artist, use_blit=use_blit)
+          self.saved = False
+          self.finalized = False
+          self.updated = []
+
+      def save_offset(self):
+          self.saved = True
+
+      def finalize_offset(self):
+          self.finalized = True
+
+      def update_offset(self, dx, dy):
+          self.updated.append((dx, dy))
+
+  def make_draggable():
+      callbacks = DummyCallbacks()
+      fig = DummyFigure(callbacks)
+      artist = DummyArtist(fig)
+      dr = TestDraggable(artist)
+      return dr, artist, fig, callbacks
+
+  def make_event_for_artist(artist, x=10, y=20):
+      return SimpleNamespace(artist=artist,
+                             mouseevent=SimpleNamespace(x=x, y=y))
+
+  def test_registers_three_callbacks_on_init():
+      dr, artist, fig, callbacks = make_draggable()
+      # Three events should be connected: pick, button_release, motion_notify
+      assert len(callbacks.connected) == 3
+      # The first two connection ids should be exposed via cids property
+      assert hasattr(dr, "cids")
+      assert isinstance(dr.cids, list)
+      assert len(dr.cids) == 2
+
+  def test_set_picker_called_when_not_pickable():
+      dr, artist, fig, callbacks = make_draggable()
+      # artist.pickable() initially False, so set_picker should have been called
+      assert artist._picker is True
+
+  def test_disconnect_clears_callbacks_even_if_figure_removed():
+      dr, artist, fig, callbacks = make_draggable()
+      # ensure connections exist
+      assert callbacks.connected
+      # simulate removal of the artist from its figure
+      artist.figure = None
+      # _check_still_parented should call disconnect (and return False)
+      assert dr._check_still_parented() is False
+      # All previously connected callbacks should have been disconnected
+      assert callbacks.connected == {}
+
+  def test_disconnect_method_is_idempotent_and_records_disconnects_once():
+      dr, artist, fig, callbacks = make_draggable()
+      original_ids = sorted(list(callbacks.connected.keys()))
+      # call disconnect explicitly
+      dr.disconnect()
+      # all connections removed
+      assert callbacks.connected == {}
+      # disconnect calls should match the original ids (order not required)
+      assert set(callbacks.disconnect_calls) == set(original_ids)
+      # calling disconnect again should not raise and should not add additional calls
+      prev_calls = list(callbacks.disconnect_calls)
+      dr.disconnect()
+      assert callbacks.disconnect_calls == prev_calls
+
+  def test_on_pick_sets_saved_and_mouse_coordinates():
+      dr, artist, fig, callbacks = make_draggable()
+      evt = make_event_for_artist(artist, x=123, y=456)
+      dr.on_pick(evt)
+      # on_pick should set mouse coordinates and mark got_artist
+      assert dr.mouse_x == 123
+      assert dr.mouse_y == 456
+      assert dr.got_artist is True
+      # save_offset (overridden) should have been called
+      assert dr.saved is True
+
+  def test_on_release_calls_finalize_and_resets_got_artist():
+      dr, artist, fig, callbacks = make_draggable()
+      # simulate that an object had been grabbed
+      dr.got_artist = True
+      evt = make_event_for_artist(artist)
+      dr.on_release(evt)
+      assert dr.finalized is True
+      assert dr.got_artist is False
+
+  def test_on_motion_updates_offset_when_got_artist_true():
+      dr, artist, fig, callbacks = make_draggable()
+      # set state as if pick happened
+      dr.got_artist = True
+      dr.mouse_x = 10
+      dr.mouse_y = 10
+      # create an event moved to (15, 14)
+      evt = SimpleNamespace(x=15, y=14)
+      dr.on_motion(evt)
+      # update_offset should have been called with the delta
+      assert dr.updated == [(5, 4)]
+
+  def test_disconnect_after_pick_and_figure_removed_clears_callbacks():
+      dr, artist, fig, callbacks = make_draggable()
+      # simulate pick so some internal state may be set
+      evt = make_event_for_artist(artist)
+      dr.on_pick(evt)
+      assert dr.got_artist is True
+      # now simulate figure removal and ensure disconnect removes callbacks
+      artist.figure = None
+      assert dr._check_still_parented() is False
+      assert callbacks.connected == {}
+
+  def test_disconnect_calls_disconnect_with_correct_ids():
+      dr, artist, fig, callbacks = make_draggable()
+      original_ids = set(callbacks.connected.keys())
+      dr.disconnect()
+      # ensure that each original id was requested to be disconnected
+      assert set(callbacks.disconnect_calls) == original_ids
+new_imports_code: |
+  from types import SimpleNamespace

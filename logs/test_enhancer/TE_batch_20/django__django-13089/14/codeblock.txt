@@ -1,0 +1,184 @@
+from unittest import mock
+from django.core.cache.backends.db import DatabaseCache
+from django.db import router, connections
+from django.utils import timezone
+
+from unittest import mock
+from django.test import SimpleTestCase
+from django.core.cache.backends.db import DatabaseCache
+from django.db import router, connections
+from django.utils import timezone
+
+
+class DBCacheCullingTests(SimpleTestCase):
+    def setUp(self):
+        # Create a DatabaseCache instance without touching the DB.
+        self.cache = DatabaseCache('test cache table', {'TIMEOUT': 300})
+        # Ensure deterministic cull parameters for tests.
+        self.cache._max_entries = 10
+        self.cache._cull_frequency = 3
+
+    def _get_db(self):
+        return router.db_for_write(self.cache.cache_model_class)
+
+    def test_cull_no_last_cache_key_does_not_raise_and_no_delete_executed(self):
+        db = self._get_db()
+        # Simulate SELECT COUNT(*) returning 20 and culling SQL returning no rows (None).
+        cursor = mock.MagicMock()
+        cursor.fetchone.side_effect = [
+            (20,),  # result for SELECT COUNT(*)
+            None,   # result for cache_key_culling_sql() -> no last_cache_key
+        ]
+        now = timezone.now()
+        # Call _cull; should not raise.
+        self.cache._cull(db, cursor, now)
+        # Ensure the culling SQL was executed (the one that tries to find last key),
+        # but no final DELETE for cache_key < last_cache_key was executed.
+        calls = [call[0][0] for call in cursor.execute.call_args_list]
+        # The last call should not be the DELETE ... WHERE cache_key < ... call.
+        delete_sql = 'DELETE FROM %s WHERE cache_key < %%s' % connections[db].ops.quote_name(self.cache._table)
+        self.assertNotIn(delete_sql, calls)
+
+    def test_cull_with_last_cache_key_executes_delete_with_key(self):
+        db = self._get_db()
+        # Simulate SELECT COUNT(*) returning 20 and culling SQL returning ('last-key',)
+        cursor = mock.MagicMock()
+        cursor.fetchone.side_effect = [
+            (20,),         # SELECT COUNT(*)
+            ('last-key',), # cache_key_culling_sql() -> last cache key tuple
+        ]
+        now = timezone.now()
+        self.cache._cull(db, cursor, now)
+        # The final DELETE should be called with last-key as parameter.
+        delete_sql = 'DELETE FROM %s WHERE cache_key < %%s' % connections[db].ops.quote_name(self.cache._table)
+        # Find matching call among execute calls
+        found = False
+        for call in cursor.execute.call_args_list:
+            sql, params = call[0]
+            if sql == delete_sql and params == ['last-key']:
+                found = True
+                break
+        self.assertTrue(found, "Expected DELETE using the fetched last cache key")
+
+    def test_cull_with_last_cache_key_bytes_executes_delete_with_decoded_bytes(self):
+        db = self._get_db()
+        # Some backends return bytes for cache keys; ensure the value passed through.
+        cursor = mock.MagicMock()
+        cursor.fetchone.side_effect = [
+            (30,),          # SELECT COUNT(*)
+            (b'bytes-key',) # last cache key as bytes
+        ]
+        now = timezone.now()
+        self.cache._cull(db, cursor, now)
+        delete_sql = 'DELETE FROM %s WHERE cache_key < %%s' % connections[db].ops.quote_name(self.cache._table)
+        found = False
+        for call in cursor.execute.call_args_list:
+            sql, params = call[0]
+            if sql == delete_sql and params == [b'bytes-key']:
+                found = True
+                break
+        self.assertTrue(found, "Expected DELETE using the fetched bytes last cache key")
+
+    def test_cull_does_not_execute_culling_sql_when_num_leq_max_entries(self):
+        db = self._get_db()
+        # num <= _max_entries so no culling_sql should be executed.
+        cursor = mock.MagicMock()
+        cursor.fetchone.side_effect = [
+            (5,),  # SELECT COUNT(*) -> 5 (<= _max_entries)
+        ]
+        now = timezone.now()
+        self.cache._cull(db, cursor, now)
+        # Only the DELETE expires and SELECT COUNT(*) should have been executed.
+        executed_sqls = [call[0][0] for call in cursor.execute.call_args_list]
+        culling_sql_fragment = connections[db].ops.cache_key_culling_sql() % connections[db].ops.quote_name(self.cache._table)
+        self.assertNotIn(culling_sql_fragment, executed_sqls)
+
+    def test_cull_clear_called_when_frequency_zero(self):
+        db = self._get_db()
+        cursor = mock.MagicMock()
+        # Force the code path where _cull_frequency == 0 triggers clear().
+        self.cache._cull_frequency = 0
+        called = {'cleared': False}
+
+        def fake_clear():
+            called['cleared'] = True
+
+        # Replace clear with fake_clear and call _cull
+        orig_clear = self.cache.clear
+        self.cache.clear = fake_clear
+        try:
+            now = timezone.now()
+            # _cull will check _cull_frequency and call clear()
+            self.cache._cull(db, cursor, now)
+            self.assertTrue(called['cleared'], "Expected clear() to be called when _cull_frequency == 0")
+        finally:
+            self.cache.clear = orig_clear
+
+    def test_cull_computes_cull_num_and_calls_culling_sql_with_cull_num(self):
+        db = self._get_db()
+        # Choose values so cull_num is deterministic: num // _cull_frequency
+        self.cache._max_entries = 10
+        self.cache._cull_frequency = 4
+        num = 50
+        expected_cull_num = num // self.cache._cull_frequency
+        cursor = mock.MagicMock()
+        cursor.fetchone.side_effect = [
+            (num,),     # SELECT COUNT(*)
+            None,       # cache_key_culling_sql() returns None for last_cache_key
+        ]
+        now = timezone.now()
+        self.cache._cull(db, cursor, now)
+        # Find the call to cache_key_culling_sql and assert it was passed expected_cull_num
+        cull_sql = connections[db].ops.cache_key_culling_sql() % connections[db].ops.quote_name(self.cache._table)
+        found = False
+        for call in cursor.execute.call_args_list:
+            sql, params = call[0]
+            if sql == cull_sql and params == [expected_cull_num]:
+                found = True
+                break
+        self.assertTrue(found, "Expected cache_key_culling_sql to be executed with cull_num=%s" % expected_cull_num)
+
+    def test_cull_uses_quoted_table_name_in_sql(self):
+        db = self._get_db()
+        cursor = mock.MagicMock()
+        cursor.fetchone.side_effect = [
+            (25,),    # SELECT COUNT(*)
+            ('k',),   # last cache key
+        ]
+        now = timezone.now()
+        self.cache._cull(db, cursor, now)
+        # Ensure the quoted table name from connection.ops.quote_name is used in the final DELETE.
+        quoted_table = connections[db].ops.quote_name(self.cache._table)
+        delete_sql = 'DELETE FROM %s WHERE cache_key < %%s' % quoted_table
+        executed_sqls = [call[0][0] for call in cursor.execute.call_args_list]
+        self.assertIn(delete_sql, executed_sqls)
+
+    def test_cull_noop_when_zero_rows(self):
+        db = self._get_db()
+        cursor = mock.MagicMock()
+        # SELECT COUNT(*) returns (0,)
+        cursor.fetchone.side_effect = [
+            (0,),  # SELECT COUNT(*)
+        ]
+        now = timezone.now()
+        self.cache._cull(db, cursor, now)
+        # No further culling SQL should be executed.
+        executed_sqls = [call[0][0] for call in cursor.execute.call_args_list]
+        cull_sql_fragment = connections[db].ops.cache_key_culling_sql() % connections[db].ops.quote_name(self.cache._table)
+        self.assertNotIn(cull_sql_fragment, executed_sqls)
+
+    def test_cull_handles_last_cache_key_none_without_indexing_error(self):
+        db = self._get_db()
+        # Simulate SELECT COUNT(*) returning 20 and cache_key_culling_sql returning None
+        # (this is the condition that previously led to a crash when code did cursor.fetchone()[0])
+        cursor = mock.MagicMock()
+        cursor.fetchone.side_effect = [
+            (20,),  # SELECT COUNT(*)
+            None,   # cache_key_culling_sql() -> last_cache_key is None
+        ]
+        now = timezone.now()
+        # This should not raise an exception (no indexing of None).
+        try:
+            self.cache._cull(db, cursor, now)
+        except Exception as exc:
+            self.fail("Unexpected exception raised during _cull when last_cache_key is None: %r" % (exc,))

@@ -1,0 +1,180 @@
+# no new imports required beyond what's in the test file above.
+# -*- coding: utf-8 -*-
+import logging
+import io
+import pytest
+import re
+import types
+import six
+from _pytest import logging as _logging
+
+
+def test_default_log_format_includes_levelname_name_filename_lineno(tmp_path, testdir):
+    # Create a simple test file that emits an INFO log from a named logger.
+    test_file = testdir.makepyfile(
+        """
+        import logging
+        logger = logging.getLogger("mylogger")
+
+        def test_one():
+            logger.info("hello-from-logger")
+            assert True
+    """
+    )
+    # Run pytest with the default log format but enable INFO so it is shown.
+    result = testdir.runpytest("--log-level=INFO")
+    assert result.ret == 0
+    out = result.stdout.str()
+    # The default format should include the LEVELNAME, the logger name, the filename and the message.
+    # e.g. "INFO     mylogger:TESTFILE.py:5 hello-from-logger"
+    # Relax the check: require "INFO" then "mylogger" then the filename then the message.
+    filename = test_file.basename
+    assert "mylogger" in out
+    assert filename in out
+    assert "hello-from-logger" in out
+    # make sure levelname appears before the filename:linenumber pattern somewhere on the same line
+    # find a line that contains both the filename and the message and check it also contains INFO and logger name
+    found = False
+    for line in out.splitlines():
+        if filename in line and "hello-from-logger" in line:
+            assert "INFO" in line
+            assert "mylogger" in line
+            found = True
+            break
+    assert found, "expected an output line with filename, logger name, level and message"
+
+
+def test_log_file_default_format_writes_name_and_location(testdir, tmp_path):
+    # write a simple test that logs INFO; request a log file and ensure the output format includes logger name & filename
+    logfile = tmp_path / "pytest.log"
+    testdir.makepyfile(
+        """
+        import logging
+        logger = logging.getLogger("filelogger")
+        def test_file():
+            logger.info("filelog-message")
+    """
+    )
+    result = testdir.runpytest("--log-level=INFO", f"--log-file={str(logfile)}", "--log-file-level=INFO")
+    assert result.ret == 0
+    contents = logfile.read_text(encoding="utf-8")
+    assert "filelogger" in contents
+    assert "filelog-message" in contents
+    # filename should be present
+    assert "test_log_file_default_format_writes_name_and_location.py" in contents or "test_file" in contents or "test_log_file" in contents
+
+
+def test_get_actual_log_level_accepts_numeric_and_named_levels():
+    class DummyConfig:
+        def __init__(self, opt, ini):
+            self._opt = opt
+            self._ini = ini
+        def getoption(self, name):
+            return self._opt.get(name)
+        def getini(self, name):
+            return self._ini.get(name)
+    # numeric passed as string should be accepted and converted to int
+    cfg = DummyConfig({"log_level": "20"}, {})
+    lvl = _logging.get_actual_log_level(cfg, "log_level")
+    assert lvl == 20
+    # named level should be converted to its numeric equivalent
+    cfg = DummyConfig({"log_level": "INFO"}, {})
+    lvl = _logging.get_actual_log_level(cfg, "log_level")
+    assert lvl == logging.INFO
+
+
+def test_get_actual_log_level_raises_on_unknown_level():
+    class DummyConfig:
+        def getoption(self, name):
+            return "not-a-level"
+        def getini(self, name):
+            return None
+    cfg = DummyConfig()
+    with pytest.raises(pytest.UsageError):
+        _logging.get_actual_log_level(cfg, "log_level")
+
+
+def test_colored_level_formatter_applies_markup_for_levels():
+    # Create a terminal writer stub that wraps text so we can detect it's used
+    class DummyTerminalWriter:
+        def markup(self, text, **kwargs):
+            # represent the chosen styles in the output for detection
+            styles = ",".join(sorted(kwargs.keys()))
+            return f"[MARKED:{styles}]{text}[/MARKED:{styles}]"
+    fmt = "%(levelname)-8s %(message)s"
+    term = DummyTerminalWriter()
+    fmttr = _logging.ColoredLevelFormatter(term, fmt)
+    # create a LogRecord with ERROR level
+    rec = logging.LogRecord("mylogger", logging.ERROR, __file__, 123, "err-msg", (), None)
+    out = fmttr.format(rec)
+    # The output should include our markup wrapper around the levelname portion
+    assert "[MARKED" in out or "[MARKED:" in out
+    assert "err-msg" in out
+
+
+def test_get_option_ini_prefers_getoption_when_not_none():
+    class DummyConfig:
+        def __init__(self, option_value, ini_value):
+            self._option_value = option_value
+            self._ini_value = ini_value
+        def getoption(self, name):
+            return self._option_value
+        def getini(self, name):
+            return self._ini_value
+    cfg = DummyConfig("optval", "inival")
+    # get_option_ini should return the getoption value when it's truthy
+    assert _logging.get_option_ini(cfg, "x", "y") == "optval"
+    # If getoption returns None, should fall back to getini
+    cfg2 = DummyConfig(None, "inival2")
+    assert _logging.get_option_ini(cfg2, "x", "y") == "inival2"
+
+
+def test_catching_logs_adds_handler_and_restores_root_level():
+    root = logging.getLogger()
+    orig_level = root.level
+    handler = logging.StreamHandler(io.StringIO())
+    # ensure handler is not already present
+    if handler in root.handlers:
+        root.removeHandler(handler)
+    with _logging.catching_logs(handler, level=logging.DEBUG) as h:
+        # inside context, handler should be present and root level should be <= DEBUG
+        assert h is handler
+        assert handler in root.handlers
+        assert root.level <= logging.DEBUG
+    # after context manager, handler should be removed and root level restored
+    assert handler not in root.handlers
+    assert root.level == orig_level
+
+
+def test_logcapturefixture_records_record_tuples_messages_and_clear():
+    # Create a fake item with a catch_log_handler and catch_log_handlers mapping
+    class DummyItem(object):
+        pass
+    item = DummyItem()
+    handler = _logging.LogCaptureHandler()
+    item.catch_log_handler = handler
+    item.catch_log_handlers = {"call": handler}
+    fixture = _logging.LogCaptureFixture(item)
+    # Create a LogRecord and emit it
+    rec = logging.LogRecord("toklogger", logging.WARNING, __file__, 10, "warn-%s", ("X",), None)
+    handler.emit(rec)
+    # Ensure the fixture exposes the records/messages/tuples correctly
+    assert fixture.records  # non-empty
+    assert fixture.record_tuples == [("toklogger", logging.WARNING, "warn-X")]
+    assert fixture.messages == ["warn-X"]
+    # text is the formatted stream content
+    assert "warn-X" in fixture.text
+    # clear resets records and stream
+    fixture.clear()
+    assert fixture.records == []
+    assert fixture.text == ""
+
+def test_at_level_context_manager_restores_previous_logger_level():
+    logger_name = "some.unique.logger.for.test"
+    logger = logging.getLogger(logger_name)
+    orig = logger.level
+    fixture = _logging.LogCaptureFixture(object())
+    with fixture.at_level(logging.DEBUG, logger=logger_name):
+        assert logger.level == logging.DEBUG
+    # after context manager the logger level should be restored
+    assert logger.level == orig

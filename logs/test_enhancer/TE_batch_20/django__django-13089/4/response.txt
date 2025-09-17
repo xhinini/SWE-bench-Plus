@@ -1,0 +1,288 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify DatabaseCache._cull handles cases where the culling query returns no rows (fetchone() is None), when it returns an actual cache key, when cull frequency is zero (forcing clear), and that the correct SQL/parameters are used (including adapted datetime values and quoted table names). They exercise branches added by the patch that guards against None results from fetchone().
+test_code: |
+  from datetime import datetime
+  from unittest import mock
+  
+  from django.core.cache.backends import db as db_module
+  from django.core.cache.backends.db import DatabaseCache
+  from django.test import SimpleTestCase
+  
+  
+  class FakeOps:
+      def __init__(self):
+          # Return a quoted table name when asked to quote
+          self._quote = lambda name: '"%s"' % name
+      def quote_name(self, name):
+          return self._quote(name)
+      def adapt_datetimefield_value(self, value):
+          # Return a sentinel adapted value so we can assert it's used
+          return "ADAPTED-%s" % value.isoformat()
+      def cache_key_culling_sql(self):
+          # Return a SQL that, when formatted with the table, will be executed
+          # by _cull to obtain the culling boundary cache_key.
+          # Use %s in the returned string to mirror real implementation.
+          return "SELECT cache_key FROM %s ORDER BY cache_key LIMIT %%s"
+  
+  class FakeConnection:
+      def __init__(self):
+          self.ops = FakeOps()
+  
+  class FakeCursor:
+      def __init__(self, fetchone_value=None):
+          # record of (sql, params) calls
+          self.calls = []
+          # value to be returned by fetchone()
+          self._fetchone_value = fetchone_value
+          # make rowcount realistic for delete operations
+          self.rowcount = 0
+      def execute(self, sql, params=None):
+          self.calls.append((sql, params))
+          # Simulate DELETE affecting some rows when executed with the cache_key bound
+          if sql.strip().upper().startswith("DELETE FROM"):
+              # pretend one row deleted for visibility in tests
+              self.rowcount = 1
+      def fetchone(self):
+          return self._fetchone_value
+      # Context manager support
+      def __enter__(self):
+          return self
+      def __exit__(self, exc_type, exc, tb):
+          return False
+  
+  class CullTests(SimpleTestCase):
+      def setUp(self):
+          # Create a DatabaseCache instance with an arbitrary table name.
+          self.cache = DatabaseCache('test_table', params={})
+          # Ensure predictable behavior for tests
+          self.cache._max_entries = 10
+          self.cache._cull_frequency = 3
+  
+      def test_cull_no_last_cache_key_does_not_raise(self):
+          """
+          When cache_key_culling_sql yields no result (fetchone() is None),
+          _cull should not raise and should not attempt the final DELETE with
+          a None subscript (the original bug).
+          """
+          fake_conn = FakeConnection()
+          # Cursor will return num after SELECT COUNT(*) and None for cache key fetch.
+          # We simulate fetchone returns for the SELECT COUNT(*) as (5,) then None for
+          # the "cache_key culling" fetch. To emulate sequential fetchone() calls,
+          # we provide a cursor whose fetchone method we wrap.
+          class SeqCursor(FakeCursor):
+              def __init__(self):
+                  super().__init__(fetchone_value=(0,))
+                  self._seq = [(20,), None]  # First fetchone -> count, second -> None
+              def fetchone(self):
+                  return self._seq.pop(0) if self._seq else None
+          cursor = SeqCursor()
+  
+          # Patch the connections in the module to use our fake connection.
+          with mock.patch.object(db_module, 'connections', {'default': fake_conn}):
+              # Call _cull with db 'default', the cursor and a timestamp
+              now = datetime.utcnow()
+              # Should not raise
+              self.cache._cull('default', cursor, now)
+  
+          # Verify that cache_key_culling_sql was executed (the SELECT),
+          # but because fetchone() returned None, there should be no final DELETE
+          # using the fetched cache key parameter.
+          executed_sqls = [call[0] for call in cursor.calls]
+          # Ensure the culling SQL (SELECT cache_key) was executed
+          assert any("SELECT cache_key" in sql for sql in executed_sqls)
+          # Ensure no DELETE ... WHERE cache_key < %s was executed (final cull)
+          assert not any("WHERE cache_key <" in sql and "SELECT cache_key" not in sql for sql in executed_sqls)
+  
+      def test_cull_with_last_cache_key_executes_delete(self):
+          """
+          When cache_key_culling_sql returns a cache key, _cull should execute
+          the DELETE ... WHERE cache_key < %s with that key as parameter.
+          """
+          fake_conn = FakeConnection()
+          # Cursor: first fetchone -> count (50), then fetchone -> ('last-key',)
+          class SeqCursor(FakeCursor):
+              def __init__(self):
+                  super().__init__()
+                  self._seq = [(50,), ('last-key',)]
+              def fetchone(self):
+                  return self._seq.pop(0) if self._seq else None
+          cursor = SeqCursor()
+          # Ensure _max_entries triggers culling: num (50) > _max_entries (10)
+          self.cache._max_entries = 30
+          self.cache._cull_frequency = 2  # so cull_num = 50 // 2 = 25
+  
+          with mock.patch.object(db_module, 'connections', {'default': fake_conn}):
+              now = datetime.utcnow()
+              self.cache._cull('default', cursor, now)
+  
+          # After running, cursor.calls should contain a DELETE with "cache_key < %s"
+          delete_calls = [call for call in cursor.calls if call[0].strip().upper().startswith("DELETE FROM")]
+          # At least one DELETE should be present and one of them should be the final cull
+          assert delete_calls, "No DELETE calls executed"
+          assert any("WHERE cache_key < %s" in sql or "WHERE cache_key < %%s" in sql for sql, _ in delete_calls)
+          # Ensure the parameter passed on the final delete is 'last-key'
+          found = False
+          for sql, params in cursor.calls:
+              if "WHERE cache_key <" in sql and params:
+                  assert params[0] == 'last-key'
+                  found = True
+          assert found, "Final cull DELETE not executed with 'last-key'"
+  
+      def test_cull_with_empty_string_cache_key_deletes(self):
+          """
+          If the culling SELECT returns an empty string cache key (''), ensure
+          DELETE is still executed with that parameter.
+          """
+          fake_conn = FakeConnection()
+          class SeqCursor(FakeCursor):
+              def __init__(self):
+                  super().__init__()
+                  self._seq = [(100,), ('',)]
+              def fetchone(self):
+                  return self._seq.pop(0) if self._seq else None
+          cursor = SeqCursor()
+          self.cache._max_entries = 50
+          self.cache._cull_frequency = 2
+          with mock.patch.object(db_module, 'connections', {'default': fake_conn}):
+              now = datetime.utcnow()
+              self.cache._cull('default', cursor, now)
+          # Ensure the DELETE with cache_key < %s was executed and param is empty string
+          found = False
+          for sql, params in cursor.calls:
+              if "WHERE cache_key <" in sql:
+                  assert params is not None
+                  assert params[0] == ''
+                  found = True
+          assert found
+  
+      def test_cull_cull_frequency_zero_calls_clear(self):
+          """
+          If _cull_frequency == 0 the _cull implementation should call clear()
+          rather than performing culling SQL. Verify clear is called.
+          """
+          # Set cull_frequency to 0 to trigger clear()
+          self.cache._cull_frequency = 0
+          fake_conn = FakeConnection()
+          cursor = FakeCursor(fetchone_value=(0,))
+          # Monkeypatch clear to record calls
+          called = {}
+          def fake_clear():
+              called['cleared'] = True
+          self.cache.clear = fake_clear
+          with mock.patch.object(db_module, 'connections', {'default': fake_conn}):
+              now = datetime.utcnow()
+              self.cache._cull('default', cursor, now)
+          assert called.get('cleared', False) is True
+  
+      def test_cull_no_culling_when_num_not_greater_than_max_entries(self):
+          """
+          If after deleting expired entries the SELECT COUNT(*) returns a number
+          not greater than _max_entries, no culling SQL is executed.
+          """
+          fake_conn = FakeConnection()
+          class SeqCursor(FakeCursor):
+              def __init__(self):
+                  super().__init__()
+                  # After deleting expired entries, count is small (5)
+                  self._seq = [(5,)]
+              def fetchone(self):
+                  return self._seq.pop(0) if self._seq else (5,)
+          cursor = SeqCursor()
+          self.cache._max_entries = 10
+          self.cache._cull_frequency = 3
+          with mock.patch.object(db_module, 'connections', {'default': fake_conn}):
+              now = datetime.utcnow()
+              self.cache._cull('default', cursor, now)
+          # Ensure cache_key_culling_sql was not executed, because num <= _max_entries
+          executed_sqls = [call[0] for call in cursor.calls]
+          assert not any("SELECT cache_key" in sql for sql in executed_sqls)
+  
+      def test_cull_uses_adapted_datetime_value(self):
+          """
+          _cull must pass an adapted datetime value (via connection.ops.adapt_datetimefield_value)
+          when binding the 'now' parameter to the DELETE that removes expired rows.
+          """
+          fake_conn = FakeConnection()
+          cursor = FakeCursor(fetchone_value=(0,))
+          self.cache._max_entries = 0
+          self.cache._cull_frequency = 1
+          with mock.patch.object(db_module, 'connections', {'default': fake_conn}):
+              now = datetime(2000, 1, 1, 12, 0, 0)
+              self.cache._cull('default', cursor, now)
+          # The first DELETE should be the one removing expired rows and its params should contain the adapted value.
+          # Find first DELETE call and assert its parameter equals the adapt result.
+          delete_calls = [c for c in cursor.calls if c[0].strip().upper().startswith("DELETE FROM")]
+          assert delete_calls, "No DELETE calls performed"
+          first_delete_params = delete_calls[0][1]
+          assert first_delete_params is not None
+          assert first_delete_params[0] == fake_conn.ops.adapt_datetimefield_value(now)
+  
+      def test_cull_calls_cache_key_culling_sql_with_quoted_table(self):
+          """
+          Ensure the culling SQL used is derived from connection.ops.cache_key_culling_sql
+          and that the quoted table name (via ops.quote_name) is used.
+          """
+          fake_conn = FakeConnection()
+          # Return count prompting culling and a last key
+          class SeqCursor(FakeCursor):
+              def __init__(self):
+                  super().__init__()
+                  self._seq = [(100,), ('last-key',)]
+              def fetchone(self):
+                  return self._seq.pop(0) if self._seq else None
+          cursor = SeqCursor()
+          self.cache._max_entries = 10
+          self.cache._cull_frequency = 2
+          with mock.patch.object(db_module, 'connections', {'default': fake_conn}):
+              now = datetime.utcnow()
+              self.cache._cull('default', cursor, now)
+          # Verify that the cache_key_culling_sql string was used and the quoted
+          # table name appears in the SQL call.
+          assert any("SELECT cache_key" in sql and '"test_table"' in sql for sql, _ in cursor.calls)
+  
+      def test_cull_final_delete_uses_less_than_operator(self):
+          """
+          The final DELETE produced by culling should delete keys less than the
+          found cache_key (i.e., 'cache_key < %s').
+          """
+          fake_conn = FakeConnection()
+          class SeqCursor(FakeCursor):
+              def __init__(self):
+                  super().__init__()
+                  self._seq = [(100,), ('boundary-key',)]
+              def fetchone(self):
+                  return self._seq.pop(0) if self._seq else None
+          cursor = SeqCursor()
+          self.cache._max_entries = 10
+          self.cache._cull_frequency = 2
+          with mock.patch.object(db_module, 'connections', {'default': fake_conn}):
+              now = datetime.utcnow()
+              self.cache._cull('default', cursor, now)
+          # Ensure final cull DELETE contains "<" operator on cache_key
+          assert any("cache_key <" in sql for sql, _ in cursor.calls)
+  
+      def test_cull_noop_if_no_keys(self):
+          """
+          If there are no rows to cull (fetchone() for count returns 0),
+          culling SQL should not be executed.
+          """
+          fake_conn = FakeConnection()
+          class SeqCursor(FakeCursor):
+              def __init__(self):
+                  super().__init__()
+                  # count is zero
+                  self._seq = [(0,)]
+              def fetchone(self):
+                  return self._seq.pop(0) if self._seq else (0,)
+          cursor = SeqCursor()
+          self.cache._max_entries = 10
+          self.cache._cull_frequency = 2
+          with mock.patch.object(db_module, 'connections', {'default': fake_conn}):
+              now = datetime.utcnow()
+              self.cache._cull('default', cursor, now)
+          # No SELECT cache_key (culling SQL) should be executed because count <= _max_entries
+          assert not any("SELECT cache_key" in sql for sql, _ in cursor.calls)
+new_imports_code: |
+  from django.core.cache.backends import db as db_module
+  from django.core.cache.backends.db import DatabaseCache

@@ -1,0 +1,136 @@
+from django.db.models import Count, Value, CharField, F
+from django.db.models.functions import Upper
+from django.test import TestCase
+
+from .models import Article, Author, ChildArticle, OrderedByFArticle
+
+
+class GroupByOrderingRegressionTests(TestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.a1 = Article.objects.create(headline="Article 1", pub_date=None)
+        cls.a2 = Article.objects.create(headline="Article 2", pub_date=None)
+        cls.a3 = Article.objects.create(headline="Article 3", pub_date=None)
+        cls.a4 = Article.objects.create(headline="Article 4", pub_date=None)
+        cls.author_1 = Author.objects.create(name="Name 1")
+        cls.author_2 = Author.objects.create(name="Name 2")
+
+    def _group_by_clause(self, qs):
+        # Helper to extract the GROUP BY clause fragment and make comparisons easy.
+        sql = str(qs.query).upper()
+        gb_idx = sql.find('GROUP BY')
+        if gb_idx == -1:
+            return ''
+        # end at ORDER BY or HAVING or LIMIT/OFFSET tokens
+        end_idx = len(sql)
+        for token in ('HAVING', 'ORDER BY', 'LIMIT', 'OFFSET', 'SELECT', 'FROM'):
+            t = sql.find(token, gb_idx + 1)
+            if t != -1 and t < end_idx:
+                end_idx = t
+        return sql[gb_idx:end_idx]
+
+    def test_meta_ordering_does_not_inject_order_by_into_group_by(self):
+        """
+        If a model defines Meta.ordering, it should not cause unrelated
+        ordering expressions to be added to the GROUP BY clause.
+        """
+        qs = Article.objects.values('author').annotate(count=Count('author')).order_by('headline')
+        gb = self._group_by_clause(qs)
+        # Meta.ordering on Article includes pub_date and headline in the test models.
+        # The GROUP BY should only include the grouping keys (author) and not the
+        # model's Meta.ordering columns.
+        self.assertIn('AUTHOR', gb.upper())
+        self.assertNotIn('HEADLINE', gb.upper())
+
+    def test_explicit_values_group_by_includes_requested_field(self):
+        """
+        If a field is explicitly requested via values(), GROUP BY should
+        include that field even when ordering is applied.
+        """
+        qs = Article.objects.values('headline').annotate(cnt=Count('headline')).order_by('headline')
+        gb = self._group_by_clause(qs)
+        self.assertIn('HEADLINE', gb.upper())
+
+    def test_order_by_expression_does_not_leak_into_group_by_when_meta_ordering(self):
+        """
+        Ordering by an expression while the model has Meta.ordering should not
+        result in that expression's columns being added to GROUP BY.
+        """
+        qs = Article.objects.values('author').annotate(cnt=Count('author')).order_by(Upper('headline'))
+        gb = self._group_by_clause(qs)
+        self.assertIn('AUTHOR', gb.upper())
+        # Upper("headline") shouldn't force headline into GROUP BY when meta ordering is present.
+        self.assertNotIn('HEADLINE', gb.upper())
+
+    def test_explicit_values_with_expression_order_by_keeps_group_by_field(self):
+        """
+        When the values() explicitly requests a field that also appears in an
+        expression-based ORDER BY, the GROUP BY should still contain the
+        explicitly requested (resolved) column.
+        """
+        qs = Article.objects.values('headline').annotate(c=Count('headline')).order_by(Upper('headline'))
+        gb = self._group_by_clause(qs)
+        self.assertIn('HEADLINE', gb.upper())
+
+    def test_annotation_order_by_does_not_force_group_by_when_meta_ordering(self):
+        """
+        Ordering by an annotation that is not in the GROUP BY or VALUES should
+        not force inclusion of unrelated model ordering fields into GROUP BY.
+        """
+        qs = Article.objects.annotate(const=Value('x', output_field=CharField())).values('author').annotate(c=Count('author')).order_by('const')
+        gb = self._group_by_clause(qs)
+        self.assertIn('AUTHOR', gb.upper())
+        self.assertNotIn('PUB_DATE', gb.upper())
+        self.assertNotIn('HEADLINE', gb.upper())
+
+    def test_order_by_f_expression_duplicate_detection_and_group_by(self):
+        """
+        Ensure that F() expressions used for ordering are handled and do not
+        accidentally alter the GROUP BY when Meta.ordering is present.
+        """
+        qs = Article.objects.values('author').annotate(c=Count('author')).order_by(F('headline'))
+        gb = self._group_by_clause(qs)
+        self.assertIn('AUTHOR', gb.upper())
+        self.assertNotIn('HEADLINE', gb.upper())
+
+    def test_explicit_values_and_meta_ordering_combination(self):
+        """
+        Combination of explicit values() (which sets group_by to a list) and
+        model Meta.ordering should still yield GROUP BY with only the
+        requested values() columns.
+        """
+        qs = Article.objects.values('author', 'headline').annotate(c=Count('author')).order_by('headline')
+        gb = self._group_by_clause(qs)
+        # Both requested grouping keys must be present.
+        self.assertIn('AUTHOR', gb.upper())
+        self.assertIn('HEADLINE', gb.upper())
+
+    def test_order_by_raw_field_with_table_prefix_does_not_affect_group_by_unless_requested(self):
+        """
+        raw table-prefixed ORDER BY shouldn't leak into GROUP BY unless the
+        field is part of explicit grouping keys.
+        """
+        qs = Article.objects.values('author').annotate(c=Count('author')).extra(order_by=['ordering_article.headline'])
+        gb = self._group_by_clause(qs)
+        self.assertIn('AUTHOR', gb.upper())
+        # ordering_article.headline should not be part of GROUP BY implicitly.
+        self.assertNotIn('ORDERING_ARTICLE.HEADLINE', gb.upper())
+        self.assertNotIn('HEADLINE', gb.upper())
+
+    def test_childptr_ordering_with_default_ordering_does_not_alter_group_by(self):
+        """
+        Ordering by a pointer/key (e.g. article_ptr on ChildArticle) while
+        a model has default ordering should not cause unexpected GROUP BY
+        additions for unrelated annotations.
+        """
+        ca1 = ChildArticle.objects.create(headline='h2', pub_date=None, author=self.author_2)
+        ca2 = ChildArticle.objects.create(headline='h2', pub_date=None, author=self.author_1)
+        qs = ChildArticle.objects.values('author').annotate(c=Count('author')).order_by('article_ptr')
+        gb = self._group_by_clause(qs)
+        self.assertIn('AUTHOR', gb.upper())
+        # article_ptr ordering should not cause additional grouping columns unless requested.
+        self.assertNotIn('ARTICLE_PTR', gb.upper())
+
+new_imports_code: |
+  # No additional imports required.

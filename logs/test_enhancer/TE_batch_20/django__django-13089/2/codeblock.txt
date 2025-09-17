@@ -1,0 +1,181 @@
+from django.utils import timezone
+from django.core.cache.backends.db import DatabaseCache
+from django.test import TransactionTestCase, override_settings
+from django.utils import timezone
+from django.core.cache.backends.db import DatabaseCache
+
+
+class FakeCursor:
+    """
+    Simulates a DB cursor for DatabaseCache._cull:
+    - First fetchone() -> (count,)
+    - Second fetchone() -> last_cache_key (tuple) or None
+    Captures execute() calls into .executed list as (sql, params).
+    """
+    def __init__(self, count, last_fetchone):
+        # First fetchone returns rowcount tuple for SELECT COUNT(*)
+        self._fetchone_results = [(count,)]
+        # Second fetchone is result of cache_key_culling_sql query;
+        # can be None or a tuple like ('key',) or (None,)
+        self._fetchone_results.append(last_fetchone)
+        self.executed = []
+        self.rowcount = 0
+
+    def execute(self, sql, params=None):
+        # Record the SQL and parameters for inspection.
+        self.executed.append((sql, list(params) if params is not None else None))
+        # Simulate a DELETE affecting rows if it's the final cache_key < delete.
+        if 'cache_key <' in sql:
+            self.rowcount = 1
+
+    def fetchone(self):
+        if not self._fetchone_results:
+            return None
+        return self._fetchone_results.pop(0)
+
+@override_settings(CACHES={
+    'default': {
+        'BACKEND': 'django.core.cache.backends.db.DatabaseCache',
+        'LOCATION': 'test cache table',
+    }
+})
+class CullingRegressionTests(TransactionTestCase):
+    """
+    Tests for DatabaseCache._cull edge cases and regressions.
+    """
+    available_apps = ['cache']
+
+    def _make_cache(self):
+        # Construct a DatabaseCache instance; params may be empty.
+        return DatabaseCache('test cache table', {})
+
+    def test_cull_no_last_cache_key_does_not_attempt_final_delete(self):
+        cache = self._make_cache()
+        # Force culling to happen.
+        cache._max_entries = 10
+        cache._cull_frequency = 5
+        # Simulate many rows, but cache_key culling query returns no row (None).
+        fake = FakeCursor(count=100, last_fetchone=None)
+        # Should not raise
+        cache._cull('default', fake, timezone.now())
+        # Ensure cache_key_culling_sql was executed (params include cull_num), but no final cache_key < delete executed
+        executed_sqls = [sql for sql, params in fake.executed]
+        # There is a delete for expires < ... and a SELECT COUNT ... and a culling SQL.
+        # Final "DELETE ... WHERE cache_key < %s" should NOT be present.
+        final_delete_present = any('cache_key <' in sql for sql in executed_sqls)
+        self.assertFalse(final_delete_present)
+
+    def test_cull_with_last_cache_key_executes_final_delete(self):
+        cache = self._make_cache()
+        cache._max_entries = 10
+        cache._cull_frequency = 5
+        # Simulate many rows and a last cache key returned.
+        fake = FakeCursor(count=100, last_fetchone=('final-key',))
+        cache._cull('default', fake, timezone.now())
+        # Verify final delete executed with the expected parameter
+        found = [
+            params for sql, params in fake.executed
+            if sql and 'cache_key <' in sql
+        ]
+        self.assertEqual(len(found), 1)
+        # The params should contain the last cache key value
+        self.assertEqual(found[0], ['final-key'])
+
+    def test_cull_does_not_run_when_under_max_entries(self):
+        cache = self._make_cache()
+        cache._max_entries = 10
+        cache._cull_frequency = 5
+        # Simulate count lower than max_entries -> no culling SQL executed
+        fake = FakeCursor(count=5, last_fetchone=None)
+        cache._cull('default', fake, timezone.now())
+        # Only the delete expires and select count should have been executed (2 calls)
+        self.assertTrue(len(fake.executed) in (1, 2))
+        # Ensure culling SQL (which passes cull_num param) did not run
+        self.assertFalse(any(len(params) == 1 and isinstance(params[0], int) for sql, params in fake.executed if params))
+
+    def test_cull_calls_clear_when_cull_frequency_zero(self):
+        cache = self._make_cache()
+        cache._max_entries = -1  # ensure cull would be triggered
+        cache._cull_frequency = 0
+        fake = FakeCursor(count=100, last_fetchone=None)
+        # Monkeypatch clear to note invocation
+        called = {}
+        def fake_clear():
+            called['cleared'] = True
+        cache.clear = fake_clear
+        cache._cull('default', fake, timezone.now())
+        self.assertTrue(called.get('cleared', False))
+        # No cursor operations should have occurred because clear() is called early
+        self.assertEqual(fake.executed, [])
+
+    def test_cull_with_last_cache_key_none_tuple_executes_delete_with_none(self):
+        cache = self._make_cache()
+        cache._max_entries = 10
+        cache._cull_frequency = 5
+        # Simulate last_cache_key being (None,)
+        fake = FakeCursor(count=100, last_fetchone=(None,))
+        cache._cull('default', fake, timezone.now())
+        # Find any final delete and verify parameter is [None]
+        found = [
+            params for sql, params in fake.executed
+            if sql and 'cache_key <' in sql
+        ]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0], [None])
+
+    def test_cull_executes_cache_key_culling_sql_with_correct_cull_num(self):
+        cache = self._make_cache()
+        cache._max_entries = 10
+        cache._cull_frequency = 4
+        # num = 100 -> cull_num = 100 // 4 = 25
+        fake = FakeCursor(count=100, last_fetchone=None)
+        cache._cull('default', fake, timezone.now())
+        # Find the culling SQL execution entry by identifying an int param equal to cull_num
+        expected_cull_num = 100 // 4
+        found = [
+            params for sql, params in fake.executed
+            if params == [expected_cull_num]
+        ]
+        self.assertTrue(found, msg="Expected cull_num %r not found in executed statements: %r" % (expected_cull_num, fake.executed))
+
+    def test_cull_no_exception_on_repeated_no_last_key(self):
+        cache = self._make_cache()
+        cache._max_entries = 10
+        cache._cull_frequency = 5
+        # Run _cull multiple times with last_fetchone None to ensure stability
+        for _ in range(3):
+            fake = FakeCursor(count=100, last_fetchone=None)
+            cache._cull('default', fake, timezone.now())
+
+    def test_cull_operation_ordering(self):
+        cache = self._make_cache()
+        cache._max_entries = 10
+        cache._cull_frequency = 5
+        fake = FakeCursor(count=100, last_fetchone=('abc',))
+        cache._cull('default', fake, timezone.now())
+        # Expected sequence: delete expires < now, select count, cache_key_culling_sql, final delete cache_key <
+        sqls = [sql for sql, params in fake.executed]
+        # Basic sanity checks on ordering
+        self.assertTrue(any('expires' in (sql or '') for sql in sqls[0:2]))
+        # ensure cache_key_culling_sql (a SELECT-like statement from ops) occurred before the final delete
+        cull_index = next((i for i, sql in enumerate(sqls) if 'cache_key' in (sql or '') and '<' not in (sql or '')), None)
+        final_index = next((i for i, sql in enumerate(sqls) if 'cache_key <' in (sql or '')), None)
+        # Both should be present and cull_index should be before final_index
+        self.assertIsNotNone(cull_index)
+        self.assertIsNotNone(final_index)
+        self.assertLess(cull_index, final_index)
+
+    def test_cull_with_empty_string_last_key_deletes_with_empty_string(self):
+        cache = self._make_cache()
+        cache._max_entries = 10
+        cache._cull_frequency = 5
+        fake = FakeCursor(count=100, last_fetchone=('',))
+        cache._cull('default', fake, timezone.now())
+        found = [
+            params for sql, params in fake.executed
+            if sql and 'cache_key <' in sql
+        ]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0], [''])
+
+# End of tests

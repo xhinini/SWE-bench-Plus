@@ -1,0 +1,1594 @@
+## Overview
+You are an expert software engineer code assistant tasked with generating additional unit tests for a Python source file and its corresponding test file.
+
+Your objective is to add 10 regression tests that detect the bug which is resolved by the provided patch.
+
+
+### Guidelines:
+
+1. Analyze the Code: Examine the provided source code to understand its functionality, inputs, outputs, and core logic.
+2. Analyze the Patch: Examine the provided patch to understand the bug it fixes in the source code.
+3. Identify Test Cases: Develop a detailed list of test cases that will fully validate the provided patch.
+4. Add and Review Tests: Integrate individual tests ensuring they collectively cover all possible scenarios, including edge cases and exception handling.
+5. Maintain Consistency: Ensure new tests are consistent with the existing test suite in terms of style, naming conventions, and structure. Assume new tests are part of the same suite if a test suite exists.
+6. Acceptance Criteria: We want tests that would FAIL under the candidate model patch (if provided below) but PASS under the gold patch (provided below). Focus on assertions that reflect the intended API behavior, not implementation details.
+
+
+### Additional constraints:
+- Return only valid Python in the YAML fields; do not produce syntax errors.
+- Octal literals must use digits 0-7 only (e.g., 0o644). Do not generate invalid octal values like 0o800.
+
+## Source File
+Here is the source file `django/db/models/fields/json.py` that you will be writing tests against.
+We have manually added line numbers to assist in understanding the code coverage.
+These line numbers are not part of the original code.
+
+-----------------------------------------------------------
+1 import json
+2 
+3 from django import forms
+4 from django.core import checks, exceptions
+5 from django.db import NotSupportedError, connections, router
+6 from django.db.models import lookups
+7 from django.db.models.lookups import PostgresOperatorLookup, Transform
+8 from django.utils.translation import gettext_lazy as _
+9 
+10 from . import Field
+11 from .mixins import CheckFieldDefaultMixin
+12 
+13 __all__ = ['JSONField']
+14 
+15 
+16 class JSONField(CheckFieldDefaultMixin, Field):
+17     empty_strings_allowed = False
+18     description = _('A JSON object')
+19     default_error_messages = {
+20         'invalid': _('Value must be valid JSON.'),
+21     }
+22     _default_hint = ('dict', '{}')
+23 
+24     def __init__(
+25         self, verbose_name=None, name=None, encoder=None, decoder=None,
+26         **kwargs,
+27     ):
+28         if encoder and not callable(encoder):
+29             raise ValueError('The encoder parameter must be a callable object.')
+30         if decoder and not callable(decoder):
+31             raise ValueError('The decoder parameter must be a callable object.')
+32         self.encoder = encoder
+33         self.decoder = decoder
+34         super().__init__(verbose_name, name, **kwargs)
+35 
+36     def check(self, **kwargs):
+37         errors = super().check(**kwargs)
+38         databases = kwargs.get('databases') or []
+39         errors.extend(self._check_supported(databases))
+40         return errors
+41 
+42     def _check_supported(self, databases):
+43         errors = []
+44         for db in databases:
+45             if not router.allow_migrate_model(db, self.model):
+46                 continue
+47             connection = connections[db]
+48             if (
+49                 self.model._meta.required_db_vendor and
+50                 self.model._meta.required_db_vendor != connection.vendor
+51             ):
+52                 continue
+53             if not (
+54                 'supports_json_field' in self.model._meta.required_db_features or
+55                 connection.features.supports_json_field
+56             ):
+57                 errors.append(
+58                     checks.Error(
+59                         '%s does not support JSONFields.'
+60                         % connection.display_name,
+61                         obj=self.model,
+62                         id='fields.E180',
+63                     )
+64                 )
+65         return errors
+66 
+67     def deconstruct(self):
+68         name, path, args, kwargs = super().deconstruct()
+69         if self.encoder is not None:
+70             kwargs['encoder'] = self.encoder
+71         if self.decoder is not None:
+72             kwargs['decoder'] = self.decoder
+73         return name, path, args, kwargs
+74 
+75     def from_db_value(self, value, expression, connection):
+76         if value is None:
+77             return value
+78         # Some backends (SQLite at least) extract non-string values in their
+79         # SQL datatypes.
+80         if isinstance(expression, KeyTransform) and not isinstance(value, str):
+81             return value
+82         try:
+83             return json.loads(value, cls=self.decoder)
+84         except json.JSONDecodeError:
+85             return value
+86 
+87     def get_internal_type(self):
+88         return 'JSONField'
+89 
+90     def get_prep_value(self, value):
+91         if value is None:
+92             return value
+93         return json.dumps(value, cls=self.encoder)
+94 
+95     def get_transform(self, name):
+96         transform = super().get_transform(name)
+97         if transform:
+98             return transform
+99         return KeyTransformFactory(name)
+100 
+101     def validate(self, value, model_instance):
+102         super().validate(value, model_instance)
+103         try:
+104             json.dumps(value, cls=self.encoder)
+105         except TypeError:
+106             raise exceptions.ValidationError(
+107                 self.error_messages['invalid'],
+108                 code='invalid',
+109                 params={'value': value},
+110             )
+111 
+112     def value_to_string(self, obj):
+113         return self.value_from_object(obj)
+114 
+115     def formfield(self, **kwargs):
+116         return super().formfield(**{
+117             'form_class': forms.JSONField,
+118             'encoder': self.encoder,
+119             'decoder': self.decoder,
+120             **kwargs,
+121         })
+122 
+123 
+124 def compile_json_path(key_transforms, include_root=True):
+125     path = ['$'] if include_root else []
+126     for key_transform in key_transforms:
+127         try:
+128             num = int(key_transform)
+129         except ValueError:  # non-integer
+130             path.append('.')
+131             path.append(json.dumps(key_transform))
+132         else:
+133             path.append('[%s]' % num)
+134     return ''.join(path)
+135 
+136 
+137 class DataContains(PostgresOperatorLookup):
+138     lookup_name = 'contains'
+139     postgres_operator = '@>'
+140 
+141     def as_sql(self, compiler, connection):
+142         if not connection.features.supports_json_field_contains:
+143             raise NotSupportedError(
+144                 'contains lookup is not supported on this database backend.'
+145             )
+146         lhs, lhs_params = self.process_lhs(compiler, connection)
+147         rhs, rhs_params = self.process_rhs(compiler, connection)
+148         params = tuple(lhs_params) + tuple(rhs_params)
+149         return 'JSON_CONTAINS(%s, %s)' % (lhs, rhs), params
+150 
+151 
+152 class ContainedBy(PostgresOperatorLookup):
+153     lookup_name = 'contained_by'
+154     postgres_operator = '<@'
+155 
+156     def as_sql(self, compiler, connection):
+157         if not connection.features.supports_json_field_contains:
+158             raise NotSupportedError(
+159                 'contained_by lookup is not supported on this database backend.'
+160             )
+161         lhs, lhs_params = self.process_lhs(compiler, connection)
+162         rhs, rhs_params = self.process_rhs(compiler, connection)
+163         params = tuple(rhs_params) + tuple(lhs_params)
+164         return 'JSON_CONTAINS(%s, %s)' % (rhs, lhs), params
+165 
+166 
+167 class HasKeyLookup(PostgresOperatorLookup):
+168     logical_operator = None
+169 
+170     def as_sql(self, compiler, connection, template=None):
+171         # Process JSON path from the left-hand side.
+172         if isinstance(self.lhs, KeyTransform):
+173             lhs, lhs_params, lhs_key_transforms = self.lhs.preprocess_lhs(compiler, connection)
+174             lhs_json_path = compile_json_path(lhs_key_transforms)
+175         else:
+176             lhs, lhs_params = self.process_lhs(compiler, connection)
+177             lhs_json_path = '$'
+178         sql = template % lhs
+179         # Process JSON path from the right-hand side.
+180         rhs = self.rhs
+181         rhs_params = []
+182         if not isinstance(rhs, (list, tuple)):
+183             rhs = [rhs]
+184         for key in rhs:
+185             if isinstance(key, KeyTransform):
+186                 *_, rhs_key_transforms = key.preprocess_lhs(compiler, connection)
+187             else:
+188                 rhs_key_transforms = [key]
+189             rhs_params.append('%s%s' % (
+190                 lhs_json_path,
+191                 compile_json_path(rhs_key_transforms, include_root=False),
+192             ))
+193         # Add condition for each key.
+194         if self.logical_operator:
+195             sql = '(%s)' % self.logical_operator.join([sql] * len(rhs_params))
+196         return sql, tuple(lhs_params) + tuple(rhs_params)
+197 
+198     def as_mysql(self, compiler, connection):
+199         return self.as_sql(compiler, connection, template="JSON_CONTAINS_PATH(%s, 'one', %%s)")
+200 
+201     def as_oracle(self, compiler, connection):
+202         sql, params = self.as_sql(compiler, connection, template="JSON_EXISTS(%s, '%%s')")
+203         # Add paths directly into SQL because path expressions cannot be passed
+204         # as bind variables on Oracle.
+205         return sql % tuple(params), []
+206 
+207     def as_postgresql(self, compiler, connection):
+208         if isinstance(self.rhs, KeyTransform):
+209             *_, rhs_key_transforms = self.rhs.preprocess_lhs(compiler, connection)
+210             for key in rhs_key_transforms[:-1]:
+211                 self.lhs = KeyTransform(key, self.lhs)
+212             self.rhs = rhs_key_transforms[-1]
+213         return super().as_postgresql(compiler, connection)
+214 
+215     def as_sqlite(self, compiler, connection):
+216         return self.as_sql(compiler, connection, template='JSON_TYPE(%s, %%s) IS NOT NULL')
+217 
+218 
+219 class HasKey(HasKeyLookup):
+220     lookup_name = 'has_key'
+221     postgres_operator = '?'
+222     prepare_rhs = False
+223 
+224 
+225 class HasKeys(HasKeyLookup):
+226     lookup_name = 'has_keys'
+227     postgres_operator = '?&'
+228     logical_operator = ' AND '
+229 
+230     def get_prep_lookup(self):
+231         return [str(item) for item in self.rhs]
+232 
+233 
+234 class HasAnyKeys(HasKeys):
+235     lookup_name = 'has_any_keys'
+236     postgres_operator = '?|'
+237     logical_operator = ' OR '
+238 
+239 
+240 class JSONExact(lookups.Exact):
+241     can_use_none_as_rhs = True
+242 
+243     def process_lhs(self, compiler, connection):
+244         lhs, lhs_params = super().process_lhs(compiler, connection)
+245         if connection.vendor == 'sqlite':
+246             rhs, rhs_params = super().process_rhs(compiler, connection)
+247             if rhs == '%s' and rhs_params == [None]:
+248                 # Use JSON_TYPE instead of JSON_EXTRACT for NULLs.
+249                 lhs = "JSON_TYPE(%s, '$')" % lhs
+250         return lhs, lhs_params
+251 
+252     def process_rhs(self, compiler, connection):
+253         rhs, rhs_params = super().process_rhs(compiler, connection)
+254         # Treat None lookup values as null.
+255         if rhs == '%s' and rhs_params == [None]:
+256             rhs_params = ['null']
+257         if connection.vendor == 'mysql':
+258             func = ["JSON_EXTRACT(%s, '$')"] * len(rhs_params)
+259             rhs = rhs % tuple(func)
+260         return rhs, rhs_params
+261 
+262 
+263 JSONField.register_lookup(DataContains)
+264 JSONField.register_lookup(ContainedBy)
+265 JSONField.register_lookup(HasKey)
+266 JSONField.register_lookup(HasKeys)
+267 JSONField.register_lookup(HasAnyKeys)
+268 JSONField.register_lookup(JSONExact)
+269 
+270 
+271 class KeyTransform(Transform):
+272     postgres_operator = '->'
+273     postgres_nested_operator = '#>'
+274 
+275     def __init__(self, key_name, *args, **kwargs):
+276         super().__init__(*args, **kwargs)
+277         self.key_name = str(key_name)
+278 
+279     def preprocess_lhs(self, compiler, connection):
+280         key_transforms = [self.key_name]
+281         previous = self.lhs
+282         while isinstance(previous, KeyTransform):
+283             key_transforms.insert(0, previous.key_name)
+284             previous = previous.lhs
+285         lhs, params = compiler.compile(previous)
+286         if connection.vendor == 'oracle':
+287             # Escape string-formatting.
+288             key_transforms = [key.replace('%', '%%') for key in key_transforms]
+289         return lhs, params, key_transforms
+290 
+291     def as_mysql(self, compiler, connection):
+292         lhs, params, key_transforms = self.preprocess_lhs(compiler, connection)
+293         json_path = compile_json_path(key_transforms)
+294         return 'JSON_EXTRACT(%s, %%s)' % lhs, tuple(params) + (json_path,)
+295 
+296     def as_oracle(self, compiler, connection):
+297         lhs, params, key_transforms = self.preprocess_lhs(compiler, connection)
+298         json_path = compile_json_path(key_transforms)
+299         return (
+300             "COALESCE(JSON_QUERY(%s, '%s'), JSON_VALUE(%s, '%s'))" %
+301             ((lhs, json_path) * 2)
+302         ), tuple(params) * 2
+303 
+304     def as_postgresql(self, compiler, connection):
+305         lhs, params, key_transforms = self.preprocess_lhs(compiler, connection)
+306         if len(key_transforms) > 1:
+307             sql = '(%s %s %%s)' % (lhs, self.postgres_nested_operator)
+308             return sql, tuple(params) + (key_transforms,)
+309         try:
+310             lookup = int(self.key_name)
+311         except ValueError:
+312             lookup = self.key_name
+313         return '(%s %s %%s)' % (lhs, self.postgres_operator), tuple(params) + (lookup,)
+314 
+315     def as_sqlite(self, compiler, connection):
+316         lhs, params, key_transforms = self.preprocess_lhs(compiler, connection)
+317         json_path = compile_json_path(key_transforms)
+318         return 'JSON_EXTRACT(%s, %%s)' % lhs, tuple(params) + (json_path,)
+319 
+320 
+321 class KeyTextTransform(KeyTransform):
+322     postgres_operator = '->>'
+323     postgres_nested_operator = '#>>'
+324 
+325 
+326 class KeyTransformTextLookupMixin:
+327     """
+328     Mixin for combining with a lookup expecting a text lhs from a JSONField
+329     key lookup. On PostgreSQL, make use of the ->> operator instead of casting
+330     key values to text and performing the lookup on the resulting
+331     representation.
+332     """
+333     def __init__(self, key_transform, *args, **kwargs):
+334         if not isinstance(key_transform, KeyTransform):
+335             raise TypeError(
+336                 'Transform should be an instance of KeyTransform in order to '
+337                 'use this lookup.'
+338             )
+339         key_text_transform = KeyTextTransform(
+340             key_transform.key_name, *key_transform.source_expressions,
+341             **key_transform.extra,
+342         )
+343         super().__init__(key_text_transform, *args, **kwargs)
+344 
+345 
+346 class CaseInsensitiveMixin:
+347     """
+348     Mixin to allow case-insensitive comparison of JSON values on MySQL.
+349     MySQL handles strings used in JSON context using the utf8mb4_bin collation.
+350     Because utf8mb4_bin is a binary collation, comparison of JSON values is
+351     case-sensitive.
+352     """
+353     def process_lhs(self, compiler, connection):
+354         lhs, lhs_params = super().process_lhs(compiler, connection)
+355         if connection.vendor == 'mysql':
+356             return 'LOWER(%s)' % lhs, lhs_params
+357         return lhs, lhs_params
+358 
+359     def process_rhs(self, compiler, connection):
+360         rhs, rhs_params = super().process_rhs(compiler, connection)
+361         if connection.vendor == 'mysql':
+362             return 'LOWER(%s)' % rhs, rhs_params
+363         return rhs, rhs_params
+364 
+365 
+366 class KeyTransformIsNull(lookups.IsNull):
+367     # key__isnull=False is the same as has_key='key'
+368     def as_oracle(self, compiler, connection):
+369         sql, params = HasKey(
+370             self.lhs.lhs,
+371             self.lhs.key_name,
+372         ).as_oracle(compiler, connection)
+373         if not self.rhs:
+374             return sql, params
+375         # Column doesn't have a key or IS NULL.
+376         lhs, lhs_params, _ = self.lhs.preprocess_lhs(compiler, connection)
+377         return '(NOT %s OR %s IS NULL)' % (sql, lhs), tuple(params) + tuple(lhs_params)
+378 
+379     def as_sqlite(self, compiler, connection):
+380         template = 'JSON_TYPE(%s, %%s) IS NULL'
+381         if not self.rhs:
+382             template = 'JSON_TYPE(%s, %%s) IS NOT NULL'
+383         return HasKey(self.lhs.lhs, self.lhs.key_name).as_sql(
+384             compiler,
+385             connection,
+386             template=template,
+387         )
+388 
+389 
+390 class KeyTransformIn(lookups.In):
+391     def resolve_expression_parameter(self, compiler, connection, sql, param):
+392         sql, params = super().resolve_expression_parameter(
+393             compiler, connection, sql, param,
+394         )
+395         if (
+396             not hasattr(param, 'as_sql') and
+397             not connection.features.has_native_json_field
+398         ):
+399             if connection.vendor == 'oracle':
+400                 value = json.loads(param)
+401                 sql = "%s(JSON_OBJECT('value' VALUE %%s FORMAT JSON), '$.value')"
+402                 if isinstance(value, (list, dict)):
+403                     sql = sql % 'JSON_QUERY'
+404                 else:
+405                     sql = sql % 'JSON_VALUE'
+406             elif connection.vendor in {'sqlite', 'mysql'}:
+407                 sql = "JSON_EXTRACT(%s, '$')"
+408         if connection.vendor == 'mysql' and connection.mysql_is_mariadb:
+409             sql = 'JSON_UNQUOTE(%s)' % sql
+410         return sql, params
+411 
+412 
+413 class KeyTransformExact(JSONExact):
+414     def process_lhs(self, compiler, connection):
+415         lhs, lhs_params = super().process_lhs(compiler, connection)
+416         if connection.vendor == 'sqlite':
+417             rhs, rhs_params = super().process_rhs(compiler, connection)
+418             if rhs == '%s' and rhs_params == ['null']:
+419                 lhs, *_ = self.lhs.preprocess_lhs(compiler, connection)
+420                 lhs = 'JSON_TYPE(%s, %%s)' % lhs
+421         return lhs, lhs_params
+422 
+423     def process_rhs(self, compiler, connection):
+424         if isinstance(self.rhs, KeyTransform):
+425             return super(lookups.Exact, self).process_rhs(compiler, connection)
+426         rhs, rhs_params = super().process_rhs(compiler, connection)
+427         if connection.vendor == 'oracle':
+428             func = []
+429             sql = "%s(JSON_OBJECT('value' VALUE %%s FORMAT JSON), '$.value')"
+430             for value in rhs_params:
+431                 value = json.loads(value)
+432                 if isinstance(value, (list, dict)):
+433                     func.append(sql % 'JSON_QUERY')
+434                 else:
+435                     func.append(sql % 'JSON_VALUE')
+436             rhs = rhs % tuple(func)
+437         elif connection.vendor == 'sqlite':
+438             func = ["JSON_EXTRACT(%s, '$')" if value != 'null' else '%s' for value in rhs_params]
+439             rhs = rhs % tuple(func)
+440         return rhs, rhs_params
+441 
+442     def as_oracle(self, compiler, connection):
+443         rhs, rhs_params = super().process_rhs(compiler, connection)
+444         if rhs_params == ['null']:
+445             # Field has key and it's NULL.
+446             has_key_expr = HasKey(self.lhs.lhs, self.lhs.key_name)
+447             has_key_sql, has_key_params = has_key_expr.as_oracle(compiler, connection)
+448             is_null_expr = self.lhs.get_lookup('isnull')(self.lhs, True)
+449             is_null_sql, is_null_params = is_null_expr.as_sql(compiler, connection)
+450             return (
+451                 '%s AND %s' % (has_key_sql, is_null_sql),
+452                 tuple(has_key_params) + tuple(is_null_params),
+453             )
+454         return super().as_sql(compiler, connection)
+455 
+456 
+457 class KeyTransformIExact(CaseInsensitiveMixin, KeyTransformTextLookupMixin, lookups.IExact):
+458     pass
+459 
+460 
+461 class KeyTransformIContains(CaseInsensitiveMixin, KeyTransformTextLookupMixin, lookups.IContains):
+462     pass
+463 
+464 
+465 class KeyTransformStartsWith(KeyTransformTextLookupMixin, lookups.StartsWith):
+466     pass
+467 
+468 
+469 class KeyTransformIStartsWith(CaseInsensitiveMixin, KeyTransformTextLookupMixin, lookups.IStartsWith):
+470     pass
+471 
+472 
+473 class KeyTransformEndsWith(KeyTransformTextLookupMixin, lookups.EndsWith):
+474     pass
+475 
+476 
+477 class KeyTransformIEndsWith(CaseInsensitiveMixin, KeyTransformTextLookupMixin, lookups.IEndsWith):
+478     pass
+479 
+480 
+481 class KeyTransformRegex(KeyTransformTextLookupMixin, lookups.Regex):
+482     pass
+483 
+484 
+485 class KeyTransformIRegex(CaseInsensitiveMixin, KeyTransformTextLookupMixin, lookups.IRegex):
+486     pass
+487 
+488 
+489 class KeyTransformNumericLookupMixin:
+490     def process_rhs(self, compiler, connection):
+491         rhs, rhs_params = super().process_rhs(compiler, connection)
+492         if not connection.features.has_native_json_field:
+493             rhs_params = [json.loads(value) for value in rhs_params]
+494         return rhs, rhs_params
+495 
+496 
+497 class KeyTransformLt(KeyTransformNumericLookupMixin, lookups.LessThan):
+498     pass
+499 
+500 
+501 class KeyTransformLte(KeyTransformNumericLookupMixin, lookups.LessThanOrEqual):
+502     pass
+503 
+504 
+505 class KeyTransformGt(KeyTransformNumericLookupMixin, lookups.GreaterThan):
+506     pass
+507 
+508 
+509 class KeyTransformGte(KeyTransformNumericLookupMixin, lookups.GreaterThanOrEqual):
+510     pass
+511 
+512 
+513 KeyTransform.register_lookup(KeyTransformIn)
+514 KeyTransform.register_lookup(KeyTransformExact)
+515 KeyTransform.register_lookup(KeyTransformIExact)
+516 KeyTransform.register_lookup(KeyTransformIsNull)
+517 KeyTransform.register_lookup(KeyTransformIContains)
+518 KeyTransform.register_lookup(KeyTransformStartsWith)
+519 KeyTransform.register_lookup(KeyTransformIStartsWith)
+520 KeyTransform.register_lookup(KeyTransformEndsWith)
+521 KeyTransform.register_lookup(KeyTransformIEndsWith)
+522 KeyTransform.register_lookup(KeyTransformRegex)
+523 KeyTransform.register_lookup(KeyTransformIRegex)
+524 
+525 KeyTransform.register_lookup(KeyTransformLt)
+526 KeyTransform.register_lookup(KeyTransformLte)
+527 KeyTransform.register_lookup(KeyTransformGt)
+528 KeyTransform.register_lookup(KeyTransformGte)
+529 
+530 
+531 class KeyTransformFactory:
+532 
+533     def __init__(self, key_name):
+534         self.key_name = key_name
+535 
+536     def __call__(self, *args, **kwargs):
+537         return KeyTransform(self.key_name, *args, **kwargs)
+-----------------------------------------------------------
+
+
+## Patch
+
+Here is the patch which is applied to the source file `django/db/models/fields/json.py` to fix a
+bug.
+
+-----------------------------------------------------------
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -366,14 +366,25 @@ def process_rhs(self, compiler, connection):
+ class KeyTransformIsNull(lookups.IsNull):
+     # key__isnull=False is the same as has_key='key'
+     def as_oracle(self, compiler, connection):
++        sql, params = HasKey(
++            self.lhs.lhs,
++            self.lhs.key_name,
++        ).as_oracle(compiler, connection)
+         if not self.rhs:
+-            return HasKey(self.lhs.lhs, self.lhs.key_name).as_oracle(compiler, connection)
+-        return super().as_sql(compiler, connection)
++            return sql, params
++        # Column doesn't have a key or IS NULL.
++        lhs, lhs_params, _ = self.lhs.preprocess_lhs(compiler, connection)
++        return '(NOT %s OR %s IS NULL)' % (sql, lhs), tuple(params) + tuple(lhs_params)
+ 
+     def as_sqlite(self, compiler, connection):
++        template = 'JSON_TYPE(%s, %%s) IS NULL'
+         if not self.rhs:
+-            return HasKey(self.lhs.lhs, self.lhs.key_name).as_sqlite(compiler, connection)
+-        return super().as_sql(compiler, connection)
++            template = 'JSON_TYPE(%s, %%s) IS NOT NULL'
++        return HasKey(self.lhs.lhs, self.lhs.key_name).as_sql(
++            compiler,
++            connection,
++            template=template,
++        )
+ 
+ 
+ class KeyTransformIn(lookups.In):
+
+-----------------------------------------------------------
+
+
+
+## Model Patch (candidate)
+
+Here is a candidate patch from a model-generated prediction ("model patch"). Prefer generating tests that would catch its deficiencies.
+
+-----------------------------------------------------------
+diff --git a/django/db/models/fields/json.py b/django/db/models/fields/json.py
+index 29c6ff0926..f5b6011509 100644
+--- a/django/db/models/fields/json.py
++++ b/django/db/models/fields/json.py
+@@ -366,14 +366,20 @@ class CaseInsensitiveMixin:
+ class KeyTransformIsNull(lookups.IsNull):
+     # key__isnull=False is the same as has_key='key'
+     def as_oracle(self, compiler, connection):
+-        if not self.rhs:
+-            return HasKey(self.lhs.lhs, self.lhs.key_name).as_oracle(compiler, connection)
+-        return super().as_sql(compiler, connection)
++        # For isnull=True, negate the HasKey lookup
++        # For isnull=False, use HasKey as before
++        sql, params = HasKey(self.lhs.lhs, self.lhs.key_name).as_oracle(compiler, connection)
++        if self.rhs:
++            sql = 'NOT (%s)' % sql
++        return sql, params
+ 
+     def as_sqlite(self, compiler, connection):
+-        if not self.rhs:
+-            return HasKey(self.lhs.lhs, self.lhs.key_name).as_sqlite(compiler, connection)
+-        return super().as_sql(compiler, connection)
++        # For isnull=True, negate the HasKey lookup
++        # For isnull=False, use HasKey as before
++        sql, params = HasKey(self.lhs.lhs, self.lhs.key_name).as_sqlite(compiler, connection)
++        if self.rhs:
++            sql = 'NOT (%s)' % sql
++        return sql, params
+ 
+ 
+ class KeyTransformIn(lookups.In):
+
+-----------------------------------------------------------
+
+
+## Test File
+Here is the file `tests/model_fields/test_jsonfield.py` that contains the existing tests.
+-----------------------------------------------------------
+import operator
+import uuid
+from unittest import mock
+
+from django import forms
+from django.core import serializers
+from django.core.exceptions import ValidationError
+from django.core.serializers.json import DjangoJSONEncoder
+from django.db import (
+    DataError, IntegrityError, NotSupportedError, OperationalError, connection,
+    models,
+)
+from django.db.models import (
+    Count, ExpressionWrapper, F, IntegerField, OuterRef, Q, Subquery,
+    Transform, Value,
+)
+from django.db.models.expressions import RawSQL
+from django.db.models.fields.json import (
+    KeyTextTransform, KeyTransform, KeyTransformFactory,
+    KeyTransformTextLookupMixin,
+)
+from django.db.models.functions import Cast
+from django.test import (
+    SimpleTestCase, TestCase, skipIfDBFeature, skipUnlessDBFeature,
+)
+from django.test.utils import CaptureQueriesContext
+
+from .models import (
+    CustomJSONDecoder, JSONModel, NullableJSONModel, RelatedJSONModel,
+)
+
+
+@skipUnlessDBFeature('supports_json_field')
+class JSONFieldTests(TestCase):
+    def test_invalid_value(self):
+        msg = 'is not JSON serializable'
+        with self.assertRaisesMessage(TypeError, msg):
+            NullableJSONModel.objects.create(value={
+                'uuid': uuid.UUID('d85e2076-b67c-4ee7-8c3a-2bf5a2cc2475'),
+            })
+
+    def test_custom_encoder_decoder(self):
+        value = {'uuid': uuid.UUID('{d85e2076-b67c-4ee7-8c3a-2bf5a2cc2475}')}
+        obj = NullableJSONModel(value_custom=value)
+        obj.clean_fields()
+        obj.save()
+        obj.refresh_from_db()
+        self.assertEqual(obj.value_custom, value)
+
+    def test_db_check_constraints(self):
+        value = '{@!invalid json value 123 $!@#'
+        with mock.patch.object(DjangoJSONEncoder, 'encode', return_value=value):
+            with self.assertRaises((IntegrityError, DataError, OperationalError)):
+                NullableJSONModel.objects.create(value_custom=value)
+
+
+class TestMethods(SimpleTestCase):
+    def test_deconstruct(self):
+        field = models.JSONField()
+        name, path, args, kwargs = field.deconstruct()
+        self.assertEqual(path, 'django.db.models.JSONField')
+        self.assertEqual(args, [])
+        self.assertEqual(kwargs, {})
+
+    def test_deconstruct_custom_encoder_decoder(self):
+        field = models.JSONField(encoder=DjangoJSONEncoder, decoder=CustomJSONDecoder)
+        name, path, args, kwargs = field.deconstruct()
+        self.assertEqual(kwargs['encoder'], DjangoJSONEncoder)
+        self.assertEqual(kwargs['decoder'], CustomJSONDecoder)
+
+    def test_get_transforms(self):
+        @models.JSONField.register_lookup
+        class MyTransform(Transform):
+            lookup_name = 'my_transform'
+        field = models.JSONField()
+        transform = field.get_transform('my_transform')
+        self.assertIs(transform, MyTransform)
+        models.JSONField._unregister_lookup(MyTransform)
+        models.JSONField._clear_cached_lookups()
+        transform = field.get_transform('my_transform')
+        self.assertIsInstance(transform, KeyTransformFactory)
+
+    def test_key_transform_text_lookup_mixin_non_key_transform(self):
+        transform = Transform('test')
+        msg = (
+            'Transform should be an instance of KeyTransform in order to use '
+            'this lookup.'
+        )
+        with self.assertRaisesMessage(TypeError, msg):
+            KeyTransformTextLookupMixin(transform)
+
+
+class TestValidation(SimpleTestCase):
+    def test_invalid_encoder(self):
+        msg = 'The encoder parameter must be a callable object.'
+        with self.assertRaisesMessage(ValueError, msg):
+            models.JSONField(encoder=DjangoJSONEncoder())
+
+    def test_invalid_decoder(self):
+        msg = 'The decoder parameter must be a callable object.'
+        with self.assertRaisesMessage(ValueError, msg):
+            models.JSONField(decoder=CustomJSONDecoder())
+
+    def test_validation_error(self):
+        field = models.JSONField()
+        msg = 'Value must be valid JSON.'
+        value = uuid.UUID('{d85e2076-b67c-4ee7-8c3a-2bf5a2cc2475}')
+        with self.assertRaisesMessage(ValidationError, msg):
+            field.clean({'uuid': value}, None)
+
+    def test_custom_encoder(self):
+        field = models.JSONField(encoder=DjangoJSONEncoder)
+        value = uuid.UUID('{d85e2076-b67c-4ee7-8c3a-2bf5a2cc2475}')
+        field.clean({'uuid': value}, None)
+
+
+class TestFormField(SimpleTestCase):
+    def test_formfield(self):
+        model_field = models.JSONField()
+        form_field = model_field.formfield()
+        self.assertIsInstance(form_field, forms.JSONField)
+
+    def test_formfield_custom_encoder_decoder(self):
+        model_field = models.JSONField(encoder=DjangoJSONEncoder, decoder=CustomJSONDecoder)
+        form_field = model_field.formfield()
+        self.assertIs(form_field.encoder, DjangoJSONEncoder)
+        self.assertIs(form_field.decoder, CustomJSONDecoder)
+
+
+class TestSerialization(SimpleTestCase):
+    test_data = (
+        '[{"fields": {"value": %s}, '
+        '"model": "model_fields.jsonmodel", "pk": null}]'
+    )
+    test_values = (
+        # (Python value, serialized value),
+        ({'a': 'b', 'c': None}, '{"a": "b", "c": null}'),
+        ('abc', '"abc"'),
+        ('{"a": "a"}', '"{\\"a\\": \\"a\\"}"'),
+    )
+
+    def test_dumping(self):
+        for value, serialized in self.test_values:
+            with self.subTest(value=value):
+                instance = JSONModel(value=value)
+                data = serializers.serialize('json', [instance])
+                self.assertJSONEqual(data, self.test_data % serialized)
+
+    def test_loading(self):
+        for value, serialized in self.test_values:
+            with self.subTest(value=value):
+                instance = list(
+                    serializers.deserialize('json', self.test_data % serialized)
+                )[0].object
+                self.assertEqual(instance.value, value)
+
+    def test_xml_serialization(self):
+        test_xml_data = (
+            '<django-objects version="1.0">'
+            '<object model="model_fields.nullablejsonmodel">'
+            '<field name="value" type="JSONField">%s'
+            '</field></object></django-objects>'
+        )
+        for value, serialized in self.test_values:
+            with self.subTest(value=value):
+                instance = NullableJSONModel(value=value)
+                data = serializers.serialize('xml', [instance], fields=['value'])
+                self.assertXMLEqual(data, test_xml_data % serialized)
+                new_instance = list(serializers.deserialize('xml', data))[0].object
+                self.assertEqual(new_instance.value, instance.value)
+
+
+@skipUnlessDBFeature('supports_json_field')
+class TestSaveLoad(TestCase):
+    def test_null(self):
+        obj = NullableJSONModel(value=None)
+        obj.save()
+        obj.refresh_from_db()
+        self.assertIsNone(obj.value)
+
+    @skipUnlessDBFeature('supports_primitives_in_json_field')
+    def test_json_null_different_from_sql_null(self):
+        json_null = NullableJSONModel.objects.create(value=Value('null'))
+        json_null.refresh_from_db()
+        sql_null = NullableJSONModel.objects.create(value=None)
+        sql_null.refresh_from_db()
+        # 'null' is not equal to NULL in the database.
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value=Value('null')),
+            [json_null],
+        )
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value=None),
+            [json_null],
+        )
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__isnull=True),
+            [sql_null],
+        )
+        # 'null' is equal to NULL in Python (None).
+        self.assertEqual(json_null.value, sql_null.value)
+
+    @skipUnlessDBFeature('supports_primitives_in_json_field')
+    def test_primitives(self):
+        values = [
+            True,
+            1,
+            1.45,
+            'String',
+            '',
+        ]
+        for value in values:
+            with self.subTest(value=value):
+                obj = JSONModel(value=value)
+                obj.save()
+                obj.refresh_from_db()
+                self.assertEqual(obj.value, value)
+
+    def test_dict(self):
+        values = [
+            {},
+            {'name': 'John', 'age': 20, 'height': 180.3},
+            {'a': True, 'b': {'b1': False, 'b2': None}},
+        ]
+        for value in values:
+            with self.subTest(value=value):
+                obj = JSONModel.objects.create(value=value)
+                obj.refresh_from_db()
+                self.assertEqual(obj.value, value)
+
+    def test_list(self):
+        values = [
+            [],
+            ['John', 20, 180.3],
+            [True, [False, None]],
+        ]
+        for value in values:
+            with self.subTest(value=value):
+                obj = JSONModel.objects.create(value=value)
+                obj.refresh_from_db()
+                self.assertEqual(obj.value, value)
+
+    def test_realistic_object(self):
+        value = {
+            'name': 'John',
+            'age': 20,
+            'pets': [
+                {'name': 'Kit', 'type': 'cat', 'age': 2},
+                {'name': 'Max', 'type': 'dog', 'age': 1},
+            ],
+            'courses': [
+                ['A1', 'A2', 'A3'],
+                ['B1', 'B2'],
+                ['C1'],
+            ],
+        }
+        obj = JSONModel.objects.create(value=value)
+        obj.refresh_from_db()
+        self.assertEqual(obj.value, value)
+
+
+@skipUnlessDBFeature('supports_json_field')
+class TestQuerying(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.primitives = [True, False, 'yes', 7, 9.6]
+        values = [
+            None,
+            [],
+            {},
+            {'a': 'b', 'c': 14},
+            {
+                'a': 'b',
+                'c': 14,
+                'd': ['e', {'f': 'g'}],
+                'h': True,
+                'i': False,
+                'j': None,
+                'k': {'l': 'm'},
+                'n': [None],
+                'o': '"quoted"',
+                'p': 4.2,
+            },
+            [1, [2]],
+            {'k': True, 'l': False, 'foo': 'bax'},
+            {
+                'foo': 'bar',
+                'baz': {'a': 'b', 'c': 'd'},
+                'bar': ['foo', 'bar'],
+                'bax': {'foo': 'bar'},
+            },
+        ]
+        cls.objs = [
+            NullableJSONModel.objects.create(value=value)
+            for value in values
+        ]
+        if connection.features.supports_primitives_in_json_field:
+            cls.objs.extend([
+                NullableJSONModel.objects.create(value=value)
+                for value in cls.primitives
+            ])
+        cls.raw_sql = '%s::jsonb' if connection.vendor == 'postgresql' else '%s'
+
+    def test_exact(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__exact={}),
+            [self.objs[2]],
+        )
+
+    def test_exact_complex(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__exact={'a': 'b', 'c': 14}),
+            [self.objs[3]],
+        )
+
+    def test_isnull(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__isnull=True),
+            [self.objs[0]],
+        )
+
+    def test_ordering_by_transform(self):
+        mariadb = connection.vendor == 'mysql' and connection.mysql_is_mariadb
+        values = [
+            {'ord': 93, 'name': 'bar'},
+            {'ord': 22.1, 'name': 'foo'},
+            {'ord': -1, 'name': 'baz'},
+            {'ord': 21.931902, 'name': 'spam'},
+            {'ord': -100291029, 'name': 'eggs'},
+        ]
+        for field_name in ['value', 'value_custom']:
+            with self.subTest(field=field_name):
+                objs = [
+                    NullableJSONModel.objects.create(**{field_name: value})
+                    for value in values
+                ]
+                query = NullableJSONModel.objects.filter(
+                    **{'%s__name__isnull' % field_name: False},
+                ).order_by('%s__ord' % field_name)
+                expected = [objs[4], objs[2], objs[3], objs[1], objs[0]]
+                if mariadb or connection.vendor == 'oracle':
+                    # MariaDB and Oracle return JSON values as strings.
+                    expected = [objs[2], objs[4], objs[3], objs[1], objs[0]]
+                self.assertSequenceEqual(query, expected)
+
+    def test_ordering_grouping_by_key_transform(self):
+        base_qs = NullableJSONModel.objects.filter(value__d__0__isnull=False)
+        for qs in (
+            base_qs.order_by('value__d__0'),
+            base_qs.annotate(key=KeyTransform('0', KeyTransform('d', 'value'))).order_by('key'),
+        ):
+            self.assertSequenceEqual(qs, [self.objs[4]])
+        qs = NullableJSONModel.objects.filter(value__isnull=False)
+        self.assertQuerysetEqual(
+            qs.filter(value__isnull=False).annotate(
+                key=KeyTextTransform('f', KeyTransform('1', KeyTransform('d', 'value'))),
+            ).values('key').annotate(count=Count('key')).order_by('count'),
+            [(None, 0), ('g', 1)],
+            operator.itemgetter('key', 'count'),
+        )
+
+    def test_ordering_grouping_by_count(self):
+        qs = NullableJSONModel.objects.filter(
+            value__isnull=False,
+        ).values('value__d__0').annotate(count=Count('value__d__0')).order_by('count')
+        self.assertQuerysetEqual(qs, [0, 1], operator.itemgetter('count'))
+
+    def test_order_grouping_custom_decoder(self):
+        NullableJSONModel.objects.create(value_custom={'a': 'b'})
+        qs = NullableJSONModel.objects.filter(value_custom__isnull=False)
+        self.assertSequenceEqual(
+            qs.values(
+                'value_custom__a',
+            ).annotate(
+                count=Count('id'),
+            ).order_by('value_custom__a'),
+            [{'value_custom__a': 'b', 'count': 1}],
+        )
+
+    def test_key_transform_raw_expression(self):
+        expr = RawSQL(self.raw_sql, ['{"x": "bar"}'])
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__foo=KeyTransform('x', expr)),
+            [self.objs[7]],
+        )
+
+    def test_nested_key_transform_raw_expression(self):
+        expr = RawSQL(self.raw_sql, ['{"x": {"y": "bar"}}'])
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__foo=KeyTransform('y', KeyTransform('x', expr))),
+            [self.objs[7]],
+        )
+
+    def test_key_transform_expression(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__d__0__isnull=False).annotate(
+                key=KeyTransform('d', 'value'),
+                chain=KeyTransform('0', 'key'),
+                expr=KeyTransform('0', Cast('key', models.JSONField())),
+            ).filter(chain=F('expr')),
+            [self.objs[4]],
+        )
+
+    def test_key_transform_annotation_expression(self):
+        obj = NullableJSONModel.objects.create(value={'d': ['e', 'e']})
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__d__0__isnull=False).annotate(
+                key=F('value__d'),
+                chain=F('key__0'),
+                expr=Cast('key', models.JSONField()),
+            ).filter(chain=F('expr__1')),
+            [obj],
+        )
+
+    def test_nested_key_transform_expression(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__d__0__isnull=False).annotate(
+                key=KeyTransform('d', 'value'),
+                chain=KeyTransform('f', KeyTransform('1', 'key')),
+                expr=KeyTransform('f', KeyTransform('1', Cast('key', models.JSONField()))),
+            ).filter(chain=F('expr')),
+            [self.objs[4]],
+        )
+
+    def test_nested_key_transform_annotation_expression(self):
+        obj = NullableJSONModel.objects.create(
+            value={'d': ['e', {'f': 'g'}, {'f': 'g'}]},
+        )
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__d__0__isnull=False).annotate(
+                key=F('value__d'),
+                chain=F('key__1__f'),
+                expr=Cast('key', models.JSONField()),
+            ).filter(chain=F('expr__2__f')),
+            [obj],
+        )
+
+    def test_nested_key_transform_on_subquery(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__d__0__isnull=False).annotate(
+                subquery_value=Subquery(
+                    NullableJSONModel.objects.filter(pk=OuterRef('pk')).values('value')
+                ),
+                key=KeyTransform('d', 'subquery_value'),
+                chain=KeyTransform('f', KeyTransform('1', 'key')),
+            ).filter(chain='g'),
+            [self.objs[4]],
+        )
+
+    def test_expression_wrapper_key_transform(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.annotate(
+                expr=ExpressionWrapper(
+                    KeyTransform('c', 'value'),
+                    output_field=IntegerField(),
+                ),
+            ).filter(expr__isnull=False),
+            self.objs[3:5],
+        )
+
+    def test_has_key(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__has_key='a'),
+            [self.objs[3], self.objs[4]],
+        )
+
+    def test_has_key_null_value(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__has_key='j'),
+            [self.objs[4]],
+        )
+
+    def test_has_key_deep(self):
+        tests = [
+            (Q(value__baz__has_key='a'), self.objs[7]),
+            (Q(value__has_key=KeyTransform('a', KeyTransform('baz', 'value'))), self.objs[7]),
+            (Q(value__has_key=F('value__baz__a')), self.objs[7]),
+            (Q(value__has_key=KeyTransform('c', KeyTransform('baz', 'value'))), self.objs[7]),
+            (Q(value__has_key=F('value__baz__c')), self.objs[7]),
+            (Q(value__d__1__has_key='f'), self.objs[4]),
+            (
+                Q(value__has_key=KeyTransform('f', KeyTransform('1', KeyTransform('d', 'value')))),
+                self.objs[4],
+            ),
+            (Q(value__has_key=F('value__d__1__f')), self.objs[4]),
+        ]
+        for condition, expected in tests:
+            with self.subTest(condition=condition):
+                self.assertSequenceEqual(
+                    NullableJSONModel.objects.filter(condition),
+                    [expected],
+                )
+
+    def test_has_key_list(self):
+        obj = NullableJSONModel.objects.create(value=[{'a': 1}, {'b': 'x'}])
+        tests = [
+            Q(value__1__has_key='b'),
+            Q(value__has_key=KeyTransform('b', KeyTransform(1, 'value'))),
+            Q(value__has_key=KeyTransform('b', KeyTransform('1', 'value'))),
+            Q(value__has_key=F('value__1__b')),
+        ]
+        for condition in tests:
+            with self.subTest(condition=condition):
+                self.assertSequenceEqual(
+                    NullableJSONModel.objects.filter(condition),
+                    [obj],
+                )
+
+    def test_has_keys(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__has_keys=['a', 'c', 'h']),
+            [self.objs[4]],
+        )
+
+    def test_has_any_keys(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__has_any_keys=['c', 'l']),
+            [self.objs[3], self.objs[4], self.objs[6]],
+        )
+
+    @skipUnlessDBFeature('supports_json_field_contains')
+    def test_contains(self):
+        tests = [
+            ({}, self.objs[2:5] + self.objs[6:8]),
+            ({'baz': {'a': 'b', 'c': 'd'}}, [self.objs[7]]),
+            ({'baz': {'a': 'b'}}, [self.objs[7]]),
+            ({'baz': {'c': 'd'}}, [self.objs[7]]),
+            ({'k': True, 'l': False}, [self.objs[6]]),
+            ({'d': ['e', {'f': 'g'}]}, [self.objs[4]]),
+            ({'d': ['e']}, [self.objs[4]]),
+            ({'d': [{'f': 'g'}]}, [self.objs[4]]),
+            ([1, [2]], [self.objs[5]]),
+            ([1], [self.objs[5]]),
+            ([[2]], [self.objs[5]]),
+            ({'n': [None]}, [self.objs[4]]),
+            ({'j': None}, [self.objs[4]]),
+        ]
+        for value, expected in tests:
+            with self.subTest(value=value):
+                qs = NullableJSONModel.objects.filter(value__contains=value)
+                self.assertSequenceEqual(qs, expected)
+
+    @skipIfDBFeature('supports_json_field_contains')
+    def test_contains_unsupported(self):
+        msg = 'contains lookup is not supported on this database backend.'
+        with self.assertRaisesMessage(NotSupportedError, msg):
+            NullableJSONModel.objects.filter(
+                value__contains={'baz': {'a': 'b', 'c': 'd'}},
+            ).get()
+
+    @skipUnlessDBFeature(
+        'supports_primitives_in_json_field',
+        'supports_json_field_contains',
+    )
+    def test_contains_primitives(self):
+        for value in self.primitives:
+            with self.subTest(value=value):
+                qs = NullableJSONModel.objects.filter(value__contains=value)
+                self.assertIs(qs.exists(), True)
+
+    @skipUnlessDBFeature('supports_json_field_contains')
+    def test_contained_by(self):
+        qs = NullableJSONModel.objects.filter(value__contained_by={'a': 'b', 'c': 14, 'h': True})
+        self.assertSequenceEqual(qs, self.objs[2:4])
+
+    @skipIfDBFeature('supports_json_field_contains')
+    def test_contained_by_unsupported(self):
+        msg = 'contained_by lookup is not supported on this database backend.'
+        with self.assertRaisesMessage(NotSupportedError, msg):
+            NullableJSONModel.objects.filter(value__contained_by={'a': 'b'}).get()
+
+    def test_deep_values(self):
+        qs = NullableJSONModel.objects.values_list('value__k__l')
+        expected_objs = [(None,)] * len(self.objs)
+        expected_objs[4] = ('m',)
+        self.assertSequenceEqual(qs, expected_objs)
+
+    @skipUnlessDBFeature('can_distinct_on_fields')
+    def test_deep_distinct(self):
+        query = NullableJSONModel.objects.distinct('value__k__l').values_list('value__k__l')
+        self.assertSequenceEqual(query, [('m',), (None,)])
+
+    def test_isnull_key(self):
+        # key__isnull=False works the same as has_key='key'.
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__a__isnull=True),
+            self.objs[:3] + self.objs[5:],
+        )
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__j__isnull=True),
+            self.objs[:4] + self.objs[5:],
+        )
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__a__isnull=False),
+            [self.objs[3], self.objs[4]],
+        )
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__j__isnull=False),
+            [self.objs[4]],
+        )
+
+    def test_isnull_key_or_none(self):
+        obj = NullableJSONModel.objects.create(value={'a': None})
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(Q(value__a__isnull=True) | Q(value__a=None)),
+            self.objs[:3] + self.objs[5:] + [obj],
+        )
+
+    def test_none_key(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__j=None),
+            [self.objs[4]],
+        )
+
+    def test_none_key_exclude(self):
+        obj = NullableJSONModel.objects.create(value={'j': 1})
+        if connection.vendor == 'oracle':
+            # Oracle supports filtering JSON objects with NULL keys, but the
+            # current implementation doesn't support it.
+            self.assertSequenceEqual(
+                NullableJSONModel.objects.exclude(value__j=None),
+                self.objs[1:4] + self.objs[5:] + [obj],
+            )
+        else:
+            self.assertSequenceEqual(NullableJSONModel.objects.exclude(value__j=None), [obj])
+
+    def test_shallow_list_lookup(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__0=1),
+            [self.objs[5]],
+        )
+
+    def test_shallow_obj_lookup(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__a='b'),
+            [self.objs[3], self.objs[4]],
+        )
+
+    def test_obj_subquery_lookup(self):
+        qs = NullableJSONModel.objects.annotate(
+            field=Subquery(NullableJSONModel.objects.filter(pk=OuterRef('pk')).values('value')),
+        ).filter(field__a='b')
+        self.assertSequenceEqual(qs, [self.objs[3], self.objs[4]])
+
+    def test_deep_lookup_objs(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__k__l='m'),
+            [self.objs[4]],
+        )
+
+    def test_shallow_lookup_obj_target(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__k={'l': 'm'}),
+            [self.objs[4]],
+        )
+
+    def test_deep_lookup_array(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__1__0=2),
+            [self.objs[5]],
+        )
+
+    def test_deep_lookup_mixed(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__d__1__f='g'),
+            [self.objs[4]],
+        )
+
+    def test_deep_lookup_transform(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__c__gt=2),
+            [self.objs[3], self.objs[4]],
+        )
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__c__gt=2.33),
+            [self.objs[3], self.objs[4]],
+        )
+        self.assertIs(NullableJSONModel.objects.filter(value__c__lt=5).exists(), False)
+
+    def test_lookup_exclude(self):
+        tests = [
+            (Q(value__a='b'), [self.objs[0]]),
+            (Q(value__foo='bax'), [self.objs[0], self.objs[7]]),
+        ]
+        for condition, expected in tests:
+            self.assertSequenceEqual(
+                NullableJSONModel.objects.exclude(condition),
+                expected,
+            )
+            self.assertSequenceEqual(
+                NullableJSONModel.objects.filter(~condition),
+                expected,
+            )
+
+    def test_lookup_exclude_nonexistent_key(self):
+        # Values without the key are ignored.
+        condition = Q(value__foo='bax')
+        objs_with_value = [self.objs[6]]
+        objs_with_different_value = [self.objs[0], self.objs[7]]
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.exclude(condition),
+            objs_with_different_value,
+        )
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.exclude(~condition),
+            objs_with_value,
+        )
+        self.assertCountEqual(
+            NullableJSONModel.objects.filter(condition | ~condition),
+            objs_with_value + objs_with_different_value,
+        )
+        self.assertCountEqual(
+            NullableJSONModel.objects.exclude(condition & ~condition),
+            objs_with_value + objs_with_different_value,
+        )
+        # Add the __isnull lookup to get an exhaustive set.
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.exclude(condition & Q(value__foo__isnull=False)),
+            self.objs[0:6] + self.objs[7:],
+        )
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(condition & Q(value__foo__isnull=False)),
+            objs_with_value,
+        )
+
+    def test_usage_in_subquery(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(
+                id__in=NullableJSONModel.objects.filter(value__c=14),
+            ),
+            self.objs[3:5],
+        )
+
+    @skipUnlessDBFeature('supports_json_field_contains')
+    def test_array_key_contains(self):
+        tests = [
+            ([], [self.objs[7]]),
+            ('bar', [self.objs[7]]),
+            (['bar'], [self.objs[7]]),
+            ('ar', []),
+        ]
+        for value, expected in tests:
+            with self.subTest(value=value):
+                self.assertSequenceEqual(
+                    NullableJSONModel.objects.filter(value__bar__contains=value),
+                    expected,
+                )
+
+    def test_key_iexact(self):
+        self.assertIs(NullableJSONModel.objects.filter(value__foo__iexact='BaR').exists(), True)
+        self.assertIs(NullableJSONModel.objects.filter(value__foo__iexact='"BaR"').exists(), False)
+
+    def test_key_in(self):
+        tests = [
+            ('value__c__in', [14], self.objs[3:5]),
+            ('value__c__in', [14, 15], self.objs[3:5]),
+            ('value__0__in', [1], [self.objs[5]]),
+            ('value__0__in', [1, 3], [self.objs[5]]),
+            ('value__foo__in', ['bar'], [self.objs[7]]),
+            (
+                'value__foo__in',
+                [KeyTransform('foo', KeyTransform('bax', 'value'))],
+                [self.objs[7]],
+            ),
+            ('value__foo__in', [F('value__bax__foo')], [self.objs[7]]),
+            (
+                'value__foo__in',
+                [KeyTransform('foo', KeyTransform('bax', 'value')), 'baz'],
+                [self.objs[7]],
+            ),
+            ('value__foo__in', [F('value__bax__foo'), 'baz'], [self.objs[7]]),
+            ('value__foo__in', ['bar', 'baz'], [self.objs[7]]),
+            ('value__bar__in', [['foo', 'bar']], [self.objs[7]]),
+            ('value__bar__in', [['foo', 'bar'], ['a']], [self.objs[7]]),
+            ('value__bax__in', [{'foo': 'bar'}, {'a': 'b'}], [self.objs[7]]),
+        ]
+        for lookup, value, expected in tests:
+            with self.subTest(lookup=lookup, value=value):
+                self.assertSequenceEqual(
+                    NullableJSONModel.objects.filter(**{lookup: value}),
+                    expected,
+                )
+
+    def test_key_values(self):
+        qs = NullableJSONModel.objects.filter(value__h=True)
+        tests = [
+            ('value__a', 'b'),
+            ('value__c', 14),
+            ('value__d', ['e', {'f': 'g'}]),
+            ('value__h', True),
+            ('value__i', False),
+            ('value__j', None),
+            ('value__k', {'l': 'm'}),
+            ('value__n', [None]),
+            ('value__p', 4.2),
+        ]
+        for lookup, expected in tests:
+            with self.subTest(lookup=lookup):
+                self.assertEqual(qs.values_list(lookup, flat=True).get(), expected)
+
+    @skipUnlessDBFeature('supports_json_field_contains')
+    def test_key_contains(self):
+        self.assertIs(NullableJSONModel.objects.filter(value__foo__contains='ar').exists(), False)
+        self.assertIs(NullableJSONModel.objects.filter(value__foo__contains='bar').exists(), True)
+
+    def test_key_icontains(self):
+        self.assertIs(NullableJSONModel.objects.filter(value__foo__icontains='Ar').exists(), True)
+
+    def test_key_startswith(self):
+        self.assertIs(NullableJSONModel.objects.filter(value__foo__startswith='b').exists(), True)
+
+    def test_key_istartswith(self):
+        self.assertIs(NullableJSONModel.objects.filter(value__foo__istartswith='B').exists(), True)
+
+    def test_key_endswith(self):
+        self.assertIs(NullableJSONModel.objects.filter(value__foo__endswith='r').exists(), True)
+
+    def test_key_iendswith(self):
+        self.assertIs(NullableJSONModel.objects.filter(value__foo__iendswith='R').exists(), True)
+
+    def test_key_regex(self):
+        self.assertIs(NullableJSONModel.objects.filter(value__foo__regex=r'^bar$').exists(), True)
+
+    def test_key_iregex(self):
+        self.assertIs(NullableJSONModel.objects.filter(value__foo__iregex=r'^bAr$').exists(), True)
+
+    def test_key_quoted_string(self):
+        self.assertEqual(
+            NullableJSONModel.objects.filter(value__o='"quoted"').get(),
+            self.objs[4],
+        )
+
+    @skipUnlessDBFeature('has_json_operators')
+    def test_key_sql_injection(self):
+        with CaptureQueriesContext(connection) as queries:
+            self.assertIs(
+                NullableJSONModel.objects.filter(**{
+                    """value__test' = '"a"') OR 1 = 1 OR ('d""": 'x',
+                }).exists(),
+                False,
+            )
+        self.assertIn(
+            """."value" -> 'test'' = ''"a"'') OR 1 = 1 OR (''d') = '"x"' """,
+            queries[0]['sql'],
+        )
+
+    @skipIfDBFeature('has_json_operators')
+    def test_key_sql_injection_escape(self):
+        query = str(JSONModel.objects.filter(**{
+            """value__test") = '"a"' OR 1 = 1 OR ("d""": 'x',
+        }).query)
+        self.assertIn('"test\\"', query)
+        self.assertIn('\\"d', query)
+
+    def test_key_escape(self):
+        obj = NullableJSONModel.objects.create(value={'%total': 10})
+        self.assertEqual(NullableJSONModel.objects.filter(**{'value__%total': 10}).get(), obj)
+
+    def test_none_key_and_exact_lookup(self):
+        self.assertSequenceEqual(
+            NullableJSONModel.objects.filter(value__a='b', value__j=None),
+            [self.objs[4]],
+        )
+
+    def test_lookups_with_key_transform(self):
+        tests = (
+            ('value__baz__has_key', 'c'),
+            ('value__baz__has_keys', ['a', 'c']),
+            ('value__baz__has_any_keys', ['a', 'x']),
+            ('value__has_key', KeyTextTransform('foo', 'value')),
+        )
+        for lookup, value in tests:
+            with self.subTest(lookup=lookup):
+                self.assertIs(NullableJSONModel.objects.filter(
+                    **{lookup: value},
+                ).exists(), True)
+
+    @skipUnlessDBFeature('supports_json_field_contains')
+    def test_contains_contained_by_with_key_transform(self):
+        tests = [
+            ('value__d__contains', 'e'),
+            ('value__d__contains', [{'f': 'g'}]),
+            ('value__contains', KeyTransform('bax', 'value')),
+            ('value__contains', F('value__bax')),
+            ('value__baz__contains', {'a': 'b'}),
+            ('value__baz__contained_by', {'a': 'b', 'c': 'd', 'e': 'f'}),
+            (
+                'value__contained_by',
+                KeyTransform('x', RawSQL(
+                    self.raw_sql,
+                    ['{"x": {"a": "b", "c": 1, "d": "e"}}'],
+                )),
+            ),
+        ]
+        # For databases where {'f': 'g'} (without surrounding []) matches
+        # [{'f': 'g'}].
+        if not connection.features.json_key_contains_list_matching_requires_list:
+            tests.append(('value__d__contains', {'f': 'g'}))
+        for lookup, value in tests:
+            with self.subTest(lookup=lookup, value=value):
+                self.assertIs(NullableJSONModel.objects.filter(
+                    **{lookup: value},
+                ).exists(), True)
+
+    def test_join_key_transform_annotation_expression(self):
+        related_obj = RelatedJSONModel.objects.create(
+            value={'d': ['f', 'e']},
+            json_model=self.objs[4],
+        )
+        RelatedJSONModel.objects.create(
+            value={'d': ['e', 'f']},
+            json_model=self.objs[4],
+        )
+        self.assertSequenceEqual(
+            RelatedJSONModel.objects.annotate(
+                key=F('value__d'),
+                related_key=F('json_model__value__d'),
+                chain=F('key__1'),
+                expr=Cast('key', models.JSONField()),
+            ).filter(chain=F('related_key__0')),
+            [related_obj],
+        )
+
+-----------------------------------------------------------
+
+
+
+Example output:
+```yaml
+language: Python
+number_of_tests: ...
+test_behavior: ...
+test_code: ...
+new_imports_code: ..
+```
+
+The response should be only a valid YAML object, without any introduction text or follow-up text.
+
+Answer:
+```yaml
+"""

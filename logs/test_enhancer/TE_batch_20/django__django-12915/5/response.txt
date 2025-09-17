@@ -1,0 +1,302 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests assert that StaticFilesHandlerMixin.get_response_async uses asgiref.sync.sync_to_async to call the synchronous 'serve' method (and response_for_exception on Http404). The candidate model patch omitted using sync_to_async, so these tests will fail against the candidate patch and pass against the gold patch.
+test_code: |
+  import pytest
+  import types
+  from django.http import Http404
+  from django.contrib.staticfiles import handlers as handlers_module
+
+  # A minimal handler-like object using the mixin under test.
+  class DummyHandler(handlers_module.StaticFilesHandlerMixin):
+      def __init__(self):
+          # base_url is a 3-tuple-like parsed URL used by file_path/_should_handle.
+          # We only need base_url[2] for get_response/get_response_async usages below.
+          self.base_url = ('', '', '/static/')
+
+  @pytest.mark.asyncio
+  async def test_get_response_async_uses_sync_to_async_on_success(monkeypatch):
+      calls = []
+
+      def make_sync_to_async(calls):
+          def sync_to_async(func):
+              calls.append(('wrap', func))
+              async def wrapper(*args, **kwargs):
+                  calls.append(('call', func, args, kwargs))
+                  return func(*args, **kwargs)
+              return wrapper
+          return sync_to_async
+
+      monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+
+      handler = DummyHandler()
+      # serve returns a simple value to emulate a "served" response
+      handler.serve = lambda request: 'served-' + str(request)
+
+      result = await handler.get_response_async('REQ')
+      assert result == 'served-REQ'
+      # Ensure sync_to_async wrapped the serve function and the wrapper was called.
+      assert any(entry[0] == 'wrap' and entry[1] == handler.serve for entry in calls)
+      assert any(entry[0] == 'call' and entry[1] == handler.serve for entry in calls)
+
+  @pytest.mark.asyncio
+  async def test_get_response_async_uses_sync_to_async_for_http404(monkeypatch):
+      calls = []
+
+      def make_sync_to_async(calls, response_value='ERR'):
+          def sync_to_async(func):
+              calls.append(('wrap', func))
+              async def wrapper(*args, **kwargs):
+                  calls.append(('call', func, args, kwargs))
+                  # Call the actual function (may raise)
+                  return func(*args, **kwargs)
+              return wrapper
+          return sync_to_async
+
+      # Patch sync_to_async
+      monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+      # Patch response_for_exception to a simple function
+      def fake_response_for_exception(request, exc):
+          return 'handled-' + str(exc)
+      monkeypatch.setattr(handlers_module, 'response_for_exception', fake_response_for_exception)
+
+      handler = DummyHandler()
+
+      def serve_raises(request):
+          raise Http404('not found')
+
+      handler.serve = serve_raises
+
+      result = await handler.get_response_async('REQ')
+      assert result == 'handled-404: not found' or result == 'handled-Http404(\'not found\')' \
+             or result == 'handled-{}'.format(Http404('not found'))
+      # The precise string formatting of the Http404 in response_for_exception can vary,
+      # but the important assertion is that sync_to_async was used to wrap both calls
+      # (serve and response_for_exception) in the correct implementation.
+      wrapped_funcs = [entry[1] for entry in calls if entry[0] == 'wrap']
+      assert handler.serve in wrapped_funcs
+      assert handlers_module.response_for_exception in wrapped_funcs
+
+  @pytest.mark.asyncio
+  async def test_get_response_async_passes_request_to_wrapped_serve(monkeypatch):
+      calls = []
+
+      def make_sync_to_async(calls):
+          def sync_to_async(func):
+              async def wrapper(*args, **kwargs):
+                  calls.append((func, args, kwargs))
+                  return func(*args, **kwargs)
+              return wrapper
+          return sync_to_async
+
+      monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+
+      handler = DummyHandler()
+      handler.serve = lambda request: f"ok-{request}"
+
+      request_obj = object()
+      result = await handler.get_response_async(request_obj)
+      assert result == f"ok-{request_obj}"
+      # The wrapper should have been called with the request argument.
+      assert any(entry[0] == handler.serve and entry[1] == (request_obj,) for entry in calls)
+
+  @pytest.mark.asyncio
+  async def test_get_response_async_propagates_non_http404_and_uses_sync_to_async(monkeypatch):
+      calls = []
+
+      def make_sync_to_async(calls):
+          def sync_to_async(func):
+              async def wrapper(*args, **kwargs):
+                  calls.append(('call', func))
+                  return func(*args, **kwargs)
+              return wrapper
+          return sync_to_async
+
+      monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+
+      handler = DummyHandler()
+      class CustomError(RuntimeError):
+          pass
+
+      def serve_raise_custom(request):
+          raise CustomError('boom')
+
+      handler.serve = serve_raise_custom
+
+      with pytest.raises(CustomError):
+          await handler.get_response_async('REQ')
+
+      # Ensure we did wrap the serve function with sync_to_async
+      assert any(entry == ('call', handler.serve) for entry in calls)
+
+  @pytest.mark.asyncio
+  async def test_get_response_async_wraps_response_for_exception(monkeypatch):
+      calls = []
+
+      def make_sync_to_async(calls):
+          def sync_to_async(func):
+              calls.append(('wrap', func))
+              async def wrapper(*args, **kwargs):
+                  calls.append(('call', func))
+                  return func(*args, **kwargs)
+              return wrapper
+          return sync_to_async
+
+      monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+
+      # Replace the response_for_exception so we can recognize it was wrapped.
+      def fake_response_for_exception(request, exc):
+          return 'fake-exc'
+      monkeypatch.setattr(handlers_module, 'response_for_exception', fake_response_for_exception)
+
+      handler = DummyHandler()
+      def serve_raises(request):
+          raise Http404('not found')
+      handler.serve = serve_raises
+
+      result = await handler.get_response_async('REQ')
+      assert result == 'fake-exc'
+      wrapped = [f for tag, f in calls if tag == 'wrap']
+      assert handlers_module.response_for_exception in wrapped
+      assert handler.serve in wrapped
+
+  @pytest.mark.asyncio
+  async def test_get_response_async_called_multiple_times_uses_sync_to_async_each_time(monkeypatch):
+      calls = []
+
+      def make_sync_to_async(calls):
+          def sync_to_async(func):
+              calls.append(('wrap', func))
+              async def wrapper(*args, **kwargs):
+                  calls.append(('call', func))
+                  return func(*args, **kwargs)
+              return wrapper
+          return sync_to_async
+
+      monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+
+      handler = DummyHandler()
+      handler.serve = lambda request: f"ok-{request}"
+
+      # Call multiple times
+      r1 = await handler.get_response_async('A')
+      r2 = await handler.get_response_async('B')
+      assert r1 == 'ok-A' and r2 == 'ok-B'
+      # Should have wrapped serve multiple times (once per call)
+      wrap_entries = [entry for entry in calls if entry[0] == 'wrap' and entry[1] == handler.serve]
+      assert len(wrap_entries) >= 2
+
+  @pytest.mark.asyncio
+  async def test_get_response_async_with_unusual_request_object(monkeypatch):
+      calls = []
+
+      def make_sync_to_async(calls):
+          def sync_to_async(func):
+              calls.append(('wrap', func))
+              async def wrapper(*args, **kwargs):
+                  calls.append(('call', func, args))
+                  return func(*args, **kwargs)
+              return wrapper
+          return sync_to_async
+
+      monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+
+      handler = DummyHandler()
+      handler.serve = lambda req: ("served", req)
+
+      class WeirdReq:
+          def __repr__(self):
+              return "<weird>"
+
+      req = WeirdReq()
+      res = await handler.get_response_async(req)
+      assert res == ("served", req)
+      # wrapper invoked with the WeirdReq
+      assert any(entry[0] == 'call' and entry[1] == handler.serve and entry[2] == (req,) for entry in calls)
+
+  @pytest.mark.asyncio
+  async def test_get_response_async_does_not_suppress_errors_raised_by_response_for_exception_wrapper(monkeypatch):
+      calls = []
+
+      def make_sync_to_async(calls):
+          def sync_to_async(func):
+              calls.append(('wrap', func))
+              async def wrapper(*args, **kwargs):
+                  calls.append(('call', func))
+                  return func(*args, **kwargs)
+              return wrapper
+          return sync_to_async
+
+      monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+
+      # Make response_for_exception raise to ensure errors propagate
+      def bad_response_for_exception(request, exc):
+          raise RuntimeError("bad handler")
+      monkeypatch.setattr(handlers_module, 'response_for_exception', bad_response_for_exception)
+
+      handler = DummyHandler()
+      def serve_raises(request):
+          raise Http404('not found')
+      handler.serve = serve_raises
+
+      with pytest.raises(RuntimeError):
+          await handler.get_response_async('REQ')
+
+      # Ensure both serve and response_for_exception were wrapped
+      wrapped = [entry for entry in calls if entry[0] == 'wrap']
+      funcs = [f for _, f in wrapped]
+      assert handler.serve in funcs and handlers_module.response_for_exception in funcs
+
+  @pytest.mark.asyncio
+  async def test_get_response_async_called_on_different_handler_instances(monkeypatch):
+      calls = []
+
+      def make_sync_to_async(calls):
+          def sync_to_async(func):
+              calls.append(('wrap', func))
+              async def wrapper(*args, **kwargs):
+                  calls.append(('call', func, args))
+                  return func(*args, **kwargs)
+              return wrapper
+          return sync_to_async
+
+      monkeypatch.setattr(handlers_module, 'sync_to_async', make_sync_to_async(calls))
+
+      h1 = DummyHandler()
+      h2 = DummyHandler()
+      h1.serve = lambda r: 'h1-' + str(r)
+      h2.serve = lambda r: 'h2-' + str(r)
+
+      r1 = await h1.get_response_async('1')
+      r2 = await h2.get_response_async('2')
+      assert r1 == 'h1-1' and r2 == 'h2-2'
+      # Ensure wrappers for both serve functions were created and called.
+      wraps = [entry for entry in calls if entry[0] == 'wrap']
+      funcs_wrapped = [f for _, f in wraps]
+      assert h1.serve in funcs_wrapped and h2.serve in funcs_wrapped
+
+  @pytest.mark.asyncio
+  async def test_get_response_async_called_after_monkeypatching_back_original_sync_to_async(monkeypatch):
+      # Ensure the behavior still uses sync_to_async when it's the real function too.
+      # We monkeypatch to a wrapper that delegates to the real one but records usage.
+      real_sync = handlers_module.sync_to_async
+      calls = []
+
+      def recording_sync_to_async(func):
+          calls.append(('wrap', func))
+          wrapped = real_sync(func)
+          async def wrapper(*args, **kwargs):
+              calls.append(('call', func))
+              return await wrapped(*args, **kwargs)
+          return wrapper
+
+      monkeypatch.setattr(handlers_module, 'sync_to_async', recording_sync_to_async)
+
+      handler = DummyHandler()
+      handler.serve = lambda r: "ok-" + str(r)
+
+      res = await handler.get_response_async('X')
+      assert res == 'ok-X'
+      assert any(c[0] == 'wrap' and c[1] == handler.serve for c in calls)
+new_imports_code: |
+  # No additional imports required beyond what's in the test file.

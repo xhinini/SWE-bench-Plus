@@ -1,0 +1,155 @@
+import os
+import tempfile
+import shutil
+import stat
+from unittest import mock
+
+from django.core.files.uploadedfile import SimpleUploadedFile, TemporaryUploadedFile
+from django.core.files.storage import default_storage
+from django.test import SimpleTestCase
+
+class FileUploadPermissionsTests(SimpleTestCase):
+    def _write_and_save_simple(self, name='test.txt', content=b'hello'):
+        uploaded = SimpleUploadedFile(name, content)
+        saved_name = default_storage.save(name, uploaded)
+        saved_path = default_storage.path(saved_name)
+        return saved_name, saved_path
+
+    def _find_chmod_call_for(self, mock_chmod, target_name, expected_mode):
+        """Return True if mock_chmod was called for a path that endswith target_name
+        with the expected_mode (int)."""
+        for call in mock_chmod.call_args_list:
+            args, kwargs = call
+            if len(args) >= 2 and os.path.basename(args[0]) == os.path.basename(target_name):
+                if args[1] == expected_mode:
+                    return True
+        return False
+
+    def setUp(self):
+        # Create a temporary directory and patch MEDIA_ROOT so default_storage writes there.
+        self._tmpdir = tempfile.mkdtemp()
+        # Use the test case settings context manager to set MEDIA_ROOT in tests.
+        self._settings_cm = self.settings(MEDIA_ROOT=self._tmpdir)
+        self._settings_cm.__enter__()
+
+    def tearDown(self):
+        try:
+            self._settings_cm.__exit__(None, None, None)
+        finally:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_settings_default_value_is_0644(self):
+        # Ensure the setting on django.conf.settings is the expected default.
+        from django.conf import settings
+        self.assertEqual(getattr(settings, 'FILE_UPLOAD_PERMISSIONS'), 0o644)
+
+    def test_default_storage_has_file_permissions_mode_0644(self):
+        # The default_storage should reflect the default setting.
+        self.assertEqual(default_storage.file_permissions_mode, 0o644)
+
+    def test_chmod_called_on_save_simple_uploaded_file(self):
+        # Saving a simple uploaded file should attempt to chmod it to 0o644.
+        with mock.patch('os.chmod') as mock_chmod:
+            name, path = self._write_and_save_simple('a_simple.txt', b'content')
+            # Confirm that os.chmod was called for the saved file with 0o644.
+            self.assertTrue(
+                self._find_chmod_call_for(mock_chmod, path, 0o644),
+                msg="os.chmod was not called for the saved file with mode 0o644"
+            )
+
+    def test_chmod_called_on_save_temporary_uploaded_file(self):
+        # TemporaryUploadedFile simulates a large upload path. It should also be chmod'ed.
+        # Create a TemporaryUploadedFile and save via default_storage.
+        with mock.patch('os.chmod') as mock_chmod:
+            # Create a TemporaryUploadedFile on disk
+            temp = TemporaryUploadedFile('big.txt', 'text/plain', 1024, 'utf-8')
+            try:
+                temp.write(b'content' * 100)
+                temp.seek(0)
+                saved_name = default_storage.save('big.txt', temp)
+                saved_path = default_storage.path(saved_name)
+            finally:
+                temp.close()
+            self.assertTrue(
+                self._find_chmod_call_for(mock_chmod, saved_path, 0o644),
+                msg="os.chmod was not called for TemporaryUploadedFile with mode 0o644"
+            )
+
+    def test_override_file_upload_permissions_affects_chmod(self):
+        # Overriding FILE_UPLOAD_PERMISSIONS should make storage chmod with new value.
+        with self.settings(FILE_UPLOAD_PERMISSIONS=0o700):
+            # default_storage.file_permissions_mode reflects override
+            self.assertEqual(default_storage.file_permissions_mode, 0o700)
+            with mock.patch('os.chmod') as mock_chmod:
+                name, path = self._write_and_save_simple('override.txt', b'hi')
+                self.assertTrue(
+                    self._find_chmod_call_for(mock_chmod, path, 0o700),
+                    msg="os.chmod was not called for the saved file with overridden mode 0o700"
+                )
+
+    def test_none_file_upload_permissions_does_not_chmod(self):
+        # When FILE_UPLOAD_PERMISSIONS is explicitly None, storage should not call os.chmod for files.
+        with self.settings(FILE_UPLOAD_PERMISSIONS=None):
+            self.assertIsNone(default_storage.file_permissions_mode)
+            with mock.patch('os.chmod') as mock_chmod:
+                name, path = self._write_and_save_simple('nochmod.txt', b'nochmod')
+                # os.chmod may still be used elsewhere, but it must not be called for our saved file with a mode
+                # (i.e., there should be no call where the target filename matches and a mode is provided).
+                called_for_file = self._find_chmod_call_for(mock_chmod, path, None) or any(
+                    (len(call[0]) >= 2 and os.path.basename(call[0][0]) == os.path.basename(path))
+                    for call in mock_chmod.call_args_list
+                )
+                self.assertFalse(
+                    called_for_file,
+                    msg="os.chmod was unexpectedly called for saved file when FILE_UPLOAD_PERMISSIONS=None"
+                )
+
+    def test_saved_file_has_expected_permissions_on_disk(self):
+        # When file permissions are set, attempt to verify resulting mode on disk.
+        # Note: this is somewhat environment-dependent (umask), but in environments where
+        # the storage code explicitly chmods the file, the mode should match exactly.
+        with mock.patch('os.chmod') as mock_chmod:
+            name, path = self._write_and_save_simple('actual_mode.txt', b'abc')
+            # Ensure chmod was attempted with 0o644.
+            self.assertTrue(
+                self._find_chmod_call_for(mock_chmod, path, 0o644),
+                msg="os.chmod was not called for the saved file with mode 0o644"
+            )
+
+    def test_directory_permissions_mode_attribute_reflects_setting(self):
+        # The directory permissions attribute should reflect the setting.
+        from django.conf import settings
+        # Default in global settings is None
+        self.assertIsNone(getattr(settings, 'FILE_UPLOAD_DIRECTORY_PERMISSIONS'))
+        self.assertIsNone(default_storage.directory_permissions_mode)
+        # Override and check attribute reflection
+        with self.settings(FILE_UPLOAD_DIRECTORY_PERMISSIONS=0o700):
+            self.assertEqual(default_storage.directory_permissions_mode, 0o700)
+
+    def test_chmod_called_for_directory_when_directory_permissions_set(self):
+        # When FILE_UPLOAD_DIRECTORY_PERMISSIONS is set, saving into a nested directory
+        # should cause an attempt to chmod that directory as well as the file.
+        with self.settings(FILE_UPLOAD_DIRECTORY_PERMISSIONS=0o700):
+            with mock.patch('os.chmod') as mock_chmod:
+                nested_name = os.path.join('nested', 'dir', 'file.txt')
+                uploaded = SimpleUploadedFile('file.txt', b'content')
+                saved = default_storage.save(nested_name, uploaded)
+                saved_path = default_storage.path(saved)
+                # Look for a call that attempted to chmod the directory with 0o700.
+                found_dir_chmod = False
+                found_file_chmod = False
+                for call in mock_chmod.call_args_list:
+                    args, kwargs = call
+                    if len(args) >= 2:
+                        target, mode = args[0], args[1]
+                        if mode == 0o700:
+                            # whether file or directory, record found
+                            if os.path.basename(target) == 'file.txt':
+                                found_file_chmod = True
+                            else:
+                                # directory chmod call will have a different basename
+                                found_dir_chmod = True
+                self.assertTrue(found_file_chmod or found_dir_chmod,
+                                msg="os.chmod was not called for file or directory with mode 0o700")
+new_imports_code: |
+  # No new top-level imports required; tests import their own dependencies.

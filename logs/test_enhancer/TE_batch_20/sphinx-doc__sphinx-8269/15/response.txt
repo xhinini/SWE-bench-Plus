@@ -1,0 +1,235 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests instantiate the CheckExternalLinksBuilder with a minimal fake Sphinx app and
+  run its worker thread to process a single URI. The requests.get / requests.head calls
+  are patched to return controlled FakeResponse objects (with configurable status_code,
+  headers, iter_content, history, and request.method). The tests assert the (uri, status,
+  info, code) tuples produced by the worker thread (taken from the builder.rqueue). The
+  set of tests covers the specific bug fixed by the patch (ensuring HTTP error status is
+  raised before checking anchors), and also includes tests that would fail with the
+  "model patch" (which changed the HEAD/GET ordering and added a content-type check).
+test_code: |
+  import os
+  import tempfile
+  from pathlib import Path
+  from unittest import mock
+  import threading
+  import queue
+  import time
+  
+  import pytest
+  from requests.exceptions import HTTPError
+  
+  from sphinx.builders.linkcheck import CheckExternalLinksBuilder
+  
+  class DummyConfig:
+      def __init__(self):
+          self.linkcheck_ignore = []
+          self.linkcheck_anchors_ignore = ["^!"]
+          self.linkcheck_auth = []
+          self.linkcheck_request_headers = {}
+          self.linkcheck_retries = 1
+          self.linkcheck_timeout = None
+          self.linkcheck_workers = 1
+          self.linkcheck_anchors = True
+  
+  class DummyEnv:
+      def __init__(self):
+          self.found_docs = set(['doc'])
+      def doc2path(self, docname, None_):
+          return docname + '.rst'
+  
+  class DummyApp:
+      def __init__(self, outdir, srcdir):
+          self.outdir = outdir
+          self.srcdir = srcdir
+          self.env = DummyEnv()
+          self.config = DummyConfig()
+          self.statuscode = 0
+          self.quiet = False
+          self.warningiserror = False
+  
+  class FakeResponse:
+      def __init__(self, url, status_code=200, chunks=None, headers=None, history=None, final_url=None, request_method='GET'):
+          self.url = final_url or url
+          self.status_code = status_code
+          self._chunks = chunks or []
+          self.headers = headers or {}
+          self.history = history or []
+          self.request = mock.Mock()
+          self.request.method = request_method
+  
+      def iter_content(self, chunk_size=4096, decode_unicode=False):
+          for c in self._chunks:
+              yield c
+  
+      def raise_for_status(self):
+          if 400 <= self.status_code < 600:
+              resp = mock.Mock()
+              resp.status_code = self.status_code
+              raise HTTPError("HTTP error", response=resp)
+  
+  def run_single_check(uri, fake_get, fake_head, config_overrides=None):
+      # Create temporary directories for outdir/srcdir
+      tmpdir = tempfile.TemporaryDirectory()
+      outdir = Path(tmpdir.name) / "out"
+      srcdir = Path(tmpdir.name) / "src"
+      outdir.mkdir(parents=True)
+      srcdir.mkdir(parents=True)
+  
+      app = DummyApp(str(outdir), str(srcdir))
+      if config_overrides:
+          for k, v in config_overrides.items():
+              setattr(app.config, k, v)
+  
+      builder = CheckExternalLinksBuilder(app)
+      # Patch requests used in linkcheck module
+      patch_get = mock.patch('sphinx.builders.linkcheck.requests.get', side_effect=fake_get)
+      patch_head = mock.patch('sphinx.builders.linkcheck.requests.head', side_effect=fake_head)
+  
+      with patch_get as pg, patch_head as ph:
+          builder.init()
+          # enqueue one URI
+          builder.wqueue.put((uri, 'doc', 1), False)
+          # get the result from the worker's rqueue (with timeout to avoid hanging tests)
+          try:
+              result = builder.rqueue.get(timeout=2.0)
+          finally:
+              # stop worker thread(s)
+              builder.finish()
+              # small sleep to let thread exit
+              time.sleep(0.05)
+      tmpdir.cleanup()
+      return result
+  
+  def test_anchor_404_is_broken():
+      """If GET returns a 404 even if the body contains the anchor, it must be reported broken."""
+      def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+          # returns 404 but body contains the anchor '#a'
+          return FakeResponse(url, status_code=404, chunks=[b"<a id='a'>x</a>"], headers={'content-type': 'text/html'})
+      def fake_head(url, config=None, auth=None, **kwargs):
+          raise AssertionError("HEAD should not be called for anchor checks")
+  
+      uri = "https://example.com/page#a"
+      uri_with_hash = uri
+      (u, doc, lineno, status, info, code) = run_single_check(uri_with_hash, fake_get, fake_head)
+      assert u == uri_with_hash
+      # With the bug (no raise_for_status before anchor checking) this might be 'working'.
+      assert status == 'broken'
+      assert '404' in info
+  
+  def test_anchor_401_returns_unauthorized():
+      """HTTP 401 on GET should be treated as working (unauthorized)."""
+      def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+          return FakeResponse(url, status_code=401, chunks=[b"<div id='sec'>x</div>"], headers={'content-type': 'text/html'})
+      def fake_head(url, config=None, auth=None, **kwargs):
+          raise AssertionError("HEAD should not be called for anchor checks")
+  
+      uri = "https://example.com/page#sec"
+      (u, doc, lineno, status, info, code) = run_single_check(uri, fake_get, fake_head)
+      assert u == uri
+      assert status == 'working'
+      # The builder returns ' - unauthorized' as info for 401
+      assert 'unauthorized' in info.lower()
+  
+  def test_anchor_200_found_working():
+      """HTTP 200 with anchor present should be reported working."""
+      def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+          return FakeResponse(url, status_code=200, chunks=[b"<span id='found'>x</span>"], headers={'content-type': 'text/html'})
+      def fake_head(url, config=None, auth=None, **kwargs):
+          raise AssertionError("HEAD should not be called for anchor checks")
+  
+      uri = "https://example.com/ok#found"
+      (u, doc, lineno, status, info, code) = run_single_check(uri, fake_get, fake_head)
+      assert status == 'working'
+      assert info == ''
+  
+  def test_anchor_200_not_found_broken():
+      """HTTP 200 but anchor missing should be broken (Anchor 'x' not found)."""
+      def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+          return FakeResponse(url, status_code=200, chunks=[b"<html><body>No anchors here</body></html>"], headers={'content-type': 'text/html'})
+      def fake_head(url, config=None, auth=None, **kwargs):
+          raise AssertionError("HEAD should not be called for anchor checks")
+  
+      uri = "https://example.com/page#nope"
+      (u, doc, lineno, status, info, code) = run_single_check(uri, fake_get, fake_head)
+      assert status == 'broken'
+      assert "Anchor 'nope' not found" in info
+  
+  def test_redirect_with_anchor_reports_redirected_and_code():
+      """If a GET returns a final URL different from the requested one and there is history,
+         ensure redirected is returned with the anchor preserved and the code from history."""
+      def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+          hist = [mock.Mock(status_code=301)]
+          return FakeResponse(url, status_code=200, chunks=[b"<a id='end'>x</a>"], headers={'content-type': 'text/html'},
+                              history=hist, final_url='https://example.com/newpage')
+      def fake_head(url, config=None, auth=None, **kwargs):
+          raise AssertionError("HEAD should not be called for anchor checks")
+  
+      uri = "https://example.com/old#end"
+      (u, doc, lineno, status, info, code) = run_single_check(uri, fake_get, fake_head)
+      assert status == 'redirected'
+      # info should include the new URL with the anchor appended
+      assert 'https://example.com/newpage#end' in info
+  
+  def test_head_not_called_for_anchor():
+      """When there is an anchor, the code must not attempt a HEAD first (this is behavior the model-patch changed)."""
+      head_called = {'val': False}
+      def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+          return FakeResponse(url, status_code=200, chunks=[b"<div id='x'>ok</div>"], headers={'content-type': 'text/html'})
+      def fake_head(url, config=None, auth=None, **kwargs):
+          head_called['val'] = True
+          # If the implementation tries to call HEAD, make it obvious
+          raise AssertionError("HEAD was called but should not be for an anchor request")
+  
+      uri = "https://example.com/onlyanchor#x"
+      (u, doc, lineno, status, info, code) = run_single_check(uri, fake_get, fake_head)
+      assert status == 'working'
+      assert not head_called['val']
+  
+  def test_anchor_missing_no_content_type_should_be_broken():
+      """If there is no Content-Type header and the document is missing the anchor,
+         the builder must still search the content and report broken. The model-patch
+         introduced a content-type check that would incorrectly skip the anchor test."""
+      def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+          # no content-type header and no anchor in body
+          return FakeResponse(url, status_code=200, chunks=[b"<html><body>no anchor</body></html>"], headers={})
+      def fake_head(url, config=None, auth=None, **kwargs):
+          raise AssertionError("HEAD should not be called for anchor checks")
+  
+      uri = "https://example.com/notype#missing"
+      (u, doc, lineno, status, info, code) = run_single_check(uri, fake_get, fake_head)
+      # Gold patch: should be 'broken' because anchor not found.
+      # Model patch: might skip anchor check and return 'working' incorrectly.
+      assert status == 'broken'
+      assert "Anchor 'missing' not found" in info
+  
+  def test_bytes_chunk_decoding_for_anchor_detection():
+      """Ensure that bytes returned from iter_content are decoded and anchors are detected."""
+      def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+          # yield bytes which contain the anchor text
+          return FakeResponse(url, status_code=200, chunks=[b"<div id='bin'>", b"content</div>"], headers={'content-type': 'text/html'})
+      def fake_head(url, config=None, auth=None, **kwargs):
+          raise AssertionError("HEAD should not be called for anchor checks")
+  
+      uri = "https://example.com/bin#bin"
+      (u, doc, lineno, status, info, code) = run_single_check(uri, fake_get, fake_head)
+      assert status == 'working'
+      assert info == ''
+  
+  def test_anchor_404_results_in_broken_json_entry():
+      """Integration: ensure the worker reports 'broken' for 404+anchor; this also ensures
+         process_result formatting will consume such a result. We only assert the worker result here."""
+      def fake_get(url, stream=False, config=None, auth=None, **kwargs):
+          return FakeResponse(url, status_code=404, chunks=[b"<a id='x'>here</a>"], headers={'content-type': 'text/html'})
+      def fake_head(url, config=None, auth=None, **kwargs):
+          raise AssertionError("HEAD should not be called for anchor checks")
+  
+      uri = "https://example.com/404#x"
+      (u, doc, lineno, status, info, code) = run_single_check(uri, fake_get, fake_head)
+      assert status == 'broken'
+      assert '404' in info
+new_imports_code: |
+  import mock
+  from requests.exceptions import HTTPError

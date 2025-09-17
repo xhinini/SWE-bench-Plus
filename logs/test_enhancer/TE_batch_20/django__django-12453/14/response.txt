@@ -1,0 +1,249 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify deserialize_db_from_string() properly disables constraint checks during loading, calls connection.check_constraints(), wraps loading in a transaction (so partial saves are rolled back on error), and correctly handles forward and circular references. They will fail against the candidate patch which omits disabling constraint checks and the final check_constraints() call.
+test_code: |
+  from unittest import mock
+
+  from django.db import IntegrityError, connection, transaction
+  from django.test import SimpleTestCase
+
+  from ..models import Object, ObjectReference
+
+  class TestDeserializeDbFromStringRegression(SimpleTestCase):
+      databases = {'default'}
+
+      def setUp(self):
+          # Ensure a clean DB before each test
+          ObjectReference.objects.all().delete()
+          Object.objects.all().delete()
+
+      def test_child_before_parent_deserializes_successfully(self):
+          # Child (ObjectReference) appears before parent (Object). Should succeed.
+          data = """
+          [
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              },
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              }
+          ]
+          """
+          # Should not raise
+          connection.creation.deserialize_db_from_string(data)
+          self.assertEqual(Object.objects.count(), 1)
+          self.assertEqual(ObjectReference.objects.count(), 1)
+          obj = Object.objects.get()
+          obj_ref = ObjectReference.objects.get()
+          self.assertEqual(obj.obj_ref.pk, obj_ref.pk)
+          self.assertEqual(obj_ref.obj.pk, obj.pk)
+
+      def test_deserialize_with_missing_foreign_key_raises_integrity_error(self):
+          # ObjectReference references a non-existent Object -> should raise.
+          data = """
+          [
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 999}
+              }
+          ]
+          """
+          with self.assertRaises(IntegrityError):
+              connection.creation.deserialize_db_from_string(data)
+
+      def test_deserialize_failure_rolls_back_all_changes(self):
+          # Mixed payload: first valid object, then one referencing non-existent parent.
+          data = """
+          [
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 2, "related_objects": []}
+              },
+              {
+                  "model": "backends.objectreference",
+                  "pk": 2,
+                  "fields": {"obj": 999}
+              }
+          ]
+          """
+          # Ensure that a failure during deserialize leaves no partial data.
+          try:
+              connection.creation.deserialize_db_from_string(data)
+          except IntegrityError:
+              pass
+          # Nothing should have been persisted because the operation is atomic.
+          self.assertEqual(Object.objects.count(), 0)
+          self.assertEqual(ObjectReference.objects.count(), 0)
+
+      def test_check_constraints_and_context_manager_are_called(self):
+          # Ensure connection.constraint_checks_disabled() and check_constraints() are used.
+          data = """
+          [
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              },
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              }
+          ]
+          """
+          mock_check = mock.MagicMock()
+          # Create a fake context manager for constraint_checks_disabled
+          fake_ctx = mock.MagicMock()
+          fake_ctx.__enter__.return_value = None
+          fake_ctx.__exit__.return_value = None
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=fake_ctx) as mock_ctx_mgr:
+              with mock.patch.object(connection, 'check_constraints', mock_check):
+                  connection.creation.deserialize_db_from_string(data)
+                  # constraint_checks_disabled() should be called to obtain context manager
+                  mock_ctx_mgr.assert_called_once()
+                  # __enter__ should have been invoked
+                  fake_ctx.__enter__.assert_called_once()
+                  # After loading, check_constraints() must be called to validate
+                  mock_check.assert_called_once()
+
+      def test_constraint_checks_disabled_context_entered(self):
+          # Similar to above but explicitly assert __exit__ is invoked.
+          data = """
+          [
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              },
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              }
+          ]
+          """
+          fake_ctx = mock.MagicMock()
+          fake_ctx.__enter__.return_value = None
+          fake_ctx.__exit__.return_value = None
+          with mock.patch.object(connection, 'constraint_checks_disabled', return_value=fake_ctx):
+              connection.creation.deserialize_db_from_string(data)
+              # Ensure __exit__ was called (context manager cleaned up)
+              fake_ctx.__exit__.assert_called_once()
+
+      def test_serialize_then_deserialize_restores_data(self):
+          # Create some objects, serialize, delete, then deserialize and verify restore.
+          obj = Object.objects.create()
+          obj_ref = ObjectReference.objects.create(obj=obj)
+          obj.obj_ref = obj_ref
+          obj.save()
+
+          serialized = connection.creation.serialize_db_to_string()
+          # Delete everything
+          ObjectReference.objects.all().delete()
+          Object.objects.all().delete()
+          self.assertEqual(Object.objects.count(), 0)
+          self.assertEqual(ObjectReference.objects.count(), 0)
+
+          # Deserialize should restore both objects and relations
+          connection.creation.deserialize_db_from_string(serialized)
+          self.assertEqual(Object.objects.count(), 1)
+          self.assertEqual(ObjectReference.objects.count(), 1)
+          restored_obj = Object.objects.get()
+          restored_obj_ref = ObjectReference.objects.get()
+          self.assertEqual(restored_obj.obj_ref.pk, restored_obj_ref.pk)
+          self.assertEqual(restored_obj_ref.obj.pk, restored_obj.pk)
+
+      def test_deserialize_multiple_forward_references(self):
+          # Multiple forward references where children appear before parents.
+          data = """
+          [
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              },
+              {
+                  "model": "backends.objectreference",
+                  "pk": 2,
+                  "fields": {"obj": 2}
+              },
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              },
+              {
+                  "model": "backends.object",
+                  "pk": 2,
+                  "fields": {"obj_ref": 2, "related_objects": []}
+              }
+          ]
+          """
+          connection.creation.deserialize_db_from_string(data)
+          self.assertEqual(Object.objects.count(), 2)
+          self.assertEqual(ObjectReference.objects.count(), 2)
+
+      def test_deserialize_duplicate_pk_raises_integrity_error(self):
+          # Two objects with the same primary key should result in an IntegrityError.
+          data = """
+          [
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              },
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              }
+          ]
+          """
+          with self.assertRaises(IntegrityError):
+              connection.creation.deserialize_db_from_string(data)
+
+      def test_deserialize_with_many_to_many_field_restored(self):
+          # Ensure many-to-many (related_objects) field is deserialized correctly.
+          # related_objects is an empty list in the JSON below; it should be preserved.
+          data = """
+          [
+              {
+                  "model": "backends.object",
+                  "pk": 1,
+                  "fields": {"obj_ref": 1, "related_objects": []}
+              },
+              {
+                  "model": "backends.objectreference",
+                  "pk": 1,
+                  "fields": {"obj": 1}
+              }
+          ]
+          """
+          connection.creation.deserialize_db_from_string(data)
+          obj = Object.objects.get()
+          # related_objects should be an empty relation set, not None or missing
+          self.assertEqual(list(obj.related_objects.all()), [])
+
+      def test_deserialize_preserves_relations_after_restore(self):
+          # Create objects with relations, serialize, clear, restore and ensure relation preserved.
+          obj = Object.objects.create()
+          obj_ref = ObjectReference.objects.create(obj=obj)
+          obj.obj_ref = obj_ref
+          obj.save()
+          serialized = connection.creation.serialize_db_to_string()
+          # Clear DB
+          ObjectReference.objects.all().delete()
+          Object.objects.all().delete()
+          # Restore
+          connection.creation.deserialize_db_from_string(serialized)
+          restored_obj = Object.objects.get()
+          restored_obj_ref = ObjectReference.objects.get()
+          self.assertEqual(restored_obj.obj_ref.pk, restored_obj_ref.pk)
+new_imports_code: |
+  # No new top-level imports required; tests reuse existing imports in the module.

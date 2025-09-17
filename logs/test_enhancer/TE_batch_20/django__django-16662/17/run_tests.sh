@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_writer_llm.AdditionalWriterImportGroupingTests._index migrations.test_writer_llm.AdditionalWriterImportGroupingTests.test_from_statements_are_after_imports_even_when_modules_alphabetically_first migrations.test_writer_llm.AdditionalWriterImportGroupingTests.test_import_before_from_when_settings_and_custom_import migrations.test_writer_llm.AdditionalWriterImportGroupingTests.test_import_before_from_with_time_and_settings migrations.test_writer_llm.AdditionalWriterImportGroupingTests.test_import_before_from_with_uuid_and_settings migrations.test_writer_llm.AdditionalWriterImportGroupingTests.test_imports_alphabetical_among_imports migrations.test_writer_llm.AdditionalWriterImportGroupingTests.test_imports_grouping_multiple_imports migrations.test_writer_llm.AdditionalWriterImportGroupingTests.test_models_import_merged_with_migrations migrations.test_writer_llm.AdditionalWriterImportGroupingTests.test_only_from_statements_present migrations.test_writer_llm.AdditionalWriterImportGroupingTests.test_only_import_statements_present
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 forms_tests.tests.test_formsets_llm.TestNonFormErrorsCaching.test_non_form_errors_after_accessing_errors_property_is_cached forms_tests.tests.test_formsets_llm.TestNonFormErrorsCaching.test_non_form_errors_after_explicit_full_clean_is_cached forms_tests.tests.test_formsets_llm.TestNonFormErrorsCaching.test_non_form_errors_cached_identity_empty_default forms_tests.tests.test_formsets_llm.TestNonFormErrorsCaching.test_non_form_errors_cached_identity_with_custom_errorclass forms_tests.tests.test_formsets_llm.TestNonFormErrorsCaching.test_non_form_errors_mutation_reflects_in_internal_storage_custom_errorclass forms_tests.tests.test_formsets_llm.TestNonFormErrorsCaching.test_non_form_errors_mutation_reflects_in_internal_storage_empty_default forms_tests.tests.test_formsets_llm.TestNonFormErrorsCaching.test_non_form_errors_mutation_visible_after_errors_access forms_tests.tests.test_formsets_llm.TestNonFormErrorsCaching.test_non_form_errors_returned_is_mutable_and_persists_after_append forms_tests.tests.test_formsets_llm.TestNonFormErrorsCaching.test_non_form_errors_str_contains_nonform_class_when_empty
+coverage json -o coverage.json
+: '>>>>> End Test Output'

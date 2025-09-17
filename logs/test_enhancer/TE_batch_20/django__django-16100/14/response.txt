@@ -1,0 +1,180 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that ModelAdmin.changelist_view uses transaction.atomic with the database alias returned by router.db_for_write(self.model). They patch django.db.transaction.atomic and django.db.router.db_for_write to assert that atomic is called with the specific using kwarg. Under the candidate (which calls transaction.atomic() with no using argument) these tests will fail; with the gold patch (which passes using=router.db_for_write(...)) they pass.
+test_code: |
+  from unittest import mock
+
+  from django.db import DatabaseError
+  from django.test import TestCase, override_settings
+  from django.urls import reverse
+  from django.contrib.auth.models import User
+
+  from .admin import SwallowAdmin
+  from .models import Swallow
+  from django.contrib import admin
+
+  @override_settings(ROOT_URLCONF="admin_changelist.urls")
+  class TransactionAtomicUsingTests(TestCase):
+      @classmethod
+      def setUpTestData(cls):
+          cls.superuser = User.objects.create_superuser(
+              username="super_atomic", email="a@b.com", password="xxx"
+          )
+
+      def setUp(self):
+          self.client.force_login(self.superuser)
+          # Create several Swallow instances used in the changelist formset.
+          self.a = Swallow.objects.create(origin="Swallow A", load=4, speed=1)
+          self.b = Swallow.objects.create(origin="Swallow B", load=2, speed=2)
+          self.c = Swallow.objects.create(origin="Swallow C", load=5, speed=5)
+          self.changelist_url = reverse("admin:admin_changelist_swallow_changelist")
+
+      def _post_data_for_swallow_forms(self, forms):
+          """
+          forms: list of dicts with keys corresponding to form fields for each form,
+                 expected to include '<prefix>-<i>-uuid' and editable fields.
+          """
+          data = {
+              "form-TOTAL_FORMS": str(len(forms)),
+              "form-INITIAL_FORMS": str(len(forms)),
+              "form-MIN_NUM_FORMS": "0",
+              "form-MAX_NUM_FORMS": "1000",
+              "_save": "Save",
+          }
+          for i, form in enumerate(forms):
+              for key, value in form.items():
+                  data[f"form-{i}-{key}"] = value
+          return data
+
+      def test_atomic_called_with_router_alias_on_basic_save(self):
+          """Ensure transaction.atomic is called with the router-provided alias for a basic save."""
+          forms = [
+              {"uuid": str(self.a.pk), "load": "9.0", "speed": "3.0"},
+              {"uuid": str(self.b.pk), "load": "5.0", "speed": "1.0"},
+          ]
+          data = self._post_data_for_swallow_forms(forms)
+          with mock.patch("django.db.transaction.atomic") as atomic_mock, mock.patch(
+              "django.db.router.db_for_write", return_value="other_db"
+          ) as router_mock:
+              response = self.client.post(self.changelist_url, data)
+              # atomic should be called with using equal to router.db_for_write return
+              atomic_mock.assert_any_call(using="other_db")
+
+      def test_atomic_called_with_router_alias_when_no_forms_changed(self):
+          """Even when none of the forms report changes, the atomic context must be used."""
+          forms = [
+              {"uuid": str(self.a.pk), "load": str(self.a.load), "speed": str(self.a.speed)},
+              {"uuid": str(self.b.pk), "load": str(self.b.load), "speed": str(self.b.speed)},
+          ]
+          data = self._post_data_for_swallow_forms(forms)
+          with mock.patch("django.db.transaction.atomic") as atomic_mock, mock.patch(
+              "django.db.router.db_for_write", return_value="alias_db"
+          ) as router_mock:
+              response = self.client.post(self.changelist_url, data)
+              atomic_mock.assert_any_call(using="alias_db")
+
+      def test_atomic_called_with_router_alias_with_three_forms(self):
+          """Multiple forms - transaction.atomic must be called with router alias."""
+          forms = [
+              {"uuid": str(self.a.pk), "load": "9.0", "speed": "3.0"},
+              {"uuid": str(self.b.pk), "load": "5.0", "speed": "1.0"},
+              {"uuid": str(self.c.pk), "load": "5.0", "speed": "4.0"},
+          ]
+          data = self._post_data_for_swallow_forms(forms)
+          with mock.patch("django.db.transaction.atomic") as atomic_mock, mock.patch(
+              "django.db.router.db_for_write", return_value="db_xyz"
+          ) as router_mock:
+              response = self.client.post(self.changelist_url, data)
+              atomic_mock.assert_any_call(using="db_xyz")
+
+      def test_atomic_called_with_router_alias_when_log_change_raises(self):
+          """If log_change raises, transaction.atomic should still have been entered with the router alias."""
+          forms = [
+              {"uuid": str(self.a.pk), "load": "9.0", "speed": "3.0"},
+              {"uuid": str(self.b.pk), "load": "5.0", "speed": "1.0"},
+          ]
+          data = self._post_data_for_swallow_forms(forms)
+          with mock.patch("django.db.transaction.atomic") as atomic_mock, mock.patch(
+              "django.db.router.db_for_write", return_value="db_raise"
+          ) as router_mock, mock.patch(
+              "django.contrib.admin.ModelAdmin.log_change", side_effect=DatabaseError
+          ):
+              with self.assertRaises(DatabaseError):
+                  self.client.post(self.changelist_url, data)
+              atomic_mock.assert_any_call(using="db_raise")
+
+      def test_atomic_called_with_router_alias_when_save_model_raises(self):
+          """If save_model raises, the atomic context should have been entered with the router alias."""
+          forms = [
+              {"uuid": str(self.a.pk), "load": "9.0", "speed": "3.0"},
+          ]
+          data = self._post_data_for_swallow_forms(forms)
+          with mock.patch("django.db.transaction.atomic") as atomic_mock, mock.patch(
+              "django.db.router.db_for_write", return_value="db_save_model"
+          ) as router_mock, mock.patch.object(
+              SwallowAdmin, "save_model", side_effect=DatabaseError
+          ):
+              with self.assertRaises(DatabaseError):
+                  self.client.post(self.changelist_url, data)
+              atomic_mock.assert_any_call(using="db_save_model")
+
+      def test_atomic_called_with_router_alias_when_save_related_raises(self):
+          """If save_related raises, the atomic context should have been entered with the router alias."""
+          forms = [
+              {"uuid": str(self.a.pk), "load": "9.0", "speed": "3.0"},
+          ]
+          data = self._post_data_for_swallow_forms(forms)
+          with mock.patch("django.db.transaction.atomic") as atomic_mock, mock.patch(
+              "django.db.router.db_for_write", return_value="db_related"
+          ) as router_mock, mock.patch.object(
+              SwallowAdmin, "save_related", side_effect=DatabaseError
+          ):
+              with self.assertRaises(DatabaseError):
+                  self.client.post(self.changelist_url, data)
+              atomic_mock.assert_any_call(using="db_related")
+
+      def test_atomic_called_with_router_alias_when_construct_change_message_raises(self):
+          """If construct_change_message raises, the atomic context should have been entered with the router alias."""
+          forms = [
+              {"uuid": str(self.a.pk), "load": "9.0", "speed": "3.0"},
+          ]
+          data = self._post_data_for_swallow_forms(forms)
+          with mock.patch("django.db.transaction.atomic") as atomic_mock, mock.patch(
+              "django.db.router.db_for_write", return_value="db_msg"
+          ) as router_mock, mock.patch.object(
+              SwallowAdmin, "construct_change_message", side_effect=DatabaseError
+          ):
+              with self.assertRaises(DatabaseError):
+                  self.client.post(self.changelist_url, data)
+              atomic_mock.assert_any_call(using="db_msg")
+
+      def test_atomic_called_with_router_alias_when_some_forms_unchanged_some_changed(self):
+          """Mixture of changed and unchanged forms should still use atomic with the router alias."""
+          forms = [
+              {"uuid": str(self.a.pk), "load": str(self.a.load), "speed": str(self.a.speed)},  # unchanged
+              {"uuid": str(self.b.pk), "load": "42.0", "speed": "7.0"},  # changed
+              {"uuid": str(self.c.pk), "load": str(self.c.load), "speed": str(self.c.speed)},  # unchanged
+          ]
+          data = self._post_data_for_swallow_forms(forms)
+          with mock.patch("django.db.transaction.atomic") as atomic_mock, mock.patch(
+              "django.db.router.db_for_write", return_value="mixed_db"
+          ) as router_mock:
+              response = self.client.post(self.changelist_url, data)
+              atomic_mock.assert_any_call(using="mixed_db")
+
+      def test_atomic_not_called_when_formset_invalid(self):
+          """If the formset is invalid, no transaction.atomic should be started for the save loop."""
+          # Craft invalid data by making an invalid UUID value so the formset fails validation.
+          forms = [
+              {"uuid": "invalid-uuid", "load": "9.0", "speed": "3.0"},
+          ]
+          data = self._post_data_for_swallow_forms(forms)
+          with mock.patch("django.db.transaction.atomic") as atomic_mock, mock.patch(
+              "django.db.router.db_for_write", return_value="won't_be_used"
+          ):
+              response = self.client.post(self.changelist_url, data)
+              # The formset validation fails and the save loop is not entered, so atomic() shouldn't be called.
+              atomic_mock.assert_not_called()
+new_imports_code: |
+  from unittest import mock
+  from django.db import DatabaseError

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 template_tests.filter_tests.test_join_llm.JoinAdditionalTests.test_direct_join_autoescape_false_preserves_joiner template_tests.filter_tests.test_join_llm.JoinAdditionalTests.test_direct_join_autoescape_false_preserves_mark_safe_joiner template_tests.filter_tests.test_join_llm.JoinAdditionalTests.test_direct_join_autoescape_false_with_generator template_tests.filter_tests.test_join_llm.JoinAdditionalTests.test_direct_join_autoescape_false_with_mark_safe_values template_tests.filter_tests.test_join_llm.JoinAdditionalTests.test_direct_join_autoescape_false_with_nonstring_values template_tests.filter_tests.test_join_llm.JoinAdditionalTests.test_direct_join_autoescape_true_still_escapes_joiner template_tests.filter_tests.test_join_llm.JoinAdditionalTests.test_template_autoescape_off_entity_joiner_not_double_escaped template_tests.filter_tests.test_join_llm.JoinAdditionalTests.test_template_autoescape_off_joiner_unescaped_html template_tests.filter_tests.test_join_llm.JoinAdditionalTests.test_template_autoescape_off_variable_joiner_with_ampersand
+coverage json -o coverage.json
+: '>>>>> End Test Output'

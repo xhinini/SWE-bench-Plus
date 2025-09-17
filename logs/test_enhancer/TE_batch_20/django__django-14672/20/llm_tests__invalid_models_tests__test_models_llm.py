@@ -1,0 +1,5 @@
+from django.db.models.fields.reverse_related import ManyToManyRel
+from django.test import SimpleTestCase
+from django.test import SimpleTestCase
+from django.db.models.fields.reverse_related import ManyToManyRel
+from builtins import object as builtin_object

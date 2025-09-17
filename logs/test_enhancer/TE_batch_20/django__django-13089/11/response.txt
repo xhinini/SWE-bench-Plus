@@ -1,0 +1,207 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests validate DatabaseCache._cull handles cases where the culling SELECT returns no row (None), an empty tuple, or a valid last cache key. They also verify that no delete-by-key is attempted when there is no last cache key, that clear() is called when cull frequency is zero, and that the SQL/parameters for the expired-rows deletion are formed using the adapted datetime value.
+new_imports_code: |
+  from django.core.cache import caches
+  from django.core import management
+  from django.db import connection, connections
+  from django.test import override_settings, TransactionTestCase
+  from django.utils import timezone
+  from datetime import datetime
+  from django.conf import settings
+  from cache.tests import caches_setting_for_tests
+test_code: |
+  @override_settings(CACHES=caches_setting_for_tests(
+      BACKEND='django.core.cache.backends.db.DatabaseCache',
+      LOCATION='test cache table'
+  ))
+  class CullRegressionTests(TransactionTestCase):
+      """
+      Regression tests for the cache culling logic to ensure that when the
+      cache-key-culling SELECT returns no rows (None) or an empty tuple, the
+      cull code does not raise and does not attempt to delete with an invalid
+      parameter. Also validates correct behavior when a last_cache_key is
+      returned and when cull frequency is zero.
+      """
+      available_apps = ['cache']
+  
+      def setUp(self):
+          super().setUp()
+          management.call_command('createcachetable', verbosity=0)
+  
+      def tearDown(self):
+          super().tearDown()
+          table_name = connections['default'].ops.quote_name('test cache table')
+          with connection.cursor() as cursor:
+              cursor.execute('DROP TABLE %s' % table_name)
+  
+      class _FakeCursor:
+          def __init__(self, fetch_results):
+              # fetch_results is a list of values to return on successive fetchone() calls
+              self._fetch_results = list(fetch_results)
+              self.execute_calls = []
+              self.rowcount = 0
+          def execute(self, sql, params=None):
+              # Record each execute for later inspection.
+              self.execute_calls.append((sql, params))
+          def fetchone(self):
+              if self._fetch_results:
+                  return self._fetch_results.pop(0)
+              return None
+  
+      def _now(self):
+          now = timezone.now()
+          return now.replace(microsecond=0)
+  
+      def test_cull_handles_no_last_cache_key(self):
+          # Simulate: SELECT COUNT(*) returns > _max_entries, but cache_key_culling_sql yields no row (None).
+          cache = caches['cull']
+          # Ensure num > _max_entries to trigger culling.
+          num = cache._max_entries + 5
+          fake_cursor = self._FakeCursor(fetch_results=[
+              None,        # For the initial expired-rows DELETE fetchone (not used) -> but safe
+              (num,),      # For SELECT COUNT(*) -> returns num
+              None,        # For cache_key_culling_sql -> fetchone() returns None (no last key)
+          ])
+          now = self._now()
+          # Should not raise
+          cache._cull('default', fake_cursor, now)
+          # Last execute should be the culling SELECT (third execute) but no final DELETE-by-key.
+          executed_sqls = [sql for sql, params in fake_cursor.execute_calls]
+          # Ensure the culling SQL was executed.
+          self.assertTrue(any('cache_key' in (s or '') and 'LIMIT' in (s or '') or 'ORDER' in (s or '') or 'cull' in (s or '').lower() for s in executed_sqls) or len(executed_sqls) >= 3)
+          # Ensure there is no SQL that deletes by cache_key < %s
+          self.assertFalse(any('WHERE cache_key <' in (s or '') for s in executed_sqls))
+  
+      def test_cull_executes_delete_when_last_cache_key_present(self):
+          cache = caches['cull']
+          num = cache._max_entries + 10
+          # Simulate fetchone returning (num,) then ('lastkey',)
+          fake_cursor = self._FakeCursor(fetch_results=[
+              None,
+              (num,),
+              ('lastkey',),
+          ])
+          now = self._now()
+          cache._cull('default', fake_cursor, now)
+          executed = fake_cursor.execute_calls
+          # Ensure a DELETE ... WHERE cache_key < %s was executed as the last step
+          delete_calls = [call for call in executed if 'WHERE cache_key <' in (call[0] or '')]
+          self.assertTrue(delete_calls, "Expected a delete-by-key call when last_cache_key is present")
+          # The parameters for that delete should include the 'lastkey' value
+          found = any(call[1] and call[1][0] == 'lastkey' for call in delete_calls)
+          self.assertTrue(found)
+  
+      def test_cull_noop_when_count_not_exceeding_max(self):
+          cache = caches['cull']
+          num = cache._max_entries  # not greater than _max_entries, so no cull
+          fake_cursor = self._FakeCursor(fetch_results=[
+              None,
+              (num,),
+          ])
+          now = self._now()
+          cache._cull('default', fake_cursor, now)
+          executed_sqls = [sql for sql, params in fake_cursor.execute_calls]
+          # Ensure we did NOT execute the culling SELECT (only the expired delete and count)
+          self.assertFalse(any('cache_key_culling' in (s or '') or 'WHERE cache_key <' in (s or '') for s in executed_sqls))
+  
+      def test_cull_calls_clear_when_frequency_zero(self):
+          cache = caches['cull']
+          old_freq = cache._cull_frequency
+          called = {'cleared': False}
+          def fake_clear():
+              called['cleared'] = True
+          cache._cull_frequency = 0
+          cache.clear, old_clear = fake_clear, cache.clear
+          try:
+              # _cull should call clear() and not raise
+              fake_cursor = self._FakeCursor(fetch_results=[])
+              cache._cull('default', fake_cursor, self._now())
+              self.assertTrue(called['cleared'])
+          finally:
+              # restore
+              cache.clear = old_clear
+              cache._cull_frequency = old_freq
+  
+      def test_cull_handles_empty_tuple_from_fetchone(self):
+          # If fetchone() returns an empty tuple for last_cache_key, it should be treated as falsy
+          cache = caches['cull']
+          num = cache._max_entries + 2
+          fake_cursor = self._FakeCursor(fetch_results=[
+              None,
+              (num,),
+              (),   # empty tuple -> falsy; original buggy code would attempt [0] and raise
+          ])
+          now = self._now()
+          # Should not raise
+          cache._cull('default', fake_cursor, now)
+          executed_sqls = [sql for sql, params in fake_cursor.execute_calls]
+          # Ensure no delete-by-key executed
+          self.assertFalse(any('WHERE cache_key <' in (s or '') for s in executed_sqls))
+  
+      def test_cull_delete_uses_quoted_table_name(self):
+          cache = caches['cull']
+          # Ensure we can observe the quoted table name being used in SQL
+          num = cache._max_entries + 3
+          fake_cursor = self._FakeCursor(fetch_results=[
+              None,
+              (num,),
+              ('k',),
+          ])
+          now = self._now()
+          cache._cull('default', fake_cursor, now)
+          # The delete-by-key SQL should contain the quoted table name
+          quoted_table = connections['default'].ops.quote_name(cache._table)
+          executed_sqls = [sql for sql, params in fake_cursor.execute_calls]
+          delete_calls = [s for s in executed_sqls if 'WHERE cache_key <' in (s or '')]
+          self.assertTrue(any(quoted_table in s for s in delete_calls))
+  
+      def test_expired_rows_delete_passes_adapted_datetime_value(self):
+          cache = caches['cull']
+          num = cache._max_entries  # ensure no further cull; we only want to inspect first delete params
+          # First fetchone call corresponds to SELECT COUNT(*)
+          fake_cursor = self._FakeCursor(fetch_results=[
+              None,
+              (num,),
+          ])
+          now = self._now()
+          cache._cull('default', fake_cursor, now)
+          # The first execute call is the DELETE FROM <table> WHERE expires < %s
+          first_call = fake_cursor.execute_calls[0]
+          params = first_call[1]
+          # The parameter should be the adapted datetime value
+          adapted = connections['default'].ops.adapt_datetimefield_value(now)
+          self.assertEqual(params, [adapted])
+  
+      def test_cull_handles_multiple_none_fetchone_calls_gracefully(self):
+          # Simulate scenario where fetchone returns None multiple times
+          cache = caches['cull']
+          num = cache._max_entries + 1
+          fake_cursor = self._FakeCursor(fetch_results=[
+              None,
+              (num,),
+              None,   # culling SELECT returns None
+              None,   # additional fetchone calls (if any) should not raise
+          ])
+          now = self._now()
+          # Should not raise even if fetchone() keeps returning None
+          cache._cull('default', fake_cursor, now)
+          # No delete-by-key should be present
+          executed_sqls = [sql for sql, params in fake_cursor.execute_calls]
+          self.assertFalse(any('WHERE cache_key <' in (s or '') for s in executed_sqls))
+  
+      def test_cull_with_zero_length_string_key_deletes(self):
+          # If last_cache_key is ('',) (empty string inside tuple), that is truthy as a tuple
+          cache = caches['cull']
+          num = cache._max_entries + 4
+          fake_cursor = self._FakeCursor(fetch_results=[
+              None,
+              (num,),
+              ('',),   # tuple with empty string -> should be treated truthy and lead to delete
+          ])
+          now = self._now()
+          cache._cull('default', fake_cursor, now)
+          # Ensure delete-by-key executed with empty string parameter
+          delete_calls = [call for call in fake_cursor.execute_calls if 'WHERE cache_key <' in (call[0] or '')]
+          self.assertTrue(delete_calls)
+          self.assertTrue(any(call[1] and call[1][0] == '' for call in delete_calls))

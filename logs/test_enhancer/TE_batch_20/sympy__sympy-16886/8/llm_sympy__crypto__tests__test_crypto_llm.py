@@ -1,0 +1,2 @@
+from sympy.crypto.crypto import char_morse, morse_char, encode_morse, decode_morse
+import pytest

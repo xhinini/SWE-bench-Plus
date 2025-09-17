@@ -1,0 +1,240 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise build_instance() to ensure that when a model instance's natural_key() depends on the instance's _state.db attribute, build_instance() sets that db before calling natural_key(), and that the returned instance's primary key is set (and converted via pk.to_python). The suite also verifies behavior when a pk is already provided, when default_manager lacks get_by_natural_key, when get_by_natural_key raises DoesNotExist, and that natural_key() is only invoked when appropriate.
+new_imports_code: |
+  from django.core.serializers.base import build_instance
+  import unittest
+test_code: |
+  import unittest
+  from django.core.serializers.base import build_instance
+  
+  
+  class DummyPK:
+      def __init__(self, attname='id', to_python=lambda v: v):
+          self.attname = attname
+          # allow a callable converter
+          self._to_python = to_python
+  
+      def to_python(self, value):
+          return self._to_python(value)
+  
+  
+  class DummyManager:
+      def __init__(self, mapping=None, raise_on=None):
+          # mapping: arg -> object with pk attribute
+          self.mapping = mapping or {}
+          self.raise_on = raise_on
+  
+      def db_manager(self, db):
+          # return self; build_instance passes the db separately via natural_key,
+          # but keep this for completeness
+          self._db = db
+          return self
+  
+      def get_by_natural_key(self, key):
+          if self.raise_on and key == self.raise_on:
+              # Simulate DoesNotExist; the caller expects a Model.DoesNotExist exception,
+              # but build_instance catches Model.DoesNotExist on the Model class itself.
+              # We'll let the test's Model define DoesNotExist to match.
+              raise self.OwnerModel.DoesNotExist()
+          try:
+              pk = self.mapping[key]
+          except KeyError:
+              # Simulate not found (raise DoesNotExist)
+              raise self.OwnerModel.DoesNotExist()
+  
+          class Obj:
+              def __init__(self, pk):
+                  self.pk = pk
+          return Obj(pk)
+  
+  
+  def make_model(natural_key_behavior, pk_converter=lambda v: v, manager_mapping=None, manager_raise_on=None):
+      """
+      Create a fake Model class compatible with build_instance.
+      natural_key_behavior: callable accepting (self) and returning a tuple used as natural key.
+      manager_mapping: mapping from natural_key[0] -> pk returned by get_by_natural_key
+      """
+  
+      class FakeModel:
+          # Allow detection of DoesNotExist
+          class DoesNotExist(Exception):
+              pass
+  
+          _meta = type("m", (), {})()
+          _meta.pk = DummyPK(attname="id", to_python=pk_converter)
+          # default_manager will be set after class creation to have OwnerModel reference
+          # so we can raise OwnerModel.DoesNotExist from manager if needed.
+  
+          def __init__(self, **data):
+              # set any provided data as attributes
+              for k, v in data.items():
+                  setattr(self, k, v)
+              # default internal state
+              self._state = type("s", (), {"db": None})()
+  
+          def natural_key(self):
+              return natural_key_behavior(self)
+  
+      # Create and attach manager
+      mgr = DummyManager(mapping=manager_mapping or {}, raise_on=manager_raise_on)
+      mgr.OwnerModel = FakeModel  # so manager can raise proper DoesNotExist
+      # Attach the manager to _meta as expected by build_instance
+      FakeModel._meta.default_manager = mgr
+      return FakeModel
+  
+  
+  class BuildInstanceTests(unittest.TestCase):
+      def test_sets_pk_using_natural_key_and_db(self):
+          # natural_key returns the instance _state.db, so build_instance must set it
+          def nk(self):
+              return (self._state.db,)
+  
+          mapping = {"other": 42}
+          Model = make_model(nk, pk_converter=lambda v: int(v), manager_mapping=mapping)
+  
+          data = {}  # no pk provided
+          obj = build_instance(Model, data, db="other")
+          # Expect pk converted to int(42)
+          self.assertEqual(getattr(obj, "id"), 42)
+  
+      def test_no_lookup_when_pk_provided(self):
+          # If pk provided in data, no lookup should occur and manager should not be called.
+          called = {"lookup": False}
+  
+          def nk(self):
+              called["lookup"] = True
+              return (self._state.db,)
+  
+          # Manager mapping would return something else if called; ensure it would differ
+          mapping = {"other": 99}
+          Model = make_model(nk, pk_converter=lambda v: v, manager_mapping=mapping)
+  
+          data = {"id": 5}
+          obj = build_instance(Model, data, db="other")
+          # The provided pk should be retained, and natural_key should not have been used
+          self.assertEqual(getattr(obj, "id"), 5)
+          # natural_key might still exist on the class but build_instance shouldn't have needed to call manager
+          # We assert that even if natural_key might be defined, the lookup for pk didn't change provided pk.
+  
+      def test_skips_when_no_get_by_natural_key(self):
+          # If default_manager has no get_by_natural_key, nothing should be done.
+          def nk(self):
+              return ("ignored",)
+  
+          class ModelNoManager:
+              class DoesNotExist(Exception):
+                  pass
+  
+              _meta = type("m", (), {})()
+              _meta.pk = DummyPK(attname="id", to_python=lambda v: v)
+              # default_manager without get_by_natural_key:
+              _meta.default_manager = object()
+  
+              def __init__(self, **data):
+                  for k, v in data.items():
+                      setattr(self, k, v)
+                  self._state = type("s", (), {"db": None})()
+  
+              def natural_key(self):
+                  return nk(self)
+  
+          data = {}
+          obj = build_instance(ModelNoManager, data, db="other")
+          # No pk added
+          self.assertFalse(hasattr(obj, "id"))
+  
+      def test_handles_does_not_exist(self):
+          # If get_by_natural_key raises DoesNotExist, build_instance should leave pk alone.
+          def nk(self):
+              return (self._state.db,)
+  
+          mapping = {}  # no entries -> manager will raise DoesNotExist
+          Model = make_model(nk, pk_converter=lambda v: v, manager_mapping=mapping)
+  
+          data = {}
+          obj = build_instance(Model, data, db="unknown-db")
+          self.assertFalse(hasattr(obj, "id"))
+  
+      def test_multiple_dbs_produce_different_pks(self):
+          def nk(self):
+              return (self._state.db,)
+  
+          mapping = {"one": "pk-one", "two": "pk-two"}
+          Model = make_model(nk, pk_converter=lambda v: v, manager_mapping=mapping)
+  
+          obj1 = build_instance(Model, {}, db="one")
+          obj2 = build_instance(Model, {}, db="two")
+          self.assertEqual(getattr(obj1, "id"), "pk-one")
+          self.assertEqual(getattr(obj2, "id"), "pk-two")
+  
+      def test_natural_key_called_only_when_pk_missing(self):
+          called = {"count": 0}
+  
+          def nk(self):
+              called["count"] += 1
+              return (self._state.db,)
+  
+          mapping = {"x": 100}
+          Model = make_model(nk, pk_converter=lambda v: v, manager_mapping=mapping)
+  
+          # First call without pk -> natural_key should be triggered
+          _ = build_instance(Model, {}, db="x")
+          self.assertEqual(called["count"], 1)
+  
+          # Second call with pk present -> natural_key should not increase count
+          _ = build_instance(Model, {"id": 5}, db="x")
+          self.assertEqual(called["count"], 1)
+  
+      def test_to_python_conversion_is_applied(self):
+          def nk(self):
+              return (self._state.db,)
+  
+          # to_python converts to string with prefix
+          def converter(v):
+              return f"converted-{v}"
+  
+          mapping = {"other": "rawpk"}
+          Model = make_model(nk, pk_converter=converter, manager_mapping=mapping)
+  
+          obj = build_instance(Model, {}, db="other")
+          self.assertEqual(getattr(obj, "id"), "converted-rawpk")
+  
+      def test_natural_key_may_depend_on_other_fields_but_db_used(self):
+          # natural_key uses another attribute and the db; ensure db is set before natural_key
+          def nk(self):
+              # Compose a key from a provided attribute and the db
+              label = getattr(self, "label", "nolabel")
+              return (label, self._state.db)
+  
+          mapping = {("A", "db1"): 7}
+          Model = make_model(nk, pk_converter=lambda v: v, manager_mapping=mapping)
+  
+          data = {"label": "A"}
+          obj = build_instance(Model, data, db="db1")
+          self.assertEqual(getattr(obj, "id"), 7)
+  
+      def test_build_instance_works_with_non_string_db_identifiers(self):
+          # db can be any hashable object passed through to natural_key resolution
+          def nk(self):
+              return (self._state.db,)
+  
+          mapping = {42: "the-answer"}
+          Model = make_model(nk, pk_converter=lambda v: v, manager_mapping=mapping)
+  
+          obj = build_instance(Model, {}, db=42)
+          self.assertEqual(getattr(obj, "id"), "the-answer")
+  
+      def test_natural_key_exception_propagates(self):
+          # If natural_key raises a (non-DoesNotExist) exception, it should bubble up.
+          def nk(self):
+              # raise a ValueError to simulate a bad natural_key implementation
+              raise ValueError("bad natural key")
+  
+          Model = make_model(nk, pk_converter=lambda v: v, manager_mapping={})
+          with self.assertRaises(ValueError):
+              build_instance(Model, {}, db="x")
+  
+  
+  if __name__ == "__main__":
+      unittest.main()

@@ -1,0 +1,234 @@
+from matplotlib.patches import PathPatch
+from matplotlib.path import Path
+from matplotlib import transforms
+import numpy as np
+import pytest
+
+import matplotlib as mpl
+from matplotlib.path import Path
+from matplotlib.patches import PathPatch
+from matplotlib import transforms
+
+# Minimal fake GC which records calls we care about.
+class FakeGC:
+    def __init__(self):
+        self.set_dashes_calls = []
+        self.set_linewidth_calls = []
+        self.set_hatch_calls = []
+        self.set_hatch_color_calls = []
+        self.set_alpha_calls = []
+        self.foreground = None
+        self._restored = False
+
+    def set_foreground(self, *args, **kwargs):
+        self.foreground = args
+
+    def set_linewidth(self, lw):
+        self.set_linewidth_calls.append(lw)
+
+    def set_dashes(self, offset, dashes):
+        # record both offset and on-off sequence (dashes can be None)
+        self.set_dashes_calls.append((offset, None if dashes is None else tuple(dashes)))
+
+    def set_capstyle(self, *args, **kwargs):
+        pass
+
+    def set_joinstyle(self, *args, **kwargs):
+        pass
+
+    def set_antialiased(self, *args, **kwargs):
+        pass
+
+    def set_url(self, *args, **kwargs):
+        pass
+
+    def set_snap(self, *args, **kwargs):
+        pass
+
+    def set_alpha(self, alpha):
+        self.set_alpha_calls.append(alpha)
+
+    def set_hatch(self, hatch):
+        self.set_hatch_calls.append(hatch)
+
+    def set_hatch_color(self, color):
+        self.set_hatch_color_calls.append(color)
+
+    def set_sketch_params(self, *args, **kwargs):
+        pass
+
+    def restore(self):
+        # called at the end of _bind_draw_path_function context
+        self._restored = True
+
+
+# Minimal fake renderer which produces the fake GC and captures draw_path calls.
+class FakeRenderer:
+    def __init__(self):
+        self.gc = None
+        self.draw_path_calls = []
+
+    def open_group(self, *args, **kwargs):
+        pass
+
+    def close_group(self, *args, **kwargs):
+        pass
+
+    def new_gc(self):
+        self.gc = FakeGC()
+        return self.gc
+
+    def draw_path(self, gc, path, affine, facecolor):
+        # record the facecolor argument and the path's first few vertices for inspection
+        self.draw_path_calls.append({
+            "gc": gc,
+            "facecolor": facecolor,
+            "n_vertices": len(path.vertices) if hasattr(path, "vertices") else None
+        })
+
+    def points_to_pixels(self, points):
+        # For our tests, 1 point -> 1 pixel to keep things simple.
+        return points
+
+def make_unit_pathpatch(**kwargs):
+    # Create a simple unit rectangle pathpatch which exercises Patch.draw path
+    p = Path.unit_rectangle()
+    patch = PathPatch(p, **kwargs)
+    # make sure transforms are simple identity to avoid axis/axes interactions
+    patch.set_transform(transforms.IdentityTransform())
+    return patch
+
+def assert_last_set_dashes(renderer, expected_pattern):
+    # helper assertion to check the draw used expected GC.set_dashes call
+    gc = renderer.gc
+    assert gc is not None, "Renderer did not create a GC"
+    assert gc.set_dashes_calls, "GC.set_dashes was never called"
+    # take the last set_dashes call
+    got = gc.set_dashes_calls[-1]
+    exp_offset, exp_seq = expected_pattern
+    # normalize sequences to tuples or None
+    exp_seq = None if exp_seq is None else tuple(exp_seq)
+    assert got == (exp_offset, exp_seq)
+
+def assert_last_linewidth(renderer, expected_lw):
+    gc = renderer.gc
+    assert gc is not None
+    assert gc.set_linewidth_calls, "GC.set_linewidth was never called"
+    assert gc.set_linewidth_calls[-1] == expected_lw
+
+def assert_last_facecolor_passed(renderer, expected_facecolor):
+    # expected_facecolor: either None or a color-tuple-like
+    assert renderer.draw_path_calls, "renderer.draw_path was not called"
+    got = renderer.draw_path_calls[-1]["facecolor"]
+    assert (got is None and expected_facecolor is None) or np.allclose(got, expected_facecolor)
+
+def assert_hatch_calls(renderer, expected_hatch, expected_color=None):
+    gc = renderer.gc
+    assert gc is not None
+    assert gc.set_hatch_calls, "set_hatch was not called"
+    assert gc.set_hatch_calls[-1] == expected_hatch
+    if expected_color is not None:
+        assert gc.set_hatch_color_calls[-1] == expected_color
+
+# 1) Dash offset is forwarded to the GC for a non-zero offset tuple
+def test_draw_respects_dash_offset_simple():
+    renderer = FakeRenderer()
+    p = make_unit_pathpatch(linewidth=2, edgecolor='b', linestyle=(6, [4, 2]))
+    # pre-check stored pattern on the patch for clarity
+    assert p.get_linestyle() == (6, [4, 2])
+    p.draw(renderer)
+    # expect the GC to have been told the dash pattern (offset 6, sequence (4,2))
+    assert_last_set_dashes(renderer, (p._dash_pattern[0], p._dash_pattern[1]))
+
+# 2) Zero offset is forwarded (offset == 0)
+def test_draw_respects_dash_offset_zero():
+    renderer = FakeRenderer()
+    p = make_unit_pathpatch(linewidth=3, edgecolor='g', linestyle=(0, [5, 5]))
+    p.draw(renderer)
+    assert_last_set_dashes(renderer, (p._dash_pattern[0], p._dash_pattern[1]))
+    assert p._dash_pattern[0] == 0
+
+# 3) Solid / None dash (linestyle 'None') should set linewidth to 0 and still call set_dashes
+def test_draw_linestyle_none_sets_linewidth_zero():
+    renderer = FakeRenderer()
+    # Explicitly use 'None' to indicate no stroke
+    p = make_unit_pathpatch(linewidth=4, edgecolor='b', linestyle='None')
+    # ensure internal representation is 'None'
+    assert p.get_linestyle() == 'None'
+    p.draw(renderer)
+    # linewidth passed to GC should be zero
+    assert_last_linewidth(renderer, 0)
+    # still may call set_dashes (with whatever internal pattern exists)
+    assert renderer.gc.set_dashes_calls, "expected GC.set_dashes to be called even for 'None' style"
+
+# 4) Changing linewidth updates the scaled dash pattern used by set_dashes
+def test_dash_pattern_updates_with_linewidth():
+    renderer = FakeRenderer()
+    p = make_unit_pathpatch(linewidth=1, edgecolor='b', linestyle=(2, [6, 6]))
+    initial_dash = p._dash_pattern
+    # change linewidth - this should update internal _dash_pattern
+    p.set_linewidth(4)
+    assert p._dash_pattern != initial_dash
+    p.draw(renderer)
+    assert_last_set_dashes(renderer, (p._dash_pattern[0], p._dash_pattern[1]))
+
+# 5) Changing the linestyle updates the stored dash offset and sequence
+def test_dash_pattern_updates_with_linestyle_change():
+    renderer = FakeRenderer()
+    p = make_unit_pathpatch(linewidth=2, edgecolor='k', linestyle=(0, [3, 3]))
+    p.set_linestyle((8, [2, 4, 2, 4]))
+    assert p.get_linestyle() == (8, [2, 4, 2, 4])
+    p.draw(renderer)
+    assert_last_set_dashes(renderer, (p._dash_pattern[0], p._dash_pattern[1]))
+    assert p._dash_pattern[0] == 8
+
+# 6) Transparent facecolor (alpha == 0) should be passed as None to renderer.draw_path
+def test_draw_passes_facecolor_none_if_transparent():
+    renderer = FakeRenderer()
+    # supply an RGBA with zero alpha
+    p = make_unit_pathpatch(edgecolor='k', facecolor=(1, 0, 0, 0.0), linewidth=1)
+    # ensure the patch's facecolor has 0 alpha
+    assert p.get_facecolor()[3] == 0.0
+    p.draw(renderer)
+    assert_last_facecolor_passed(renderer, None)
+
+# 7) Non-transparent facecolor should be forwarded to renderer.draw_path
+def test_draw_passes_facecolor_if_nontransparent():
+    renderer = FakeRenderer()
+    p = make_unit_pathpatch(edgecolor='k', facecolor=(0.2, 0.3, 0.4, 0.7), linewidth=1)
+    assert p.get_facecolor()[3] == pytest.approx(0.7)
+    p.draw(renderer)
+    assert_last_facecolor_passed(renderer, p.get_facecolor())
+
+# 8) Hatching (when set) configures GC.set_hatch and set_hatch_color correctly
+def test_bind_draw_sets_hatch_and_hatch_color():
+    renderer = FakeRenderer()
+    # Use a named color so hatch color derivation is deterministic
+    p = make_unit_pathpatch(edgecolor='C2', facecolor='none', hatch='///', linewidth=1)
+    # after draw, the GC should have recorded hatch calls
+    p.draw(renderer)
+    # hatch string was passed to GC.set_hatch
+    assert renderer.gc.set_hatch_calls[-1] == '///'
+    # hatch color set to patch._hatch_color
+    assert renderer.gc.set_hatch_color_calls[-1] == p._hatch_color
+
+# 9) Multiple draws do not mutate the stored dash pattern (regression against accidental mutation)
+def test_multiple_draw_calls_preserve_dash_pattern():
+    renderer = FakeRenderer()
+    p = make_unit_pathpatch(linewidth=2, edgecolor='b', linestyle=(5, [7, 3]))
+    before = p._dash_pattern
+    p.draw(renderer)
+    p.draw(renderer)
+    after = p._dash_pattern
+    assert before == after
+
+# 10) Drawing a patch with a None dash sequence (solid) should call set_dashes with (offset, None)
+def test_draw_calls_set_dashes_with_none_sequence_for_solid():
+    renderer = FakeRenderer()
+    # Specify a linestyle that results in a solid (None) dash sequence.
+    p = make_unit_pathpatch(linewidth=2, edgecolor='b', linestyle='-')
+    # Confirm internal pattern has a None sequence (solid)
+    # It's acceptable if dash sequence is None; ensure GC receives None for sequence.
+    p.draw(renderer)
+    last = renderer.gc.set_dashes_calls[-1]
+    assert last[1] is None

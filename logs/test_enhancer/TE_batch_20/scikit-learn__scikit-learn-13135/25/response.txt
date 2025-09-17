@@ -1,0 +1,183 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests monkeypatch sklearn.cluster.KMeans to force returning unsorted cluster centers. They verify that KBinsDiscretizer (with strategy='kmeans') sorts centers internally so that bin_edges_ are strictly increasing, transform/inverse_transform behave correctly (including one-hot encoding), constant features are handled, clipping outside the fit range works, and bin_edges_ shapes match n_bins_. These tests would fail against an implementation that does not sort the k-means centers but pass once the centers are sorted in KBinsDiscretizer.
+test_code: |
+  import numpy as np
+  import pytest
+  from sklearn.preprocessing import KBinsDiscretizer
+  import sklearn.cluster as _skcluster
+  from sklearn.utils.testing import assert_array_equal
+  
+  # Helper: create a Dummy KMeans class that yields a sequence of pre-defined
+  # unsorted centers for successive .fit() calls (KBinsDiscretizer fits once per feature).
+  def make_dummy_kmeans(centers_sequence):
+      """Return a Dummy KMeans class which will yield centers from centers_sequence
+      in order each time fit() is called.
+      centers_sequence: list of 2D-arrays shape (n_clusters, 1)
+      """
+      centers_iter = iter(list(centers_sequence))
+  
+      class DummyKMeans:
+          def __init__(self, n_clusters=None, init=None, n_init=None):
+              self.n_clusters = n_clusters
+              self.init = init
+              self.n_init = n_init
+              self.cluster_centers_ = None
+  
+          def fit(self, X):
+              try:
+                  centers = next(centers_iter)
+              except StopIteration:
+                  # If sequence exhausted, just produce sorted centers based on X
+                  uniq = np.unique(X.ravel())
+                  centers = uniq[:self.n_clusters][:, None]
+                  if centers.shape[0] != self.n_clusters:
+                      centers = np.linspace(X.min(), X.max(), self.n_clusters)[:, None]
+              # Intentionally do not sort here: return whatever is provided
+              self.cluster_centers_ = np.asarray(centers, dtype=float)
+              return self
+  
+      return DummyKMeans
+  
+  def assert_strictly_increasing(arr):
+      diffs = np.diff(arr)
+      assert np.all(diffs > 0), "Array is not strictly increasing: %r" % (arr,)
+  
+  def test_kmeans_centers_sorted_single_feature(monkeypatch):
+      # Single feature; force KMeans to return unsorted centers
+      centers_seq = [np.array([[10.0], [1.0], [5.0]])]  # unsorted
+      monkeypatch.setattr(_skcluster, "KMeans", make_dummy_kmeans(centers_seq))
+  
+      X = np.linspace(0, 10, 11)[:, None]
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+  
+      # bin_edges_ must be strictly increasing (the fix sorts centers)
+      edges = est.bin_edges_[0]
+      assert_strictly_increasing(edges)
+      # shape check: n_bins + 1
+      assert edges.shape[0] == est.n_bins_[0] + 1
+  
+  def test_kmeans_centers_sorted_multi_feature(monkeypatch):
+      # Two features; make KMeans produce different unsorted centers on successive fits
+      centers_seq = [
+          np.array([[30.0], [1.0], [10.0]]),  # feature 0 unsorted
+          np.array([[2.0], [0.0], [5.0]])     # feature 1 unsorted
+      ]
+      monkeypatch.setattr(_skcluster, "KMeans", make_dummy_kmeans(centers_seq))
+  
+      X = np.vstack([
+          np.linspace(0, 30, 31),
+          np.linspace(0, 5, 31)
+      ]).T
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+  
+      # Both features must have strictly increasing bin edges
+      for j in range(X.shape[1]):
+          edges = est.bin_edges_[j]
+          assert_strictly_increasing(edges)
+          assert edges.shape[0] == est.n_bins_[j] + 1
+  
+  def test_inverse_transform_roundtrip_with_forced_unsorted_centers(monkeypatch):
+      centers_seq = [np.array([[8.0], [1.0], [4.0]])]
+      monkeypatch.setattr(_skcluster, "KMeans", make_dummy_kmeans(centers_seq))
+  
+      rng = np.random.RandomState(42)
+      X = rng.uniform(0, 8, size=(100, 1))
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      Xt = est.fit_transform(X)
+      Xinv = est.inverse_transform(Xt)
+      # Re-discretize the inverse; should match original bin indices
+      Xt2 = est.fit_transform(Xinv)
+      assert_array_equal(Xt, Xt2)
+  
+  def test_onehot_encode_with_kmeans_and_unsorted_centers(monkeypatch):
+      centers_seq = [np.array([[10.0], [0.0], [5.0]])]
+      monkeypatch.setattr(_skcluster, "KMeans", make_dummy_kmeans(centers_seq))
+  
+      X = np.linspace(0, 10, 11)[:, None]
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='onehot')
+      Xt = est.fit_transform(X)
+      # Should be sparse matrix representation; inverse_transform should work
+      Xinv = est.inverse_transform(Xt)
+      # After inverse_transform, discretizing again yields the same one-hot pattern
+      Xt2 = est.transform(Xinv)
+      # Convert to dense to compare irrespective of sparse/dense
+      assert_array_equal(Xt.toarray(), Xt2.toarray() if hasattr(Xt2, "toarray") else Xt2)
+  
+  def test_constant_feature_with_kmeans_on_other_feature(monkeypatch):
+      # First feature constant: should be replaced with single bin; second uses kmeans
+      centers_seq = [np.array([[3.0], [1.0], [6.0]])]  # will be used for second feature
+      monkeypatch.setattr(_skcluster, "KMeans", make_dummy_kmeans(centers_seq))
+  
+      X = np.column_stack([np.ones(50), np.linspace(0, 6, 50)])
+      est = KBinsDiscretizer(n_bins=[2, 3], strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      # First feature is constant -> n_bins_[0] == 1
+      assert est.n_bins_[0] == 1
+      # Second feature bin edges must be strictly increasing
+      edges = est.bin_edges_[1]
+      assert_strictly_increasing(edges)
+  
+  def test_varied_n_bins_array_with_kmeans(monkeypatch):
+      # Test with different n_bins per feature; force unsorted centers for the kmeans-using feature
+      # Feature 0: use kmeans with 4 bins; Feature 1: uniform (we won't call kmeans for it).
+      centers_seq = [np.array([[10.0], [0.0], [5.0], [7.0]])]
+      monkeypatch.setattr(_skcluster, "KMeans", make_dummy_kmeans(centers_seq))
+  
+      X = np.column_stack([
+          np.linspace(0, 10, 40),
+          np.linspace(-1, 1, 40)
+      ])
+      est = KBinsDiscretizer(n_bins=[4, 3], strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      # Check shapes and monotonicity for feature 0 (kmeans)
+      edges0 = est.bin_edges_[0]
+      assert edges0.shape[0] == 4 + 1
+      assert_strictly_increasing(edges0)
+      # Feature 1: check bin_edges shape matches n_bins_ as well
+      edges1 = est.bin_edges_[1]
+      assert edges1.shape[0] == 3 + 1
+  
+  def test_transform_outside_fit_range_with_unsorted_centers(monkeypatch):
+      centers_seq = [np.array([[9.0], [1.0], [4.0]])]
+      monkeypatch.setattr(_skcluster, "KMeans", make_dummy_kmeans(centers_seq))
+  
+      X_fit = np.array([0.0, 1.0, 2.0, 3.0])[:, None]
+      est = KBinsDiscretizer(n_bins=3, strategy='kmeans', encode='ordinal')
+      est.fit(X_fit)
+      # Values outside range should be clipped to [0, n_bins - 1]
+      X_out = np.array([[-10.0], [100.0]])
+      Xt_out = est.transform(X_out)
+      assert Xt_out.min() >= 0
+      assert Xt_out.max() <= est.n_bins_[0] - 1
+  
+  def test_numeric_stability_near_edges_with_forced_unsorted_centers(monkeypatch):
+      centers_seq = [np.array([[0.0], [1.0]])]  # two centers unsorted (but trivial)
+      monkeypatch.setattr(_skcluster, "KMeans", make_dummy_kmeans(centers_seq))
+  
+      X_init = np.array([0.0, 1.0])[:, None]
+      est = KBinsDiscretizer(n_bins=2, strategy='kmeans', encode='ordinal')
+      est.fit(X_init)
+      # Values extremely close to the boundary should still discretize consistently
+      X = np.array([0.5 - 1e-9, 0.5, 0.5 + 1e-9])[:, None]
+      Xt = est.transform(X)
+      # Increasing inputs should not map to decreasing bin indices
+      assert np.all(np.diff(Xt.ravel()) >= 0)
+  
+  def test_small_dataset_more_bins_than_unique_points(monkeypatch):
+      # If there are fewer unique points than bins, dummy KMeans may still return unsorted centers.
+      centers_seq = [np.array([[2.0], [0.5], [1.0], [3.0]])]
+      monkeypatch.setattr(_skcluster, "KMeans", make_dummy_kmeans(centers_seq))
+  
+      X = np.array([0.0, 1.0, 2.0])[:, None]  # only 3 unique points
+      est = KBinsDiscretizer(n_bins=4, strategy='kmeans', encode='ordinal')
+      est.fit(X)
+      # bin_edges_ must be increasing and of length n_bins + 1
+      edges = est.bin_edges_[0]
+      assert edges.shape[0] == 4 + 1
+      assert_strictly_increasing(edges)
+new_imports_code: |
+  import sklearn.cluster as _skcluster
+  from sklearn.utils.testing import assert_array_equal

@@ -1,0 +1,422 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise build_instance() from django.core.serializers.base with a variety of Model-like dummy classes and manager implementations to ensure that natural key resolution uses the provided db (via obj._state.db) and that relation fields and to_python conversions are handled correctly. They are designed to fail for the incorrect/candidate patch that doesn't set obj._state.db and that partially populates instance attributes (skipping relational fields), but pass for the fixed/gold implementation that sets obj._state.db on the temporary instance created to compute natural_key().
+test_code: |
+  import unittest
+  from types import SimpleNamespace
+  
+  from django.core.serializers.base import build_instance
+  
+  
+  class BuildInstanceTests(unittest.TestCase):
+      def test_sets_pk_using_natural_key_and_db_state(self):
+          """
+          If pk is missing and Model has natural_key and default_manager.get_by_natural_key,
+          build_instance should populate pk using the provided db parameter. The natural_key
+          implementation below reads self._state.db (so obj._state.db must be set before
+          calling natural_key()).
+          """
+  
+          class DoesNotExist(Exception):
+              pass
+  
+          class Meta:
+              class PK:
+                  attname = "id"
+  
+                  @staticmethod
+                  def to_python(value):
+                      return int(value)
+  
+              pk = PK()
+              default_manager = None  # will attach below
+  
+          class Manager:
+              def __init__(self):
+                  # mapping: natural_key_tuple -> pk
+                  self.mapping = {("other:alice",): "99"}
+                  self.last_db = None
+  
+              def db_manager(self, db):
+                  # return a DB-specific manager
+                  self.last_db = db
+  
+                  class DBManager:
+                      def __init__(self, outer, db):
+                          self._outer = outer
+                          self._db = db
+                          self.marker = str(db)
+  
+                      def get_by_natural_key(self, key):
+                          # Accept either single-arg or multi-arg calls
+                          if isinstance(key, tuple):
+                              key = tuple(key)
+                          if (key,) in self._outer.mapping:
+                              class O:
+                                  def __init__(self, pk):
+                                      self.pk = pk
+                              return O(self._outer.mapping[(key,)])
+                          # allow direct match for our constructed single-element keys
+                          if (key,) in self._outer.mapping:
+                              class O2:
+                                  def __init__(self, pk):
+                                      self.pk = pk
+                              return O2(self._outer.mapping[(key,)])
+                          raise DoesNotExist()
+  
+                  return DBManager(self, db)
+  
+          class Model:
+              _meta = Meta
+              DoesNotExist = DoesNotExist
+  
+              def __init__(self, **data):
+                  # store provided fields
+                  for k, v in data.items():
+                      setattr(self, k, v)
+                  self._state = SimpleNamespace(db=None)
+  
+              def natural_key(self):
+                  # Natural key depends on marker from manager which depends on self._state.db
+                  marker = self._meta.default_manager.db_manager(self._state.db).marker
+                  return (marker + ":" + getattr(self, "name"),)
+  
+          # Attach manager
+          mgr = Manager()
+          Meta.default_manager = mgr
+  
+          data = {"name": "alice"}
+          inst = build_instance(Model, data, "other")
+          # id should have been set to 99 by the mapping and converted to int
+          self.assertEqual(getattr(inst, "id"), 99)
+  
+      def test_leaves_pk_none_when_get_by_natural_key_raises(self):
+          """
+          If the default_manager.get_by_natural_key raises Model.DoesNotExist,
+          build_instance should not set the pk.
+          """
+          class DoesNotExist(Exception):
+              pass
+  
+          class Meta:
+              class PK:
+                  attname = "id"
+  
+                  @staticmethod
+                  def to_python(value):
+                      return int(value)
+  
+              pk = PK()
+  
+              class Manager:
+                  def db_manager(self, db):
+                      class DBManager:
+                          def get_by_natural_key(self, *args):
+                              raise DoesNotExist()
+                      return DBManager()
+  
+              default_manager = Manager()
+  
+          class Model:
+              _meta = Meta
+              DoesNotExist = DoesNotExist
+  
+              def __init__(self, **data):
+                  for k, v in data.items():
+                      setattr(self, k, v)
+                  self._state = SimpleNamespace(db=None)
+  
+              def natural_key(self):
+                  return ("whatever",)
+  
+          data = {"name": "bob"}
+          inst = build_instance(Model, data, "other")
+          # No id attribute should be set
+          self.assertFalse(hasattr(inst, "id") and getattr(inst, "id") is not None)
+  
+      def test_relation_field_needed_by_natural_key(self):
+          """
+          Candidate (incorrect) patch that only sets non-relation fields will miss setting
+          relation fields, causing natural_key to raise AttributeError (and be swallowed
+          by that candidate). The correct implementation sets obj._state.db on a fully
+          initialized Model(**data), allowing natural_key to access relation data.
+          """
+          class DoesNotExist(Exception):
+              pass
+  
+          class Meta:
+              class PK:
+                  attname = "id"
+  
+                  @staticmethod
+                  def to_python(value):
+                      return int(value)
+  
+              pk = PK()
+  
+          class Manager:
+              def __init__(self):
+                  self.mapping = {("relvalue",): "7"}
+  
+              def db_manager(self, db):
+                  class DBManager:
+                      def get_by_natural_key(self, *args):
+                          if args == ("relvalue",):
+                              class O:
+                                  def __init__(self, pk):
+                                      self.pk = pk
+                              return O("7")
+                          raise DoesNotExist()
+  
+                  return DBManager()
+  
+          class Model:
+              _meta = Meta
+              DoesNotExist = DoesNotExist
+  
+              def __init__(self, **data):
+                  # relation 'rel' is expected to be present in data and used by natural_key
+                  for k, v in data.items():
+                      setattr(self, k, v)
+                  self._state = SimpleNamespace(db=None)
+  
+              def natural_key(self):
+                  # Natural key uses a relation-like attribute
+                  return (getattr(self, "rel"),)
+  
+          Meta.default_manager = Manager()
+  
+          data = {"rel": "relvalue"}
+          inst = build_instance(Model, data, "other")
+          self.assertEqual(getattr(inst, "id"), 7)
+  
+      def test_to_python_conversion_called_on_returned_pk(self):
+          """
+          Ensure build_instance converts the found pk using pk.to_python().
+          """
+          class DoesNotExist(Exception):
+              pass
+  
+          class Meta:
+              class PK:
+                  attname = "id"
+  
+                  @staticmethod
+                  def to_python(value):
+                      return int(value) + 1  # transform to show conversion happened
+  
+              pk = PK()
+  
+          class Manager:
+              def db_manager(self, db):
+                  class DBManager:
+                      def get_by_natural_key(self, *args):
+                          class O:
+                              def __init__(self, pk):
+                                  self.pk = pk
+                          return O("5")
+                  return DBManager()
+  
+          class Model:
+              _meta = Meta
+              DoesNotExist = DoesNotExist
+  
+              def __init__(self, **data):
+                  for k, v in data.items():
+                      setattr(self, k, v)
+                  self._state = SimpleNamespace(db=None)
+  
+              def natural_key(self):
+                  return ("x",)
+  
+          Meta.default_manager = Manager()
+          data = {"name": "x"}
+          inst = build_instance(Model, data, "other")
+          # to_python returns int("5") + 1 => 6
+          self.assertEqual(getattr(inst, "id"), 6)
+  
+      def test_natural_key_with_multiple_arguments(self):
+          """
+          natural_key can return multiple values and they should be forwarded to get_by_natural_key.
+          """
+          class DoesNotExist(Exception):
+              pass
+  
+          class Meta:
+              class PK:
+                  attname = "id"
+  
+                  @staticmethod
+                  def to_python(value):
+                      return int(value)
+  
+              pk = PK()
+  
+          class Manager:
+              def db_manager(self, db):
+                  class DBManager:
+                      def get_by_natural_key(self, a, b):
+                          if (a, b) == ("one", "two"):
+                              class O:
+                                  def __init__(self, pk):
+                                      self.pk = pk
+                              return O("33")
+                          raise DoesNotExist()
+                  return DBManager()
+  
+          class Model:
+              _meta = Meta
+              DoesNotExist = DoesNotExist
+  
+              def __init__(self, **data):
+                  for k, v in data.items():
+                      setattr(self, k, v)
+                  self._state = SimpleNamespace(db=None)
+  
+              def natural_key(self):
+                  return ("one", "two")
+  
+          Meta.default_manager = Manager()
+          data = {}
+          inst = build_instance(Model, data, "other")
+          self.assertEqual(getattr(inst, "id"), 33)
+  
+      def test_respects_existing_pk_and_does_not_call_manager(self):
+          """
+          If data already contains the pk value, build_instance must not attempt
+          to resolve natural keys and should therefore not call the manager.
+          """
+          class Meta:
+              class PK:
+                  attname = "id"
+  
+                  @staticmethod
+                  def to_python(value):
+                      return int(value)
+  
+              pk = PK()
+  
+          class Manager:
+              def __init__(self):
+                  self.called = False
+  
+              def db_manager(self, db):
+                  self.called = True
+                  class DBManager:
+                      def get_by_natural_key(self, *args):
+                          raise AssertionError("Should not be called")
+                  return DBManager()
+  
+          class Model:
+              _meta = Meta
+  
+              def __init__(self, **data):
+                  for k, v in data.items():
+                      setattr(self, k, v)
+                  self._state = SimpleNamespace(db=None)
+  
+          mgr = Manager()
+          Meta.default_manager = mgr
+          data = {"id": 10}
+          inst = build_instance(Model, data, "other")
+          self.assertEqual(getattr(inst, "id"), 10)
+          # Manager.db_manager should not have been invoked
+          self.assertFalse(mgr.called)
+  
+      def test_skips_if_default_manager_has_no_get_by_natural_key(self):
+          """
+          If the default_manager doesn't provide get_by_natural_key, build_instance should skip lookup.
+          """
+          class Meta:
+              class PK:
+                  attname = "id"
+  
+                  @staticmethod
+                  def to_python(value):
+                      return int(value)
+  
+              pk = PK()
+  
+              # default_manager without get_by_natural_key
+              class Manager:
+                  def db_manager(self, db):
+                      class DBManager:
+                          def get_by_natural_key(self, *args):
+                              raise AssertionError("Should not be used")
+                      return DBManager()
+  
+              default_manager = Manager()
+  
+          class Model:
+              _meta = Meta
+  
+              def __init__(self, **data):
+                  for k, v in data.items():
+                      setattr(self, k, v)
+                  self._state = SimpleNamespace(db=None)
+  
+          data = {"name": "z"}
+          inst = build_instance(Model, data, "other")
+          # since there's no get_by_natural_key on the default_manager object itself,
+          # we don't attempt to set id
+          self.assertFalse(hasattr(inst, "id") and getattr(inst, "id") is not None)
+  
+      def test_preserves_other_fields(self):
+          """
+          Ensure fields other than the pk are preserved in the returned instance.
+          """
+          class Meta:
+              class PK:
+                  attname = "id"
+  
+                  @staticmethod
+                  def to_python(value):
+                      return int(value)
+  
+              pk = PK()
+  
+          class Model:
+              _meta = Meta
+  
+              def __init__(self, **data):
+                  for k, v in data.items():
+                      setattr(self, k, v)
+                  self._state = SimpleNamespace(db=None)
+  
+          data = {"name": "charlie", "extra": 42}
+          inst = build_instance(Model, data, "other")
+          self.assertEqual(getattr(inst, "extra"), 42)
+  
+      def test_skips_natural_key_if_model_has_no_natural_key_attr(self):
+          """
+          If the Model class does not define natural_key, build_instance should not attempt lookup.
+          """
+          class Meta:
+              class PK:
+                  attname = "id"
+  
+                  @staticmethod
+                  def to_python(value):
+                      return int(value)
+  
+              pk = PK()
+  
+          class Model:
+              _meta = Meta
+              # no natural_key attribute here
+  
+              def __init__(self, **data):
+                  for k, v in data.items():
+                      setattr(self, k, v)
+                  self._state = SimpleNamespace(db=None)
+  
+          data = {"name": "no_nk"}
+          inst = build_instance(Model, data, "other")
+          # no id set and no exception raised
+          self.assertFalse(hasattr(inst, "id") and getattr(inst, "id") is not None)
+  
+  
+  if __name__ == "__main__":
+      unittest.main()
+new_imports_code: |-
+  # No additional global imports required; all imports are included in test_code.

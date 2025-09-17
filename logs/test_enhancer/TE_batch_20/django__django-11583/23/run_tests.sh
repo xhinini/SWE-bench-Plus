@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 utils_tests.test_autoreload_llm.IterModulesAndFilesValueErrorTests._patch_resolve_for utils_tests.test_autoreload_llm.IterModulesAndFilesValueErrorTests.setUp utils_tests.test_autoreload_llm.IterModulesAndFilesValueErrorTests.tearDown utils_tests.test_autoreload_llm.IterModulesAndFilesValueErrorTests.test_cache_cleared_between_calls_allows_new_errors_to_be_handled utils_tests.test_autoreload_llm.IterModulesAndFilesValueErrorTests.test_handles_embedded_null_byte_message utils_tests.test_autoreload_llm.IterModulesAndFilesValueErrorTests.test_handles_value_error_with_arbitrary_message_path_object utils_tests.test_autoreload_llm.IterModulesAndFilesValueErrorTests.test_handles_value_error_with_arbitrary_message_string_path utils_tests.test_autoreload_llm.IterModulesAndFilesValueErrorTests.test_handles_value_error_with_empty_message utils_tests.test_autoreload_llm.IterModulesAndFilesValueErrorTests.test_handles_value_error_with_null_char_in_message utils_tests.test_autoreload_llm.IterModulesAndFilesValueErrorTests.test_handles_value_error_with_unicode_message utils_tests.test_autoreload_llm.IterModulesAndFilesValueErrorTests.test_iter_all_python_module_files_uses_error_files_safely utils_tests.test_autoreload_llm.IterModulesAndFilesValueErrorTests.test_resolve_called_with_strict_true utils_tests.test_autoreload_llm.IterModulesAndFilesValueErrorTests.test_valid_and_bad_files_together_only_valid_returned
+coverage json -o coverage.json
+: '>>>>> End Test Output'

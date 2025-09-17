@@ -1,0 +1,171 @@
+from datetime import datetime
+from operator import attrgetter
+
+from django.db.models import (
+    CharField, Count, DateTimeField, F, Max, OuterRef, Subquery, Value,
+)
+from django.db.models.functions import Upper
+from django.test import TestCase
+
+from .models import Article, Author, ChildArticle, OrderedByFArticle, Reference
+
+
+class OrderingTests(TestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.a1 = Article.objects.create(headline="Article 1", pub_date=datetime(2005, 7, 26))
+        cls.a2 = Article.objects.create(headline="Article 2", pub_date=datetime(2005, 7, 27))
+        cls.a3 = Article.objects.create(headline="Article 3", pub_date=datetime(2005, 7, 27))
+        cls.a4 = Article.objects.create(headline="Article 4", pub_date=datetime(2005, 7, 28))
+        cls.author_1 = Author.objects.create(name="Name 1")
+        cls.author_2 = Author.objects.create(name="Name 2")
+        for i in range(2):
+            Author.objects.create()
+
+    # --- New regression tests added below ---
+    def test_values_author_annotate_count_unaffected_by_meta_ordering(self):
+        """
+        values('author').annotate(count=Count('pk')) must group by author only,
+        even though the model has a default ordering (Meta.ordering).
+        """
+        Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+        Article.objects.filter(headline='Article 4').update(author=self.author_2)
+        qs = Article.objects.values('author').annotate(count=Count('pk')).order_by('author')
+        # Expect two rows: author_1 has 3 articles, author_2 has 1.
+        expected = [
+            {'author': self.author_1.pk, 'count': 3},
+            {'author': self.author_2.pk, 'count': 1},
+        ]
+        self.assertCountEqual(list(qs), expected)
+
+    def test_values_headline_annotate_count(self):
+        """
+        Grouping by headline should give one group per headline.
+        """
+        qs = Article.objects.values('headline').annotate(count=Count('pk')).order_by('headline')
+        # Each headline is unique in test data.
+        expected = [{'headline': 'Article 1', 'count': 1},
+                    {'headline': 'Article 2', 'count': 1},
+                    {'headline': 'Article 3', 'count': 1},
+                    {'headline': 'Article 4', 'count': 1}]
+        self.assertCountEqual(list(qs), expected)
+
+    def test_values_author_annotate_max_pub_date_unaffected_by_meta_ordering(self):
+        """
+        Annotating with Max('pub_date') and grouping by author should return
+        the correct max pub_date per author regardless of Meta.ordering.
+        """
+        Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+        Article.objects.filter(headline='Article 4').update(author=self.author_2)
+        qs = Article.objects.values('author').annotate(last_date=Max('pub_date')).order_by('author')
+        # Compute expected mapping directly from ORM to be robust across DBs.
+        expected_map = {}
+        for a in Article.objects.all():
+            if a.author_id is None:
+                continue
+            current = expected_map.get(a.author_id)
+            if current is None or a.pub_date > current:
+                expected_map[a.author_id] = a.pub_date
+        expected = [{'author': k, 'last_date': v} for k, v in expected_map.items()]
+        self.assertCountEqual(list(qs), expected)
+
+    def test_values_author_then_order_by_pub_date_keeps_grouping_by_author(self):
+        """
+        Explicitly ordering by a field (pub_date) should not turn a values('author')
+        aggregate into extra groups when default Meta.ordering is present.
+        """
+        Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+        Article.objects.filter(headline='Article 4').update(author=self.author_2)
+        qs = Article.objects.values('author').annotate(count=Count('pk')).order_by('pub_date')
+        # Still expect the same two aggregated rows for authors.
+        expected = [
+            {'author': self.author_1.pk, 'count': 3},
+            {'author': self.author_2.pk, 'count': 1},
+        ]
+        self.assertCountEqual(list(qs), expected)
+
+    def test_values_author_pub_date_together_grouping(self):
+        """
+        When values includes 'pub_date' explicitly, grouping should be by
+        both author and pub_date and return the expected tuples.
+        """
+        # Set authors so groups are meaningful.
+        Article.objects.filter(headline='Article 1').update(author=self.author_1)
+        Article.objects.filter(headline='Article 2').update(author=self.author_1)
+        Article.objects.filter(headline='Article 3').update(author=self.author_1)
+        Article.objects.filter(headline='Article 4').update(author=self.author_2)
+        qs = Article.objects.values('author', 'pub_date').annotate(count=Count('pk')).order_by('author', 'pub_date')
+        # Each (author, pub_date) combination should be present.
+        rows = list(qs)
+        # Total grouped rows must equal the number of distinct (author, pub_date) pairs.
+        distinct_pairs = {
+            (a['author'], a['pub_date']) for a in rows
+        }
+        self.assertEqual(len(distinct_pairs), len(rows))
+
+    def test_annotate_then_values_preserves_grouping(self):
+        """
+        Annotate first (adding an aggregate), then values() to project should
+        still group correctly by the requested values.
+        """
+        Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+        Article.objects.filter(headline='Article 4').update(author=self.author_2)
+        annotated = Article.objects.annotate(last_date=Max('pub_date'))
+        qs = annotated.values('author').annotate(count=Count('pk')).order_by('author')
+        expected = [
+            {'author': self.author_1.pk, 'count': 3},
+            {'author': self.author_2.pk, 'count': 1},
+        ]
+        self.assertCountEqual(list(qs), expected)
+
+    def test_ordering_from_meta_with_expression_ordering_does_not_affect_group_by(self):
+        """
+        Ensure that when ordering in Meta uses expressions (e.g. F expressions),
+        grouping for values+annotate queries is not polluted by the ordering.
+        """
+        # Use OrderedByFArticle which has an F() expression in Meta.ordering.
+        of1 = OrderedByFArticle.objects.create(headline='h1', pub_date=datetime(2005, 7, 27))
+        of2 = OrderedByFArticle.objects.create(headline='h2', pub_date=datetime(2005, 7, 28))
+        # Group by headline, count rows. Meta ordering should not create extra groups.
+        qs = OrderedByFArticle.objects.values('headline').annotate(count=Count('pk'))
+        expected = [{'headline': 'h1', 'count': 1}, {'headline': 'h2', 'count': 1}]
+        self.assertCountEqual(list(qs), expected)
+
+    def test_values_with_extra_select_and_meta_ordering(self):
+        """
+        Using extra(select=...) and values().annotate() must respect only the
+        requested grouping (the extra select column should not implicitly
+        change grouping because of Meta.ordering).
+        """
+        Article.objects.exclude(headline='Article 4').update(author=self.author_1)
+        Article.objects.filter(headline='Article 4').update(author=self.author_2)
+        qs = Article.objects.extra(select={'foo': 'pub_date'}).values('author').annotate(count=Count('pk')).order_by('author')
+        expected = [
+            {'author': self.author_1.pk, 'count': 3},
+            {'author': self.author_2.pk, 'count': 1},
+        ]
+        self.assertCountEqual(list(qs), expected)
+
+    def test_group_by_with_filtered_subquery_and_meta_ordering(self):
+        """
+        Complex case with a filtered subquery used in an annotation should not
+        be inadvertently grouped by Meta.ordering fields.
+        """
+        Article.objects.filter(headline='Article 1').update(author=self.author_1)
+        Article.objects.filter(headline='Article 2').update(author=self.author_1)
+        Article.objects.filter(headline='Article 4').update(author=self.author_2)
+        Author.objects.filter(name__isnull=True).delete()
+        author_3 = Author.objects.create(name='Name 3')
+        article_subquery = Article.objects.filter(
+            author=OuterRef('pk'),
+            headline__icontains='Article',
+        ).order_by().values('author').annotate(
+            last_date=Max('pub_date'),
+        ).values('last_date')
+        qs = Author.objects.annotate(
+            last_date=Subquery(article_subquery, output_field=DateTimeField())
+        ).values('pk', 'last_date').annotate(count=Count('pk')).order_by('pk')
+        # There should be one row per author (3 authors present).
+        self.assertEqual(len(list(qs)), 3)
+new_imports_code: ""

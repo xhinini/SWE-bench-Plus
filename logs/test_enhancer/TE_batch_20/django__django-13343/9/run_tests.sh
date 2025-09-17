@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 file_storage.tests_llm.FileFieldStorageCallableRetentionTests.setUp file_storage.tests_llm.FileFieldStorageCallableRetentionTests.tearDown file_storage.tests_llm.FileFieldStorageCallableRetentionTests.test_attribute_persists_after_deconstruct file_storage.tests_llm.FileFieldStorageCallableRetentionTests.test_class_callable_sets__storage_callable file_storage.tests_llm.FileFieldStorageCallableRetentionTests.test_deconstruct_returns_original_callable_for_functor file_storage.tests_llm.FileFieldStorageCallableRetentionTests.test_function_callable_sets__storage_callable file_storage.tests_llm.FileFieldStorageCallableRetentionTests.test_functor_callable_sets__storage_callable file_storage.tests_llm.FileFieldStorageCallableRetentionTests.test_lambda_callable_sets__storage_callable file_storage.tests_llm.FileFieldStorageCallableRetentionTests.test_partial_and_lambda_callable_deconstruct_and_attribute file_storage.tests_llm.FileFieldStorageCallableRetentionTests.test_partial_callable_sets__storage_callable
+coverage json -o coverage.json
+: '>>>>> End Test Output'

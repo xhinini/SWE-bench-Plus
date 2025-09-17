@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.test_admin_llm.SearchRegressionTests.setUp admin_changelist.test_admin_llm.SearchRegressionTests.test_may_have_duplicates_flag_reflects_lookup_spawning admin_changelist.test_admin_llm.SearchRegressionTests.test_multiple_terms_are_combined_as_and_across_lookups admin_changelist.test_admin_llm.SearchRegressionTests.test_quoted_phrase_is_treated_as_single_search_term admin_changelist.test_admin_llm.SearchRegressionTests.test_search_handles_escaped_quoted_string_literals admin_changelist.test_admin_llm.SearchRegressionTests.test_search_multiple_bits_with_one_field admin_changelist.test_admin_llm.SearchRegressionTests.test_search_pk_alias_is_resolved admin_changelist.test_admin_llm.SearchRegressionTests.test_search_related_field_lookup_chaining admin_changelist.test_admin_llm.SearchRegressionTests.test_search_with_prefix_equal_for_exact_match admin_changelist.test_admin_llm.SearchRegressionTests.test_search_with_prefix_startswith
+coverage json -o coverage.json
+: '>>>>> End Test Output'

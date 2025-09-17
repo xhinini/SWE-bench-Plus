@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_writer_llm.MigrationWriterImportGroupingTests.test_complex_mixed_import_ordering migrations.test_writer_llm.MigrationWriterImportGroupingTests.test_duplicate_imports_are_not_repeated migrations.test_writer_llm.MigrationWriterImportGroupingTests.test_from_same_module_multiple_imports_preserved migrations.test_writer_llm.MigrationWriterImportGroupingTests.test_from_statements_sorted_by_module_name migrations.test_writer_llm.MigrationWriterImportGroupingTests.test_group_imports_before_from_statements migrations.test_writer_llm.MigrationWriterImportGroupingTests.test_imports_not_dropped_if_unexpected_prefix migrations.test_writer_llm.MigrationWriterImportGroupingTests.test_imports_sorted_by_module_name_within_import_group migrations.test_writer_llm.MigrationWriterImportGroupingTests.test_imports_with_submodules_sorted_correctly migrations.test_writer_llm.MigrationWriterImportGroupingTests.test_models_merging_into_migrations_import migrations.test_writer_llm.SingleArgOperation.__init__ migrations.test_writer_llm.SingleArgOperation.deconstruct migrations.test_writer_llm._register_serializer_for migrations.test_writer_llm._unregister
+coverage json -o coverage.json
+: '>>>>> End Test Output'

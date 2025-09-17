@@ -1,0 +1,156 @@
+from datetime import datetime
+from django.db.models import Count, CharField, Value, F
+from django.test import TestCase
+from datetime import datetime
+
+from django.db.models import Count, CharField, Value, F
+from django.test import TestCase
+
+from .models import Article, OrderedByFArticle, ChildArticle, Author
+
+class GroupByMetaOrderingTests(TestCase):
+
+    @classmethod
+    def setUpTestData(cls):
+        # Create authors
+        cls.author_1 = Author.objects.create(name="Name 1")
+        cls.author_2 = Author.objects.create(name="Name 2")
+        # Articles: pub_date has duplicates, headline unique
+        cls.a1 = Article.objects.create(headline="Article 1", pub_date=datetime(2005, 7, 26))
+        cls.a2 = Article.objects.create(headline="Article 2", pub_date=datetime(2005, 7, 27))
+        cls.a3 = Article.objects.create(headline="Article 3", pub_date=datetime(2005, 7, 27))
+        cls.a4 = Article.objects.create(headline="Article 4", pub_date=datetime(2005, 7, 28))
+
+    def assert_group_by_does_not_contain(self, qs, forbidden_column_fragment):
+        """
+        Helper that asserts the generated SQL GROUP BY clause does not
+        contain the given fragment (e.g. 'headline') and that aggregation
+        results are as expected when grouping only by the explicit fields.
+        """
+        sql = str(qs.query).upper()
+        # If there's a GROUP BY, ensure the forbidden fragment is not in it.
+        if 'GROUP BY' in sql:
+            group_by_part = sql[sql.find('GROUP BY'):]
+            self.assertNotIn(forbidden_column_fragment.upper(), group_by_part)
+        return list(qs)
+
+    def test_values_group_by_pub_date_not_affected_by_meta_ordering(self):
+        """
+        .values('pub_date').annotate(count=Count('pk')) should GROUP BY pub_date only,
+        even if the model has default Meta.ordering that references other fields.
+        """
+        qs = Article.objects.values('pub_date').annotate(count=Count('pk'))
+        results = self.assert_group_by_does_not_contain(qs, 'headline')
+        # Expect 3 groups: 2005-07-26, 2005-07-27, 2005-07-28
+        pubs = {r['pub_date'] for r in results}
+        self.assertEqual(len(pubs), 3)
+
+    def test_values_list_group_by_pub_date_not_affected_by_meta_ordering(self):
+        qs = Article.objects.values_list('pub_date').annotate(count=Count('pk'))
+        results = self.assert_group_by_does_not_contain(qs, 'headline')
+        # values_list with single field returns tuples like (pub_date,)
+        pubs = {r[0] for r in results}
+        self.assertEqual(len(pubs), 3)
+
+    def test_annotate_on_values_with_extra_select(self):
+        # Use extra select-like behavior by annotating a constant and group by pub_date
+        qs = Article.objects.values('pub_date').annotate(
+            count=Count('pk'),
+            const=Value('x', output_field=CharField())
+        )
+        results = self.assert_group_by_does_not_contain(qs, 'headline')
+        pubs = {r['pub_date'] for r in results}
+        self.assertEqual(len(pubs), 3)
+
+    def test_distinct_with_values_and_annotate(self):
+        # distinct() with values + annotate should still group by only the explicit field
+        qs = Article.objects.values('pub_date').annotate(count=Count('pk')).distinct()
+        results = self.assert_group_by_does_not_contain(qs, 'headline')
+        pubs = {r['pub_date'] for r in results}
+        self.assertEqual(len(pubs), 3)
+
+    def test_group_by_pub_date_with_f_expression_in_meta_ordering_model(self):
+        """
+        Ensure models that use F expressions in Meta.ordering (OrderedByFArticle)
+        don't leak their ordering into GROUP BY for a values(...).annotate(...) query.
+        """
+        # Create test rows for OrderedByFArticle
+        o1 = OrderedByFArticle.objects.create(headline="A1")
+        o2 = OrderedByFArticle.objects.create(headline="A2")
+        # Set different authors to avoid collapsing
+        o1.author = self.author_1
+        o1.save(update_fields=['author'])
+        o2.author = self.author_2
+        o2.save(update_fields=['author'])
+        qs = OrderedByFArticle.objects.values('author').annotate(count=Count('pk'))
+        results = list(qs)
+        # If Meta.ordering leaked into GROUP BY we'd get unexpected grouping; expect 2 groups (author None may be present)
+        self.assertTrue(len(results) >= 2)
+
+    def test_group_by_with_values_and_ordering_not_specified(self):
+        """
+        When no explicit order_by() is provided, Meta.ordering should not affect GROUP BY.
+        Grouping by pub_date should not group by headline (a Meta.ordering field).
+        """
+        qs = Article.objects.values('pub_date').annotate(count=Count('pk'))
+        # Also check SQL-level absence to be strict
+        sql = str(qs.query).upper()
+        if 'GROUP BY' in sql:
+            group_by_part = sql[sql.find('GROUP BY'):]
+            self.assertNotIn('HEADLINE', group_by_part)
+
+    def test_group_by_with_values_and_filtering(self):
+        """
+        Filtering should not change grouping behavior with respect to Meta.ordering.
+        """
+        Article.objects.filter(headline='Article 1').update(author=self.author_1)
+        qs = Article.objects.values('pub_date').annotate(count=Count('pk'))
+        results = self.assert_group_by_does_not_contain(qs, 'headline')
+        pubs = {r['pub_date'] for r in results}
+        self.assertEqual(len(pubs), 3)
+
+    def test_group_by_on_child_model_with_meta_ordering_in_parent(self):
+        """
+        ChildArticle inherits ordering via parent model. GROUP BY on a single field
+        should not absorb parent Meta.ordering fields.
+        """
+        ca1 = ChildArticle.objects.create(
+            headline='h2',
+            pub_date=datetime(2005, 7, 27),
+            author=self.author_2,
+        )
+        ca2 = ChildArticle.objects.create(
+            headline='h2',
+            pub_date=datetime(2005, 7, 27),
+            author=self.author_1,
+        )
+        qs = ChildArticle.objects.values('pub_date').annotate(count=Count('pk'))
+        results = self.assert_group_by_does_not_contain(qs, 'headline')
+        pubs = {r['pub_date'] for r in results}
+        # There should be at most 2 distinct pub_date values here
+        self.assertTrue(len(pubs) >= 1)
+
+    def test_group_by_values_and_ordering_with_annotation_constant(self):
+        """
+        Annotating a constant and grouping by pub_date shouldn't include meta-ordering fields.
+        """
+        qs = Article.objects.values('pub_date').annotate(const=Value('1', output_field=CharField()), count=Count('pk'))
+        results = self.assert_group_by_does_not_contain(qs, 'headline')
+        pubs = {r['pub_date'] for r in results}
+        self.assertEqual(len(pubs), 3)
+
+# Additional targeted test to ensure headline isn't part of GROUP BY even if Meta.ordering exists
+class GroupByExactSQLTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.a1 = Article.objects.create(headline="Article 1", pub_date=datetime(2005, 7, 26))
+        cls.a2 = Article.objects.create(headline="Article 2", pub_date=datetime(2005, 7, 27))
+        cls.a3 = Article.objects.create(headline="Article 3", pub_date=datetime(2005, 7, 27))
+
+    def test_sql_group_by_does_not_include_meta_ordering_field(self):
+        qs = Article.objects.values('pub_date').annotate(cnt=Count('pk'))
+        sql = str(qs.query).upper()
+        # Assert that the SQL GROUP BY clause (if present) does not reference the META ordering field 'headline'
+        if 'GROUP BY' in sql:
+            group_by_clause = sql[sql.find('GROUP BY'):].split('HAVING')[0]
+            self.assertNotIn('HEADLINE', group_by_clause)

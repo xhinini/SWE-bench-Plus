@@ -1,0 +1,174 @@
+from django.db import router, connections, IntegrityError
+from django.apps.registry import apps
+from django.conf import settings
+from django.contrib.contenttypes import management as contenttypes_management
+from django.contrib.contenttypes.models import ContentType
+from django.db import connections, IntegrityError
+from django.test import TransactionTestCase, override_settings
+from django.db import router
+
+
+class RenameContentTypeUsingDBTests(TransactionTestCase):
+    databases = {'default', 'other'}
+    available_apps = ['django.contrib.contenttypes']
+
+    def _make_router_force_default(self):
+        class ForcingDefaultRouter:
+            def db_for_read(self, model, **hints):
+                return 'default'
+
+            def db_for_write(self, model, **hints):
+                return 'default'
+
+            def allow_migrate(self, db, app_label, model_name=None, **hints):
+                # allow migrations on both DBs for test purposes
+                return True
+        return ForcingDefaultRouter()
+
+    @override_settings(DATABASE_ROUTERS=[])
+    def test_rename_uses_using_parameter_when_router_absent(self):
+        # Ensure basic behaviour: rename writes to the 'other' DB when using is provided.
+        # Setup: create content type in 'other'
+        ContentType.objects.using('other').create(app_label='myapp', model='oldmodel')
+        rename_op = contenttypes_management.RenameContentType('myapp', 'oldmodel', 'newmodel')
+        with connections['other'].schema_editor() as schema_editor:
+            rename_op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+        # After rename, 'other' should have newmodel, default should not.
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='myapp', model='newmodel').exists())
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='myapp', model='newmodel').exists())
+
+    @override_settings(DATABASE_ROUTERS=[object])
+    def test_rename_uses_using_even_if_router_forces_default_on_writes(self):
+        # Router forces writes to default; save must still occur on 'other' due to using=db
+        router.routers = [self._make_router_force_default()]
+        ContentType.objects.using('other').create(app_label='myapp2', model='oldmodel')
+        rename_op = contenttypes_management.RenameContentType('myapp2', 'oldmodel', 'newmodel')
+        with connections['other'].schema_editor() as schema_editor:
+            rename_op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+        # Correct behaviour: other DB updated, default not modified
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='myapp2', model='newmodel').exists())
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='myapp2', model='newmodel').exists())
+
+    @override_settings(DATABASE_ROUTERS=[object])
+    def test_save_called_with_using_kwarg(self):
+        # Monkeypatch the model.save to capture the 'using' kwarg passed in
+        router.routers = [self._make_router_force_default()]
+        ContentType.objects.using('other').create(app_label='myapp3', model='oldmodel')
+        seen = {}
+        Model = ContentType
+        original_save = Model.save
+        def fake_save(self, *args, **kwargs):
+            seen['using'] = kwargs.get('using', None)
+            return original_save(self, *args, **kwargs)
+        Model.save = fake_save
+        try:
+            rename_op = contenttypes_management.RenameContentType('myapp3', 'oldmodel', 'newmodel')
+            with connections['other'].schema_editor() as schema_editor:
+                rename_op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+            # Ensure the save() received the using argument 'other'
+            self.assertEqual(seen.get('using'), 'other')
+        finally:
+            Model.save = original_save
+
+    @override_settings(DATABASE_ROUTERS=[object])
+    def test_get_by_natural_key_reads_from_correct_db_when_router_forces_reads_to_default(self):
+        # Router forces reads to default; get_by_natural_key must still use provided db_manager(db)
+        class ForcingDefaultReadRouter:
+            def db_for_read(self, model, **hints):
+                return 'default'
+            def db_for_write(self, model, **hints):
+                return 'default'
+            def allow_migrate(self, db, app_label, model_name=None, **hints):
+                return True
+        router.routers = [ForcingDefaultReadRouter()]
+        ContentType.objects.using('other').create(app_label='myapp4', model='oldmodel')
+        rename_op = contenttypes_management.RenameContentType('myapp4', 'oldmodel', 'newmodel')
+        with connections['other'].schema_editor() as schema_editor:
+            rename_op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+        # If get_by_natural_key ignored db_manager, rename would fail; verify success.
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='myapp4', model='newmodel').exists())
+
+    @override_settings(DATABASE_ROUTERS=[object])
+    def test_integrity_error_in_default_does_not_prevent_successful_rename_on_other(self):
+        # Setup a conflicting object in default so that if save() was wrongly sent to default it would conflict.
+        router.routers = [self._make_router_force_default()]
+        # Create original in other
+        ContentType.objects.using('other').create(app_label='conflictapp', model='oldmodel')
+        # Create a row in default that would conflict if save was executed in default (same app_label and new model)
+        ContentType.objects.using('default').create(app_label='conflictapp', model='newmodel')
+        # Perform rename: correct behaviour is to rename in 'other' DB and leave default untouched.
+        rename_op = contenttypes_management.RenameContentType('conflictapp', 'oldmodel', 'newmodel')
+        with connections['other'].schema_editor() as schema_editor:
+            rename_op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+        # other should have been renamed
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='conflictapp', model='newmodel').exists())
+        self.assertFalse(ContentType.objects.using('other').filter(app_label='conflictapp', model='oldmodel').exists())
+        # default should still have its existing conflicting row
+        self.assertTrue(ContentType.objects.using('default').filter(app_label='conflictapp', model='newmodel').exists())
+
+    @override_settings(DATABASE_ROUTERS=[object])
+    def test_clear_cache_called_on_successful_rename(self):
+        # Monkeypatch clear_cache to assert it is called on success
+        router.routers = [self._make_router_force_default()]
+        ContentType.objects.using('other').create(app_label='cacheapp', model='oldmodel')
+        called = {'count': 0}
+        original_clear_cache = ContentType.objects.clear_cache
+        def fake_clear_cache():
+            called['count'] += 1
+        ContentType.objects.clear_cache = fake_clear_cache
+        try:
+            rename_op = contenttypes_management.RenameContentType('cacheapp', 'oldmodel', 'newmodel')
+            with connections['other'].schema_editor() as schema_editor:
+                rename_op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+            self.assertEqual(called['count'], 1)
+        finally:
+            ContentType.objects.clear_cache = original_clear_cache
+
+    @override_settings(DATABASE_ROUTERS=[object])
+    def test_clear_cache_not_called_when_integrity_error_occurs(self):
+        # Simulate IntegrityError by creating conflicting row in same DB ('other') so save will raise IntegrityError.
+        router.routers = [self._make_router_force_default()]
+        ContentType.objects.using('other').create(app_label='cacheapp2', model='oldmodel')
+        ContentType.objects.using('other').create(app_label='cacheapp2', model='newmodel')  # conflict in other DB
+        called = {'count': 0}
+        original_clear_cache = ContentType.objects.clear_cache
+        def fake_clear_cache():
+            called['count'] += 1
+        ContentType.objects.clear_cache = fake_clear_cache
+        try:
+            rename_op = contenttypes_management.RenameContentType('cacheapp2', 'oldmodel', 'newmodel')
+            with connections['other'].schema_editor() as schema_editor:
+                # Should catch IntegrityError and not call clear_cache
+                rename_op._rename(apps, schema_editor, 'oldmodel', 'newmodel')
+            self.assertEqual(called['count'], 0)
+        finally:
+            ContentType.objects.clear_cache = original_clear_cache
+
+    @override_settings(DATABASE_ROUTERS=[object])
+    def test_rename_backward_uses_using_parameter(self):
+        # Ensure backward rename writes to the provided DB alias
+        router.routers = [self._make_router_force_default()]
+        ContentType.objects.using('other').create(app_label='backapp', model='modelb')
+        # Perform forward rename to "modelc" then backward to "modelb"
+        rename_op = contenttypes_management.RenameContentType('backapp', 'modelb', 'modelc')
+        with connections['other'].schema_editor() as schema_editor:
+            rename_op.rename_forward(apps, schema_editor)
+        # Verify forward rename worked
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='backapp', model='modelc').exists())
+        # Now run rename_backward and verify it uses 'other' DB to restore modelb
+        with connections['other'].schema_editor() as schema_editor:
+            rename_op.rename_backward(apps, schema_editor)
+        self.assertTrue(ContentType.objects.using('other').filter(app_label='backapp', model='modelb').exists())
+        self.assertFalse(ContentType.objects.using('other').filter(app_label='backapp', model='modelc').exists())
+
+    @override_settings(DATABASE_ROUTERS=[object])
+    def test_missing_content_type_does_nothing_and_no_errors(self):
+        # Running rename when the content type is missing should be a no-op
+        router.routers = [self._make_router_force_default()]
+        rename_op = contenttypes_management.RenameContentType('noapp', 'nonexistent', 'stillnonexistent')
+        with connections['other'].schema_editor() as schema_editor:
+            # Should not raise and should leave DBs untouched
+            rename_op._rename(apps, schema_editor, 'nonexistent', 'stillnonexistent')
+        # Ensure neither DB has such content type
+        self.assertFalse(ContentType.objects.using('other').filter(app_label='noapp').exists())
+        self.assertFalse(ContentType.objects.using('default').filter(app_label='noapp').exists())

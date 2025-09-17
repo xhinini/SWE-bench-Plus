@@ -1,0 +1,230 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise django.core.serializers.base.build_instance. They create lightweight fake "Model" classes (with a _meta and default_manager) to simulate different scenarios around natural key resolution, database routing (the db argument), pk to_python conversion, and error handling. The tests assert that build_instance sets the primary key in the input data when a natural key lookup succeeds (and uses the provided db value when building the instance), leaves the data unchanged when get_by_natural_key reports DoesNotExist, propagates non-DoesNotExist exceptions, skips natural key resolution when default_manager lacks get_by_natural_key or when the Model has no natural_key, and that the implementation is robust to natural_key implementations that require _state.db to be set. These tests would fail against the candidate (incorrect) patch and pass against the fixed (gold) patch.
+test_code: |
+  import unittest
+  from types import SimpleNamespace
+
+  from django.core.serializers import base
+
+  # Helper exceptions to mimic Django model DoesNotExist
+  class ModelDoesNotExist(Exception):
+      pass
+
+  def make_meta(default_manager, pk_attname="id", pk_to_python=lambda x: x):
+      class PK:
+          attname = pk_attname
+          to_python = staticmethod(pk_to_python)
+
+      meta = SimpleNamespace()
+      meta.default_manager = default_manager
+      meta.pk = PK()
+      return meta
+
+  class DummyState:
+      def __init__(self):
+          # In real Django Model._state.db defaults to None.
+          self.db = None
+
+  class BaseFakeModel:
+      DoesNotExist = ModelDoesNotExist
+
+      def __init__(self, **data):
+          # set all passed fields as attributes
+          for k, v in data.items():
+              setattr(self, k, v)
+          # a small compatibility alias: .pk returns attribute named by pk.attname if present
+          pk_name = self._meta.pk.attname
+          self.pk = getattr(self, pk_name, None)
+          self._state = DummyState()
+
+      def __repr__(self):
+          return "<FakeModel pk=%r>" % (self.pk,)
+
+  class SimpleManager:
+      """
+      A manager that can return different results depending on the db it was
+      asked to operate on. The mapping maps natural_key tuples to pk values.
+      Optionally raise_on_db_none causes db_manager(None) to raise ValueError
+      (simulating managers that require an explicit db).
+      """
+      def __init__(self, mapping=None, raise_on_db_none=False, raise_exc=None):
+          self._db = None
+          self.mapping = mapping or {}
+          self.raise_on_db_none = raise_on_db_none
+          self.raise_exc = raise_exc
+
+      def db_manager(self, db):
+          self._db = db
+          if self.raise_on_db_none and db is None:
+              # simulate behavior where the manager can't work without an explicit db
+              raise ValueError("db must be provided")
+          return self
+
+      def get_by_natural_key(self, *args):
+          if self.raise_exc:
+              raise self.raise_exc
+          key = tuple(args)
+          if key in self.mapping:
+              return SimpleNamespace(pk=self.mapping[key])
+          raise ModelDoesNotExist
+
+      # helper used by some natural_key implementations (marker based on db)
+      def marker(self):
+          return "mk_" + str(self._db)
+
+  class TestBuildInstance(unittest.TestCase):
+      def test_pk_present_no_change(self):
+          # If pk is already present in data, build_instance should not attempt to find by natural key.
+          mgr = SimpleManager(mapping={("irrelevant",): 99})
+          class M(BaseFakeModel):
+              _meta = make_meta(mgr)
+          data = {"id": 5, "name": "x"}
+          inst = base.build_instance(M, data.copy(), db="other")
+          # Since data already had id, returned instance should reflect that id
+          self.assertEqual(getattr(inst, "id"), 5)
+
+      def test_resolve_natural_key_uses_state_db(self):
+          # natural_key depends on _state.db via the manager.marker value.
+          # build_instance should set obj._state.db before calling natural_key
+          mapping = {("mk_other",): 42}
+          mgr = SimpleManager(mapping=mapping, raise_on_db_none=True)
+          class M(BaseFakeModel):
+              _meta = make_meta(mgr)
+              def natural_key(self):
+                  # This natural_key will call into the manager and therefore requires
+                  # _state.db to have been set (simulated via raise_on_db_none).
+                  marker = self._meta.default_manager.db_manager(self._state.db).marker()
+                  return (marker,)
+          data = {}
+          inst = base.build_instance(M, data, db="other")
+          # When lookup succeeds the data should have been updated and the returned
+          # instance should have the resolved pk value.
+          self.assertEqual(getattr(inst, "id"), 42)
+
+      def test_missing_get_by_natural_key_leaves_data(self):
+          # If get_by_natural_key raises DoesNotExist, data should remain unchanged.
+          mgr = SimpleManager(mapping={})  # empty mapping -> lookup fails
+          class M(BaseFakeModel):
+              _meta = make_meta(mgr)
+              def natural_key(self):
+                  return ("whatever",)
+          data = {}
+          inst = base.build_instance(M, data, db="default")
+          # No pk was resolvable, so returned instance should have no id attribute set
+          self.assertIsNone(getattr(inst, "id", None))
+
+      def test_natural_key_requires_state_db_raises_without_it_but_fixed_by_patch(self):
+          # natural_key calls db_manager(self._state.db) where db_manager raises
+          # if db is None. This would raise on implementations that don't set _state.db.
+          mgr = SimpleManager(mapping={("mk_prod",): 7}, raise_on_db_none=True)
+          class M(BaseFakeModel):
+              _meta = make_meta(mgr)
+              def natural_key(self):
+                  # Require _state.db to be set (db_manager will raise otherwise).
+                  return (self._meta.default_manager.db_manager(self._state.db).marker(),)
+          data = {}
+          # With the bug (not setting _state.db) this would raise ValueError.
+          # The fixed implementation sets _state.db and the call should succeed.
+          inst = base.build_instance(M, data, db="prod")
+          self.assertEqual(getattr(inst, "id"), 7)
+
+      def test_to_python_conversion_applied(self):
+          # Ensure pk is converted via pk.to_python before being placed into data
+          mgr = SimpleManager(mapping={(("natural",),): "123"})
+          # pk.to_python converts string to int
+          class M(BaseFakeModel):
+              _meta = make_meta(mgr, pk_to_python=lambda x: int(x))
+              def natural_key(self):
+                  return ("natural",)
+          data = {}
+          inst = base.build_instance(M, data, db="db")
+          # pk should have been converted to int by to_python
+          self.assertEqual(getattr(inst, "id"), 123)
+          self.assertIsInstance(getattr(inst, "id"), int)
+
+      def test_skip_when_no_get_by_natural_key(self):
+          # If the default_manager doesn't have get_by_natural_key, build_instance should skip resolution.
+          class ManagerNoNK:
+              def db_manager(self, db):
+                  return self
+          mgr = ManagerNoNK()
+          class M(BaseFakeModel):
+              _meta = make_meta(mgr)
+              # note: no natural_key method -> even if present, default_manager lacks get_by_natural_key
+          data = {}
+          inst = base.build_instance(M, data, db="db")
+          self.assertIsNone(getattr(inst, "id", None))
+
+      def test_skip_when_no_natural_key_method_on_model(self):
+          # If Model has no natural_key attribute, build_instance should not attempt any resolution.
+          mgr = SimpleManager(mapping={("foo",): 1})
+          class M(BaseFakeModel):
+              _meta = make_meta(mgr)
+              # no natural_key defined
+          data = {}
+          inst = base.build_instance(M, data, db="db")
+          self.assertIsNone(getattr(inst, "id", None))
+
+      def test_propagates_non_does_not_exist_exceptions(self):
+          # If get_by_natural_key raises an unexpected exception (not DoesNotExist),
+          # it should be propagated.
+          class SomeError(Exception):
+              pass
+          mgr = SimpleManager(mapping={}, raise_exc=SomeError("boom"))
+          class M(BaseFakeModel):
+              _meta = make_meta(mgr)
+              def natural_key(self):
+                  return ("anything",)
+          data = {}
+          with self.assertRaises(SomeError):
+              base.build_instance(M, data, db="db")
+
+      def test_candidate_patch_fails_to_set_remote_fields_affecting_natural_key(self):
+          # Ensure build_instance works even if natural_key depends on fields that
+          # might be considered "remote" in candidate faulty implementations that
+          # skip setting remote fields on the constructed instance.
+          # Here natural_key uses a value that would be present in data but that a
+          # naive constructor approach (setting only non-remote fields) might omit.
+          mgr = SimpleManager(mapping={("title_x", "author_mk_db"): 99})
+          class M(BaseFakeModel):
+              # _meta.get_field is provided because some candidate approaches attempt to
+              # inspect field objects; provide a fake get_field that marks fields with remote_field.
+              @staticmethod
+              def _get_field_descriptor(name):
+                  # simple descriptor: name 'author' is considered remote, 'title' not
+                  remote = name == "author"
+                  return SimpleNamespace(remote_field=(SimpleNamespace() if remote else None))
+
+              _meta = make_meta(mgr)
+              @staticmethod
+              def _meta_get_field(name):
+                  return M._get_field_descriptor(name)
+
+              # The real code doesn't call Model._meta_get_field here, but some
+              # incorrect implementations may. Provide compatibility attribute.
+              _meta.get_field = lambda self, name: M._get_field_descriptor(name)
+
+              def __init__(self, **data):
+                  # We allow Model(**data) to set attributes normally.
+                  super().__init__(**data)
+
+              def natural_key(self):
+                  # natural_key relies on both title (non-remote) and author marker produced
+                  # by the manager based on _state.db (simulating nested dependence)
+                  author_marker = self._meta.default_manager.db_manager(self._state.db).marker()
+                  return (getattr(self, "title", None), author_marker)
+
+          # The incoming data contains both title and author (author is its natural form
+          # in serialized input). The correct build_instance should set _state.db and
+          # use natural_key to find the pk.
+          data = {"title": "title_x", "author": ("author_mk_db",)}
+          # Adapt manager to accept ("title_x", "author_mk_db") -> 99
+          mgr.mapping = {("title_x", "author_mk_db"): 99}
+          inst = base.build_instance(M, data, db="db")
+          self.assertEqual(getattr(inst, "id"), 99)
+
+  if __name__ == "__main__":
+      unittest.main()
+new_imports_code: |
+  from types import SimpleNamespace

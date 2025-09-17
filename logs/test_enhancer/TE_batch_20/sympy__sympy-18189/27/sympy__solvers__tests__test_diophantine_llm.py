@@ -1,0 +1,52 @@
+from sympy import symbols
+from sympy.solvers.diophantine import diophantine
+from sympy.utilities.iterables import signed_permutations, permutations
+n, m = symbols('n m', integer=True)
+eq = n ** 4 + m ** 4 - 2 ** 4 - 3 ** 4
+base = diophantine(eq, permute=True)
+alt = diophantine(eq, syms=(m, n), permute=True)
+assert alt == reorder_solutions(base, (n, m), (m, n))
+x, y, z = symbols('x y z', integer=True)
+eq3 = x ** 2 + y ** 2 + z ** 2 - 14
+base3 = diophantine(eq3, permute=True)
+alt3 = diophantine(eq3, syms=(z, y, x), permute=True)
+assert alt3 == reorder_solutions(base3, (x, y, z), (z, y, x))
+a, b, c, d, e = symbols('a b c d e', integer=True)
+eq5 = a ** 2 + b ** 2 + c ** 2 + d ** 2 + e ** 2 - 234
+base5 = diophantine(eq5, permute=True)
+alt5 = diophantine(eq5, syms=(e, d, c, b, a), permute=True)
+assert alt5 == reorder_solutions(base5, (a, b, c, d, e), (e, d, c, b, a))
+u, v = symbols('u v', integer=True)
+eq_lin = 2 * u + 3 * v - 5
+base_lin = diophantine(eq_lin, permute=True)
+alt_lin = diophantine(eq_lin, syms=(v, u), permute=True)
+assert alt_lin == reorder_solutions(base_lin, (u, v), (v, u))
+eq_mix = x * (2 * x + 3 * y - z)
+base_mix = diophantine(eq_mix, permute=True)
+alt_mix = diophantine(eq_mix, syms=(z, x, y), permute=True)
+assert alt_mix == reorder_solutions(base_mix, (x, y, z), (z, x, y))
+p, q, r = symbols('p q r', integer=True)
+eq_tern = 2 * x ** 2 + y ** 2 - 2 * z ** 2
+base_tern = diophantine(eq_tern, permute=True)
+alt_tern = diophantine(eq_tern, syms=(z, y, x), permute=True)
+assert alt_tern == reorder_solutions(base_tern, (x, y, z), (z, y, x))
+A, B, C, D = symbols('A B C D', integer=True)
+eq_pyth = A ** 2 + B ** 2 + C ** 2 - D ** 2
+base_pyth = diophantine(eq_pyth, permute=True)
+alt_pyth = diophantine(eq_pyth, syms=(D, C, B, A), permute=True)
+assert alt_pyth == reorder_solutions(base_pyth, (A, B, C, D), (D, C, B, A))
+p1, p2, p3 = symbols('p1 p2 p3', integer=True)
+eq_even = p1 ** 4 + p2 ** 4 + p3 ** 4 - (1 ** 4 + 2 ** 4 + 3 ** 4)
+base_even = diophantine(eq_even, permute=True)
+alt_even = diophantine(eq_even, syms=(p3, p1, p2), permute=True)
+assert alt_even == reorder_solutions(base_even, (p1, p2, p3), (p3, p1, p2))
+r1, r2 = symbols('r1 r2', integer=True)
+eq2 = r1 ** 4 + r2 ** 4 - (2 ** 4 + 3 ** 4)
+base2 = diophantine(eq2, permute=True)
+alt2 = diophantine(eq2, syms=(r2, r1), permute=True)
+assert alt2 == reorder_solutions(base2, (r1, r2), (r2, r1))
+s, t = symbols('s t', integer=True)
+eq_mixed = s * (s - t) * (s + t - 3)
+base_mixed = diophantine(eq_mixed, permute=True)
+alt_mixed = diophantine(eq_mixed, syms=(t, s), permute=True)
+assert alt_mixed == reorder_solutions(base_mixed, (s, t), (t, s))

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.HideSaveM2M.__getattribute__ auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests._make_form_and_save auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.setUp auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_with_hidden_save_m2m_basic auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_with_hidden_save_m2m_different_usernames auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_with_hidden_save_m2m_long_username auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_with_hidden_save_m2m_many_calls auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_with_hidden_save_m2m_no_validators auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_with_hidden_save_m2m_numeric_username auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_with_hidden_save_m2m_password_whitespace auth_tests.test_forms_llm.UserCreationSaveM2MGuardTests.test_save_with_hidden_save_m2m_unicode_username
+coverage json -o coverage.json
+: '>>>>> End Test Output'

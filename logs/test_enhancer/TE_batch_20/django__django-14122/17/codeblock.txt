@@ -1,0 +1,171 @@
+import re
+from datetime import datetime
+from operator import attrgetter
+import re
+
+from django.db.models import Count, Value, Max
+from django.test import TestCase
+
+from .models import Article, Author, ChildArticle, OrderedByFArticle
+
+
+def _group_by_columns_from_sql(sql):
+    """
+    Extract the GROUP BY clause from the SQL and return a list of columns
+    (split on commas) with whitespace stripped. Return empty list if no GROUP BY.
+    """
+    m = re.search(r'\bGROUP BY\b(.*?)(?:\bHAVING\b|\bORDER BY\b|$)', sql, re.IGNORECASE | re.DOTALL)
+    if not m:
+        return []
+    cols_fragment = m.group(1).strip()
+    # Remove possible surrounding parentheses and trailing characters
+    cols_fragment = cols_fragment.strip().strip('() ')
+    # Split by commas that are not inside parentheses (simple split is fine for our cases)
+    cols = [c.strip() for c in cols_fragment.split(',') if c.strip()]
+    return cols
+
+
+class GroupByOrderingTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.a1 = Article.objects.create(headline="Article 1", pub_date=datetime(2005, 7, 26))
+        cls.a2 = Article.objects.create(headline="Article 2", pub_date=datetime(2005, 7, 27))
+        cls.a3 = Article.objects.create(headline="Article 3", pub_date=datetime(2005, 7, 27))
+        cls.a4 = Article.objects.create(headline="Article 4", pub_date=datetime(2005, 7, 28))
+        cls.author_1 = Author.objects.create(name="Name 1")
+        cls.author_2 = Author.objects.create(name="Name 2")
+        # Assign authors to exercises
+        Article.objects.exclude(headline='Article 4').update(author=cls.author_1)
+        Article.objects.filter(headline='Article 4').update(author=cls.author_2)
+
+    def test_values_annotate_with_meta_ordering_only_groups_by_values_field(self):
+        """
+        When Meta.ordering is in effect (no explicit order_by provided),
+        a values(...).annotate(...) query should GROUP BY only the values()
+        column(s), not by the Meta.ordering fields.
+        """
+        qs = Article.objects.values('author').annotate(count=Count('id'))
+        sql = str(qs.query)
+        cols = _group_by_columns_from_sql(sql)
+        # Should group only by the values('author') column.
+        self.assertEqual(len(cols), 1)
+        # The aggregation result should reflect two authors.
+        results = list(qs)
+        self.assertCountEqual(results, [
+            {'author': self.author_1.pk, 'count': 3},
+            {'author': self.author_2.pk, 'count': 1},
+        ])
+
+    def test_values_annotate_with_explicit_order_by_adds_order_by_cols_to_group_by(self):
+        """
+        When an explicit order_by is provided, and it's not taken from Meta.ordering,
+        order_by columns that reference selected fields should be added to GROUP BY.
+        """
+        qs = Article.objects.values('author').annotate(count=Count('id')).order_by('headline')
+        sql = str(qs.query)
+        cols = _group_by_columns_from_sql(sql)
+        # Should group by author and by headline because order_by('headline') is explicit.
+        self.assertGreaterEqual(len(cols), 2)
+        # Aggregation still yields the expected grouping by author (results unaffected).
+        results = list(qs)
+        self.assertCountEqual(results, [
+            {'author': self.author_1.pk, 'count': 3},
+            {'author': self.author_2.pk, 'count': 1},
+        ])
+
+    def test_order_by_cleared_with_order_by_empty_uses_meta_ordering_and_does_not_affect_group_by(self):
+        """
+        order_by() with no args clears explicit ordering, causing Meta.ordering to be used.
+        In that case the GROUP BY should not get extra columns from Meta.ordering.
+        """
+        qs = Article.objects.values('author').annotate(count=Count('id')).order_by()
+        sql = str(qs.query)
+        cols = _group_by_columns_from_sql(sql)
+        # Only the values('author') column should be present in GROUP BY.
+        self.assertEqual(len(cols), 1)
+
+    def test_annotate_constant_then_values_then_annotate_group_by(self):
+        """
+        Annotating a constant and then using values()/annotate() should not
+        allow Meta.ordering to pollute the GROUP BY clause.
+        """
+        qs = Article.objects.annotate(const=Value('1')).values('author').annotate(cnt=Count('id'))
+        sql = str(qs.query)
+        cols = _group_by_columns_from_sql(sql)
+        self.assertEqual(len(cols), 1)
+        results = list(qs)
+        self.assertCountEqual(results, [
+            {'author': self.author_1.pk, 'cnt': 3},
+            {'author': self.author_2.pk, 'cnt': 1},
+        ])
+
+    def test_having_expressions_are_added_to_group_by(self):
+        """
+        Filters that end up as HAVING should ensure any referenced expressions
+        are included in GROUP BY. Meta.ordering should still not add extra cols.
+        """
+        qs = Article.objects.values('author').annotate(cnt=Count('id')).filter(cnt__gte=1)
+        sql = str(qs.query)
+        cols = _group_by_columns_from_sql(sql)
+        # Only the values('author') column is required for grouping; HAVING should not add unexpected ones.
+        self.assertEqual(len(cols), 1)
+
+    def test_order_by_annotation_reference_is_skipped_in_group_by(self):
+        """
+        Ordering by an annotation reference (annotation alias) should not add
+        extra GROUP BY columns (is_ref should be True and be skipped).
+        """
+        qs = Article.objects.annotate(latest=Max('pub_date')).values('author').annotate(cnt=Count('id')).order_by('latest')
+        sql = str(qs.query)
+        cols = _group_by_columns_from_sql(sql)
+        # 'latest' is an annotation reference; the GROUP BY should still be only the values() column.
+        self.assertEqual(len(cols), 1)
+
+    def test_values_with_multiple_fields_and_meta_ordering(self):
+        """
+        When multiple fields are used in values(), the GROUP BY should include
+        only those fields even if Meta.ordering exists.
+        """
+        qs = Article.objects.values('author', 'headline').annotate(cnt=Count('id'))
+        sql = str(qs.query)
+        cols = _group_by_columns_from_sql(sql)
+        # Two fields in values(), so two GROUP BY columns.
+        self.assertEqual(len(cols), 2)
+
+    def test_order_by_rawsql_table_col_with_meta_ordering(self):
+        """
+        An order_by referencing a table-qualified column (extra order_by) should
+        be treated as an explicit order_by and therefore added to GROUP BY
+        when appropriate (i.e., when not coming from Meta.ordering).
+        """
+        qs = Article.objects.values('author').annotate(cnt=Count('id')).order_by('ordering_article.headline')
+        sql = str(qs.query)
+        cols = _group_by_columns_from_sql(sql)
+        # The explicit table-qualified order_by should force an extra grouping column.
+        self.assertGreaterEqual(len(cols), 2)
+
+    def test_childarticle_order_by_ptr_with_meta_ordering(self):
+        """
+        Ensure ordering by a ptr/id field on a subclass interacts correctly with GROUP BY.
+        """
+        ca1 = ChildArticle.objects.create(
+            headline='h2',
+            pub_date=datetime(2005, 7, 27),
+            author=self.author_2,
+        )
+        ca2 = ChildArticle.objects.create(
+            headline='h2',
+            pub_date=datetime(2005, 7, 27),
+            author=self.author_1,
+        )
+        ca3 = ChildArticle.objects.create(
+            headline='h3',
+            pub_date=datetime(2005, 7, 27),
+            author=self.author_1,
+        )
+        ca4 = ChildArticle.objects.create(headline='h1', pub_date=datetime(2005, 7, 28))
+        qs = ChildArticle.objects.values('author').annotate(cnt=Count('id')).order_by()
+        sql = str(qs.query)
+        cols = _group_by_columns_from_sql(sql)
+        # With order_by() cleared, Meta.ordering should not add columns to GROUP BY.
+        self.assertEqual(len(cols), 1)

@@ -1,0 +1,185 @@
+from unittest import mock
+from django.db.models.query import QuerySet
+from math import ceil
+from unittest import mock
+
+from django.db import connections, NotSupportedError
+from django.test import TestCase
+
+from .models import TwoFields
+from django.db.models.query import QuerySet
+
+
+class BatchedInsertBatchSizeTests(TestCase):
+    def setUp(self):
+        # Prepare a small set of model instances for testing.
+        self.objs = [TwoFields(f1=i, f2=i + 1) for i in range(0, 5)]
+        self.fields = [f for f in TwoFields._meta.concrete_fields]
+
+    def _get_qs(self):
+        return TwoFields.objects.all()
+
+    def test_batched_insert_capped_when_batch_size_greater_than_max(self):
+        qs = self._get_qs()
+        db = qs.db
+        calls = []
+
+        def fake_insert(self, items, **kwargs):
+            # record the length of each batch inserted
+            calls.append(len(items))
+            return None
+
+        with mock.patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs: 2):
+            with mock.patch.object(QuerySet, '_insert', new=fake_insert):
+                qs._batched_insert(self.objs, self.fields, batch_size=100)
+        # Expect batches of at most 2 -> ceil(5/2) == 3 batches
+        self.assertEqual(len(calls), ceil(len(self.objs) / 2))
+        for c in calls:
+            self.assertTrue(c <= 2)
+
+    def test_batched_insert_uses_provided_batch_size_when_smaller_than_max(self):
+        qs = self._get_qs()
+        db = qs.db
+        calls = []
+
+        def fake_insert(self, items, **kwargs):
+            calls.append(len(items))
+            return None
+
+        with mock.patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs: 10):
+            with mock.patch.object(QuerySet, '_insert', new=fake_insert):
+                qs._batched_insert(self.objs, self.fields, batch_size=3)
+        # Provided batch_size 3 (smaller than max 10) -> ceil(5/3) == 2 batches
+        self.assertEqual(len(calls), ceil(len(self.objs) / 3))
+        for c in calls:
+            self.assertTrue(c <= 3)
+
+    def test_batched_insert_uses_max_when_batch_size_none(self):
+        qs = self._get_qs()
+        db = qs.db
+        calls = []
+
+        def fake_insert(self, items, **kwargs):
+            calls.append(len(items))
+            return None
+
+        with mock.patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs: 4):
+            with mock.patch.object(QuerySet, '_insert', new=fake_insert):
+                # batch_size None -> use max_batch_size == 4
+                qs._batched_insert(self.objs, self.fields, batch_size=None)
+        self.assertEqual(len(calls), ceil(len(self.objs) / 4))
+        for c in calls:
+            self.assertTrue(c <= 4)
+
+    def test_batched_insert_exact_division_when_capped(self):
+        qs = self._get_qs()
+        db = qs.db
+        calls = []
+
+        def fake_insert(self, items, **kwargs):
+            calls.append(list(items))
+            return None
+
+        with mock.patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs: 3):
+            with mock.patch.object(QuerySet, '_insert', new=fake_insert):
+                # batch_size provided (6) but capped to max_batch_size 3
+                qs._batched_insert([TwoFields(f1=i, f2=i) for i in range(12)], self.fields, batch_size=6)
+        # 12 items with batch size capped to 3 => 4 batches
+        self.assertEqual(len(calls), 4)
+        for batch in calls:
+            self.assertTrue(len(batch) == 3)
+
+    def test_batched_insert_returns_inserted_rows_when_bulk_return_list(self):
+        qs = self._get_qs()
+        db = qs.db
+
+        # Simulate a backend that returns rows from bulk insert (bulk_return True)
+        # Make _insert return a list of tuples for each batch.
+        def fake_insert(self, items, **kwargs):
+            # Return a list with one tuple per inserted item (simulate RETURNING data)
+            return [(i.f1,) for i in items]
+
+        with mock.patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs: 2):
+            with mock.patch.object(connections[db].features, 'can_return_rows_from_bulk_insert', new=True):
+                with mock.patch.object(QuerySet, '_insert', new=fake_insert):
+                    rows = qs._batched_insert(self.objs, self.fields, batch_size=100)
+        # Each returned row corresponds to one object; should be 5 tuples total.
+        self.assertEqual(len(rows), len(self.objs))
+        self.assertEqual(rows, [(i.f1,) for i in self.objs])
+
+    def test_batched_insert_appends_when_insert_returns_single_value(self):
+        qs = self._get_qs()
+        db = qs.db
+
+        # Simulate a backend that returns a single value (not a list) per batch.
+        def fake_insert(self, items, **kwargs):
+            # Return a single tuple representing the batch (e.g., custom DB behavior)
+            return (len(items),)
+
+        with mock.patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs: 2):
+            with mock.patch.object(connections[db].features, 'can_return_rows_from_bulk_insert', new=True):
+                with mock.patch.object(QuerySet, '_insert', new=fake_insert):
+                    rows = qs._batched_insert(self.objs, self.fields, batch_size=100)
+        # Each batch returns one tuple appended; with batch size capped to 2 -> ceil(5/2) == 3 tuples
+        self.assertEqual(len(rows), ceil(len(self.objs) / 2))
+        self.assertTrue(all(isinstance(r, tuple) for r in rows))
+
+    def test_ignore_conflicts_raises_when_backend_does_not_support(self):
+        qs = self._get_qs()
+        db = qs.db
+        # Ensure backend reports not supporting ignoring conflicts.
+        with mock.patch.object(connections[db].features, 'supports_ignore_conflicts', new=False):
+            with self.assertRaises(NotSupportedError):
+                # Call private API to trigger the NotSupportedError check.
+                qs._batched_insert(self.objs, self.fields, batch_size=None, ignore_conflicts=True)
+
+    def test_batched_insert_handles_batch_size_one(self):
+        qs = self._get_qs()
+        db = qs.db
+        calls = []
+
+        def fake_insert(self, items, **kwargs):
+            calls.append(len(items))
+            return None
+
+        with mock.patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs: 100):
+            with mock.patch.object(QuerySet, '_insert', new=fake_insert):
+                qs._batched_insert(self.objs, self.fields, batch_size=1)
+        # batch_size 1 -> 5 calls
+        self.assertEqual(len(calls), len(self.objs))
+        for c in calls:
+            self.assertEqual(c, 1)
+
+    def test_batched_insert_handles_max_batch_size_one(self):
+        qs = self._get_qs()
+        db = qs.db
+        calls = []
+
+        def fake_insert(self, items, **kwargs):
+            calls.append(len(items))
+            return None
+
+        # bulk_batch_size returns 0 (should be normalized to at least 1 by max(..., 1))
+        with mock.patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs: 0):
+            with mock.patch.object(QuerySet, '_insert', new=fake_insert):
+                qs._batched_insert(self.objs, self.fields, batch_size=1000)
+        # max batch size becomes 1 -> 5 calls
+        self.assertEqual(len(calls), len(self.objs))
+        for c in calls:
+            self.assertEqual(c, 1)
+
+    def test_batched_insert_preserves_order_of_batches(self):
+        qs = self._get_qs()
+        db = qs.db
+        seen_firsts = []
+
+        def fake_insert(self, items, **kwargs):
+            # Record the first object's f1 for each batch to verify order
+            seen_firsts.append(items[0].f1)
+            return None
+
+        with mock.patch.object(connections[db].ops, 'bulk_batch_size', new=lambda fields, objs: 2):
+            with mock.patch.object(QuerySet, '_insert', new=fake_insert):
+                qs._batched_insert(self.objs, self.fields, batch_size=100)
+        # The sequence of first elements in each batch should be [0,2,4]
+        self.assertEqual(seen_firsts, [0, 2, 4])

@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_autodetector_llm.test_added_field_dependency_with_fk_no_to migrations.test_autodetector_llm.test_create_model_with_fk_without_to_key_does_not_raise migrations.test_autodetector_llm.test_generate_renamed_models_with_fk_without_to_key migrations.test_autodetector_llm.test_generate_renamed_models_with_multiple_fks_without_to_key migrations.test_autodetector_llm.test_mix_fields_with_and_without_to_key migrations.test_autodetector_llm.test_only_relation_agnostic_fields_handles_fk_without_to_key migrations.test_autodetector_llm.test_only_relation_agnostic_fields_handles_foreignobject_without_to_key migrations.test_autodetector_llm.test_only_relation_agnostic_fields_handles_manytomany_without_to_key migrations.test_autodetector_llm.test_only_relation_agnostic_fields_handles_onetoone_without_to_key
+coverage json -o coverage.json
+: '>>>>> End Test Output'

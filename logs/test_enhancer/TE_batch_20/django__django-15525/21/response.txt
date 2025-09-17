@@ -1,0 +1,281 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise build_instance() from django.core.serializers.base. They validate that when a model instance is built without a primary key, Model.natural_key() is called on a transient instance that has its _state.db set to the provided db. The tests cover cases where natural_key depends on self._state.db, where it depends on attributes that are remote fields (which a broken candidate implementation might not set), propagation of unexpected exceptions from natural_key (AttributeError should not be swallowed), handling of Model.DoesNotExist raised by the manager, absence of get_by_natural_key on the manager, to_python conversion of the returned pk, None db handling, and compound natural keys.
+test_code: |
+  import unittest
+  from types import SimpleNamespace
+  
+  from django.core.serializers.base import build_instance
+  
+  
+  class DummyPK:
+      def __init__(self, attname="id", to_python=lambda x: x):
+          self.attname = attname
+          self._to_python = to_python
+  
+      def to_python(self, value):
+          return self._to_python(value)
+  
+  
+  class DummyManager:
+      def __init__(self, get_by_natural_key_callable=None):
+          # get_by_natural_key_callable should be a callable taking (*args)
+          # and returning an object with a 'pk' attribute or raising.
+          self._gbnk = get_by_natural_key_callable
+          self.last_db = None
+  
+      def db_manager(self, db):
+          # Return an object that exposes get_by_natural_key. Keep self
+          # to allow assertions about 'db' passed in.
+          self.last_db = db
+          return self
+  
+      def get_by_natural_key(self, *args):
+          if self._gbnk is None:
+              raise AttributeError("No get_by_natural_key")
+          return self._gbnk(*args)
+  
+  
+  def make_model_class(
+      *,
+      has_natural_key=True,
+      natural_key_func=None,
+      default_manager=None,
+      pk_attname="id",
+      pk_to_python=lambda x: x,
+      fields_meta=None,
+  ):
+      """
+      Dynamically create a Model-like class appropriate for build_instance tests.
+      fields_meta: dict mapping field name -> remote_field flag (True/False)
+      """
+  
+      class ModelLike:
+          DoesNotExist = type("DoesNotExist", (Exception,), {})
+  
+          def __init__(self, **data):
+              # Set attributes directly from data (like Django model __init__ would).
+              for k, v in data.items():
+                  setattr(self, k, v)
+              # Default _state
+              self._state = SimpleNamespace(db=None)
+  
+          # Attach meta
+          _meta = SimpleNamespace()
+  
+      # attach pk descriptor
+      ModelLike._meta.pk = DummyPK(attname=pk_attname, to_python=pk_to_python)
+      if default_manager is None:
+          default_manager = DummyManager(get_by_natural_key_callable=None)
+      ModelLike._meta.default_manager = default_manager
+  
+      # define get_field to return objects having remote_field attribute
+      fields_meta = fields_meta or {}
+  
+      def get_field(name):
+          class FieldObj:
+              def __init__(self, remote):
+                  # remote_field is truthy for relation fields; use a simple flag
+                  self.remote_field = True if remote else None
+                  # For many uses, field.field_name/attname might be required.
+                  self.name = name
+                  self.attname = name
+                  # The field used in many parts for foreign key lookups:
+                  self.remote_field = SimpleNamespace(model=None) if remote else None
+  
+          return FieldObj(fields_meta.get(name, False))
+  
+      ModelLike._meta.get_field = staticmethod(get_field)
+  
+      # attach get_by_natural_key behavior on class (natural_key method)
+      if has_natural_key:
+          if natural_key_func is None:
+              # default simple natural_key returning tuple of ('nk',)
+              def natural_key(self):
+                  return ("nk",)
+          else:
+              natural_key = natural_key_func
+          ModelLike.natural_key = natural_key
+  
+      return ModelLike
+  
+  
+  class BuildInstanceTests(unittest.TestCase):
+      def test_existing_pk_is_preserved_when_provided(self):
+          # If pk is present in data, build_instance should not attempt natural key lookup.
+          mgr = DummyManager(get_by_natural_key_callable=lambda *a: type("O", (), {"pk": "should-not-be-used"}))
+          Model = make_model_class(default_manager=mgr, pk_attname="id")
+          data = {"id": "7", "name": "foo"}
+          inst = build_instance(Model, dict(data), db="anydb")
+          # Should preserve provided pk (string "7"), not converted via to_python
+          self.assertEqual(getattr(inst, "id"), "7")
+  
+      def test_missing_pk_populates_using_natural_key_and_state_db(self):
+          # natural_key uses self._state.db to produce the key
+          def natural_key(self):
+              return (self._state.db,)
+  
+          def gbnk(db_value):
+              # get_by_natural_key receives db_value; return object with pk "42"
+              class Res:
+                  pk = "42"
+  
+              return Res()
+  
+          mgr = DummyManager(get_by_natural_key_callable=gbnk)
+          Model = make_model_class(
+              natural_key_func=natural_key,
+              default_manager=mgr,
+              pk_attname="id",
+              pk_to_python=lambda x: int(x),
+          )
+          inst = build_instance(Model, {}, db="target_db")
+          # Should have set id by converting returned pk ("42") to int(42)
+          self.assertEqual(getattr(inst, "id"), 42)
+          # Ensure the manager was called with the db we passed
+          self.assertEqual(mgr.last_db, "target_db")
+  
+      def test_natural_key_depends_on_relation_field_present_in_data(self):
+          # natural_key builds from a related attribute 'author_name'
+          def natural_key(self):
+              # expects self.author to exist (a relation-like object in data)
+              return (self.author.name,)
+  
+          # The get_by_natural_key should be called with that tuple
+          def gbnk(name):
+              class Res:
+                  pk = f"pk-for-{name}"
+  
+              return Res()
+  
+          # field 'author' is a relation (remote_field present)
+          Model = make_model_class(
+              natural_key_func=natural_key,
+              default_manager=DummyManager(get_by_natural_key_callable=gbnk),
+              pk_attname="id",
+              pk_to_python=lambda x: x,
+              fields_meta={"author": True},
+          )
+  
+          # Provide an "author" object in data (Model.__init__ will set it)
+          author_obj = SimpleNamespace(name="Tolkien")
+          inst = build_instance(Model, {"author": author_obj}, db="dbx")
+          self.assertEqual(getattr(inst, "id"), "pk-for-Tolkien")
+  
+      def test_natural_key_attribute_error_propagates(self):
+          # If natural_key raises AttributeError, it should not be swallowed.
+          def natural_key(self):
+              # Will raise AttributeError purposely
+              raise AttributeError("broken natural_key")
+  
+          mgr = DummyManager(get_by_natural_key_callable=lambda *a: type("O", (), {"pk": "x"}))
+          Model = make_model_class(natural_key_func=natural_key, default_manager=mgr, pk_attname="id")
+          with self.assertRaises(AttributeError):
+              build_instance(Model, {}, db="DB")
+  
+      def test_get_by_natural_key_raises_doesnotexist_leaves_pk_unset(self):
+          # get_by_natural_key raises Model.DoesNotExist which should be caught
+          def gbnk(*a):
+              raise make_model.DoesNotExist()
+  
+          make_model = make_model_class  # alias for clarity
+          Model = make_model(
+              natural_key_func=lambda self: ("abc",),
+              default_manager=DummyManager(get_by_natural_key_callable=gbnk),
+              pk_attname="id",
+          )
+          inst = build_instance(Model, {}, db="DB")
+          # pk should remain unset (i.e., attribute 'id' not present)
+          self.assertFalse(hasattr(inst, "id"))
+  
+      def test_absence_of_get_by_natural_key_results_in_no_lookup(self):
+          # If default_manager has no get_by_natural_key attribute, nothing should be done
+          mgr = DummyManager(get_by_natural_key_callable=None)
+          Model = make_model_class(default_manager=mgr, has_natural_key=False, pk_attname="id")
+          data = {"name": "no_pk_provided"}
+          inst = build_instance(Model, dict(data), db="DB")
+          # Should produce instance with provided attributes
+          self.assertEqual(getattr(inst, "name"), "no_pk_provided")
+          self.assertFalse(hasattr(inst, "id"))
+  
+      def test_to_python_called_with_manager_returned_pk(self):
+          called_with = []
+  
+          def gbnk(*a):
+              class Res:
+                  pk = 987
+              return Res()
+  
+          def to_python(v):
+              called_with.append(v)
+              return f"converted-{v}"
+  
+          mgr = DummyManager(get_by_natural_key_callable=gbnk)
+          Model = make_model_class(natural_key_func=lambda self: ("x",), default_manager=mgr, pk_attname="id", pk_to_python=to_python)
+          inst = build_instance(Model, {}, db="DBZ")
+          self.assertEqual(getattr(inst, "id"), "converted-987")
+          self.assertEqual(called_with, [987])
+  
+      def test_db_none_is_allowed_and_used_in_natural_key(self):
+          # natural_key uses the _state.db directly (which may be None)
+          def natural_key(self):
+              return (self._state.db,)
+  
+          def gbnk(val):
+              class Res:
+                  pk = "pknone"
+              return Res()
+  
+          mgr = DummyManager(get_by_natural_key_callable=gbnk)
+          Model = make_model_class(natural_key_func=natural_key, default_manager=mgr, pk_attname="id", pk_to_python=lambda x: x)
+          inst = build_instance(Model, {}, db=None)
+          self.assertEqual(getattr(inst, "id"), "pknone")
+          self.assertIsNone(mgr.last_db)
+  
+      def test_compound_natural_key_with_mixed_fields(self):
+          # natural_key uses a mix of direct attributes and relation attributes
+          def natural_key(self):
+              # expects self.title (simple field) and self.author (relation-like with .name)
+              return (self.title, self.author.name)
+  
+          def gbnk(title, author_name):
+              class Res:
+                  pk = f"{title}:{author_name}"
+              return Res()
+  
+          mgr = DummyManager(get_by_natural_key_callable=gbnk)
+          Model = make_model_class(
+              natural_key_func=natural_key,
+              default_manager=mgr,
+              pk_attname="id",
+              pk_to_python=lambda x: x,
+              fields_meta={"author": True},
+          )
+          author_obj = SimpleNamespace(name="Rowling")
+          inst = build_instance(Model, {"title": "HP", "author": author_obj}, db="dbmix")
+          self.assertEqual(getattr(inst, "id"), "HP:Rowling")
+  
+      def test_build_instance_returns_distinct_instances_for_consecutive_calls(self):
+          # Ensure build_instance constructs a new Model instance each time and sets pk if needed.
+          def natural_key(self):
+              return ("once",)
+  
+          call_count = {"n": 0}
+  
+          def gbnk(*a):
+              call_count["n"] += 1
+              class Res:
+                  pk = f"pk{call_count['n']}"
+              return Res()
+  
+          mgr = DummyManager(get_by_natural_key_callable=gbnk)
+          Model = make_model_class(natural_key_func=natural_key, default_manager=mgr, pk_attname="id", pk_to_python=lambda x: x)
+          inst1 = build_instance(Model, {}, db="db1")
+          inst2 = build_instance(Model, {}, db="db1")
+          # Each call should produce an instance with the pk returned for that call
+          self.assertNotEqual(getattr(inst1, "id"), getattr(inst2, "id"))
+  
+  if __name__ == "__main__":
+      unittest.main()
+new_imports_code: |
+  # No additional top-level import code required; tests import what they need inline.

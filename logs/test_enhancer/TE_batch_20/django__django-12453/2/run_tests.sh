@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 backends.base.test_creation_llm.TestDeserializeDbFromStringAdditional._wrap_and_assert backends.base.test_creation_llm.TestDeserializeDbFromStringAdditional.test_check_constraints_called_once_for_circular_reference backends.base.test_creation_llm.TestDeserializeDbFromStringAdditional.test_circular_reference_calls_constraint_disable_and_check_constraints backends.base.test_creation_llm.TestDeserializeDbFromStringAdditional.test_constraint_checks_disabled_and_check_constraints_called_when_data_has_comments_like_spacing backends.base.test_creation_llm.TestDeserializeDbFromStringAdditional.test_constraint_checks_disabled_called_for_forward_references backends.base.test_creation_llm.TestDeserializeDbFromStringAdditional.test_constraint_checks_disabled_called_for_large_payload backends.base.test_creation_llm.TestDeserializeDbFromStringAdditional.test_constraint_checks_disabled_called_with_non_standard_spacing backends.base.test_creation_llm.TestDeserializeDbFromStringAdditional.test_constraint_context_enter_and_exit_called_for_circular_reference backends.base.test_creation_llm.TestDeserializeDbFromStringAdditional.test_empty_list_calls_constraint_disable_and_check_constraints backends.base.test_creation_llm.TestDeserializeDbFromStringAdditional.test_multiple_objects_calls_constraint_disable_and_check_constraints backends.base.test_creation_llm.TestDeserializeDbFromStringAdditional.test_whitespace_handling_calls_constraint_disable_and_check_constraints
+coverage json -o coverage.json
+: '>>>>> End Test Output'

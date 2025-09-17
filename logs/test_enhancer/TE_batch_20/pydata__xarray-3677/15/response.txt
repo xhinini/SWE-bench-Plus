@@ -1,0 +1,204 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These tests verify that Dataset.merge correctly handles being passed an
+  object that is returned by xr.DataArray (i.e., DataArray-like objects),
+  even if the top-level xr.DataArray symbol has been monkeypatched to point
+  to a different (wrapper) class. The gold patch converts incoming
+  DataArray instances (as recognized by the xr.DataArray symbol) using
+  to_dataset() before calling the merge internals. The tests monkeypatch
+  xr.DataArray to a wrapper class that is not the original DataArray class,
+  and check that Dataset.merge still calls to_dataset() on that wrapper via
+  the xr.DataArray symbol. These tests would FAIL if the implementation
+  checks against the original internal DataArray class (imported directly
+  from xarray.core.dataarray) instead of the current xr.DataArray symbol.
+test_code: |
+  import numpy as np
+  import pytest
+  import xarray as xr
+  from xarray.testing import assert_identical
+  
+  def _install_fake_dataarray():
+      """
+      Replace xr.DataArray with a lightweight wrapper class that simply
+      constructs and holds an instance of the original DataArray class, and
+      exposes a to_dataset() method. Return the original class so callers can
+      restore it later.
+      """
+      Orig = xr.DataArray
+      class FakeDA:
+          def __init__(self, *args, **kwargs):
+              # store an instance of the original DataArray for behavior
+              self._inner = Orig(*args, **kwargs)
+  
+          # The gold implementation uses isinstance(other, xr.DataArray) and
+          # then calls other.to_dataset(). Provide that method.
+          def to_dataset(self):
+              return self._inner.to_dataset()
+  
+          # Provide a repr for easier debugging if tests fail
+          def __repr__(self):
+              return f"FakeDA({self._inner!r})"
+  
+      xr.DataArray = FakeDA
+      return Orig
+  
+  def _restore_dataarray(orig):
+      xr.DataArray = orig
+  
+  def test_merge_method_converts_wrapped_dataarray_named():
+      orig = _install_fake_dataarray()
+      try:
+          ds = xr.Dataset({"a": 0})
+          # create fake DataArray (instance of the wrapper)
+          fake = xr.DataArray(1, name="b")
+  
+          # expected: same as merging a Dataset and a normal DataArray
+          expected = xr.merge([ds, orig(data=1, name="b")])
+          result = ds.merge(fake)
+          assert_identical(result, expected)
+      finally:
+          _restore_dataarray(orig)
+  
+  def test_merge_method_unnamed_wrapped_dataarray_raises():
+      orig = _install_fake_dataarray()
+      try:
+          ds = xr.Dataset({"a": 0})
+          # unnamed DataArray should raise a ValueError (same behavior as top-level)
+          fake = xr.DataArray([1, 2], dims="x")
+          with pytest.raises(ValueError) as exc:
+              ds.merge(fake)
+          assert "without providing an explicit name" in str(exc.value)
+      finally:
+          _restore_dataarray(orig)
+  
+  def test_merge_method_conflict_with_wrapped_dataarray_raises_MergeError():
+      orig = _install_fake_dataarray()
+      try:
+          ds = xr.Dataset({"a": ("x", [1, 2]), "x": [0, 1]})
+          # fake DataArray has same name "a" but different values -> conflict
+          fake = xr.DataArray([9, 9], dims="x", coords={"x": [0, 1]}, name="a")
+          with pytest.raises(xr.MergeError):
+              ds.merge(fake)
+      finally:
+          _restore_dataarray(orig)
+  
+  def test_merge_method_no_conflicts_with_wrapped_dataarray_compat_no_conflicts():
+      orig = _install_fake_dataarray()
+      try:
+          ds1 = xr.Dataset({"a": ("x", [1, 2]), "x": [0, 1]})
+          # fake dataset to merge has complementary (non-overlapping) data
+          fake = xr.DataArray([2, 3], dims="x", coords={"x": [1, 2]}, name="a")
+          # expected result when using compat="no_conflicts"
+          expected = xr.merge([ds1, orig(data=[2, 3], dims=("x",), coords={"x": [1, 2]}, name="a")], compat="no_conflicts")
+          result = ds1.merge(fake, compat="no_conflicts")
+          assert_identical(result, expected)
+      finally:
+          _restore_dataarray(orig)
+  
+  def test_merge_method_preserves_variable_attrs_from_wrapped_dataarray():
+      orig = _install_fake_dataarray()
+      try:
+          ds = xr.Dataset({"a": 0})
+          inner = orig(data=1, name="b")
+          inner.b.attrs["units"] = "m"
+          # Create wrapper around an already-constructed original DataArray:
+          # We cannot directly do that because our FakeDA constructs an inner Orig.
+          # To simulate attributes, create same data via wrapper but reapply attrs.
+          fake = xr.DataArray(1, name="b")
+          # re-apply attrs to the inner (wrapper holds an inner Orig)
+          fake._inner.b.attrs["units"] = "m"
+  
+          result = ds.merge(fake)
+          assert result["b"].attrs.get("units") == "m"
+      finally:
+          _restore_dataarray(orig)
+  
+  def test_merge_method_join_behavior_with_wrapped_dataarray_left_right_inner():
+      orig = _install_fake_dataarray()
+      try:
+          ds1 = xr.Dataset({"a": ("x", [1, 2]), "x": [0, 1]})
+          fake = xr.DataArray([3, 4], dims="x", coords={"x": [1, 2]}, name="b")
+  
+          # outer join (default) -> union of x coordinates
+          outer_expected = xr.merge([ds1, orig(data=[3, 4], dims=("x",), coords={"x": [1, 2]}, name="b")])
+          assert_identical(ds1.merge(fake), outer_expected)
+  
+          # left join -> keep ds1's coords
+          left_expected = ds1.merge(outer_expected, join="left")
+          assert_identical(ds1.merge(fake, join="left"), left_expected)
+  
+          # inner join -> intersection
+          inner_expected = ds1.merge(outer_expected, join="inner")
+          assert_identical(ds1.merge(fake, join="inner"), inner_expected)
+      finally:
+          _restore_dataarray(orig)
+  
+  def test_merge_method_fill_value_with_wrapped_dataarray():
+      orig = _install_fake_dataarray()
+      try:
+          ds1 = xr.Dataset({"a": ("x", [1, 2]), "x": [0, 1]})
+          fake = xr.DataArray([3, 4], dims="x", coords={"x": [1, 2]}, name="b")
+          # Using fill_value explicitly (e.g., 0) should appear in the merged result
+          merged = ds1.merge(fake, fill_value=0)
+          # Ensure the 'a' variable has a fill_value where x==2 (the union is [0,1,2])
+          assert merged["a"].values.shape[0] == 3
+          # explicit fill value 0 should appear (for numeric arrays)
+          assert merged["a"].values[2] == 0
+      finally:
+          _restore_dataarray(orig)
+  
+  def test_merge_method_attaches_coords_from_wrapped_dataarray_indexer():
+      orig = _install_fake_dataarray()
+      try:
+          ds = xr.Dataset({"a": ("x", [1, 2]), "x": [0, 1]})
+          # fake has an auxiliary coordinate 'y' that should be attached as a coord
+          fake = xr.DataArray([5, 6], dims="x", coords={"x": [0, 1], "y": ("x", [10, 11])}, name="b")
+          merged = ds.merge(fake)
+          # 'y' should be in coords after merging (attached from the DataArray)
+          assert "y" in merged.coords
+          # check values match
+          assert np.array_equal(merged["y"].values, np.array([10, 11, np.nan])) or np.array_equal(merged["y"].values[:2], np.array([10,11]))
+      finally:
+          _restore_dataarray(orig)
+  
+  def test_merge_method_multiple_calls_with_wrapped_dataarray_stability():
+      orig = _install_fake_dataarray()
+      try:
+          ds = xr.Dataset({"a": 0})
+          fake = xr.DataArray(1, name="b")
+          # call merge repeatedly to make sure no state leak occurs when xr.DataArray is wrapped
+          r1 = ds.merge(fake)
+          r2 = ds.merge(fake)
+          assert_identical(r1, r2)
+      finally:
+          _restore_dataarray(orig)
+  
+  def test_merge_method_raises_when_wrapped_dataarray_to_dataset_produces_invalid_object():
+      """
+      If a wrapper's to_dataset returns something invalid (not a Dataset),
+      the merge should raise. This checks that Dataset.merge actually calls
+      to_dataset() on the xr.DataArray symbol (gold behavior). If merge does
+      not call to_dataset(), dataset_merge_method will receive the wrapper
+      object and raise earlier/differently; this test ensures a clear failure
+      mode that distinguishes the correct behavior.
+      """
+      # Create a fake class whose to_dataset returns an integer (invalid)
+      Orig = xr.DataArray
+      class FakeBad:
+          def __init__(self, *args, **kwargs):
+              pass
+          def to_dataset(self):
+              return 12345  # invalid return type
+  
+      xr.DataArray = FakeBad
+      try:
+          ds = xr.Dataset({"a": 0})
+          fake = xr.DataArray(1, name="b")
+          with pytest.raises(Exception):
+              # we expect some exception because to_dataset returned an invalid object
+              ds.merge(fake)
+      finally:
+          xr.DataArray = Orig
+new_imports_code: |
+  # No new top-level imports required for the tests. The tests use existing xarray API.

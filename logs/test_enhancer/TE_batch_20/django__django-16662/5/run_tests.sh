@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 migrations.test_writer_llm.LeadingWhitespaceImportTests._register_serializer_and_get_output migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_space_before_from_is_included migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_space_before_import_is_included migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_tab_before_from_is_included migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_tab_before_import_is_included migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_whitespace_and_models_merge migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_whitespace_duplicate_modules migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_whitespace_many_entries_sorted_presence migrations.test_writer_llm.LeadingWhitespaceImportTests.test_leading_whitespace_with_commas_in_from migrations.test_writer_llm.LeadingWhitespaceImportTests.test_mixed_normal_and_leading_imports migrations.test_writer_llm.LeadingWhitespaceImportTests.test_multiple_leading_whitespace_imports_are_included
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,209 @@
+language: Python
+number_of_tests: 10
+test_behavior: |
+  These tests exercise the CheckExternalLinksBuilder.check_thread/check_uri
+  behavior for URLs containing anchors when the target resource has a
+  non-HTML content-type (e.g. application/pdf or application/octet-stream)
+  and the anchor is not present in the response body.
+
+  The candidate (model) patch incorrectly short-circuits anchor checking for
+  non-HTML content by returning "working" early when the Content-Type header
+  is not text/html. The original/gold behavior performs the anchor check
+  (by GETting the resource and scanning the body) and marks the link as
+  broken if the anchor is not found.
+
+  Each test below sets up a single worker builder (linkcheck_workers=1),
+  starts the builder, pushes a single (uri, docname, lineno) item onto the
+  work queue, and then checks the result from the result queue. The mocked
+  responses are crafted so the HTTP requests succeed (200 OK) but the
+  body does not contain the anchor; therefore the expected status is
+  "broken" under the gold behavior but would be incorrectly "working"
+  under the candidate model patch.
+
+test_code: |
+  import json
+  import threading
+  from unittest import mock
+  import pytest
+  from requests.exceptions import HTTPError
+  import sphinx.builders.linkcheck as linkcheck_mod
+
+  # Helper fake response to simulate requests responses used by linkcheck
+  class FakeResponse:
+      def __init__(self, url, content_chunks, headers=None, status_code=200,
+                   history=None, request_method='GET'):
+          self.url = url
+          self._content_chunks = content_chunks
+          self.headers = headers or {}
+          self.status_code = status_code
+          self.history = history or []
+          self.request = mock.MagicMock()
+          self.request.method = request_method
+
+      def raise_for_status(self):
+          if self.status_code >= 400:
+              # Linkcheck code expects an HTTPError that carries a response attr
+              raise HTTPError(response=self)
+
+      def iter_content(self, chunk_size=4096, decode_unicode=True):
+          for chunk in self._content_chunks:
+              yield chunk
+
+  # Utility to run one check job and get the result from rqueue
+  def run_one_check(app, uri, mock_head_response, mock_get_response):
+      builder = app.builder
+      # Ensure a single worker for deterministic behavior already set via confoverrides in decorator
+      builder.init()
+
+      # Patch the requests used inside the builder module
+      with mock.patch.multiple(linkcheck_mod, get=mock.MagicMock(), head=mock.MagicMock()) as mocks:
+          mocks['get'].return_value = mock_get_response
+          mocks['head'].return_value = mock_head_response
+
+          # Put a single job on the worker queue (non-blocking flag False as in production code)
+          builder.wqueue.put((uri, 'docname', 1), False)
+
+          # Fetch the result produced by the worker
+          result = builder.rqueue.get(timeout=5.0)
+
+      # Clean up worker threads
+      builder.finish()
+      return result
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True,
+                       confoverrides={'linkcheck_workers': 1})
+  def test_anchor_on_pdf_head_ok_bytes(app, status, warning):
+      # HEAD returns 200 and reports a non-HTML content type; GET returns 200
+      uri = "https://example.com/file.pdf#section"
+      headers = {'content-type': 'application/pdf'}
+      # GET yields bytes chunks that do NOT contain the anchor "section"
+      get_resp = FakeResponse(uri, [b"<html><body>No anchor here</body></html>"], headers=headers, status_code=200, request_method='GET')
+      # HEAD simulates a HEAD response (request.method == 'HEAD' on the response)
+      head_resp = FakeResponse(uri, [], headers=headers, status_code=200, request_method='HEAD')
+
+      uri_out, docname, lineno, status_res, info, code = run_one_check(app, uri, head_resp, get_resp)
+      assert uri_out == uri
+      # Under correct behavior anchor not found -> broken
+      assert status_res == 'broken'
+      assert "Anchor 'section' not found" in info
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True,
+                       confoverrides={'linkcheck_workers': 1})
+  def test_anchor_on_pdf_head_ok_text_iter(app, status, warning):
+      uri = "https://example.com/another.pdf#frag"
+      headers = {'content-type': 'application/pdf'}
+      # GET yields str chunks (decode_unicode True path)
+      get_resp = FakeResponse(uri, ["<html>", "<body>no frag</body>", "</html>"], headers=headers, status_code=200, request_method='GET')
+      head_resp = FakeResponse(uri, [], headers=headers, status_code=200, request_method='HEAD')
+
+      uri_out, docname, lineno, status_res, info, code = run_one_check(app, uri, head_resp, get_resp)
+      assert uri_out == uri
+      assert status_res == 'broken'
+      assert "Anchor 'frag' not found" in info
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True,
+                       confoverrides={'linkcheck_workers': 1})
+  def test_anchor_on_octet_stream_head_ok(app, status, warning):
+      uri = "https://example.com/raw.bin#abc"
+      headers = {'content-type': 'application/octet-stream'}
+      get_resp = FakeResponse(uri, [b"binary-data-without-anchor"], headers=headers, status_code=200, request_method='GET')
+      head_resp = FakeResponse(uri, [], headers=headers, status_code=200, request_method='HEAD')
+
+      uri_out, docname, lineno, status_res, info, code = run_one_check(app, uri, head_resp, get_resp)
+      assert status_res == 'broken'
+      assert "Anchor 'abc' not found" in info
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True,
+                       confoverrides={'linkcheck_workers': 1})
+  def test_anchor_on_nonhtml_head_fails_then_get_bytes(app, status, warning):
+      # HEAD fails (simulate servers that don't allow HEAD), GET succeeds but non-HTML
+      uri = "https://example.org/doc#section2"
+      headers = {'content-type': 'application/pdf'}
+      # HEAD raises HTTPError
+      head_resp = FakeResponse(uri, [], headers=headers, status_code=404, request_method='HEAD')
+      get_resp = FakeResponse(uri, [b"no anchor in pdf"], headers=headers, status_code=200, request_method='GET')
+
+      # patch get/head so that HEAD.raise_for_status() will raise inside check_uri
+      with mock.patch.multiple(linkcheck_mod, get=mock.MagicMock(return_value=get_resp),
+                                         head=mock.MagicMock(return_value=head_resp)):
+          builder = app.builder
+          builder.init()
+          builder.wqueue.put((uri, 'docname', 2), False)
+          uri_out, docname, lineno, status_res, info, code = builder.rqueue.get(timeout=5.0)
+          builder.finish()
+
+      assert status_res == 'broken'
+      assert "Anchor 'section2' not found" in info
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True,
+                       confoverrides={'linkcheck_workers': 1})
+  def test_anchor_percent_encoded(app, status, warning):
+      # anchor with percent-encoding; unquote should be applied before checking
+      uri = "https://example.com/page#my%20anchor"
+      headers = {'content-type': 'application/pdf'}
+      get_resp = FakeResponse(uri, ["<html><body>no match for my anchor</body></html>"], headers=headers, status_code=200, request_method='GET')
+      head_resp = FakeResponse(uri, [], headers=headers, status_code=200, request_method='HEAD')
+
+      uri_out, docname, lineno, status_res, info, code = run_one_check(app, uri, head_resp, get_resp)
+      assert status_res == 'broken'
+      # ensure unquote applied -> space-decoded anchor shown in message
+      assert "Anchor 'my anchor' not found" in info
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True,
+                       confoverrides={'linkcheck_workers': 1})
+  def test_anchor_non_html_with_redirect_history(app, status, warning):
+      # GET succeeded but response.history is non-empty (redirects). Still, anchor missing => broken.
+      uri = "https://example.com/redirected.pdf#top"
+      headers = {'content-type': 'application/pdf'}
+      hist_resp = FakeResponse("https://example.com/intermediate", [], headers=headers, status_code=302, request_method='GET')
+      get_resp = FakeResponse(uri, [b"no anchor here"], headers=headers, status_code=200, history=[hist_resp], request_method='GET')
+      head_resp = FakeResponse(uri, [], headers=headers, status_code=200, request_method='HEAD')
+
+      uri_out, docname, lineno, status_res, info, code = run_one_check(app, uri, head_resp, get_resp)
+      assert status_res == 'broken'
+      assert "Anchor 'top' not found" in info
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True,
+                       confoverrides={'linkcheck_workers': 1})
+  def test_anchor_non_html_multiple_chunks_bytes(app, status, warning):
+      # Multiple byte-chunks are supplied; none contains the anchor
+      uri = "https://example.com/multi.pdf#part"
+      headers = {'content-type': 'application/pdf'}
+      get_resp = FakeResponse(uri, [b"chunk1-", b"chunk2-without", b"-anchor"], headers=headers, status_code=200, request_method='GET')
+      head_resp = FakeResponse(uri, [], headers=headers, status_code=200, request_method='HEAD')
+
+      uri_out, docname, lineno, status_res, info, code = run_one_check(app, uri, head_resp, get_resp)
+      assert status_res == 'broken'
+      assert "Anchor 'part' not found" in info
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True,
+                       confoverrides={'linkcheck_workers': 1})
+  def test_anchor_non_html_multiple_chunks_text(app, status, warning):
+      # Multiple text chunks; anchor absent
+      uri = "https://example.com/textdoc#frag2"
+      headers = {'content-type': 'application/pdf'}
+      get_resp = FakeResponse(uri, ["a", "b", "c without frag2"], headers=headers, status_code=200, request_method='GET')
+      head_resp = FakeResponse(uri, [], headers=headers, status_code=200, request_method='HEAD')
+
+      uri_out, docname, lineno, status_res, info, code = run_one_check(app, uri, head_resp, get_resp)
+      assert status_res == 'broken'
+      assert "Anchor 'frag2' not found" in info
+
+  @pytest.mark.sphinx('linkcheck', testroot='linkcheck', freshenv=True,
+                       confoverrides={'linkcheck_workers': 1})
+  def test_anchor_on_nonhtml_when_anchor_not_ignored(app, status, warning):
+      # If anchors_ignore does not match the anchor, behavior should check for
+      # anchor presence and report broken when not found (gold). Candidate may
+      # incorrectly return 'working' for non-HTML content.
+      uri = "https://example.com/noval#uniqueanchor"
+      headers = {'content-type': 'application/octet-stream'}
+      get_resp = FakeResponse(uri, ["no uniqueanchor present"], headers=headers, status_code=200, request_method='GET')
+      head_resp = FakeResponse(uri, [], headers=headers, status_code=200, request_method='HEAD')
+
+      uri_out, docname, lineno, status_res, info, code = run_one_check(app, uri, head_resp, get_resp)
+      assert status_res == 'broken'
+      assert "Anchor 'uniqueanchor' not found" in info
+
+new_imports_code: |
+  from requests.exceptions import HTTPError
+  import sphinx.builders.linkcheck as linkcheck_mod

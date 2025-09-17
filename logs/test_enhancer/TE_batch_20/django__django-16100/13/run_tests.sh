@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_changelist.tests_llm.TransactionAtomicTests._valid_post_data_for_three admin_changelist.tests_llm.TransactionAtomicTests.setUp admin_changelist.tests_llm.TransactionAtomicTests.setUpTestData admin_changelist.tests_llm.TransactionAtomicTests.test_atomic_called_even_when_message_user_called admin_changelist.tests_llm.TransactionAtomicTests.test_atomic_called_with_using_arg_for_different_admin_instance admin_changelist.tests_llm.TransactionAtomicTests.test_atomic_called_with_using_arg_for_many_changed_forms admin_changelist.tests_llm.TransactionAtomicTests.test_atomic_called_with_using_arg_on_successful_post admin_changelist.tests_llm.TransactionAtomicTests.test_atomic_called_with_using_arg_when_log_change_fails_after_first admin_changelist.tests_llm.TransactionAtomicTests.test_atomic_called_with_using_arg_when_log_change_raises admin_changelist.tests_llm.TransactionAtomicTests.test_atomic_called_with_using_arg_when_some_forms_unchanged admin_changelist.tests_llm.TransactionAtomicTests.test_atomic_not_called_for_non_list_editable_action_post admin_changelist.tests_llm.TransactionAtomicTests.test_atomic_not_called_when_formset_invalid
+coverage json -o coverage.json
+: '>>>>> End Test Output'

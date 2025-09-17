@@ -1,0 +1,226 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise pytest_runtest_makereport's skip-location correction behavior. They create synthetic Item/Call/Report objects and drive the hookwrapper to simulate several scenarios where earlier branches in the report-making logic may change rep.outcome (e.g. xfail.Exception in call.excinfo or an xfailed mark with raises matching the exception). The gold patch ensures the skip-location correction runs after xfail processing (so longrepr is adjusted to the item's reportinfo location). The candidate (model) patch moved the correction earlier and removed the final correction, which can miss correcting the location when rep.outcome transitions to 'skipped' later in the hook. The tests assert that rep.longrepr is rewritten to the item's reportinfo location in those cases. These tests should pass with the gold patch and fail with the candidate patch.
+test_code: |
+  import types
+  from _pytest.outcomes import xfail as _xfail
+  from _pytest.skipping import (
+      pytest_runtest_makereport,
+      skipped_by_mark_key,
+      xfailed_key,
+  )
+  from _pytest.skipping import Xfail
+  
+  class DummyRep:
+      def __init__(self, when, outcome, longrepr):
+          self.when = when
+          self.outcome = outcome
+          self._longrepr = longrepr
+          # wasxfail may be set by the hook
+          # allow arbitrary attributes to be set later
+      @property
+      def skipped(self):
+          return self.outcome == "skipped"
+      @property
+      def passed(self):
+          return self.outcome == "passed"
+      @property
+      def failed(self):
+          return self.outcome == "failed"
+      @property
+      def longrepr(self):
+          return self._longrepr
+      @longrepr.setter
+      def longrepr(self, val):
+          self._longrepr = val
+  
+  class DummyCall:
+      def __init__(self, when="call", exc=None):
+          self.when = when
+          # mimic ExceptionInfo-like object with .value attribute
+          if exc is None:
+              self.excinfo = None
+          else:
+              self.excinfo = types.SimpleNamespace(value=exc)
+  
+  class DummyConfig:
+      def __init__(self, runxfail=False):
+          self.option = types.SimpleNamespace(runxfail=runxfail)
+      def getini(self, name):
+          # default xfail_strict handling not required for these tests
+          return False
+  
+  class DummyItem:
+      def __init__(self, report_filename="file.py", report_line=100):
+          self._store = {}
+          self.config = DummyConfig(runxfail=False)
+          self._report_filename = report_filename
+          self._report_line = report_line
+      def reportinfo(self):
+          # return filename, line, something else (ignored)
+          return (self._report_filename, self._report_line, None)
+  
+  class _Outcome:
+      def __init__(self, rep):
+          self._rep = rep
+      def get_result(self):
+          return self._rep
+  
+  def run_makereport(item, call, rep):
+      """Drive the hookwrapper generator to completion and return the report."""
+      gen = pytest_runtest_makereport(item, call)
+      # advance to yield
+      next(gen)
+      outcome = _Outcome(rep)
+      # send the outcome into the generator to execute the hook body
+      try:
+          gen.send(outcome)
+      except StopIteration:
+          pass
+      return rep
+  
+  # Test 1
+  def test_skip_location_after_xfail_exception_call_failed():
+      item = DummyItem(report_filename="newfile.py", report_line=200)
+      item._store[skipped_by_mark_key] = True
+      # initial longrepr is a tuple as produced by a skip call
+      original_longrepr = ("orig.py", 10, "original reason")
+      rep = DummyRep(when="call", outcome="failed", longrepr=original_longrepr)
+      # simulate a pytest.xfail() occurred during the call
+      call = DummyCall(when="call", exc=_xfail.Exception("xfail-reason"))
+      res = run_makereport(item, call, rep)
+      assert isinstance(res.longrepr, tuple)
+      assert res.longrepr[0] == "newfile.py"
+      assert res.longrepr[1] == 201
+      assert res.longrepr[2] == "original reason"
+  
+  # Test 2
+  def test_skip_location_after_xfail_exception_call_passed():
+      item = DummyItem(report_filename="alpha.py", report_line=5)
+      item._store[skipped_by_mark_key] = True
+      original_longrepr = ("orig2.py", 2, "skip reason")
+      rep = DummyRep(when="call", outcome="passed", longrepr=original_longrepr)
+      call = DummyCall(when="call", exc=_xfail.Exception("xfail-msg"))
+      res = run_makereport(item, call, rep)
+      assert isinstance(res.longrepr, tuple)
+      assert res.longrepr[0] == "alpha.py"
+      assert res.longrepr[1] == 6
+      assert res.longrepr[2] == "skip reason"
+  
+  # Test 3
+  def test_skip_location_after_xfail_exception_setup_phase():
+      item = DummyItem(report_filename="setup_file.py", report_line=11)
+      item._store[skipped_by_mark_key] = True
+      original_longrepr = ("orig_setup.py", 3, "setup skip")
+      rep = DummyRep(when="setup", outcome="failed", longrepr=original_longrepr)
+      call = DummyCall(when="setup", exc=_xfail.Exception("xfail-setup"))
+      res = run_makereport(item, call, rep)
+      assert isinstance(res.longrepr, tuple)
+      assert res.longrepr[0] == "setup_file.py"
+      assert res.longrepr[1] == 12
+      assert res.longrepr[2] == "setup skip"
+  
+  # Test 4
+  def test_skip_location_after_xfailed_store_with_matching_raises_typeerror():
+      item = DummyItem(report_filename="match1.py", report_line=77)
+      item._store[skipped_by_mark_key] = True
+      # place an Xfail in the store with raises set to TypeError
+      item._store[xfailed_key] = Xfail(reason="r1", run=True, strict=False, raises=(TypeError,))
+      original_longrepr = ("orig_match.py", 7, "mr")
+      rep = DummyRep(when="call", outcome="failed", longrepr=original_longrepr)
+      call = DummyCall(when="call", exc=TypeError("boom"))
+      res = run_makereport(item, call, rep)
+      assert isinstance(res.longrepr, tuple)
+      assert res.longrepr[0] == "match1.py"
+      assert res.longrepr[1] == 78
+      assert res.longrepr[2] == "mr"
+  
+  # Test 5
+  def test_skip_location_after_xfailed_store_with_matching_raises_exception_base():
+      item = DummyItem(report_filename="match2.py", report_line=50)
+      item._store[skipped_by_mark_key] = True
+      item._store[xfailed_key] = Xfail(reason="r2", run=True, strict=False, raises=(Exception,))
+      original_longrepr = ("orig_match2.py", 20, "reason2")
+      rep = DummyRep(when="call", outcome="failed", longrepr=original_longrepr)
+      call = DummyCall(when="call", exc=IndexError("idx"))
+      res = run_makereport(item, call, rep)
+      assert isinstance(res.longrepr, tuple)
+      assert res.longrepr[0] == "match2.py"
+      assert res.longrepr[1] == 51
+      assert res.longrepr[2] == "reason2"
+  
+  # Test 6
+  def test_skip_location_after_xfailed_store_matching_keyerror():
+      item = DummyItem(report_filename="match3.py", report_line=1)
+      item._store[skipped_by_mark_key] = True
+      item._store[xfailed_key] = Xfail(reason="r3", run=True, strict=False, raises=(KeyError,))
+      original_longrepr = ("orig_k.py", 99, "k")
+      rep = DummyRep(when="call", outcome="failed", longrepr=original_longrepr)
+      call = DummyCall(when="call", exc=KeyError("kerr"))
+      res = run_makereport(item, call, rep)
+      assert isinstance(res.longrepr, tuple)
+      assert res.longrepr[0] == "match3.py"
+      assert res.longrepr[1] == 2
+      assert res.longrepr[2] == "k"
+  
+  # Test 7
+  def test_skip_location_after_xfailed_store_matching_when_setup():
+      # even if the call.when is 'setup', when raises matches, outcome becomes skipped
+      item = DummyItem(report_filename="match_setup.py", report_line=9)
+      item._store[skipped_by_mark_key] = True
+      item._store[xfailed_key] = Xfail(reason="rs", run=True, strict=False, raises=(RuntimeError,))
+      original_longrepr = ("orig_s.py", 4, "sr")
+      rep = DummyRep(when="setup", outcome="failed", longrepr=original_longrepr)
+      call = DummyCall(when="setup", exc=RuntimeError("rt"))
+      res = run_makereport(item, call, rep)
+      assert isinstance(res.longrepr, tuple)
+      assert res.longrepr[0] == "match_setup.py"
+      assert res.longrepr[1] == 10
+      assert res.longrepr[2] == "sr"
+  
+  # Test 8
+  def test_skip_location_after_xfailed_store_with_multiple_raises_tuple():
+      item = DummyItem(report_filename="many.py", report_line=15)
+      item._store[skipped_by_mark_key] = True
+      item._store[xfailed_key] = Xfail(reason="many", run=True, strict=False, raises=(KeyError, ValueError, IndexError))
+      original_longrepr = ("orig_many.py", 16, "m")
+      rep = DummyRep(when="call", outcome="failed", longrepr=original_longrepr)
+      call = DummyCall(when="call", exc=ValueError("v"))
+      res = run_makereport(item, call, rep)
+      assert isinstance(res.longrepr, tuple)
+      assert res.longrepr[0] == "many.py"
+      assert res.longrepr[1] == 16
+      assert res.longrepr[2] == "m"
+  
+  # Test 9
+  def test_skip_location_after_xfail_exception_preserves_reason_text():
+      item = DummyItem(report_filename="reasons.py", report_line=2000)
+      item._store[skipped_by_mark_key] = True
+      original_longrepr = ("orig_reason.py", 77, "the original skip text")
+      rep = DummyRep(when="call", outcome="failed", longrepr=original_longrepr)
+      call = DummyCall(when="call", exc=_xfail.Exception("xx"))
+      res = run_makereport(item, call, rep)
+      assert isinstance(res.longrepr, tuple)
+      assert res.longrepr[2] == "the original skip text"
+      assert res.longrepr[0] == "reasons.py"
+      assert res.longrepr[1] == 2001
+  
+  # Test 10
+  def test_skip_location_after_xfailed_store_and_xfail_exception_combined():
+      # if both an xfailed mark with raises matching and a call excinfo of xfail.Exception happen,
+      # the final longrepr should be corrected to the item's reportinfo location
+      item = DummyItem(report_filename="combo.py", report_line=33)
+      item._store[skipped_by_mark_key] = True
+      item._store[xfailed_key] = Xfail(reason="combo", run=True, strict=False, raises=(Exception,))
+      original_longrepr = ("orig_combo.py", 9, "combo reason")
+      rep = DummyRep(when="call", outcome="failed", longrepr=original_longrepr)
+      # simulate both situations: call.excinfo is a non-matching normal exception instance
+      # but also there is an xfailed mark -- the logic should ultimately result in correction
+      call = DummyCall(when="call", exc=ValueError("v"))
+      res = run_makereport(item, call, rep)
+      assert isinstance(res.longrepr, tuple)
+      assert res.longrepr[0] == "combo.py"
+      assert res.longrepr[1] == 34
+      assert res.longrepr[2] == "combo reason"
+new_imports_code: |
+  # no extra imports beyond those used in the test file (use stdlib and pytest internals)

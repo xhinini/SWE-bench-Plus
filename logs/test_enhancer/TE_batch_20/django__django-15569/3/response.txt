@@ -1,0 +1,205 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests assert that unregistering a lookup clears the cached lookups on the target class and all its subclasses. They exercise direct use of the classmethod register_lookup/_unregister_lookup and the lru_cache-based get_lookups caching behavior to ensure caches are invalidated for parent and descendant classes. Tests also verify behavior when using a custom lookup_name and that unregistering a non-registered lookup raises KeyError.
+test_code: |
+  from django.test import SimpleTestCase
+  from django.db import models
+  
+  
+  class TempLookup(models.lookups.Lookup):
+      lookup_name = "temp_unreg"
+  
+      def as_sql(self, compiler, connection):
+          # Not used in these tests; provide a minimal implementation.
+          lhs, lhs_params = self.process_lhs(compiler, connection)
+          rhs, rhs_params = self.process_rhs(compiler, connection)
+          lhs_params.extend(rhs_params)
+          return "%s = %s" % (lhs, rhs), lhs_params
+  
+  
+  class UnregisterLookupCacheTests(SimpleTestCase):
+      def _snapshot_and_restore_field_class_lookups(self):
+          """
+          Helper to snapshot and restore models.Field.class_lookups to avoid
+          leaking state across tests.
+          """
+          had_attr = "class_lookups" in models.Field.__dict__
+          orig = models.Field.__dict__.get("class_lookups", None)
+  
+          def restore():
+              if had_attr:
+                  models.Field.class_lookups = orig.copy() if orig is not None else {}
+              else:
+                  if "class_lookups" in models.Field.__dict__:
+                      del models.Field.class_lookups
+              # Ensure caches are cleared after restoration.
+              if hasattr(models.Field.get_lookups, "cache_clear"):
+                  models.Field.get_lookups.cache_clear()
+              models.Field._clear_cached_lookups()
+  
+          return restore
+  
+      def test_unregistration_clears_cache_on_subclass(self):
+          restore = self._snapshot_and_restore_field_class_lookups()
+          try:
+              # Register on the parent (models.Field)
+              models.Field.register_lookup(TempLookup)
+              # Create a dynamic subclass which will inherit lookup resolution.
+              ChildField = type("ChildField", (models.Field,), {})
+              # Prime the subclass cache.
+              self.assertIn("temp_unreg", ChildField.get_lookups())
+              # Ensure the subclass has cached the lookups.
+              ChildField.get_lookups.cache_clear()  # clear first, then prime to create cache state
+              _ = ChildField.get_lookups()
+              # Now unregister from the parent; this should clear cached results
+              # for the parent and all subclasses.
+              models.Field._unregister_lookup(TempLookup)
+              # The cached lookups for ChildField must reflect the removal.
+              self.assertNotIn("temp_unreg", ChildField.get_lookups())
+          finally:
+              restore()
+  
+      def test_unregistration_with_custom_lookup_name(self):
+          restore = self._snapshot_and_restore_field_class_lookups()
+          try:
+              # Register using an explicit lookup name
+              models.Field.register_lookup(TempLookup, lookup_name="altname")
+              ChildField = type("ChildField2", (models.Field,), {})
+              # Prime cache
+              _ = ChildField.get_lookups()
+              # Unregister by passing the explicit lookup_name
+              models.Field._unregister_lookup(TempLookup, lookup_name="altname")
+              self.assertNotIn("altname", ChildField.get_lookups())
+          finally:
+              restore()
+  
+      def test_get_lookup_returns_none_after_unregistration(self):
+          restore = self._snapshot_and_restore_field_class_lookups()
+          try:
+              models.Field.register_lookup(TempLookup)
+              # Use an actual Field instance to check get_lookup
+              f = models.IntegerField()
+              # Prime cache on the instance class
+              _ = f.get_lookups()
+              # Ensure lookup is currently resolvable through get_lookup
+              self.assertIsNotNone(f.get_lookup("temp_unreg"))
+              # Unregister and validate the lookup is no longer returned
+              models.Field._unregister_lookup(TempLookup)
+              self.assertIsNone(f.get_lookup("temp_unreg"))
+          finally:
+              restore()
+  
+      def test_unregister_busts_cache_for_multiple_subclasses(self):
+          restore = self._snapshot_and_restore_field_class_lookups()
+          try:
+              models.Field.register_lookup(TempLookup)
+              ChildA = type("ChildA", (models.Field,), {})
+              ChildB = type("ChildB", (models.Field,), {})
+              # Prime caches
+              _ = ChildA.get_lookups()
+              _ = ChildB.get_lookups()
+              # Now unregister and ensure both caches are updated
+              models.Field._unregister_lookup(TempLookup)
+              self.assertNotIn("temp_unreg", ChildA.get_lookups())
+              self.assertNotIn("temp_unreg", ChildB.get_lookups())
+          finally:
+              restore()
+  
+      def test_unregister_busts_cache_when_cached_on_parent(self):
+          restore = self._snapshot_and_restore_field_class_lookups()
+          try:
+              models.Field.register_lookup(TempLookup)
+              # Prime parent cache
+              _ = models.Field.get_lookups()
+              # Unregister and ensure parent cache no longer contains the lookup
+              models.Field._unregister_lookup(TempLookup)
+              self.assertNotIn("temp_unreg", models.Field.get_lookups())
+          finally:
+              restore()
+  
+      def test_unregister_raises_key_error_when_missing(self):
+          restore = self._snapshot_and_restore_field_class_lookups()
+          try:
+              # Ensure the lookup is not present
+              if "temp_unreg" in models.Field.get_lookups():
+                  models.Field._unregister_lookup(TempLookup)
+              # Attempt to unregister a lookup that isn't registered should raise KeyError
+              with self.assertRaises(KeyError):
+                  models.Field._unregister_lookup(TempLookup)
+          finally:
+              restore()
+  
+      def test_unregister_clears_cache_after_multiple_registrations(self):
+          restore = self._snapshot_and_restore_field_class_lookups()
+          try:
+              class OtherLookup(models.lookups.Lookup):
+                  lookup_name = "other_temp"
+                  def as_sql(self, compiler, connection):
+                      lhs, lhs_params = self.process_lhs(compiler, connection)
+                      rhs, rhs_params = self.process_rhs(compiler, connection)
+                      lhs_params.extend(rhs_params)
+                      return "%s = %s" % (lhs, rhs), lhs_params
+              # Register two lookups on the parent
+              models.Field.register_lookup(TempLookup)
+              models.Field.register_lookup(OtherLookup)
+              Child = type("ChildMulti", (models.Field,), {})
+              # Prime cache
+              _ = Child.get_lookups()
+              # Unregister one of them
+              models.Field._unregister_lookup(TempLookup)
+              lookups = Child.get_lookups()
+              self.assertNotIn("temp_unreg", lookups)
+              self.assertIn("other_temp", lookups)
+              # Clean up the second lookup
+              models.Field._unregister_lookup(OtherLookup)
+          finally:
+              restore()
+  
+      def test_register_lookup_clears_cache_on_descendants(self):
+          # This test ensures register_lookup still clears caches on descendants.
+          restore = self._snapshot_and_restore_field_class_lookups()
+          try:
+              Desc = type("DescField", (models.Field,), {})
+              # Prime cache
+              _ = Desc.get_lookups()
+              # Now register a new lookup; cache for Desc must reflect it.
+              models.Field.register_lookup(TempLookup)
+              self.assertIn("temp_unreg", Desc.get_lookups())
+              # cleanup
+              models.Field._unregister_lookup(TempLookup)
+          finally:
+              restore()
+  
+      def test_unregister_with_lookup_name_string_parameter(self):
+          restore = self._snapshot_and_restore_field_class_lookups()
+          try:
+              # Register with explicit name, then unregister using that string
+              models.Field.register_lookup(TempLookup, lookup_name="some_name")
+              C = type("ChildName", (models.Field,), {})
+              _ = C.get_lookups()
+              models.Field._unregister_lookup(TempLookup, lookup_name="some_name")
+              self.assertNotIn("some_name", C.get_lookups())
+          finally:
+              restore()
+  
+      def test_unregister_clears_cache_when_subclass_cached_before_registration(self):
+          """
+          If a subclass has get_lookups cached before we register+unregister a lookup
+          on the parent, caches should still end up cleared after unregistering.
+          """
+          restore = self._snapshot_and_restore_field_class_lookups()
+          try:
+              Sub = type("SubBefore", (models.Field,), {})
+              # Prime subclass cache (empty)
+              _ = Sub.get_lookups()
+              # Register a lookup on parent (this clears caches)
+              models.Field.register_lookup(TempLookup)
+              self.assertIn("temp_unreg", Sub.get_lookups())
+              # Now unregister the lookup from parent
+              models.Field._unregister_lookup(TempLookup)
+              self.assertNotIn("temp_unreg", Sub.get_lookups())
+          finally:
+              restore()
+new_imports_code: |
+  from django.test import SimpleTestCase
+  from django.db import models

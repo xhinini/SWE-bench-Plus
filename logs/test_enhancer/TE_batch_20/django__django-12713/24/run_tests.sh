@@ -1,0 +1,17 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+export LANG=en_US.UTF-8
+export LANGUAGE=en_US:en
+export LC_ALL=en_US.UTF-8
+export PYTHONIOENCODING=utf8
+python --version && python -m pip install -U pip
+python -m pip install -U 'coverage==6.2'
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 admin_widgets.tests_llm.ManyToManyFormfieldOverridesNoRequestTests._make_admin_raising_on_get_autocomplete admin_widgets.tests_llm.ManyToManyFormfieldOverridesNoRequestTests.test_autocomplete_fields_with_widget_override_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyFormfieldOverridesNoRequestTests.test_combined_filters_with_widget_override_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyFormfieldOverridesNoRequestTests.test_filter_horizontal_with_widget_override_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyFormfieldOverridesNoRequestTests.test_filter_vertical_with_widget_override_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyFormfieldOverridesNoRequestTests.test_multiple_admin_attributes_with_widget_override_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyFormfieldOverridesNoRequestTests.test_raw_id_fields_with_widget_override_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyFormfieldOverridesNoRequestTests.test_widget_override_instance_not_class_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyFormfieldOverridesNoRequestTests.test_widget_override_on_different_m2m_field_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyFormfieldOverridesNoRequestTests.test_widget_override_with_empty_filter_lists_does_not_call_get_autocomplete admin_widgets.tests_llm.ManyToManyFormfieldOverridesNoRequestTests.test_widget_override_with_no_admin_attrs_does_not_call_get_autocomplete
+coverage json -o coverage.json
+: '>>>>> End Test Output'

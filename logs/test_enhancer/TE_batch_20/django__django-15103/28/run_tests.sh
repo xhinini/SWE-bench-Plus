@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 utils_tests.test_html_llm.JsonScriptRegressionTests.test_empty_bytes_element_id_omitted utils_tests.test_html_llm.JsonScriptRegressionTests.test_empty_string_element_id_omitted utils_tests.test_html_llm.JsonScriptRegressionTests.test_false_does_not_stringify_into_id_attribute utils_tests.test_html_llm.JsonScriptRegressionTests.test_false_element_id_omitted utils_tests.test_html_llm.JsonScriptRegressionTests.test_zero_element_id_omitted
+coverage json -o coverage.json
+: '>>>>> End Test Output'

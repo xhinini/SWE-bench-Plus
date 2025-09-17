@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 file_storage.test_models_llm.FileFieldDeconstructTests.assert_storage_in_kwargs file_storage.test_models_llm.FileFieldDeconstructTests.assert_storage_not_in_kwargs file_storage.test_models_llm.FileFieldDeconstructTests.test_custom_valid_name_storage_included file_storage.test_models_llm.FileFieldDeconstructTests.test_deconstruct_omits_default_storage_when_set_directly file_storage.test_models_llm.FileFieldDeconstructTests.test_default_field_with_explicit_temp_storage_included file_storage.test_models_llm.FileFieldDeconstructTests.test_extented_length_field_includes_temp_storage file_storage.test_models_llm.FileFieldDeconstructTests.test_limited_length_field_includes_temp_storage file_storage.test_models_llm.FileFieldDeconstructTests.test_normal_field_includes_temp_storage file_storage.test_models_llm.FileFieldDeconstructTests.test_pathlib_direct_includes_temp_storage file_storage.test_models_llm.FileFieldDeconstructTests.test_storage_callable_class_includes_class file_storage.test_models_llm.FileFieldDeconstructTests.test_storage_callable_default_includes_callable file_storage.test_models_llm.FileFieldDeconstructTests.test_storage_callable_includes_callable
+coverage json -o coverage.json
+: '>>>>> End Test Output'

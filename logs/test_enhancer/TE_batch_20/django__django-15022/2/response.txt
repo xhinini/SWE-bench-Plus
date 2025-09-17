@@ -1,0 +1,144 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise the ModelAdmin.get_search_results behavior for multiple search terms, quoted phrases, and related-field lookups. They ensure that multiple search terms are combined correctly (each term must match at least one of the configured search lookups, i.e. terms are ANDed, while lookups within a term are ORed). The tests will fail for implementations that incorrectly combine term queries (the candidate patch's change to the search Q-object combination led to incorrect behavior in some cases) and will pass for the fixed (gold) implementation.
+test_code: |
+  from django.test import TestCase
+  from django.test import RequestFactory
+  from django.contrib import admin
+  from django.contrib.auth.models import User
+  from django.contrib.admin.sites import AdminSite
+  from django.db import models
+
+  # Import models and admin registrations from the app used in the existing tests.
+  from tests.admin_changelist.models import Parent, Child, Band, Swallow
+  from tests.admin_changelist.admin import (
+      ParentAdmin, ParentAdminTwoSearchFields, DynamicSearchFieldsChildAdmin,
+      BandAdmin, SwallowAdmin, site as test_site
+  )
+
+  class DummyReq:
+      """Simple dummy request that can be passed where only the request argument is needed."""
+      def __init__(self):
+          self.GET = {}
+          self.POST = {}
+          self.resolver_match = None
+          self.user = None
+
+  class GetSearchResultsTests(TestCase):
+      def setUp(self):
+          # Create parents and children to exercise related lookups.
+          # Parent <-> Child: Child has ForeignKey to Parent.
+          self.parent1 = Parent.objects.create(name="Parent One")
+          self.child1 = Child.objects.create(name="Alice Wonderland", age=30, parent=self.parent1)
+  
+          self.parent2 = Parent.objects.create(name="Parent Two")
+          self.child2 = Child.objects.create(name="Alice", age=30, parent=self.parent2)
+  
+          self.parent3 = Parent.objects.create(name="Parent Three")
+          self.child3 = Child.objects.create(name="Wonderland", age=40, parent=self.parent3)
+  
+          # A parent with child having both tokens in separate fields vs same field:
+          self.parent4 = Parent.objects.create(name="Parent Four")
+          self.child4 = Child.objects.create(name="Alpha", age=50, parent=self.parent4)
+          # We will search across child__name and child__age for numeric/word mix.
+
+          # Admin instances to test with
+          self.parent_admin = ParentAdmin(Parent, test_site)
+          self.parent_admin_two = ParentAdminTwoSearchFields(Parent, test_site)
+          self.dynamic_child_admin = DynamicSearchFieldsChildAdmin(Child, test_site)
+  
+          self.req = DummyReq()
+  
+      def test_single_term_related_lookup(self):
+          # Searching parents by their child's name with a single term should match both parent1 and parent2.
+          qs, may_have_duplicates = self.parent_admin.get_search_results(self.req, Parent.objects.all(), "Alice")
+          pks = set(qs.values_list('pk', flat=True))
+          self.assertIn(self.parent1.pk, pks)
+          self.assertIn(self.parent2.pk, pks)
+          # The search only involved one term, duplicates shouldn't be signaled incorrectly.
+          self.assertFalse(may_have_duplicates)
+  
+      def test_two_terms_and_behavior_same_field(self):
+          # Searching for two tokens that appear in the same related field (child.name)
+          # should match parent1 (Alice Wonderland) but not parent2 or parent3 alone.
+          qs, _ = self.parent_admin.get_search_results(self.req, Parent.objects.all(), "Alice Wonderland")
+          pks = set(qs.values_list('pk', flat=True))
+          self.assertIn(self.parent1.pk, pks)
+          self.assertNotIn(self.parent2.pk, pks)
+          self.assertNotIn(self.parent3.pk, pks)
+  
+      def test_two_terms_and_behavior_split_across_fields(self):
+          # Using ParentAdminTwoSearchFields which includes child__name and child__age,
+          # searching for a name token and an age token should match the parent where
+          # child's name matches one token and child's age matches the numeric token.
+          # Add a child with name "Bob" and age 50 on parent4 to exercise this.
+          child_extra = Child.objects.create(name="Bob", age=50, parent=self.parent4)
+          # Search for "Bob 50" - one token matches name, the other the age lookup.
+          qs, _ = self.parent_admin_two.get_search_results(self.req, Parent.objects.all(), "Bob 50")
+          pks = set(qs.values_list('pk', flat=True))
+          self.assertIn(self.parent4.pk, pks)
+  
+      def test_quoted_phrase_treated_as_single_term(self):
+          # Quoted phrase should be treated as single token. Query for "Alice Wonderland" quoted
+          # should match parent1 (single term covering full name).
+          qs, _ = self.parent_admin.get_search_results(self.req, Parent.objects.all(), '"Alice Wonderland"')
+          pks = set(qs.values_list('pk', flat=True))
+          self.assertIn(self.parent1.pk, pks)
+          self.assertNotIn(self.parent2.pk, pks)
+  
+      def test_search_on_child_age_via_dynamic_search_fields(self):
+          # The dynamic child admin augments search_fields with age (via get_search_fields).
+          # Searching for a numeric age should return child objects matching that age.
+          qs, _ = self.dynamic_child_admin.get_search_results(self.req, Child.objects.all(), "30")
+          child_pks = set(qs.values_list('pk', flat=True))
+          self.assertIn(self.child1.pk, child_pks)
+          self.assertIn(self.child2.pk, child_pks)
+          self.assertNotIn(self.child3.pk, child_pks)
+  
+      def test_multiple_terms_with_overlap(self):
+          # Search with overlapping tokens where multiple parents might satisfy parts.
+          # "Alice Wonderland" should only match the parent whose child has both tokens,
+          # not the union of parents who individually match tokens.
+          qs, _ = self.parent_admin.get_search_results(self.req, Parent.objects.all(), "Alice Wonderland")
+          pks = list(qs.values_list('pk', flat=True))
+          self.assertEqual({self.parent1.pk}, set(pks))
+  
+      def test_search_respects_and_not_or(self):
+          # Ensure that multiple tokens are ANDed: searching "Alice 40" should not match parent1 (age 30).
+          qs, _ = self.parent_admin_two.get_search_results(self.req, Parent.objects.all(), "Alice 40")
+          pks = set(qs.values_list('pk', flat=True))
+          # Only parent3 has age 40 but doesn't have 'Alice' name; no parent should match both.
+          self.assertNotIn(self.parent1.pk, pks)
+          self.assertNotIn(self.parent3.pk, pks)
+          self.assertEqual(0, qs.count())
+  
+      def test_search_case_insensitive_and_lookup_types(self):
+          # Add variations to ensure case-insensitive lookups and different prefixes behave.
+          # Searching for 'alice' lowercase should still find matches.
+          qs_lower, _ = self.parent_admin.get_search_results(self.req, Parent.objects.all(), "alice")
+          self.assertTrue(qs_lower.exists())
+  
+      def test_search_multiple_tokens_with_commas_and_spaces(self):
+          # Ensure tokenization handles commas and multiple whitespace correctly.
+          # Add a child with a name containing comma
+          parent_comma = Parent.objects.create(name="Parent Comma")
+          Child.objects.create(name="Comma,Separated", age=60, parent=parent_comma)
+          qs, _ = self.parent_admin.get_search_results(self.req, Parent.objects.all(), "Comma Separated")
+          pks = set(qs.values_list('pk', flat=True))
+          self.assertIn(parent_comma.pk, pks)
+  
+      def test_search_results_do_not_return_duplicates_unnecessarily(self):
+          # When searching across related fields, results shouldn't contain duplicates.
+          # Use a Band/ManyToMany style admin (BandAdmin) from the admin module to ensure
+          # duplicate-flagging is computed.
+          # Create bands and related objects to trigger lookup_spawns_duplicates if relevant.
+          b1 = Band.objects.create(name="DupBand")
+          # We don't need to populate genres deeply for this test; just ensure calling
+          # get_search_results returns a queryset and a boolean flag.
+          band_admin = BandAdmin(Band, test_site)
+          qs, may_have_duplicates = band_admin.get_search_results(self.req, Band.objects.all(), "")
+          # For empty search term, queryset should be unchanged and duplicates False
+          self.assertEqual(qs.count(), Band.objects.count())
+          self.assertFalse(may_have_duplicates)
+new_imports_code: |
+  from django.test import RequestFactory

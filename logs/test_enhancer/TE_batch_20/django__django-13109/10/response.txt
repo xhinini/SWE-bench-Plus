@@ -1,0 +1,177 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests validate that ForeignKey.validate() uses the related model's base manager (._base_manager) rather than the default manager (_default_manager), so objects excluded by the default manager (e.g., archived objects) are still accepted by validation. They exercise validate() directly, model.full_clean(), ModelForm validation (with queryset adjusted to base manager), router usage, handling of None and string PK values, parent_link short-circuit, and proper ValidationError when the target does not exist.
+test_code: |
+  from django import forms
+  from django.test import TestCase
+  from django.core.exceptions import ValidationError
+  import datetime
+
+  from tests.model_forms.models import Writer, Article
+  from django.db import router
+
+  class ForeignKeyValidateTests(TestCase):
+      def setUp(self):
+          # Create an archived writer that is filtered out by the default manager.
+          # Writer.objects is a custom manager that filters archived=False.
+          self.archived_writer = Writer.objects.create(name='Archived Writer', archived=True)
+          self.today = datetime.date.today()
+
+      def test_field_validate_allows_archived_writer(self):
+          """
+          Field.validate should find the archived writer using the base manager
+          even though the default manager filters it out.
+          """
+          field = Article._meta.get_field('writer')
+          inst = Article(headline='h', slug='s', pub_date=self.today, created=self.today)
+          # Should not raise ValidationError
+          try:
+              field.validate(self.archived_writer.pk, inst)
+          except ValidationError:
+              self.fail("field.validate raised ValidationError for archived target when it should use _base_manager.")
+
+      def test_full_clean_allows_archived_writer(self):
+          """
+          Model.full_clean() should not raise for an archived related object
+          when the underlying validation uses the base manager.
+          """
+          inst = Article(headline='h2', slug='s2', pub_date=self.today, created=self.today)
+          # assign by id to simulate incoming data (like what a form would do)
+          inst.writer_id = self.archived_writer.pk
+          # Should not raise ValidationError
+          try:
+              inst.full_clean()  # should validate writer via base manager
+          except ValidationError as exc:
+              self.fail(f"full_clean raised ValidationError unexpectedly: {exc}")
+
+      def test_field_validate_raises_for_nonexistent(self):
+          """
+          When the related object really does not exist, validation should raise.
+          """
+          field = Article._meta.get_field('writer')
+          inst = Article(headline='h3', slug='s3', pub_date=self.today, created=self.today)
+          non_existent_pk = 999999
+          with self.assertRaises(ValidationError) as cm:
+              field.validate(non_existent_pk, inst)
+          # Verify error code is 'invalid'
+          self.assertTrue(any(getattr(e, 'code', None) == 'invalid' for e in cm.exception.error_list))
+
+      def test_modelform_validation_allows_archived_when_queryset_set_to_base_manager(self):
+          """
+          ModelForm field conversion uses the field queryset. If a form
+          sets the ForeignKey field's queryset to the base manager, the form
+          will convert the posted PK into an object. The model-level validation
+          must still accept the archived object (base manager usage).
+          """
+          class ArticleForm(forms.ModelForm):
+              class Meta:
+                  model = Article
+                  fields = ['headline', 'slug', 'pub_date', 'created', 'writer']
+
+          form_data = {
+              'headline': 'fm',
+              'slug': 'fm-slug',
+              'pub_date': self.today.isoformat(),
+              'created': self.today.isoformat(),
+              'writer': str(self.archived_writer.pk),
+          }
+          form = ArticleForm(data=form_data)
+          # The form's default queryset would exclude the archived writer;
+          # emulate a frontend that has the full queryset by setting base_manager.
+          form.fields['writer'].queryset = Writer._base_manager.all()
+          self.assertTrue(form.is_valid(), msg=f"Form errors: {form.errors}")
+          # Saving the form should produce an Article instance with that writer.
+          article = form.save(commit=False)
+          self.assertEqual(article.writer_id, self.archived_writer.pk)
+
+      def test_router_db_for_read_called_with_instance(self):
+          """
+          Validate that router.db_for_read is called with the related model and
+          the instance passed through to validate().
+          """
+          field = Article._meta.get_field('writer')
+          inst = Article(headline='h4', slug='s4', pub_date=self.today, created=self.today)
+          called = {}
+
+          original = router.db_for_read
+          def spying_db_for_read(model, instance=None):
+              called['model'] = model
+              called['instance'] = instance
+              return original(model, instance=instance)
+
+          try:
+              router.db_for_read = spying_db_for_read
+              # Trigger validation; should call our spying function.
+              field.validate(self.archived_writer.pk, inst)
+          finally:
+              router.db_for_read = original
+
+          self.assertIs(called.get('model'), field.remote_field.model)
+          self.assertIs(called.get('instance'), inst)
+
+      def test_validate_accepts_string_pk_values(self):
+          """
+          Passing the PK as a string (e.g., from form data) should be accepted
+          as long as the referenced object exists (and can be found via base manager).
+          """
+          field = Article._meta.get_field('writer')
+          inst = Article(headline='h5', slug='s5', pub_date=self.today, created=self.today)
+          # Provide the pk as a string
+          try:
+              field.validate(str(self.archived_writer.pk), inst)
+          except ValidationError:
+              self.fail("field.validate raised ValidationError for string PK when it should accept it.")
+
+      def test_validate_none_is_accepted(self):
+          """
+          If the value is None, validate() should return without raising.
+          """
+          field = Article._meta.get_field('writer')
+          inst = Article(headline='h6', slug='s6', pub_date=self.today, created=self.today)
+          # Should not raise
+          try:
+              field.validate(None, inst)
+          except ValidationError:
+              self.fail("field.validate raised ValidationError for None value.")
+
+      def test_parent_link_short_circuits_validation(self):
+          """
+          If the ForeignKey is a parent_link, validation should be skipped.
+          """
+          field = Article._meta.get_field('writer')
+          original_parent_link = field.remote_field.parent_link
+          field.remote_field.parent_link = True
+          inst = Article(headline='h7', slug='s7', pub_date=self.today, created=self.today)
+          try:
+              # Even for a non-existent ID, parent_link=True should avoid validation
+              field.validate(999999, inst)  # should not raise because parent_link short-circuits
+          except ValidationError:
+              self.fail("field.validate raised ValidationError despite parent_link=True.")
+          finally:
+              field.remote_field.parent_link = original_parent_link
+
+      def test_validation_error_contains_model_name_and_field(self):
+          """
+          When validation fails, the ValidationError message parameters should
+          contain the model verbose name and the field name (backwards compatible keys).
+          """
+          field = Article._meta.get_field('writer')
+          inst = Article(headline='h8', slug='s8', pub_date=self.today, created=self.today)
+          non_existent_pk = 1234567
+          with self.assertRaises(ValidationError) as cm:
+              field.validate(non_existent_pk, inst)
+          exc = cm.exception
+          # The params should include 'model' and 'field' keys per the error message format
+          params = exc.params if hasattr(exc, 'params') else None
+          # If params is not on the exception directly, inspect the error_list
+          if not params and exc.error_list:
+              params = exc.error_list[0].params
+          self.assertIn('model', params)
+          self.assertIn('field', params)
+new_imports_code: |
+  from django import forms
+  from django.test import TestCase
+  from django.core.exceptions import ValidationError
+  import datetime
+  from tests.model_forms.models import Writer, Article
+  from django.db import router

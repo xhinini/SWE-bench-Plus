@@ -1,0 +1,136 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that SafeExceptionReporterFilter.cleanse_setting correctly handles list-like settings when the value is an instance of a custom list subclass whose constructor raises when called with an iterable. The candidate model patch constructs a new instance using type(value)(cleansed) which may raise a TypeError for such subclasses and cause the function to return the original (uncleansed) value. The golden patch avoids instantiating the original subclass when cleansing lists/tuples and therefore is not affected. Each test exercises a different nested structure (dicts, callables, nested lists/tuples, empty lists, deep nesting) to ensure recursive cleansing still occurs and that callables are wrapped rather than evaluated.
+test_code: |
+  from django.test import SimpleTestCase
+  from django.views.debug import SafeExceptionReporterFilter, CallableSettingWrapper
+  
+  
+  class BadListTests(SimpleTestCase):
+      def setUp(self):
+          self.filter = SafeExceptionReporterFilter()
+  
+      def _make_bad_list(self, items):
+          """
+          Create an instance of a list subclass whose constructor raises
+          if called with positional args. This simulates a list-like type
+          that cannot be re-instantiated via type(value)(iterable) without
+          raising a TypeError (the scenario that exposes the candidate patch bug).
+          We instantiate it without args and then extend it so the original
+          instance exists for passing into cleanse_setting.
+          """
+          class BadList(list):
+              def __init__(self, *args, **kwargs):
+                  # Allow no-arg construction so we can build the original
+                  # instance, but raise if constructed with arguments.
+                  if args:
+                      raise TypeError("BadList cannot be constructed from iterable")
+                  super().__init__()
+          bl = BadList()
+          bl.extend(items)
+          return bl
+  
+      def test_custom_list_subclass_with_sensitive_inner_dict_is_cleansed(self):
+          secret = "very_secret_value"
+          bad = self._make_bad_list([{"PASSWORD": secret}])
+          cleansed = self.filter.cleanse_setting("SETTING_NAME", bad)
+          # The sensitive inner value should be removed/replaced.
+          self.assertNotIn(secret, repr(cleansed))
+          self.assertIn(self.filter.cleansed_substitute, repr(cleansed))
+  
+      def test_custom_list_subclass_wraps_callable_element(self):
+          called = {"flag": False}
+  
+          def callable_setting():
+              called["flag"] = True
+              return "I ran"
+  
+          bad = self._make_bad_list([callable_setting])
+          cleansed = self.filter.cleanse_setting("SETTING_NAME", bad)
+          # The callable must not be executed; it should be wrapped.
+          self.assertFalse(called["flag"], "Callable was unexpectedly executed")
+          # Expect the CallableSettingWrapper to appear in the cleansed representation.
+          found_wrapper = False
+          # Cleansed might be the original bad list on a failing implementation
+          for item in (list(cleansed) if hasattr(cleansed, "__iter__") else [cleansed]):
+              if isinstance(item, CallableSettingWrapper):
+                  found_wrapper = True
+                  break
+          self.assertTrue(found_wrapper, "CallableSettingWrapper not present in cleansed output")
+  
+      def test_custom_list_subclass_cleanses_nested_dicts(self):
+          secret = "nested_secret"
+          bad = self._make_bad_list([{"outer": {"PASSWORD": secret}}])
+          cleansed = self.filter.cleanse_setting("SETTING_NAME", bad)
+          self.assertNotIn(secret, repr(cleansed))
+          self.assertIn(self.filter.cleansed_substitute, repr(cleansed))
+  
+      def test_custom_list_subclass_cleanses_inner_tuple_contents(self):
+          # Inner tuple contains dicts with sensitive keys.
+          secret = "tuple_secret"
+          bad = self._make_bad_list([({"SECRET_KEY": secret},)])
+          cleansed = self.filter.cleanse_setting("SETTING_NAME", bad)
+          self.assertNotIn(secret, repr(cleansed))
+          self.assertIn(self.filter.cleansed_substitute, repr(cleansed))
+  
+      def test_custom_list_subclass_with_multiple_sensitive_entries(self):
+          secret1 = "s1"
+          secret2 = "s2"
+          bad = self._make_bad_list([{"API_KEY": secret1}, {"PASSWORD": secret2}])
+          cleansed = self.filter.cleanse_setting("SETTING_NAME", bad)
+          self.assertNotIn(secret1, repr(cleansed))
+          self.assertNotIn(secret2, repr(cleansed))
+          self.assertEqual(repr(cleansed).count(self.filter.cleansed_substitute), 2)
+  
+      def test_custom_list_subclass_handles_empty_list(self):
+          bad = self._make_bad_list([])
+          cleansed = self.filter.cleanse_setting("SETTING_NAME", bad)
+          # Empty list stays empty (or becomes an empty list-like structure),
+          # but must not raise and must produce a representation without errors.
+          self.assertTrue("[]" in repr(cleansed) or "BadList" in type(cleansed).__name__ or cleansed == [] )
+  
+      def test_custom_list_subclass_cleanses_deeply_nested_structures(self):
+          secret = "deep_secret"
+          deep = [{"level1": [{"level2": {"PASSWORD": secret}}]}]
+          bad = self._make_bad_list(deep)
+          cleansed = self.filter.cleanse_setting("SETTING_NAME", bad)
+          self.assertNotIn(secret, repr(cleansed))
+          self.assertIn(self.filter.cleansed_substitute, repr(cleansed))
+  
+      def test_custom_list_subclass_does_not_evaluate_callables(self):
+          # Another callable test but ensure even if callables are nested inside dicts,
+          # they are not called.
+          called = {"flag": False}
+  
+          def inner_callable():
+              called["flag"] = True
+              return "ran"
+  
+          bad = self._make_bad_list([{"callme": inner_callable}])
+          cleansed = self.filter.cleanse_setting("SETTING_NAME", bad)
+          self.assertFalse(called["flag"])
+          # The callable should be wrapped somewhere in the representation.
+          self.assertIn("CallableSettingWrapper", repr(cleansed))
+  
+      def test_custom_list_subclass_preserves_inner_tuple_types(self):
+          # Ensure that inner tuple elements remain tuples (but with contents cleansed).
+          secret = "tuple_inner_secret"
+          bad = self._make_bad_list([({"PASSWORD": secret},)])
+          cleansed = self.filter.cleanse_setting("SETTING_NAME", bad)
+          # Find the inner element and assert it is a tuple (or tuple-like) and cleansed.
+          found_tuple = False
+          for item in list(cleansed):
+              if isinstance(item, tuple):
+                  found_tuple = True
+                  self.assertNotIn(secret, repr(item))
+                  self.assertIn(self.filter.cleansed_substitute, repr(item))
+          self.assertTrue(found_tuple, "No tuple found in cleansed result")
+  
+      def test_custom_list_subclass_recurses_in_list_of_lists(self):
+          secret = "ll_secret"
+          bad = self._make_bad_list([[{"PASSWORD": secret}]])
+          cleansed = self.filter.cleanse_setting("SETTING_NAME", bad)
+          self.assertNotIn(secret, repr(cleansed))
+          self.assertIn(self.filter.cleansed_substitute, repr(cleansed))
+new_imports_code: |-
+  from django.views.debug import SafeExceptionReporterFilter, CallableSettingWrapper

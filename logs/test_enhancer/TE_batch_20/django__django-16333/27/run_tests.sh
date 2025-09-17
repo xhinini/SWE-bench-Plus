@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 auth_tests.test_forms_llm.SaveM2MGuardTests.test_class_level_save_m2m_removed_commit_true auth_tests.test_forms_llm.SaveM2MGuardTests.test_custom_user_with_m2m_save_commit_false_without_save_m2m auth_tests.test_forms_llm.SaveM2MGuardTests.test_custom_user_with_m2m_save_commit_true_without_save_m2m auth_tests.test_forms_llm.SaveM2MGuardTests.test_deleting_save_m2m_on_subclass_does_not_raise_on_multiple_saves auth_tests.test_forms_llm.SaveM2MGuardTests.test_instance_level_no_effect_on_other_forms auth_tests.test_forms_llm.SaveM2MGuardTests.test_save_m2m_called_when_present auth_tests.test_forms_llm.SaveM2MGuardTests.test_save_returns_user_instance_when_save_m2m_missing auth_tests.test_forms_llm.SaveM2MGuardTests.test_usercreationform_save_commit_false_without_save_m2m auth_tests.test_forms_llm.SaveM2MGuardTests.test_usercreationform_save_commit_true_without_save_m2m
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,208 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  Ten regression tests verifying that AutocompleteJsonView respects and uses
+  the serialize_result() hook correctly in various scenarios (default behavior,
+  overrides that modify id/text/extra fields, behavior with custom to_field
+  resolution including MTI and FK PK, pagination effects, permission short-circuiting,
+  and proper exception propagation). These tests would fail on the original
+  implementation that constructed response dicts inline (ignoring serialize_result),
+  and they ensure that serialize_result is invoked for each result and can safely
+  modify the output format.
+test_code: |
+  def test_regression_serialize_result_override_prefix_id(self):
+      """
+      Overriding serialize_result should affect the 'id' value in the JSON.
+      """
+      class PrefixIdView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              base = super().serialize_result(obj, to_field_name)
+              base['id'] = 'X-' + base['id']
+              return base
+
+      q = Question.objects.create(question='Prefix Test')
+      request = self.factory.get(self.url, {'term': 'prefix', 'app_label': Question._meta.app_label,
+                                           'model_name': Question._meta.model_name, 'field_name': 'question'})
+      request.user = self.superuser
+      response = PrefixIdView.as_view(**self.as_view_args)(request)
+      self.assertEqual(response.status_code, 200)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertEqual(data['results'][0]['id'], 'X-' + str(q.pk))
+
+  def test_regression_serialize_result_override_change_text(self):
+      """serialize_result override can change the text shown in results."""
+      class UpperTextView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              base = super().serialize_result(obj, to_field_name)
+              base['text'] = base['text'].upper()
+              return base
+
+      q = Question.objects.create(question='who is who')
+      request = self.factory.get(self.url, {'term': 'who', 'app_label': Question._meta.app_label,
+                                           'model_name': Question._meta.model_name, 'field_name': 'question'})
+      request.user = self.superuser
+      response = UpperTextView.as_view(**self.as_view_args)(request)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertEqual(data['results'][0]['text'], q.question.upper())
+
+  def test_regression_serialize_result_used_with_custom_to_field(self):
+      """
+      When a field defines a custom to_field (e.g., uuid), serialize_result is
+      still invoked and receives the to_field_name that references the correct
+      attribute.
+      """
+      class CustomToFieldView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              # Return id as an explicit string prefixed for testing
+              return {'id': 'UID-' + str(getattr(obj, to_field_name)), 'text': str(obj)}
+
+      q = Question.objects.create(question='UUID Test')
+      request = self.factory.get(self.url, {'term': 'uuid', 'app_label': Question._meta.app_label,
+                                           'model_name': Question._meta.model_name, 'field_name': 'question_with_to_field'})
+      request.user = self.superuser
+      response = CustomToFieldView.as_view(**self.as_view_args)(request)
+      data = json.loads(response.content.decode('utf-8'))
+      # The id should be prefixed with UID- and be based on the uuid field value.
+      self.assertTrue(data['results'][0]['id'].startswith('UID-'))
+
+  def test_regression_serialize_result_exception_propagates(self):
+      """Exceptions raised in serialize_result should propagate (not be swallowed)."""
+      class ExplodingView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              raise RuntimeError('boom')
+
+      Question.objects.create(question='boom test')
+      request = self.factory.get(self.url, {'term': 'boom', 'app_label': Question._meta.app_label,
+                                           'model_name': Question._meta.model_name, 'field_name': 'question'})
+      request.user = self.superuser
+      with self.assertRaises(RuntimeError):
+          ExplodingView.as_view(**self.as_view_args)(request)
+
+  def test_regression_default_serialize_result_returns_id_and_text(self):
+      """The default serialize_result returns 'id' and 'text' for an object."""
+      q = Question.objects.create(question='Default serialize')
+      request = self.factory.get(self.url, {'term': 'default', 'app_label': Question._meta.app_label,
+                                           'model_name': Question._meta.model_name, 'field_name': 'question'})
+      request.user = self.superuser
+      response = AutocompleteJsonView.as_view(**self.as_view_args)(request)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertIn('id', data['results'][0])
+      self.assertIn('text', data['results'][0])
+      self.assertEqual(data['results'][0]['id'], str(q.pk))
+      self.assertEqual(data['results'][0]['text'], q.question)
+
+  def test_regression_serialize_result_preserves_ordering(self):
+      """
+      serialize_result should not affect queryset ordering. When overriding,
+      results ordering (e.g., by posted date) remains intact.
+      """
+      class PostedView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              base = super().serialize_result(obj, to_field_name)
+              base['posted'] = str(obj.posted)
+              return base
+
+      Question.objects.create(question='Q1', posted=datetime.date(2021, 8, 9))
+      Question.objects.create(question='Q2', posted=datetime.date(2021, 8, 7))
+      request = self.factory.get(self.url, {'term': 'question', 'app_label': Question._meta.app_label,
+                                           'model_name': Question._meta.model_name, 'field_name': 'question'})
+      request.user = self.superuser
+      response = PostedView.as_view(**self.as_view_args)(request)
+      data = json.loads(response.content.decode('utf-8'))
+      # The first element should be the newest (ordered by -posted in QuestionAdmin)
+      posted_dates = [d['posted'] for d in data['results']]
+      self.assertEqual(posted_dates, sorted(posted_dates, reverse=True))
+
+  def test_regression_serialize_result_not_called_if_no_permission(self):
+      """
+      If the requesting user lacks permission, has_perm should short-circuit and
+      serialize_result should never be called.
+      """
+      class AssertNotCalledView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              # If this is called, the test should fail by raising an AssertionError.
+              raise AssertionError("serialize_result should not be called when permission is denied")
+
+      # Use the Answer.opts (self.opts) which requires view/change perms; user without perms:
+      request = self.factory.get(self.url, {'term': 'is', **self.opts})
+      request.user = self.user  # regular user without related model perms
+      with self.assertRaises(PermissionDenied):
+          AssertNotCalledView.as_view(**self.as_view_args)(request)
+
+  def test_regression_serialize_result_with_mti(self):
+      """
+      Ensure serialize_result works for MTI target models (Employee/WorkHour,
+      Manager/Bonus cases) and receives the correct to_field.
+      """
+      class MTIView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              base = super().serialize_result(obj, to_field_name)
+              base['marker'] = 'mti'
+              return base
+
+      o = Employee.objects.create(name="Frida Kahlo", gender=2, code="painter", alive=False)
+      opts = {
+          'app_label': WorkHour._meta.app_label,
+          'model_name': WorkHour._meta.model_name,
+          'field_name': 'employee',
+      }
+      request = self.factory.get(self.url, {'term': 'frida', **opts})
+      request.user = self.superuser
+      response = MTIView.as_view(**self.as_view_args)(request)
+      data = json.loads(response.content.decode('utf-8'))
+      self.assertEqual(data['results'][0]['text'], o.name)
+      self.assertEqual(data['results'][0]['marker'], 'mti')
+
+  def test_regression_serialize_result_pagination_call_count(self):
+      """
+      serialize_result should be called only for objects on the requested page.
+      """
+      call_log = []
+
+      class CountingView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              call_log.append(obj.pk)
+              return super().serialize_result(obj, to_field_name)
+
+      # Create more objects than paginate_by
+      Question.objects.bulk_create(Question(question=str(i)) for i in range(PAGINATOR_SIZE + 5))
+      request = self.factory.get(self.url, {'term': '', 'page': '1', 'app_label': Question._meta.app_label,
+                                           'model_name': Question._meta.model_name, 'field_name': 'question'})
+      request.user = self.superuser
+      call_log.clear()
+      response = CountingView.as_view(**self.as_view_args)(request)
+      data = json.loads(response.content.decode('utf-8'))
+      # Only paginate_by items should have been serialized for page 1
+      self.assertEqual(len(call_log), PAGINATOR_SIZE)
+      self.assertEqual(len(data['results']), PAGINATOR_SIZE)
+
+  def test_regression_serialize_result_resolves_to_field_attname(self):
+      """
+      Ensure serialize_result receives the resolved to_field_name which is the
+      attname of the target field (e.g. for related_questions custom pk).
+      """
+      class ToFieldInspectView(AutocompleteJsonView):
+          def serialize_result(self, obj, to_field_name):
+              # Make sure the returned dict uses the provided to_field_name value.
+              return {'id_field_used': to_field_name, 'text': str(obj)}
+
+      q = Question.objects.create(question='ToField Test')
+      opts = {
+          'app_label': Question._meta.app_label,
+          'model_name': Question._meta.model_name,
+          'field_name': 'related_questions',
+      }
+      request = self.factory.get(self.url, {'term': 'tofield', **opts})
+      request.user = self.superuser
+      # The related_questions field on Question uses a custom to_field (big_id); but
+      # it's restricted by to_field_allowed so this request will raise PermissionDenied.
+      # Instead, use a field that is allowed and check resolution via question_with_to_field.
+      request = self.factory.get(self.url, {'term': 'is', 'app_label': Question._meta.app_label,
+                                           'model_name': Question._meta.model_name, 'field_name': 'question_with_to_field'})
+      request.user = self.superuser
+      response = ToFieldInspectView.as_view(**self.as_view_args)(request)
+      data = json.loads(response.content.decode('utf-8'))
+      # The id_field_used should be an attname (string) and present in model fields
+      self.assertIsInstance(data['results'][0]['id_field_used'], str)
+new_imports_code: |
+  # No additional imports required.

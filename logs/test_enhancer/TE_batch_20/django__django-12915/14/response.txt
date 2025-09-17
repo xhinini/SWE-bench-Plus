@@ -1,0 +1,236 @@
+language: Python
+number_of_tests: 10
+test_behavior: >
+  These tests verify that StaticFilesHandlerMixin.get_response_async uses
+  asgiref.sync.sync_to_async to call the synchronous serve method and to call
+  response_for_exception when a Http404 is raised. They assert that sync_to_async
+  is invoked the expected number of times, that the bound methods/functions
+  passed to sync_to_async are the expected objects, that non-Http404 exceptions
+  propagate, and that correct arguments are forwarded to response_for_exception.
+  The model patch omitted usage of sync_to_async for these calls; these tests
+  would fail against that incorrect implementation and pass against the fixed one.
+test_code: |
+  import asyncio
+  from urllib.parse import urlparse
+  
+  import pytest
+  
+  from django.http import Http404
+  from django.contrib.staticfiles import handlers
+  
+  class DummyRequest:
+      def __init__(self, path):
+          self.path = path
+  
+  def make_handler(serve_func):
+      """
+      Create a simple handler instance with a custom synchronous serve method.
+      """
+      class H(handlers.StaticFilesHandlerMixin):
+          pass
+      h = H()
+      # base_url parsing: index 2 is path, index 1 is netloc (empty -> handle)
+      h.base_url = urlparse('/static/')
+      # bind the serve method
+      h.serve = serve_func.__get__(h, H)
+      return h
+  
+  def make_fake_sync_to_async(call_log, result_wrapper=None):
+      """
+      Returns a fake sync_to_async replacement which records the function passed
+      to it into call_log and returns an async wrapper that invokes the function.
+      If result_wrapper is provided it will be used to transform the return value.
+      """
+      def fake_sync_to_async(func):
+          call_log.append(func)
+          async def inner(*args, **kwargs):
+              res = func(*args, **kwargs)
+              if result_wrapper:
+                  return result_wrapper(res)
+              return res
+          return inner
+      return fake_sync_to_async
+  
+  def test_get_response_async_calls_sync_to_async_on_success(monkeypatch):
+      call_log = []
+      async_result = object()
+  
+      def serve(self, request):
+          return async_result
+  
+      handler = make_handler(serve)
+      # fake sync_to_async that returns the serve return value
+      monkeypatch.setattr(handlers, "sync_to_async", make_fake_sync_to_async(call_log))
+  
+      request = DummyRequest("/static/test.txt")
+      result = asyncio.run(handler.get_response_async(request))
+  
+      assert result is async_result
+      # sync_to_async should have been called once (for serve)
+      assert len(call_log) == 1
+      assert call_log[0] == handler.serve
+  
+  def test_get_response_async_passes_request_arg_and_returns_value(monkeypatch):
+      call_log = []
+  
+      def serve(self, request):
+          # return something based on request to ensure argument forwarded
+          return f"served:{request.path}"
+  
+      handler = make_handler(serve)
+      monkeypatch.setattr(handlers, "sync_to_async", make_fake_sync_to_async(call_log))
+  
+      req = DummyRequest("/static/abc")
+      result = asyncio.run(handler.get_response_async(req))
+  
+      assert result == "served:/static/abc"
+      assert len(call_log) == 1
+      assert call_log[0] == handler.serve
+  
+  def test_get_response_async_handles_http404_via_response_for_exception(monkeypatch):
+      call_log = []
+      response_called = {}
+  
+      def serve(self, request):
+          raise Http404("not found")
+  
+      def fake_response_for_exception(request, exc):
+          # record args and return sentinel
+          response_called['request'] = request
+          response_called['exc'] = exc
+          return "handled"
+  
+      handler = make_handler(serve)
+      monkeypatch.setattr(handlers, "sync_to_async", make_fake_sync_to_async(call_log))
+      monkeypatch.setattr(handlers, "response_for_exception", fake_response_for_exception)
+  
+      req = DummyRequest("/static/missing")
+      result = asyncio.run(handler.get_response_async(req))
+  
+      assert result == "handled"
+      # sync_to_async called for serve and for response_for_exception (2 calls)
+      assert len(call_log) == 2
+      # first call should be the bound serve method
+      assert call_log[0] == handler.serve
+      # second call should be the response_for_exception function we've patched in module
+      assert call_log[1] == handlers.response_for_exception
+      # response_for_exception received the same request and the Http404 instance
+      assert response_called['request'] is req
+      assert isinstance(response_called['exc'], Http404)
+  
+  def test_get_response_async_calls_sync_to_async_twice_on_404(monkeypatch):
+      call_log = []
+  
+      def serve(self, request):
+          raise Http404()
+  
+      def fake_response_for_exception(request, exc):
+          return "resp"
+  
+      handler = make_handler(serve)
+      monkeypatch.setattr(handlers, "sync_to_async", make_fake_sync_to_async(call_log))
+      monkeypatch.setattr(handlers, "response_for_exception", fake_response_for_exception)
+  
+      req = DummyRequest("/static/x")
+      result = asyncio.run(handler.get_response_async(req))
+  
+      assert result == "resp"
+      assert len(call_log) == 2
+  
+  def test_get_response_async_propagates_non_http404_exceptions_and_uses_sync_to_async(monkeypatch):
+      call_log = []
+  
+      def serve(self, request):
+          raise ValueError("boom")
+  
+      handler = make_handler(serve)
+      monkeypatch.setattr(handlers, "sync_to_async", make_fake_sync_to_async(call_log))
+  
+      req = DummyRequest("/static/boom")
+      with pytest.raises(ValueError):
+          asyncio.run(handler.get_response_async(req))
+      # sync_to_async should have been used once for the serve call
+      assert len(call_log) == 1
+      assert call_log[0] == handler.serve
+  
+  def test_get_response_async_multiple_calls_each_calls_sync_to_async(monkeypatch):
+      call_log = []
+  
+      def serve(self, request):
+          return request.path
+  
+      handler = make_handler(serve)
+      monkeypatch.setattr(handlers, "sync_to_async", make_fake_sync_to_async(call_log))
+  
+      r1 = DummyRequest("/static/1")
+      r2 = DummyRequest("/static/2")
+      res1 = asyncio.run(handler.get_response_async(r1))
+      res2 = asyncio.run(handler.get_response_async(r2))
+  
+      assert res1 == "/static/1"
+      assert res2 == "/static/2"
+      # two calls to sync_to_async expected (one per invocation)
+      assert len(call_log) == 2
+      assert call_log[0] == handler.serve
+      assert call_log[1] == handler.serve
+  
+  def test_get_response_async_with_bound_method_identity(monkeypatch):
+      call_log = []
+  
+      def serve(self, request):
+          return "ok"
+  
+      handler = make_handler(serve)
+      # preserve the bound method object for identity check
+      bound = handler.serve
+      monkeypatch.setattr(handlers, "sync_to_async", make_fake_sync_to_async(call_log))
+  
+      r = DummyRequest("/static/id")
+      res = asyncio.run(handler.get_response_async(r))
+  
+      assert res == "ok"
+      # ensure the exact bound method object was passed to sync_to_async
+      assert call_log[0] is bound
+  
+  def test_get_response_async_response_for_exception_called_with_correct_args(monkeypatch):
+      call_log = []
+      recorded = {}
+  
+      def serve(self, request):
+          raise Http404("not found again")
+  
+      def fake_response_for_exception(request, exc):
+          recorded['request'] = request
+          recorded['exc'] = exc
+          return "handled2"
+  
+      handler = make_handler(serve)
+      monkeypatch.setattr(handlers, "sync_to_async", make_fake_sync_to_async(call_log))
+      monkeypatch.setattr(handlers, "response_for_exception", fake_response_for_exception)
+  
+      req = DummyRequest("/static/zzz")
+      result = asyncio.run(handler.get_response_async(req))
+  
+      assert result == "handled2"
+      # response_for_exception should have recorded the original request and Http404
+      assert recorded['request'] is req
+      assert isinstance(recorded['exc'], Http404)
+  
+  def test_get_response_async_with_different_request_objects(monkeypatch):
+      call_log = []
+  
+      def serve(self, request):
+          # echo back path to verify distinct requests handled correctly
+          return request.path
+  
+      handler = make_handler(serve)
+      monkeypatch.setattr(handlers, "sync_to_async", make_fake_sync_to_async(call_log))
+  
+      for i in range(5):
+          req = DummyRequest(f"/static/item-{i}")
+          res = asyncio.run(handler.get_response_async(req))
+          assert res == f"/static/item-{i}"
+      # ensure sync_to_async was called for each invocation
+      assert len(call_log) == 5
+new_imports_code: |
+  import asyncio

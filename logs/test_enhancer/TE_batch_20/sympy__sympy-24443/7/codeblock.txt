@@ -1,0 +1,99 @@
+# no additional imports required beyond those in test_code
+from sympy.combinatorics.homomorphisms import homomorphism, group_isomorphism, is_isomorphic
+from sympy.combinatorics.named_groups import DihedralGroup, AlternatingGroup
+from sympy.combinatorics.perm_groups import PermutationGroup
+
+def test_homomorphism_dihedral_full_gens_identity():
+    # Identity mapping on the full generating set should be an isomorphism.
+    D = DihedralGroup(8)
+    gens = D.generators
+    T = homomorphism(D, D, gens, gens)
+    assert T.is_isomorphism()
+    # check a non-trivial element maps to itself
+    r = gens[0]  # rotation
+    assert T(r**3) == r**3
+
+def test_homomorphism_dihedral_full_gens_inversion():
+    # Mapping rotation to its inverse and reflection to itself is an automorphism.
+    D = DihedralGroup(8)
+    r, s = D.generators
+    images = [r**-1, s]
+    T = homomorphism(D, D, D.generators, images)
+    assert T.is_isomorphism()
+    # check that conjugation relation is preserved
+    assert T(s*r*s) == s*(r**-1)*s
+
+def test_homomorphism_dihedral_partial_gens():
+    # Map only the rotation generator; other generators default to identity.
+    D = DihedralGroup(8)
+    r, s = D.generators
+    T = homomorphism(D, D, [r], [r])
+    # Since reflection maps to identity, mapping is not injective.
+    assert not T.is_injective()
+    # Check that rotation still maps correctly
+    assert T(r) == r
+
+def test_homomorphism_dihedral_generators_map_to_inverses_isomorphism():
+    # Map both generators to their inverses - should still be an isomorphism
+    # for dihedral groups (this corresponds to an automorphism).
+    D = DihedralGroup(8)
+    r, s = D.generators
+    images = [r**-1, s**-1]
+    T = homomorphism(D, D, D.generators, images)
+    assert T.is_isomorphism()
+    # sanity check on a composite
+    assert T(r*s) == (r**-1)*(s**-1)
+
+def test_homomorphism_alternating_full_gens_identity():
+    # Identity mapping on AlternatingGroup(4) generators should be an isomorphism.
+    A = AlternatingGroup(4)
+    T = homomorphism(A, A, A.generators, A.generators)
+    assert T.is_isomorphism()
+    # check mapping of a specific element
+    a = A.generators[0]
+    assert T(a**2) == a**2
+
+def test_homomorphism_alternating_partial_gen():
+    # Map only a single generator of A4 to itself; other generators default to identity.
+    A = AlternatingGroup(4)
+    g = A.generators[0]
+    T = homomorphism(A, A, [g], [g])
+    # Not injective, but mapping of specified generator should hold
+    assert not T.is_injective()
+    assert T(g) == g
+
+def test_group_isomorphism_perm_perm_dihedral():
+    # group_isomorphism should detect isomorphism of a group with itself.
+    D = DihedralGroup(8)
+    check, iso = group_isomorphism(D, D)
+    assert check
+    assert iso is not None
+    # iso should act like identity on one generator
+    r = D.generators[0]
+    assert iso(r) in D
+
+def test_is_isomorphic_dihedral_self():
+    D = DihedralGroup(8)
+    assert is_isomorphic(D, D)
+
+def test_homomorphism_dihedral_compose_identity():
+    # Compose identity homomorphism with itself; result should be identity.
+    D = DihedralGroup(8)
+    T = homomorphism(D, D, D.generators, D.generators)
+    S = T.compose(T)
+    assert S.is_isomorphism()
+    # ensure a few elements map correctly
+    r, s = D.generators
+    assert S(r*s) == r*s
+
+def test_homomorphism_alternating_generators_map_to_inverses():
+    # Mapping each generator of A4 to its inverse should yield a homomorphism.
+    A = AlternatingGroup(4)
+    gens = A.generators
+    images = [g**-1 for g in gens]
+    T = homomorphism(A, A, gens, images)
+    assert T.is_isomorphism()
+    # verify a relator stays trivial under the mapping
+    # pick product of generators (a*b)**2 or similar element and test image is identity if appropriate
+    x = gens[0]*gens[1]
+    assert (T(x**2)).is_identity

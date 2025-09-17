@@ -1,0 +1,13 @@
+#!/bin/bash
+set -uxo pipefail
+source /opt/miniconda3/bin/activate
+conda activate testbed
+cd /testbed
+export PYTHONIOENCODING=utf8
+python --version
+pip install -U coverage
+
+: '>>>>> Start Test Output'
+./tests/runtests.py --verbosity 2 --settings=test_sqlite --parallel 1 custom_lookups.tests_llm.UnregisterLookupTests.test_unregister_after_caching_multiple_times custom_lookups.tests_llm.UnregisterLookupTests.test_unregister_clears_cache_when_lookup_was_shadowed custom_lookups.tests_llm.UnregisterLookupTests.test_unregister_clears_caches_for_multiple_subclasses custom_lookups.tests_llm.UnregisterLookupTests.test_unregister_clears_subclass_cache_on_field_subclass custom_lookups.tests_llm.UnregisterLookupTests.test_unregister_non_overlapping_names_do_not_affect_each_other custom_lookups.tests_llm.UnregisterLookupTests.test_unregister_on_parent_clears_deep_descendants custom_lookups.tests_llm.UnregisterLookupTests.test_unregister_on_subclass_clears_its_descendants_only custom_lookups.tests_llm.UnregisterLookupTests.test_unregister_with_explicit_lookup_name_clears_cache custom_lookups.tests_llm.UnregisterLookupTests.test_unregister_with_string_name_and_custom_hierarchy
+coverage json -o coverage.json
+: '>>>>> End Test Output'

@@ -1,0 +1,158 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests exercise KeyTransformIsNull.as_oracle and KeyTransformIsNull.as_sqlite behavior for both True and False isnull lookups, ensuring the SQL and params generated match the expected forms. They would fail with the candidate (incorrect) patch that negates the HasKey SQL for isnull lookups instead of producing the combined "(NOT <has_key_sql> OR <lhs> IS NULL)" expression for Oracle and using the correct JSON_TYPE template for SQLite.
+test_code: |
+  from django.db.models.fields.json import KeyTransform, KeyTransformIsNull, HasKey, KeyTransformFactory
+  from django.db.models.expressions import RawSQL, Value, F
+  from django.db.models.lookups import IsNull
+  from django.db.models.fields.json import KeyTextTransform
+  from django.db.models import Transform
+  import json
+  import unittest
+  from unittest import mock
+
+  # We need dummy compiler and connection objects to drive the as_oracle/as_sqlite logic.
+  class DummyCompiler:
+      def compile(self, expr):
+          # If expr is a RawSQL-like tuple, simulate RawSQL; otherwise return a quoted column.
+          if isinstance(expr, RawSQL):
+              # RawSQL.compile returns (sql, params)
+              return expr.as_sql(DummyCompiler(), DummyConnection())[0], expr.params
+          return ('"t"."value"', [])
+
+  class DummyConnection:
+      def __init__(self, vendor='oracle', mysql_is_mariadb=False):
+          self.vendor = vendor
+          self.mysql_is_mariadb = mysql_is_mariadb
+          # features used by some code paths
+          class Features:
+              has_native_json_field = True
+              supports_json_field_contains = True
+              supports_json_field = True
+              json_key_contains_list_matching_requires_list = True
+          self.features = Features()
+          self.display_name = vendor
+
+  class FakeKeyTransform(KeyTransform):
+      # Expose preprocess_lhs easily by allowing passing lhs as a plain string
+      def __init__(self, key_name, lhs):
+          super().__init__(key_name, lhs)
+
+  class KeyTransformIsNullTests(unittest.TestCase):
+      def setUp(self):
+          # A simple KeyTransform with lhs being a Mock expression that compiler.compile will handle.
+          self.lhs_expr = 'value'  # Dummy; DummyCompiler.compile will return '"t"."value"'
+          self.key_name = 'a'
+
+      def test_as_oracle_isnull_false_uses_haskey(self):
+          # key__isnull=False should behave like has_key: return HasKey.as_oracle(...)
+          kt = KeyTransform(self.key_name, self.lhs_expr)
+          lookup = KeyTransformIsNull(kt, False)
+          compiler = DummyCompiler()
+          connection = DummyConnection(vendor='oracle')
+          # Monkeypatch HasKey.as_oracle to observe return
+          expected_sql, expected_params = HasKey(kt.lhs, kt.key_name).as_oracle(compiler, connection)
+          sql, params = lookup.as_oracle(compiler, connection)
+          self.assertEqual(sql, expected_sql)
+          self.assertEqual(params, expected_params)
+
+      def test_as_oracle_isnull_true_combines_haskey_and_is_null(self):
+          # key__isnull=True should return "(NOT <has_key_sql> OR <lhs> IS NULL)" and params appended
+          kt = KeyTransform(self.key_name, self.lhs_expr)
+          lookup = KeyTransformIsNull(kt, True)
+          compiler = DummyCompiler()
+          connection = DummyConnection(vendor='oracle')
+          haskey_sql, haskey_params = HasKey(kt.lhs, kt.key_name).as_oracle(compiler, connection)
+          lhs, lhs_params, _ = kt.preprocess_lhs(compiler, connection)
+          expected_sql = '(NOT %s OR %s IS NULL)' % (haskey_sql, lhs)
+          expected_params = tuple(haskey_params) + tuple(lhs_params)
+          sql, params = lookup.as_oracle(compiler, connection)
+          self.assertEqual(sql, expected_sql)
+          self.assertEqual(params, expected_params)
+
+      def test_as_sqlite_isnull_false_uses_haskey_sql_with_is_not_null_template(self):
+          # key__isnull=False should use JSON_TYPE(... ) IS NOT NULL template via HasKey.as_sql
+          kt = KeyTransform(self.key_name, self.lhs_expr)
+          lookup = KeyTransformIsNull(kt, False)
+          compiler = DummyCompiler()
+          connection = DummyConnection(vendor='sqlite')
+          # The expected template when isnull=False is 'JSON_TYPE(%s, %%s) IS NOT NULL'
+          # HasKey.as_sql should be called with that template and return SQL and params accordingly.
+          sql, params = lookup.as_sqlite(compiler, connection)
+          # Ensure the SQL contains JSON_TYPE(... ) IS NOT NULL
+          self.assertIn('JSON_TYPE', sql)
+          self.assertIn('IS NOT NULL', sql)
+
+      def test_as_sqlite_isnull_true_uses_haskey_sql_with_is_null_template(self):
+          # key__isnull=True should use JSON_TYPE(... ) IS NULL template via HasKey.as_sql
+          kt = KeyTransform(self.key_name, self.lhs_expr)
+          lookup = KeyTransformIsNull(kt, True)
+          compiler = DummyCompiler()
+          connection = DummyConnection(vendor='sqlite')
+          sql, params = lookup.as_sqlite(compiler, connection)
+          self.assertIn('JSON_TYPE', sql)
+          self.assertIn('IS NULL', sql)
+
+      def test_oracle_combination_params_include_lhs_params(self):
+          # Ensure params from both HasKey.as_oracle and preprocess_lhs are combined in order
+          kt = KeyTransform(self.key_name, self.lhs_expr)
+          lookup = KeyTransformIsNull(kt, True)
+          compiler = DummyCompiler()
+          connection = DummyConnection(vendor='oracle')
+          haskey_sql, haskey_params = HasKey(kt.lhs, kt.key_name).as_oracle(compiler, connection)
+          lhs, lhs_params, _ = kt.preprocess_lhs(compiler, connection)
+          sql, params = lookup.as_oracle(compiler, connection)
+          self.assertEqual(params, tuple(haskey_params) + tuple(lhs_params))
+
+      def test_sqlite_templates_use_compile_json_path(self):
+          # For sqlite the JSON path should be passed via the HasKey.as_sql template parameter
+          kt = KeyTransform(self.key_name, self.lhs_expr)
+          lookup_false = KeyTransformIsNull(kt, False)
+          lookup_true = KeyTransformIsNull(kt, True)
+          compiler = DummyCompiler()
+          connection = DummyConnection(vendor='sqlite')
+          sql_false, params_false = lookup_false.as_sqlite(compiler, connection)
+          sql_true, params_true = lookup_true.as_sqlite(compiler, connection)
+          # Both SQLs should contain JSON_EXTRACT or JSON_TYPE depending on template usage; ensure params are paths
+          self.assertTrue(any('JSON' in part for part in sql_false.split()))
+          self.assertTrue(any('JSON' in part for part in sql_true.split()))
+
+      def test_oracle_haskey_called_once_and_not_negated(self):
+          # Regression: candidate incorrectly returns NOT (has_key_sql) for isnull True.
+          # Ensure the SQL starts with "(NOT " but follows expected combined form rather than pure negation.
+          kt = KeyTransform(self.key_name, self.lhs_expr)
+          lookup = KeyTransformIsNull(kt, True)
+          compiler = DummyCompiler()
+          connection = DummyConnection(vendor='oracle')
+          sql, params = lookup.as_oracle(compiler, connection)
+          # Correct form should start with '(' and contain 'OR' (combined), not a simple NOT(<haskey_sql>)
+          self.assertTrue(sql.startswith('('))
+          self.assertIn('OR', sql)
+          self.assertNotEqual(sql.strip().upper().startswith('NOT ('), True)
+
+      def test_sqlite_haskey_not_simple_negation(self):
+          # Ensure sqlite branch doesn't produce a simple NOT(<haskey_sql>) for isnull True.
+          kt = KeyTransform(self.key_name, self.lhs_expr)
+          lookup = KeyTransformIsNull(kt, True)
+          compiler = DummyCompiler()
+          connection = DummyConnection(vendor='sqlite')
+          sql, params = lookup.as_sqlite(compiler, connection)
+          # Should not simply be 'NOT ( ... )'
+          self.assertFalse(sql.strip().upper().startswith('NOT ('))
+
+      def test_integration_with_haskey_on_rawsql_lhs_oracle(self):
+          # Simulate KeyTransform.lhs being a RawSQL expression and ensure preprocessing escapes/returns values correctly.
+          raw = RawSQL('%s', ['{"a": 1}'])
+          kt = KeyTransform('a', raw)
+          lookup_true = KeyTransformIsNull(kt, True)
+          compiler = DummyCompiler()
+          connection = DummyConnection(vendor='oracle')
+          sql, params = lookup_true.as_oracle(compiler, connection)
+          # Should include JSON path pieces and have params length >= 1
+          self.assertGreaterEqual(len(params), 1)
+          self.assertIn('IS NULL', sql)
+
+  if __name__ == '__main__':
+      unittest.main()
+new_imports_code: |
+  from django.db.models.expressions import RawSQL

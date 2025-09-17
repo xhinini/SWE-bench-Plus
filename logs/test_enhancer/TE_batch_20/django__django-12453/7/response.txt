@@ -1,0 +1,298 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that deserialize_db_from_string uses the connection's constraint_checks_disabled context manager and calls check_constraints, that serializers.deserialize is invoked with the correct 'using' argument, and that object.save() calls occur while constraints are disabled. The tests will fail if the code does not disable constraint checks or does not call check_constraints (as in the candidate model patch), but will pass with the fixed (gold) patch.
+test_code: |
+  from contextlib import contextmanager
+  from unittest import mock
+  
+  from django.core import serializers
+  from django.db import connection
+  from django.test import SimpleTestCase
+  
+  from ..models import Object, ObjectReference
+  from ..test_creation import get_connection_copy
+  
+  
+  class DeserializeConstraintTests(SimpleTestCase):
+      """
+      A suite of tests to ensure deserialize_db_from_string uses the
+      constraint_checks_disabled context manager and calls check_constraints,
+      and that saves occur while constraints are disabled.
+      """
+  
+      def _make_cm_and_hooks(self, events):
+          """
+          Return a contextmanager function and a check_constraints mock
+          which append markers to the events list to record ordering.
+          """
+          @contextmanager
+          def cm():
+              events.append("enter")
+              try:
+                  yield
+              finally:
+                  events.append("exit")
+  
+          def check_constraints():
+              events.append("check")
+  
+          return cm, check_constraints
+  
+      def test_constraint_context_and_check_constraints_called_single_object(self):
+          events = []
+  
+          # Fake deserialize to yield one object whose save appends an event.
+          def fake_deserialize(format, data, using=None):
+              events.append(("deserialize_called_with_using", using))
+  
+              class Obj:
+                  def save(self_inner):
+                      events.append("save1")
+  
+              yield Obj()
+  
+          cm, check_constraints = self._make_cm_and_hooks(events)
+  
+          with mock.patch('django.core.serializers.deserialize', new=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', new=cm):
+                  with mock.patch.object(connection, 'check_constraints', new=check_constraints):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          # Validate ordering and that hooks were called.
+          self.assertIn(("deserialize_called_with_using", connection.alias), events)
+          # enter -> save1 -> exit -> check
+          self.assertEqual(events, [
+              ("deserialize_called_with_using", connection.alias),
+              "enter",
+              "save1",
+              "exit",
+              "check",
+          ])
+  
+      def test_multiple_objects_order(self):
+          events = []
+  
+          def fake_deserialize(format, data, using=None):
+              events.append(("deserialize_called_with_using", using))
+  
+              class Obj:
+                  def __init__(self, i):
+                      self.i = i
+                  def save(self_inner):
+                      events.append(f"save{self_inner.i}")
+  
+              # Yield multiple objects
+              yield Obj(1)
+              yield Obj(2)
+              yield Obj(3)
+  
+          cm, check_constraints = self._make_cm_and_hooks(events)
+  
+          with mock.patch('django.core.serializers.deserialize', new=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', new=cm):
+                  with mock.patch.object(connection, 'check_constraints', new=check_constraints):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          # Ensure enter occurs before any save, and check after exit
+          expected = [
+              ("deserialize_called_with_using", connection.alias),
+              "enter",
+              "save1",
+              "save2",
+              "save3",
+              "exit",
+              "check",
+          ]
+          self.assertEqual(events, expected)
+  
+      def test_no_objects_still_calls_context_and_check_constraints(self):
+          events = []
+  
+          def fake_deserialize(format, data, using=None):
+              events.append(("deserialize_called_with_using", using))
+              if False:
+                  yield  # no items
+  
+              return
+              yield  # pragma: no cover
+  
+          cm, check_constraints = self._make_cm_and_hooks(events)
+  
+          with mock.patch('django.core.serializers.deserialize', new=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', new=cm):
+                  with mock.patch.object(connection, 'check_constraints', new=check_constraints):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          # Even with no objects, enter/exit/check should be called
+          self.assertEqual(events, [
+              ("deserialize_called_with_using", connection.alias),
+              "enter",
+              "exit",
+              "check",
+          ])
+  
+      def test_deserialize_passes_using_to_serializers(self):
+          # Ensure the 'using' argument passed to serializers.deserialize is the connection alias
+          called_args = {}
+  
+          def fake_deserialize(format, data, using=None):
+              called_args['using'] = using
+              if False:
+                  yield
+              return
+              yield  # pragma: no cover
+  
+          cm, check_constraints = self._make_cm_and_hooks([])
+  
+          with mock.patch('django.core.serializers.deserialize', new=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', new=cm):
+                  with mock.patch.object(connection, 'check_constraints', new=check_constraints):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          self.assertEqual(called_args.get('using'), connection.alias)
+  
+      def test_save_called_for_each_deserialized_object(self):
+          saves = []
+  
+          def fake_deserialize(format, data, using=None):
+              class Obj:
+                  def __init__(self, name):
+                      self.name = name
+                  def save(self_inner):
+                      saves.append(self_inner.name)
+  
+              yield Obj('a')
+              yield Obj('b')
+  
+          cm, check_constraints = self._make_cm_and_hooks([])
+  
+          with mock.patch('django.core.serializers.deserialize', new=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', new=cm):
+                  with mock.patch.object(connection, 'check_constraints', new=check_constraints):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          self.assertEqual(saves, ['a', 'b'])
+  
+      def test_check_constraints_called_after_exit(self):
+          events = []
+  
+          def fake_deserialize(format, data, using=None):
+              class Obj:
+                  def save(self_inner):
+                      events.append("save")
+              yield Obj()
+  
+          cm, check_constraints = self._make_cm_and_hooks(events)
+  
+          with mock.patch('django.core.serializers.deserialize', new=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', new=cm):
+                  with mock.patch.object(connection, 'check_constraints', new=check_constraints):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          # check must appear after exit
+          self.assertTrue(events.index("check") > events.index("exit"))
+  
+      def test_deserialize_on_custom_connection_uses_its_methods(self):
+          # Use a copy of the connection to ensure the creation uses that connection's methods
+          test_connection = get_connection_copy()
+          events = []
+  
+          def fake_deserialize(format, data, using=None):
+              events.append(("deserialize_called_with_using", using))
+              class Obj:
+                  def save(self_inner):
+                      events.append("save")
+              yield Obj()
+  
+          @contextmanager
+          def cm():
+              events.append("enter")
+              try:
+                  yield
+              finally:
+                  events.append("exit")
+  
+          def check_constraints():
+              events.append("check")
+  
+          # Patch deserialize globally, but patch the methods on the copied connection
+          with mock.patch('django.core.serializers.deserialize', new=fake_deserialize):
+              with mock.patch.object(test_connection, 'constraint_checks_disabled', new=cm):
+                  with mock.patch.object(test_connection, 'check_constraints', new=check_constraints):
+                      # Call the method on the creation object tied to test_connection
+                      test_connection.creation.deserialize_db_from_string('[]')
+  
+          self.assertEqual(events, [
+              ("deserialize_called_with_using", test_connection.alias),
+              "enter",
+              "save",
+              "exit",
+              "check",
+          ])
+  
+      def test_deserialize_works_with_generator_from_serializers(self):
+          events = []
+  
+          def generator_deserialize(format, data, using=None):
+              events.append(("deserialize_called_with_using", using))
+              class Obj:
+                  def __init__(self, n):
+                      self.n = n
+                  def save(self_inner):
+                      events.append(f"saved-{self_inner.n}")
+              # Return a generator explicitly
+              def gen():
+                  for i in range(3):
+                      yield Obj(i)
+              return gen()
+  
+          cm, check_constraints = self._make_cm_and_hooks(events)
+  
+          with mock.patch('django.core.serializers.deserialize', new=generator_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', new=cm):
+                  with mock.patch.object(connection, 'check_constraints', new=check_constraints):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          expected = [
+              ("deserialize_called_with_using", connection.alias),
+              "enter",
+              "saved-0",
+              "saved-1",
+              "saved-2",
+              "exit",
+              "check",
+          ]
+          self.assertEqual(events, expected)
+  
+      def test_order_with_mixed_iterator_and_list(self):
+          events = []
+  
+          # Simulate deserialize returning a mix (iterator implemented as list iterator)
+          def fake_deserialize(format, data, using=None):
+              events.append(("deserialize_called_with_using", using))
+              class Obj:
+                  def __init__(self, name):
+                      self.name = name
+                  def save(self_inner):
+                      events.append(f"save-{self_inner.name}")
+              items = [Obj('x'), Obj('y')]
+              for it in iter(items):
+                  yield it
+  
+          cm, check_constraints = self._make_cm_and_hooks(events)
+  
+          with mock.patch('django.core.serializers.deserialize', new=fake_deserialize):
+              with mock.patch.object(connection, 'constraint_checks_disabled', new=cm):
+                  with mock.patch.object(connection, 'check_constraints', new=check_constraints):
+                      connection.creation.deserialize_db_from_string('[]')
+  
+          self.assertEqual(events, [
+              ("deserialize_called_with_using", connection.alias),
+              "enter",
+              "save-x",
+              "save-y",
+              "exit",
+              "check",
+          ])
+new_imports_code: |
+  from contextlib import contextmanager

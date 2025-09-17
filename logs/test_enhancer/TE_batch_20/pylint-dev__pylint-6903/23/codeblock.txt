@@ -1,0 +1,151 @@
+from pylint.lint.run import _query_cpu, _cpu_count
+# Additional regression tests for _query_cpu and _cpu_count behaviors
+import os
+from unittest.mock import patch, MagicMock, mock_open
+
+import pytest
+
+from pylint.lint.run import _query_cpu, _cpu_count
+
+
+def _make_mock_open(mapping):
+    """Return a function suitable for patching builtins.open that
+    returns the mapped data for particular filenames."""
+    builtin_open = open
+
+    def _mock_open(path, *args, **kwargs):
+        if path in mapping:
+            return mock_open(read_data=mapping[path])(*args, **kwargs)
+        return builtin_open(path, *args, **kwargs)
+
+    return _mock_open
+
+
+def _make_mock_path(true_files):
+    """Return a Path-like constructor which marks files in true_files as existing."""
+    real_Path = __import__("pathlib").Path
+
+    def _mock_path(path):
+        if path in true_files:
+            return MagicMock(is_file=lambda: True)
+        return real_Path(path)
+
+    return _mock_path
+
+
+def test_query_cpu_quota_fractional_rounds_up_50000_over_100000():
+    # cpu_quota = 50000, cpu_period = 100000 -> int(0.5) == 0 -> should become 1
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "50000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    with patch("builtins.open", _make_mock_open(mapping)):
+        with patch("pylint.lint.run.Path", _make_mock_path(
+            {"/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us"}
+        )):
+            assert _query_cpu() == 1
+
+
+def test_query_cpu_quota_fractional_rounds_up_tiny_quota():
+    # cpu_quota = 1, cpu_period = 100000 -> 0 -> should become 1
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "1\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    with patch("builtins.open", _make_mock_open(mapping)):
+        with patch("pylint.lint.run.Path", _make_mock_path(
+            {"/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us"}
+        )):
+            assert _query_cpu() == 1
+
+
+def test_query_cpu_quota_exact_one_returns_one():
+    # cpu_quota == cpu_period => exactly 1 CPU
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "100000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    with patch("builtins.open", _make_mock_open(mapping)):
+        with patch("pylint.lint.run.Path", _make_mock_path(
+            {"/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us"}
+        )):
+            assert _query_cpu() == 1
+
+
+def test_query_cpu_quota_multiple_cpus():
+    # cpu_quota double the period => 2 CPUs
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "200000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    with patch("builtins.open", _make_mock_open(mapping)):
+        with patch("pylint.lint.run.Path", _make_mock_path(
+            {"/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us"}
+        )):
+            assert _query_cpu() == 2
+
+
+def test_query_cpu_negative_quota_treated_as_one():
+    # cpu_quota negative (not equal -1) may result in int(-2/period) == 0 => should become 1
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-2\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    with patch("builtins.open", _make_mock_open(mapping)):
+        with patch("pylint.lint.run.Path", _make_mock_path(
+            {"/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us"}
+        )):
+            assert _query_cpu() == 1
+
+
+def test_query_cpu_falls_back_to_shares_when_quota_is_minus_one():
+    # cpu_quota == -1 so we should fall back to cpu.shares branch
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "-1\n",
+        "/sys/fs/cgroup/cpu/cpu.shares": "512\n",
+    }
+    with patch("builtins.open", _make_mock_open(mapping)):
+        with patch("pylint.lint.run.Path", _make_mock_path(
+            {"/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.shares"}
+        )):
+            # 512 / 1024 = 0 -> should be normalized to 1
+            assert _query_cpu() == 1
+
+
+def test_query_cpu_quota_zero_file_returns_none_if_no_shares():
+    # cpu_quota file contains 0: cpu_quota is falsy and the quota branch is skipped.
+    # If there is no cpu.shares file, result should be None.
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "0\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    with patch("builtins.open", _make_mock_open(mapping)):
+        # Only mark the quota/period files as present (quota is 0 so code will skip quota branch)
+        with patch("pylint.lint.run.Path", _make_mock_path(
+            {"/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us"}
+        )):
+            assert _query_cpu() is None
+
+
+def test_cpu_count_uses_sched_affinity_and_normalizes_quota_fraction():
+    # When sched_getaffinity returns a set of 4 CPUs and quota computation yields 0 (but normalized to 1),
+    # the _cpu_count should return min(1, 4) == 1.
+    mapping = {
+        "/sys/fs/cgroup/cpu/cpu.cfs_quota_us": "50000\n",
+        "/sys/fs/cgroup/cpu/cpu.cfs_period_us": "100000\n",
+    }
+    with patch("builtins.open", _make_mock_open(mapping)):
+        with patch("pylint.lint.run.Path", _make_mock_path(
+            {"/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "/sys/fs/cgroup/cpu/cpu.cfs_period_us"}
+        )):
+            with patch("pylint.lint.run.os.sched_getaffinity", lambda _: {0, 1, 2, 3}):
+                assert _cpu_count() == 1
+
+
+def test_cpu_count_falls_back_to_single_process_when_no_sched_and_no_multiprocessing():
+    # Simulate absence of sched_getaffinity and multiprocessing module to force fallback to 1
+    with patch("pylint.lint.run.os.sched_getaffinity", None):
+        with patch("pylint.lint.run.multiprocessing", None):
+            # No cgroup files present; _query_cpu returns None and _cpu_count should be 1
+            with patch("pylint.lint.run.Path", _make_mock_path(set())):
+                assert _cpu_count() == 1

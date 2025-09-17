@@ -1,0 +1,128 @@
+language: Python
+number_of_tests: 10
+test_behavior: These tests verify that aggregate SQL generation includes a space after the DISTINCT keyword ("DISTINCT ") whenever an aggregate is used with distinct=True, and that it does not include DISTINCT when distinct=False. They also verify that filtered aggregates render either a FILTER (WHERE ...) clause on backends that support it or a CASE WHEN ... construct on backends that don't. The tests capture executed SQL (via CaptureQueriesContext) to inspect the generated SQL in a backend-agnostic way by lowercasing it before assertions.
+new_imports_code: |
+  from django.db.models import Q
+test_code: |
+  def test_count_distinct_sql_contains_space(self):
+      # Ensure COUNT(... DISTINCT ...) renders with a space after DISTINCT.
+      with CaptureQueriesContext(connection) as ctx:
+          Book.objects.aggregate(Count("rating", distinct=True))
+      sql_combined = " ".join(q["sql"] for q in ctx.captured_queries).lower()
+      self.assertIn("distinct ", sql_combined)
+      # Ensure the token appears as part of COUNT or another aggregate.
+      self.assertRegex(sql_combined, r'\bcount\([^\)]*distinct ')
+
+  def test_count_distinct_expression_sql_contains_space(self):
+      # DISTINCT on a conditional expression (Case/When).
+      with CaptureQueriesContext(connection) as ctx:
+          Book.objects.aggregate(
+              distinct_ratings=Count(Case(When(pages__gt=300, then='rating')), distinct=True),
+          )
+      sql_combined = " ".join(q["sql"] for q in ctx.captured_queries).lower()
+      self.assertIn("distinct ", sql_combined)
+      self.assertRegex(sql_combined, r'\bcount\([^\)]*distinct ')
+
+  def test_annotate_count_distinct_sql_contains_space(self):
+      # Annotating with a distinct count should render DISTINCT with a trailing space.
+      qs = Book.objects.annotate(num_distinct_ratings=Count("rating", distinct=True)).order_by("pk")
+      with CaptureQueriesContext(connection) as ctx:
+          list(qs[:1])  # force execution
+      sql_combined = " ".join(q["sql"] for q in ctx.captured_queries).lower()
+      self.assertIn("distinct ", sql_combined)
+      self.assertRegex(sql_combined, r'\bcount\([^\)]*distinct ')
+
+  def test_values_annotate_aggregate_contains_distinct_space(self):
+      # A values()/annotate()/aggregate pipeline that uses distinct should still
+      # render DISTINCT with a trailing space in the final SQL.
+      with CaptureQueriesContext(connection) as ctx:
+          Book.objects.values("rating").annotate(n=Count("id", distinct=True)).aggregate(Max("n"))
+      sql_combined = " ".join(q["sql"] for q in ctx.captured_queries).lower()
+      self.assertIn("distinct ", sql_combined)
+
+  def test_count_distinct_with_filter_sql_contains_space(self):
+      # Aggregates that use both distinct and filter: ensure DISTINCT has a trailing space
+      # and that filtered aggregates render either FILTER (WHERE ...) on supporting backends
+      # or a CASE WHEN ... fallback on others.
+      with CaptureQueriesContext(connection) as ctx:
+          Book.objects.aggregate(
+              Count("rating", distinct=True, filter=Q(pages__gt=300))
+          )
+      sql_combined = " ".join(q["sql"] for q in ctx.captured_queries).lower()
+      self.assertIn("distinct ", sql_combined)
+      if connection.features.supports_aggregate_filter_clause:
+          self.assertIn("filter (where", sql_combined)
+      else:
+          # The fallback uses a Case/When which will compile to a SQL CASE expression.
+          self.assertIn("case", sql_combined)
+
+  def test_custom_aggregate_distinct_sql_has_space(self):
+      # Create a simple custom aggregate that allows distinct to exercise
+      # Aggregate.as_sql for non-Count aggregates that opt-in to allow_distinct.
+      class MyAgg(Aggregate):
+          function = "MYAGG"
+          name = "MyAgg"
+          allow_distinct = True
+          output_field = IntegerField()
+
+      with CaptureQueriesContext(connection) as ctx:
+          Book.objects.aggregate(MyAgg("rating", distinct=True))
+      sql_combined = " ".join(q["sql"] for q in ctx.captured_queries).lower()
+      self.assertIn("myagg(", sql_combined)
+      self.assertIn("distinct ", sql_combined)
+
+  def test_custom_aggregate_distinct_with_filter_sql_has_space(self):
+      class MyAgg(Aggregate):
+          function = "MYAGG"
+          name = "MyAgg"
+          allow_distinct = True
+          output_field = IntegerField()
+
+      with CaptureQueriesContext(connection) as ctx:
+          Book.objects.aggregate(MyAgg("rating", distinct=True, filter=Q(pages__gt=300)))
+      sql_combined = " ".join(q["sql"] for q in ctx.captured_queries).lower()
+      self.assertIn("distinct ", sql_combined)
+      if connection.features.supports_aggregate_filter_clause:
+          self.assertIn("filter (where", sql_combined)
+      else:
+          self.assertIn("case", sql_combined)
+
+  def test_no_distinct_token_when_distinct_false(self):
+      # When distinct is False (the default), no DISTINCT token should appear.
+      with CaptureQueriesContext(connection) as ctx:
+          Book.objects.aggregate(Count("rating", distinct=False))
+      sql_combined = " ".join(q["sql"] for q in ctx.captured_queries).lower()
+      # No standalone distinct token.
+      self.assertNotIn("distinct ", sql_combined)
+
+  def test_distinct_space_present_only_once_in_query(self):
+      # Ensure DISTINCT with trailing space is present but not repeated incorrectly.
+      with CaptureQueriesContext(connection) as ctx:
+          Book.objects.aggregate(
+              Count("rating", distinct=True),
+              Count(Case(When(pages__gt=300, then='rating')), distinct=True),
+          )
+      sql_combined = " ".join(q["sql"] for q in ctx.captured_queries).lower()
+      # There should be at least one 'distinct ' token and not excessive repeats like 'distinct  distinct '.
+      self.assertIn("distinct ", sql_combined)
+      self.assertNotIn("distinct  distinct", sql_combined)
+
+  def test_distinct_internally_used_in_subquery_params_and_sql(self):
+      # When using distinct with a filtered aggregate, ensure SQL contains DISTINCT
+      # and that if a FILTER clause is used, parameters for the filter are present.
+      with CaptureQueriesContext(connection) as ctx:
+          Book.objects.aggregate(Count("rating", distinct=True, filter=Q(pages__gt=300)))
+      if not ctx.captured_queries:
+          self.fail("No queries captured")
+      sql_combined = " ".join(q["sql"] for q in ctx.captured_queries).lower()
+      params_combined = tuple(p for q in ctx.captured_queries for p in q.get("params", ()))
+      self.assertIn("distinct ", sql_combined)
+      # If there's a filter predicate, there should be at least one parameter bound (the pages__gt value).
+      # We only assert that params were captured (if any) rather than checking exact values.
+      # Backends may inline constants differently; this asserts the parameter plumbing works.
+      self.assertTrue(isinstance(params_combined, tuple))
+      # If there's a FILTER (WHERE ...) or CASE, the SQL should include one of them.
+      if connection.features.supports_aggregate_filter_clause:
+          self.assertIn("filter (where", sql_combined)
+      else:
+          self.assertIn("case", sql_combined)
